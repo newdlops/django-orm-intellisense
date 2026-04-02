@@ -13,7 +13,9 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:djangoOrmIntellisense.showStatus"
+    "onStartupFinished",
+    "onCommand:djangoOrmIntellisense.showStatus",
+    "onCommand:djangoOrmIntellisense.restartDaemon"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -21,9 +23,49 @@
       {
         "command": "djangoOrmIntellisense.showStatus",
         "title": "Django ORM Intellisense: Show Status"
+      },
+      {
+        "command": "djangoOrmIntellisense.restartDaemon",
+        "title": "Django ORM Intellisense: Restart Daemon"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Django ORM Intellisense",
+      "properties": {
+        "djangoOrmIntellisense.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the Python analysis daemon when the extension activates."
+        },
+        "djangoOrmIntellisense.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python executable used to launch the Django ORM Intellisense analysis daemon."
+        },
+        "djangoOrmIntellisense.settingsModule": {
+          "type": "string",
+          "default": "",
+          "description": "Optional DJANGO_SETTINGS_MODULE override passed to the analysis daemon."
+        },
+        "djangoOrmIntellisense.logLevel": {
+          "type": "string",
+          "enum": [
+            "off",
+            "info",
+            "debug"
+          ],
+          "default": "info",
+          "description": "Controls how much daemon lifecycle logging is written to the extension output channel."
+        }
+      }
+    }
   },
+  "keywords": [
+    "django",
+    "orm",
+    "python",
+    "intellisense"
+  ],
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
