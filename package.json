@@ -1,0 +1,42 @@
+{
+  "name": "django-orm-intellisense",
+  "displayName": "Django ORM Intellisense",
+  "description": "VS Code extension scaffold for Django ORM development assistance.",
+  "version": "0.0.1",
+  "publisher": "newdlops",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:djangoOrmIntellisense.showStatus"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "djangoOrmIntellisense.showStatus",
+        "title": "Django ORM Intellisense: Show Status"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.17.30",
+    "@types/vscode": "^1.90.0",
+    "@vscode/test-cli": "^0.0.10",
+    "@vscode/test-electron": "^2.5.2",
+    "typescript": "^5.8.3"
+  }
+}
