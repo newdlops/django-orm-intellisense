@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from ..runtime.inspector import RuntimeInspection, RuntimeModelSummary
+from ..runtime.inspector import RuntimeInspection, get_runtime_field
+from ..semantic.graph import ModelGraph, build_model_graph
 from ..static_index.indexer import FieldCandidate, StaticIndex
 
 RELATION_ONLY_METHODS = {'select_related', 'prefetch_related'}
 FILTER_LOOKUP_METHODS = {'filter', 'exclude', 'get'}
-LOOKUP_OPERATORS = (
+DEFAULT_LOOKUP_OPERATORS = (
     'exact',
     'iexact',
     'contains',
@@ -45,10 +46,11 @@ def list_lookup_path_completions(
     prefix: str,
     method: str,
 ) -> dict[str, object]:
+    model_graph = build_model_graph(static_index, runtime)
     normalized_prefix = _normalize_lookup_path(prefix, method)
     completed_segments, current_partial = _split_lookup_prefix(normalized_prefix)
     traversal = _analyze_lookup_completion_context(
-        static_index=static_index,
+        model_graph=model_graph,
         runtime=runtime,
         base_model_label=base_model_label,
         segments=completed_segments,
@@ -62,31 +64,42 @@ def list_lookup_path_completions(
         }
 
     items: list[dict[str, object]]
-    if traversal['completionMode'] == 'lookup_operator':
-        items = [
-            _lookup_operator_item_dict(
-                owner_model_label=str(traversal['ownerModelLabel']),
-                operator=operator,
-            )
-            for operator in LOOKUP_OPERATORS
-            if operator.startswith(current_partial)
-        ]
-    else:
+    if traversal['completionMode'] == 'field':
         current_model_label = str(traversal['currentModelLabel'])
         relation_only = method in RELATION_ONLY_METHODS
         items = [
             _lookup_item_dict(field)
-            for field in _lookup_fields_for_model(
-                static_index=static_index,
-                runtime=runtime,
-                model_label=current_model_label,
-            )
+            for field in model_graph.fields_for_model(current_model_label)
             if (field.is_relation or not relation_only)
             and field.name.startswith(current_partial)
         ]
+    elif traversal['completionMode'] == 'field_and_lookup':
+        current_model_label = str(traversal['currentModelLabel'])
+        relation_only = method in RELATION_ONLY_METHODS
+        items = [
+            _lookup_item_dict(field)
+            for field in model_graph.fields_for_model(current_model_label)
+            if (field.is_relation or not relation_only)
+            and field.name.startswith(current_partial)
+        ]
+        items.extend(
+            _lookup_chain_completion_items(
+                runtime=runtime,
+                field=traversal['lookupField'],
+                current_partial=current_partial,
+            )
+        )
+    else:
+        items = _lookup_chain_completion_items(
+            runtime=runtime,
+            field=traversal['lookupField'],
+            current_partial=current_partial,
+            runtime_field=traversal.get('runtimeField'),
+        )
 
     items.sort(
         key=lambda item: (
+            2 if item.get('fieldKind') == 'lookup_operator' else 1 if item.get('fieldKind') == 'lookup_transform' else 0,
             0 if item.get('isRelation') else 1,
             str(item['name']).lower(),
         )
@@ -106,6 +119,7 @@ def resolve_lookup_path(
     path: str,
     method: str,
 ) -> dict[str, object]:
+    model_graph = build_model_graph(static_index, runtime)
     normalized_path = _normalize_lookup_path(path, method)
     if not normalized_path:
         return {
@@ -120,33 +134,25 @@ def resolve_lookup_path(
     lookup_operator: str | None = None
 
     for index, segment in enumerate(segments):
-        field = _find_lookup_field(
-            static_index=static_index,
-            runtime=runtime,
-            model_label=current_model_label,
-            field_name=segment,
-        )
+        field = model_graph.find_field(current_model_label, segment)
         if field is None:
             if (
                 method in FILTER_LOOKUP_METHODS
                 and terminal_field is not None
-                and not terminal_field.is_relation
-                and _is_lookup_operator(segment)
-                and index == len(segments) - 1
             ):
-                lookup_operator = segment
-                break
-            if (
-                method in FILTER_LOOKUP_METHODS
-                and terminal_field is not None
-                and not terminal_field.is_relation
-                and index == len(segments) - 1
-            ):
+                lookup_resolution = _resolve_lookup_chain(
+                    runtime=runtime,
+                    field=terminal_field,
+                    segments=segments[index:],
+                )
+                if lookup_resolution['resolved']:
+                    lookup_operator = lookup_resolution.get('lookupOperator')
+                    break
                 return {
                     'resolved': False,
-                    'reason': 'invalid_lookup_operator',
+                    'reason': lookup_resolution['reason'],
                     'resolvedSegments': resolved_segments,
-                    'missingSegment': segment,
+                    'missingSegment': lookup_resolution.get('missingSegment', segment),
                 }
             return {
                 'resolved': False,
@@ -162,35 +168,59 @@ def resolve_lookup_path(
         if is_last:
             break
 
-        if not field.is_relation or not field.related_model_label:
-            next_segment = segments[index + 1]
-            if (
-                method in FILTER_LOOKUP_METHODS
-                and not field.is_relation
-                and _is_lookup_operator(next_segment)
-                and index + 1 == len(segments) - 1
-            ):
-                lookup_operator = next_segment
-                break
-            if (
-                method in FILTER_LOOKUP_METHODS
-                and not field.is_relation
-                and index + 1 == len(segments) - 1
-            ):
+        next_segment = segments[index + 1]
+        if field.is_relation and field.related_model_label:
+            next_field = model_graph.find_field(field.related_model_label, next_segment)
+            if next_field is not None:
+                current_model_label = field.related_model_label
+                continue
+
+            if method in FILTER_LOOKUP_METHODS:
+                lookup_resolution = _resolve_lookup_chain(
+                    runtime=runtime,
+                    field=field,
+                    segments=segments[index + 1:],
+                )
+                if lookup_resolution['resolved']:
+                    lookup_operator = lookup_resolution.get('lookupOperator')
+                    break
                 return {
                     'resolved': False,
-                    'reason': 'invalid_lookup_operator',
+                    'reason': lookup_resolution['reason'],
                     'resolvedSegments': resolved_segments,
-                    'missingSegment': next_segment,
+                    'missingSegment': lookup_resolution.get('missingSegment', next_segment),
                 }
+
+            return {
+                'resolved': False,
+                'reason': 'segment_not_found',
+                'resolvedSegments': resolved_segments,
+                'missingSegment': next_segment,
+            }
+
+        if not field.is_relation or not field.related_model_label:
+            if method in FILTER_LOOKUP_METHODS:
+                lookup_resolution = _resolve_lookup_chain(
+                    runtime=runtime,
+                    field=field,
+                    segments=segments[index + 1:],
+                )
+                if lookup_resolution['resolved']:
+                    lookup_operator = lookup_resolution.get('lookupOperator')
+                    break
+                return {
+                    'resolved': False,
+                    'reason': lookup_resolution['reason'],
+                    'resolvedSegments': resolved_segments,
+                    'missingSegment': lookup_resolution.get('missingSegment', next_segment),
+                }
+
             return {
                 'resolved': False,
                 'reason': 'non_relation_intermediate',
                 'resolvedSegments': resolved_segments,
                 'missingSegment': segment,
             }
-
-        current_model_label = field.related_model_label
 
     if terminal_field is None:
         return {
@@ -216,7 +246,7 @@ def resolve_lookup_path(
 
 def _analyze_lookup_completion_context(
     *,
-    static_index: StaticIndex,
+    model_graph: ModelGraph,
     runtime: RuntimeInspection,
     base_model_label: str,
     segments: list[str],
@@ -224,14 +254,11 @@ def _analyze_lookup_completion_context(
 ) -> dict[str, object]:
     current_model_label = base_model_label
     last_field: FieldCandidate | None = None
+    index = 0
 
-    for segment in segments:
-        field = _find_lookup_field(
-            static_index=static_index,
-            runtime=runtime,
-            model_label=current_model_label,
-            field_name=segment,
-        )
+    while index < len(segments):
+        segment = segments[index]
+        field = model_graph.find_field(current_model_label, segment)
         if field is None:
             return {
                 'resolved': False,
@@ -240,15 +267,85 @@ def _analyze_lookup_completion_context(
 
         last_field = field
 
-        if not field.is_relation or not field.related_model_label:
+        next_segment = segments[index + 1] if index + 1 < len(segments) else None
+        if next_segment is None:
+            if field.is_relation and field.related_model_label:
+                if method in FILTER_LOOKUP_METHODS:
+                    return {
+                        'resolved': True,
+                        'currentModelLabel': field.related_model_label,
+                        'completionMode': 'field_and_lookup',
+                        'lookupField': field,
+                    }
+                return {
+                    'resolved': True,
+                    'currentModelLabel': field.related_model_label,
+                    'completionMode': 'field',
+                }
+
+            if method in FILTER_LOOKUP_METHODS:
+                lookup_context = _resolve_lookup_completion_chain(
+                    runtime=runtime,
+                    field=field,
+                    segments=[],
+                )
+                return {
+                    'resolved': lookup_context['resolved'],
+                    'reason': lookup_context.get('reason'),
+                    'completionMode': 'lookup_chain' if lookup_context['resolved'] else None,
+                    'lookupField': field,
+                    'runtimeField': lookup_context.get('runtimeField'),
+                }
+
             return {
-                'resolved': method in FILTER_LOOKUP_METHODS,
-                'reason': None if method in FILTER_LOOKUP_METHODS else 'non_relation_intermediate',
-                'completionMode': 'lookup_operator' if method in FILTER_LOOKUP_METHODS else None,
-                'ownerModelLabel': field.model_label,
+                'resolved': False,
+                'reason': 'non_relation_intermediate',
             }
 
-        current_model_label = field.related_model_label
+        if field.is_relation and field.related_model_label:
+            next_field = model_graph.find_field(field.related_model_label, next_segment)
+            if next_field is not None:
+                current_model_label = field.related_model_label
+                index += 1
+                continue
+
+            if method in FILTER_LOOKUP_METHODS:
+                lookup_context = _resolve_lookup_completion_chain(
+                    runtime=runtime,
+                    field=field,
+                    segments=segments[index + 1:],
+                )
+                return {
+                    'resolved': lookup_context['resolved'],
+                    'reason': lookup_context.get('reason'),
+                    'completionMode': 'lookup_chain' if lookup_context['resolved'] else None,
+                    'lookupField': field,
+                    'runtimeField': lookup_context.get('runtimeField'),
+                }
+
+            return {
+                'resolved': False,
+                'reason': 'segment_not_found',
+            }
+
+        if method in FILTER_LOOKUP_METHODS:
+            lookup_context = _resolve_lookup_completion_chain(
+                runtime=runtime,
+                field=field,
+                segments=segments[index + 1:],
+            )
+            return {
+                'resolved': lookup_context['resolved'],
+                'reason': lookup_context.get('reason'),
+                'completionMode': 'lookup_chain' if lookup_context['resolved'] else None,
+                'lookupField': field,
+                'runtimeField': lookup_context.get('runtimeField'),
+            }
+
+        return {
+            'resolved': False,
+            'reason': 'non_relation_intermediate',
+        }
 
     if (
         last_field is not None
@@ -257,8 +354,8 @@ def _analyze_lookup_completion_context(
     ):
         return {
             'resolved': True,
-            'completionMode': 'lookup_operator',
-            'ownerModelLabel': last_field.model_label,
+            'completionMode': 'lookup_chain',
+            'lookupField': last_field,
         }
 
     return {
@@ -266,81 +363,6 @@ def _analyze_lookup_completion_context(
         'currentModelLabel': current_model_label,
         'completionMode': 'field',
     }
-
-
-def _lookup_fields_for_model(
-    *,
-    static_index: StaticIndex,
-    runtime: RuntimeInspection,
-    model_label: str,
-) -> list[FieldCandidate]:
-    fields_by_name = {
-        field.name: field
-        for field in static_index.fields_for_model(model_label)
-    }
-    runtime_model = _runtime_model_summary(runtime, model_label)
-    if runtime_model is None:
-        return list(fields_by_name.values())
-
-    model_candidate = static_index.find_model_candidate(model_label)
-    fallback_file_path = model_candidate.file_path if model_candidate else ''
-    fallback_line = model_candidate.line if model_candidate else 1
-    fallback_column = model_candidate.column if model_candidate else 1
-
-    for relation in runtime_model.relations:
-        existing = fields_by_name.get(relation.name)
-        if (
-            existing is not None
-            and existing.is_relation
-            and existing.related_model_label == relation.related_model_label
-        ):
-            continue
-
-        fields_by_name[relation.name] = FieldCandidate(
-            model_label=model_label,
-            name=relation.name,
-            file_path=existing.file_path if existing is not None else fallback_file_path,
-            line=existing.line if existing is not None else fallback_line,
-            column=existing.column if existing is not None else fallback_column,
-            field_kind=relation.field_kind,
-            is_relation=True,
-            relation_direction=relation.direction,
-            related_model_label=relation.related_model_label,
-            declared_model_label=existing.declared_model_label if existing is not None else model_label,
-            related_name=existing.related_name if existing is not None else None,
-            source='runtime',
-        )
-
-    return list(fields_by_name.values())
-
-
-def _find_lookup_field(
-    *,
-    static_index: StaticIndex,
-    runtime: RuntimeInspection,
-    model_label: str,
-    field_name: str,
-) -> FieldCandidate | None:
-    for field in _lookup_fields_for_model(
-        static_index=static_index,
-        runtime=runtime,
-        model_label=model_label,
-    ):
-        if field.name == field_name:
-            return field
-
-    return None
-
-
-def _runtime_model_summary(
-    runtime: RuntimeInspection,
-    model_label: str,
-) -> RuntimeModelSummary | None:
-    for model in runtime.model_catalog:
-        if model.label == model_label:
-            return model
-
-    return None
 
 
 def _split_lookup_prefix(prefix: str) -> tuple[list[str], str]:
@@ -361,7 +383,9 @@ def _normalize_lookup_path(path: str, method: str) -> str:
     return normalized
 
 
-def _lookup_item_dict(field: FieldCandidate) -> dict[str, object]:
+def _lookup_item_dict(
+    field: FieldCandidate,
+) -> dict[str, object]:
     return {
         'name': field.name,
         'modelLabel': field.model_label,
@@ -397,5 +421,233 @@ def _lookup_operator_item_dict(
     }
 
 
+def _lookup_transform_item_dict(
+    *,
+    owner_model_label: str,
+    transform: str,
+) -> dict[str, object]:
+    return {
+        'name': transform,
+        'modelLabel': owner_model_label,
+        'relatedModelLabel': None,
+        'filePath': None,
+        'line': None,
+        'column': None,
+        'fieldKind': 'lookup_transform',
+        'isRelation': False,
+        'relationDirection': None,
+        'source': 'django_transform',
+        'lookupOperator': None,
+    }
+
+
+def _lookup_chain_completion_items(
+    *,
+    runtime: RuntimeInspection,
+    field: FieldCandidate,
+    current_partial: str,
+    runtime_field: object | None = None,
+) -> list[dict[str, object]]:
+    owner_model_label = field.model_label
+    field_object = runtime_field or get_runtime_field(
+        runtime.settings_module,
+        model_label=field.model_label,
+        field_name=field.name,
+    )
+    if field_object is None:
+        return [
+            _lookup_operator_item_dict(
+                owner_model_label=owner_model_label,
+                operator=operator,
+            )
+            for operator in DEFAULT_LOOKUP_OPERATORS
+            if operator.startswith(current_partial)
+        ]
+
+    items: dict[str, dict[str, object]] = {}
+    for transform_name in _runtime_transform_names(field_object):
+        if transform_name.startswith(current_partial):
+            items[transform_name] = _lookup_transform_item_dict(
+                owner_model_label=owner_model_label,
+                transform=transform_name,
+            )
+
+    for lookup_name in _runtime_lookup_names(field_object):
+        if lookup_name.startswith(current_partial):
+            items[lookup_name] = _lookup_operator_item_dict(
+                owner_model_label=owner_model_label,
+                operator=lookup_name,
+            )
+
+    return list(items.values())
+
+
+def _resolve_lookup_completion_chain(
+    *,
+    runtime: RuntimeInspection,
+    field: FieldCandidate,
+    segments: list[str],
+) -> dict[str, object]:
+    field_object = get_runtime_field(
+        runtime.settings_module,
+        model_label=field.model_label,
+        field_name=field.name,
+    )
+    if field_object is None:
+        if not segments:
+            return {
+                'resolved': True,
+                'runtimeField': None,
+            }
+        return {
+            'resolved': False,
+            'reason': 'invalid_lookup_operator',
+            'missingSegment': segments[0],
+        }
+
+    current_field_object = field_object
+    for index, segment in enumerate(segments):
+        transformed_field = _runtime_transform_output_field(current_field_object, segment)
+        if transformed_field is not None:
+            current_field_object = transformed_field
+            continue
+
+        if _runtime_lookup_exists(current_field_object, segment):
+            return {
+                'resolved': False,
+                'reason': 'invalid_lookup_operator',
+                'missingSegment': segment,
+            }
+
+        return {
+            'resolved': False,
+            'reason': 'invalid_lookup_operator',
+            'missingSegment': segment,
+        }
+
+    return {
+        'resolved': True,
+        'runtimeField': current_field_object,
+    }
+
+
+def _resolve_lookup_chain(
+    *,
+    runtime: RuntimeInspection,
+    field: FieldCandidate,
+    segments: list[str],
+) -> dict[str, object]:
+    field_object = get_runtime_field(
+        runtime.settings_module,
+        model_label=field.model_label,
+        field_name=field.name,
+    )
+    if field_object is None:
+        if len(segments) == 1 and _is_lookup_operator(segments[0]):
+            return {
+                'resolved': True,
+                'lookupOperator': segments[0],
+            }
+        return {
+            'resolved': False,
+            'reason': 'invalid_lookup_operator',
+            'missingSegment': segments[0] if segments else None,
+        }
+
+    current_field_object = field_object
+    lookup_operator: str | None = None
+    for index, segment in enumerate(segments):
+        transformed_field = _runtime_transform_output_field(current_field_object, segment)
+        if transformed_field is not None:
+            current_field_object = transformed_field
+            continue
+
+        if _runtime_lookup_exists(current_field_object, segment):
+            if index != len(segments) - 1:
+                return {
+                    'resolved': False,
+                    'reason': 'invalid_lookup_operator',
+                    'missingSegment': segment,
+                }
+            lookup_operator = segment
+            break
+
+        return {
+            'resolved': False,
+            'reason': 'invalid_lookup_operator',
+            'missingSegment': segment,
+        }
+
+    return {
+        'resolved': True,
+        'lookupOperator': lookup_operator,
+    }
+
+
+def _runtime_lookup_names(field: object) -> list[str]:
+    if not hasattr(field, 'get_lookups'):
+        return []
+
+    lookups = field.get_lookups()  # type: ignore[call-arg]
+    if not isinstance(lookups, dict):
+        return []
+
+    names: list[str] = []
+    for name in lookups:
+        if _runtime_lookup_exists(field, str(name)):
+            names.append(str(name))
+    return sorted(set(names))
+
+
+def _runtime_transform_names(field: object) -> list[str]:
+    if not hasattr(field, 'get_lookups'):
+        return []
+
+    lookups = field.get_lookups()  # type: ignore[call-arg]
+    if not isinstance(lookups, dict):
+        return []
+
+    names: list[str] = []
+    for name in lookups:
+        if _runtime_transform_output_field(field, str(name)) is not None:
+            names.append(str(name))
+    return sorted(set(names))
+
+
+def _runtime_lookup_exists(field: object, lookup_name: str) -> bool:
+    if not hasattr(field, 'get_lookup'):
+        return False
+
+    try:
+        return field.get_lookup(lookup_name) is not None  # type: ignore[call-arg]
+    except Exception:
+        return False
+
+
+def _runtime_transform_output_field(field: object, transform_name: str) -> object | None:
+    if not hasattr(field, 'get_transform'):
+        return None
+
+    try:
+        transform_class = field.get_transform(transform_name)  # type: ignore[call-arg]
+    except Exception:
+        return None
+
+    if transform_class is None:
+        return None
+
+    try:
+        transform = transform_class(_RuntimeLookupLhs(field))
+    except Exception:
+        return None
+
+    return getattr(transform, 'output_field', None)
+
+
+class _RuntimeLookupLhs:
+    def __init__(self, output_field: object) -> None:
+        self.output_field = output_field
+
+
 def _is_lookup_operator(segment: str) -> bool:
-    return segment in LOOKUP_OPERATORS
+    return segment in DEFAULT_LOOKUP_OPERATORS

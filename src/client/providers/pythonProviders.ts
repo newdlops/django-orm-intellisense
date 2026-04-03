@@ -292,7 +292,10 @@ export function registerPythonProviders(
               lookupCompletionKind(item)
             );
             completion.detail = lookupCompletionDetail(item);
-            completion.insertText = item.name;
+            completion.insertText = lookupCompletionInsertText(
+              lookupContext.method,
+              item
+            );
             completion.filterText = lookupFilterText(lookupContext.prefix, item.name);
             completion.sortText = lookupCompletionSortText(
               lookupContext.method,
@@ -309,6 +312,10 @@ export function registerPythonProviders(
               item,
               lookupContext.method,
               baseModelLabel
+            );
+            completion.command = lookupCompletionCommand(
+              lookupContext.method,
+              item
             );
             return completion;
           });
@@ -509,7 +516,10 @@ export function registerPythonProviders(
 function lookupCompletionLabel(
   item: LookupPathItem
 ): string | vscode.CompletionItemLabel {
-  if (item.fieldKind === 'lookup_operator') {
+  if (
+    item.fieldKind === 'lookup_operator' ||
+    item.fieldKind === 'lookup_transform'
+  ) {
     return item.name;
   }
 
@@ -520,7 +530,10 @@ function lookupCompletionLabel(
 }
 
 function lookupCompletionKind(item: LookupPathItem): vscode.CompletionItemKind {
-  if (item.fieldKind === 'lookup_operator') {
+  if (
+    item.fieldKind === 'lookup_operator' ||
+    item.fieldKind === 'lookup_transform'
+  ) {
     return vscode.CompletionItemKind.Operator;
   }
 
@@ -531,9 +544,51 @@ function lookupCompletionDetail(item: LookupPathItem): string {
   if (item.fieldKind === 'lookup_operator') {
     return `Django lookup · ${item.modelLabel}`;
   }
+  if (item.fieldKind === 'lookup_transform') {
+    return `Django transform · ${item.modelLabel}`;
+  }
 
   const fieldType = item.isRelation ? 'Django relation field' : 'Django field';
   return `${fieldType} · ${item.modelLabel}${item.relatedModelLabel ? ` -> ${item.relatedModelLabel}` : ''}`;
+}
+
+function lookupCompletionInsertText(
+  method: string,
+  item: LookupPathItem
+): string {
+  if (!lookupCompletionCanContinue(method, item)) {
+    return item.name;
+  }
+
+  return item.name.endsWith('__') ? item.name : `${item.name}__`;
+}
+
+function lookupCompletionCommand(
+  method: string,
+  item: LookupPathItem
+): vscode.Command | undefined {
+  if (!lookupCompletionCanContinue(method, item)) {
+    return undefined;
+  }
+
+  return {
+    title: 'Continue Django ORM lookup',
+    command: 'editor.action.triggerSuggest',
+  };
+}
+
+function lookupCompletionCanContinue(
+  method: string,
+  item: LookupPathItem
+): boolean {
+  if (item.fieldKind === 'lookup_operator') {
+    return false;
+  }
+  if (item.fieldKind === 'lookup_transform') {
+    return true;
+  }
+
+  return item.isRelation || DJANGO_FIELD_PRIORITY_METHODS.has(method);
 }
 
 function prioritizeLookupCompletionItems(
@@ -556,7 +611,10 @@ function prioritizeLookupCompletionItems(
 }
 
 function lookupCompletionPriority(item: LookupPathItem): number {
-  if (item.fieldKind === 'lookup_operator') {
+  if (
+    item.fieldKind === 'lookup_operator' ||
+    item.fieldKind === 'lookup_transform'
+  ) {
     return 2;
   }
 
@@ -1130,6 +1188,10 @@ function buildLookupItemMarkdown(
   markdown.appendMarkdown(`Owner model: \`${item.modelLabel}\`\n\n`);
   if (item.fieldKind === 'lookup_operator') {
     markdown.appendMarkdown(`Lookup operator: \`${item.lookupOperator ?? item.name}\``);
+    return markdown;
+  }
+  if (item.fieldKind === 'lookup_transform') {
+    markdown.appendMarkdown(`Lookup transform: \`${item.name}\``);
     return markdown;
   }
 

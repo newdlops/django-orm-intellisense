@@ -13,7 +13,7 @@ from ..discovery.workspace import PythonSourceSnapshot
 from ..runtime.inspector import RuntimeInspection
 from ..static_index.indexer import ModuleIndex, StaticIndex, build_static_index
 
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
 STATIC_INDEX_CACHE_NAME = 'static-index.json'
 RUNTIME_CACHE_NAME = 'runtime-inspection.json'
 

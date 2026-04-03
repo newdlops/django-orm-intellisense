@@ -1,3 +1,17 @@
-from .inspector import RuntimeInspection, RuntimeModelSummary, inspect_runtime
+from .inspector import (
+    get_runtime_field,
+    RuntimeFieldSummary,
+    RuntimeInspection,
+    RuntimeModelSummary,
+    RuntimeRelationSummary,
+    inspect_runtime,
+)
 
-__all__ = ['RuntimeInspection', 'RuntimeModelSummary', 'inspect_runtime']
+__all__ = [
+    'get_runtime_field',
+    'RuntimeFieldSummary',
+    'RuntimeInspection',
+    'RuntimeModelSummary',
+    'RuntimeRelationSummary',
+    'inspect_runtime',
+]

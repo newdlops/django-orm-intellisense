@@ -5,6 +5,10 @@ import os
 import sys
 from dataclasses import dataclass
 
+_RUNTIME_FIELD_REGISTRY: dict[tuple[str, str], object] = {}
+_RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE: str | None = None
+_RUNTIME_FIELD_REGISTRY_READY = False
+
 
 @dataclass(frozen=True)
 class RuntimeRelationSummary:
@@ -32,12 +36,41 @@ class RuntimeRelationSummary:
 
 
 @dataclass(frozen=True)
+class RuntimeFieldSummary:
+    name: str
+    field_kind: str
+    is_relation: bool
+    related_model_label: str | None
+    direction: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            'name': self.name,
+            'fieldKind': self.field_kind,
+            'isRelation': self.is_relation,
+            'relatedModelLabel': self.related_model_label,
+            'direction': self.direction,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> RuntimeFieldSummary:
+        return cls(
+            name=str(payload['name']),
+            field_kind=str(payload['fieldKind']),
+            is_relation=bool(payload['isRelation']),
+            related_model_label=_string_or_none(payload.get('relatedModelLabel')),
+            direction=_string_or_none(payload.get('direction')),
+        )
+
+
+@dataclass(frozen=True)
 class RuntimeModelSummary:
     label: str
     module: str
     field_names: list[str]
     relation_names: list[str]
     reverse_relation_names: list[str]
+    fields: list[RuntimeFieldSummary]
     relations: list[RuntimeRelationSummary]
     manager_names: list[str]
 
@@ -48,6 +81,7 @@ class RuntimeModelSummary:
             'fieldNames': list(self.field_names),
             'relationNames': list(self.relation_names),
             'reverseRelationNames': list(self.reverse_relation_names),
+            'fields': [field.to_dict() for field in self.fields],
             'relations': [relation.to_dict() for relation in self.relations],
             'managerNames': list(self.manager_names),
         }
@@ -61,6 +95,11 @@ class RuntimeModelSummary:
             relation_names=[str(name) for name in payload.get('relationNames', [])],
             reverse_relation_names=[
                 str(name) for name in payload.get('reverseRelationNames', [])
+            ],
+            fields=[
+                RuntimeFieldSummary.from_dict(dict(field))
+                for field in payload.get('fields', [])
+                if isinstance(field, dict)
             ],
             relations=[
                 RuntimeRelationSummary.from_dict(dict(relation))
@@ -162,6 +201,7 @@ class RuntimeInspection:
 
 def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
     if importlib.util.find_spec('django') is None:
+        _clear_runtime_field_registry()
         return RuntimeInspection(
             python_executable=sys.executable,
             django_importable=False,
@@ -184,6 +224,7 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
     django_version = getattr(django, 'get_version', lambda: None)()
 
     if not settings_module:
+        _clear_runtime_field_registry()
         return RuntimeInspection(
             python_executable=sys.executable,
             django_importable=True,
@@ -205,6 +246,7 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
         os.environ['DJANGO_SETTINGS_MODULE'] = settings_module
         django.setup()
     except Exception as error:
+        _clear_runtime_field_registry()
         return RuntimeInspection(
             python_executable=sys.executable,
             django_importable=True,
@@ -230,6 +272,7 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
     reverse_relation_count = 0
     manager_count = 0
     model_preview: list[RuntimeModelSummary] = []
+    runtime_field_registry: dict[tuple[str, str], object] = {}
 
     for model in sorted(
         apps.get_models(),
@@ -243,6 +286,7 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
         field_names: list[str] = []
         relation_names: list[str] = []
         reverse_relation_names: list[str] = []
+        fields: list[RuntimeFieldSummary] = []
         relations: list[RuntimeRelationSummary] = []
         manager_names = [manager.name for manager in meta.managers]
         manager_count += len(manager_names)
@@ -251,8 +295,18 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
             if getattr(field, 'auto_created', False) and not getattr(field, 'concrete', True):
                 reverse_name = _relation_name(field)
                 if reverse_name:
+                    runtime_field_registry[(f'{meta.app_label}.{meta.object_name}', reverse_name)] = field
                     reverse_relation_names.append(reverse_name)
                     reverse_relation_count += 1
+                    fields.append(
+                        RuntimeFieldSummary(
+                            name=reverse_name,
+                            field_kind=_relation_field_kind(field, reverse=True),
+                            is_relation=True,
+                            related_model_label=_related_model_label(field),
+                            direction='reverse',
+                        )
+                    )
                     relations.append(
                         RuntimeRelationSummary(
                             name=reverse_name,
@@ -265,6 +319,16 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
 
             field_names.append(field.name)
             field_count += 1
+            runtime_field_registry[(f'{meta.app_label}.{meta.object_name}', str(field.name))] = field
+            fields.append(
+                RuntimeFieldSummary(
+                    name=str(field.name),
+                    field_kind=field.__class__.__name__,
+                    is_relation=bool(getattr(field, 'is_relation', False)),
+                    related_model_label=_related_model_label(field),
+                    direction='forward' if getattr(field, 'is_relation', False) else None,
+                )
+            )
 
             if getattr(field, 'is_relation', False) and getattr(field, 'related_model', None) is not None:
                 relation_names.append(field.name)
@@ -285,10 +349,13 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
                 field_names=field_names,
                 relation_names=relation_names,
                 reverse_relation_names=reverse_relation_names,
+                fields=fields,
                 relations=relations,
                 manager_names=manager_names,
             )
         )
+
+    _set_runtime_field_registry(settings_module, runtime_field_registry)
 
     return RuntimeInspection(
         python_executable=sys.executable,
@@ -306,6 +373,83 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
         model_catalog=model_preview,
         model_preview=model_preview[:10],
     )
+
+
+def get_runtime_field(
+    settings_module: str | None,
+    *,
+    model_label: str,
+    field_name: str,
+) -> object | None:
+    _ensure_runtime_field_registry(settings_module)
+    return _RUNTIME_FIELD_REGISTRY.get((model_label, field_name))
+
+
+def _ensure_runtime_field_registry(settings_module: str | None) -> None:
+    global _RUNTIME_FIELD_REGISTRY_READY
+
+    if (
+        _RUNTIME_FIELD_REGISTRY_READY
+        and _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE == settings_module
+    ):
+        return
+
+    if importlib.util.find_spec('django') is None or not settings_module:
+        _clear_runtime_field_registry()
+        _RUNTIME_FIELD_REGISTRY_READY = True
+        return
+
+    try:
+        import django  # type: ignore
+
+        os.environ['DJANGO_SETTINGS_MODULE'] = settings_module
+        django.setup()
+
+        from django.apps import apps  # type: ignore
+    except Exception:
+        _clear_runtime_field_registry()
+        _RUNTIME_FIELD_REGISTRY_READY = True
+        return
+
+    runtime_field_registry: dict[tuple[str, str], object] = {}
+    for model in apps.get_models():
+        meta = model._meta
+        model_label = f'{meta.app_label}.{meta.object_name}'
+        for field in meta.get_fields(include_hidden=True):
+            if getattr(field, 'auto_created', False) and not getattr(field, 'concrete', True):
+                reverse_name = _relation_name(field)
+                if reverse_name:
+                    runtime_field_registry[(model_label, reverse_name)] = field
+                continue
+
+            field_name = getattr(field, 'name', None)
+            if field_name:
+                runtime_field_registry[(model_label, str(field_name))] = field
+
+    _set_runtime_field_registry(settings_module, runtime_field_registry)
+
+
+def _set_runtime_field_registry(
+    settings_module: str | None,
+    registry: dict[tuple[str, str], object],
+) -> None:
+    global _RUNTIME_FIELD_REGISTRY
+    global _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE
+    global _RUNTIME_FIELD_REGISTRY_READY
+
+    _RUNTIME_FIELD_REGISTRY = registry
+    _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE = settings_module
+    _RUNTIME_FIELD_REGISTRY_READY = True
+
+
+def _clear_runtime_field_registry() -> None:
+    global _RUNTIME_FIELD_REGISTRY
+    global _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE
+    global _RUNTIME_FIELD_REGISTRY_READY
+
+    _RUNTIME_FIELD_REGISTRY = {}
+    _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE = None
+    _RUNTIME_FIELD_REGISTRY_READY = False
 
 
 def _relation_name(field: object) -> str | None:

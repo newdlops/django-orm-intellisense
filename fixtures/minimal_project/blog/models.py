@@ -1,4 +1,5 @@
 from django.db import models
+from django.db.models.lookups import Lookup
 
 COMPANY_REGISTRATION_RELATED_NAME = 'corporate_registration'
 
@@ -41,6 +42,22 @@ class Tag(models.Model):
     label = models.CharField(max_length=64)
 
 
+class Status(models.CharField):
+    pass
+
+
+class ReadyLookup(Lookup):
+    lookup_name = 'ready'
+
+    def as_sql(self, compiler, connection):
+        lhs, lhs_params = self.process_lhs(compiler, connection)
+        rhs, rhs_params = self.process_rhs(compiler, connection)
+        return f'{lhs} = {rhs}', [*lhs_params, *rhs_params]
+
+
+Status.register_lookup(ReadyLookup)
+
+
 class Post(models.Model):
     author = models.ForeignKey(
         Author,
@@ -54,6 +71,7 @@ class Post(models.Model):
 
 class Company(models.Model):
     name = models.CharField(max_length=255)
+    state = Status(max_length=32)
 
 
 class CorporateRegistration(models.Model):

@@ -36,8 +36,51 @@ suite('Django ORM Intellisense UI', () => {
 
     assert.ok(completionList, 'Expected completion items for lookup path.');
     assert.ok(
-      completionList.items.some((item) => item.label === 'profile'),
+      hasCompletionItemLabel(completionList.items, 'profile'),
       'Expected lookup path completion to include `profile`.'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(completionList.items, 'profile__timezone'),
+      'Expected lookup path completion to suggest only the next lookup segment.'
+    );
+    const relationCompletionItem = findCompletionItemByLabel(
+      completionList.items,
+      'profile'
+    );
+    assert.strictEqual(
+      relationCompletionItem?.insertText,
+      'profile__',
+      'Expected string lookup relation completion to continue the `__` chain.'
+    );
+    assert.strictEqual(
+      relationCompletionItem?.command?.command,
+      'editor.action.triggerSuggest',
+      'Expected string lookup relation completion to reopen suggestions.'
+    );
+
+    const operatorCompletionPosition = positionAfterTextInContainer(
+      document,
+      "filter(author__profile__timezone__='Asia/Seoul')",
+      'author__profile__timezone__'
+    );
+    const operatorCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        operatorCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(operatorCompletionList?.items, 'contains'),
+      'Expected lookup operator completion to include `contains` after a completed field path.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(operatorCompletionList?.items, 'gte'),
+      'Expected lookup operator completion to include `gte` after a completed field path.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(operatorCompletionList?.items, 'in'),
+      'Expected lookup operator completion to include `in` after a completed field path.'
     );
 
     const hoverPosition = positionInsideText(document, 'author__profile__timezone', 'timezone');
@@ -97,7 +140,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      completionList?.items.some((item) => item.label === 'registration_code'),
+      hasCompletionItemLabel(completionList?.items, 'registration_code'),
       'Expected reverse lookup completion to include `registration_code`.'
     );
 
@@ -133,7 +176,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      65,
+      70,
       'Expected reverse lookup definition to target the CorporateRegistration.registration_code field.'
     );
 
@@ -147,6 +190,103 @@ suite('Django ORM Intellisense UI', () => {
         (item) => !item.message.includes('corporate_registration__registration_code')
       ),
       `Expected runtime-backed reverse lookup path to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+  });
+
+  test('resolves runtime-backed custom fields in keyword lookups', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const completionPosition = positionAfterTextInContainer(
+      document,
+      "Company.objects.filter(st='READY')",
+      'st'
+    );
+    const completionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        completionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(completionList?.items, 'state'),
+      'Expected runtime-backed custom field completion to include `state`.'
+    );
+    const customFieldCompletionItem = findCompletionItemByLabel(
+      completionList?.items,
+      'state'
+    );
+    assert.strictEqual(
+      customFieldCompletionItem?.insertText,
+      'state__',
+      'Expected runtime-backed custom field completion to continue lookup operators.'
+    );
+    assert.strictEqual(
+      customFieldCompletionItem?.command?.command,
+      'editor.action.triggerSuggest',
+      'Expected runtime-backed custom field completion to reopen suggestions.'
+    );
+
+    const customLookupCompletionPosition = positionAfterTextInContainer(
+      document,
+      "Company.objects.filter(state__rea='READY')",
+      'state__rea'
+    );
+    const customLookupCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        customLookupCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(customLookupCompletionList?.items, 'ready'),
+      'Expected runtime-backed custom lookup completion to include `ready`.'
+    );
+
+    const hoverPosition = positionInsideText(
+      document,
+      "Company.objects.filter(state__in=['READY'])",
+      'state__in'
+    );
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      hoverPosition
+    );
+    const hoverText = stringifyHovers(hovers);
+
+    assert.ok(
+      hoverText.includes('Owner model: `blog.Company`'),
+      `Expected runtime-backed custom field hover to mention blog.Company. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('Field kind: `Status`'),
+      `Expected runtime-backed custom field hover to mention the custom field kind. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('Lookup operator: `in`'),
+      `Expected runtime-backed custom field hover to mention the lookup operator. Received: ${hoverText}`
+    );
+
+    const diagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) =>
+        items.some((item) => item.message.includes('author__unknown'))
+    );
+    assert.ok(
+      diagnostics.every(
+        (item) => !item.message.includes("state__in")
+      ),
+      `Expected runtime-backed custom field lookup to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
     );
   });
 
@@ -174,16 +314,56 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      fieldCompletionList?.items.some((item) => item.label === 'profile'),
+      hasCompletionItemLabel(fieldCompletionList?.items, 'profile'),
       'Expected keyword lookup completion to include `profile`.'
     );
-    const fieldCompletionItem = fieldCompletionList?.items.find(
-      (item) => item.label === 'profile'
+    assert.ok(
+      !hasCompletionItemLabel(fieldCompletionList?.items, 'profile__timezone'),
+      'Expected keyword lookup completion to suggest only the next lookup segment.'
+    );
+    const fieldCompletionItem = findCompletionItemByLabel(
+      fieldCompletionList?.items,
+      'profile'
     );
     assert.strictEqual(
       fieldCompletionItem?.filterText,
       'author__profile',
       'Expected keyword lookup field completion to use the full lookup path as filterText.'
+    );
+    assert.strictEqual(
+      fieldCompletionItem?.insertText,
+      'profile__',
+      'Expected keyword lookup relation completion to continue the `__` chain.'
+    );
+    assert.strictEqual(
+      fieldCompletionItem?.command?.command,
+      'editor.action.triggerSuggest',
+      'Expected keyword lookup relation completion to reopen suggestions.'
+    );
+
+    const blankOperatorCompletionPosition = positionAfterTextInContainer(
+      document,
+      "Post.objects.filter(title__='x')",
+      'title__'
+    );
+    const blankOperatorCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        blankOperatorCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(blankOperatorCompletionList?.items, 'contains'),
+      'Expected blank operator completion to include `contains`.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(blankOperatorCompletionList?.items, 'gte'),
+      'Expected blank operator completion to include `gte`.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(blankOperatorCompletionList?.items, 'in'),
+      'Expected blank operator completion to include `in`.'
     );
 
     const inheritedBaseCompletionPosition = positionAfterTextInContainer(
@@ -199,7 +379,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      inheritedBaseCompletionList?.items.some((item) => item.label === 'name'),
+      hasCompletionItemLabel(inheritedBaseCompletionList?.items, 'name'),
       'Expected abstract-base model keyword lookup completion to include `name`.'
     );
 
@@ -216,7 +396,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      multiInheritedCompletionList?.items.some((item) => item.label === 'slug'),
+      hasCompletionItemLabel(multiInheritedCompletionList?.items, 'slug'),
       'Expected multiple-abstract-inheritance keyword lookup completion to include `slug`.'
     );
 
@@ -233,7 +413,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      multilineCompletionList?.items.some((item) => item.label === 'timezone'),
+      hasCompletionItemLabel(multilineCompletionList?.items, 'timezone'),
       'Expected multiline keyword lookup completion to include `timezone`.'
     );
 
@@ -250,11 +430,12 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      operatorCompletionList?.items.some((item) => item.label === 'icontains'),
+      hasCompletionItemLabel(operatorCompletionList?.items, 'icontains'),
       'Expected keyword lookup operator completion to include `icontains`.'
     );
-    const operatorCompletionItem = operatorCompletionList?.items.find(
-      (item) => item.label === 'icontains'
+    const operatorCompletionItem = findCompletionItemByLabel(
+      operatorCompletionList?.items,
+      'icontains'
     );
     assert.strictEqual(
       operatorCompletionItem?.filterText,
@@ -326,7 +507,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      stringCompletionList?.items.some((item) => item.label === 'title'),
+      hasCompletionItemLabel(stringCompletionList?.items, 'title'),
       'Expected queryset variable string lookup completion to include `title`.'
     );
 
@@ -343,11 +524,12 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      keywordCompletionList?.items.some((item) => item.label === 'slug'),
+      hasCompletionItemLabel(keywordCompletionList?.items, 'slug'),
       'Expected queryset variable keyword lookup completion to include `slug`.'
     );
-    const keywordCompletionItem = keywordCompletionList?.items.find(
-      (item) => item.label === 'slug'
+    const keywordCompletionItem = findCompletionItemByLabel(
+      keywordCompletionList?.items,
+      'slug'
     );
     assert.strictEqual(
       keywordCompletionItem?.filterText,
@@ -368,7 +550,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      multilineKeywordList?.items.some((item) => item.label === 'title'),
+      hasCompletionItemLabel(multilineKeywordList?.items, 'title'),
       'Expected multiline queryset variable keyword lookup completion to include `title`.'
     );
 
@@ -385,7 +567,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      chainedKeywordList?.items.some((item) => item.label === 'slug'),
+      hasCompletionItemLabel(chainedKeywordList?.items, 'slug'),
       'Expected dot-chained keyword lookup completion to include `slug`.'
     );
 
@@ -402,7 +584,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      chainedStringList?.items.some((item) => item.label === 'title'),
+      hasCompletionItemLabel(chainedStringList?.items, 'title'),
       'Expected dot-chained string lookup completion to include `title`.'
     );
 
@@ -472,7 +654,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      helperCompletionList?.items.some((item) => item.label === 'slug'),
+      hasCompletionItemLabel(helperCompletionList?.items, 'slug'),
       'Expected helper function queryset completion to include `slug`.'
     );
 
@@ -489,7 +671,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      selfCompletionList?.items.some((item) => item.label === 'slug'),
+      hasCompletionItemLabel(selfCompletionList?.items, 'slug'),
       'Expected self receiver queryset completion to include `slug`.'
     );
 
@@ -506,7 +688,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      superCompletionList?.items.some((item) => item.label === 'slug'),
+      hasCompletionItemLabel(superCompletionList?.items, 'slug'),
       'Expected super receiver queryset completion to include `slug`.'
     );
 
@@ -523,7 +705,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      clsCompletionList?.items.some((item) => item.label === 'slug'),
+      hasCompletionItemLabel(clsCompletionList?.items, 'slug'),
       'Expected cls receiver queryset completion to include `slug`.'
     );
 
@@ -751,7 +933,7 @@ suite('Django ORM Intellisense UI', () => {
       );
 
     assert.ok(
-      completionList?.items.some((item) => item.label === 'title'),
+      hasCompletionItemLabel(completionList?.items, 'title'),
       'Expected re-exported model keyword lookup completion to include `title`.'
     );
   });
@@ -1028,6 +1210,24 @@ function positionInsideText(
   const targetOffset = document.getText().indexOf(target, containerOffset);
   assert.ok(targetOffset >= 0, `Could not find target text: ${target}`);
   return document.positionAt(targetOffset + Math.floor(target.length / 2));
+}
+
+function completionItemLabel(item: vscode.CompletionItem): string {
+  return typeof item.label === 'string' ? item.label : item.label.label;
+}
+
+function hasCompletionItemLabel(
+  items: readonly vscode.CompletionItem[] | undefined,
+  label: string
+): boolean {
+  return (items ?? []).some((item) => completionItemLabel(item) === label);
+}
+
+function findCompletionItemByLabel(
+  items: readonly vscode.CompletionItem[] | undefined,
+  label: string
+): vscode.CompletionItem | undefined {
+  return (items ?? []).find((item) => completionItemLabel(item) === label);
 }
 
 function stringifyHovers(hovers: vscode.Hover[] | undefined): string {
