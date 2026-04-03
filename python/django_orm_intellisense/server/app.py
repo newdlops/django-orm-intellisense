@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import sys
 import traceback
@@ -7,7 +9,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..discovery.workspace import WorkspaceProfile, discover_workspace
+from ..cache import (
+    load_cached_runtime_inspection,
+    load_cached_static_index,
+    save_runtime_inspection,
+    save_static_index,
+)
+from ..discovery.workspace import (
+    PythonSourceSnapshot,
+    WorkspaceProfile,
+    discover_workspace,
+    snapshot_python_sources,
+)
 from ..features.health import build_health_snapshot
 from ..features.lookup_paths import (
     list_lookup_path_completions,
@@ -18,10 +31,10 @@ from ..features.relation_targets import (
     list_relation_targets,
     resolve_relation_target,
 )
-from ..runtime.inspector import inspect_runtime
+from ..pylance import PylanceStubGenerationSummary, generate_pylance_stubs
+from ..runtime.inspector import RuntimeInspection, inspect_runtime
 from ..semantic.graph import SemanticGraphSummary, build_semantic_graph
 from ..static_index.indexer import StaticIndex, build_static_index
-from ..runtime.inspector import RuntimeInspection
 
 
 class DaemonServer:
@@ -33,6 +46,7 @@ class DaemonServer:
         self.static_index: StaticIndex | None = None
         self.runtime_inspection: RuntimeInspection | None = None
         self.semantic_graph: SemanticGraphSummary | None = None
+        self.pylance_stubs: PylanceStubGenerationSummary | None = None
 
     def run_stdio(self) -> None:
         for raw_line in sys.stdin:
@@ -59,22 +73,25 @@ class DaemonServer:
         params = request.get('params') or {}
 
         try:
-            if method == 'initialize':
-                result = self._initialize(params)
-            elif method == 'health':
-                result = self._health()
-            elif method == 'relationTargets':
-                result = self._relation_targets(params)
-            elif method == 'resolveRelationTarget':
-                result = self._resolve_relation_target(params)
-            elif method == 'resolveExportOrigin':
-                result = self._resolve_export_origin(params)
-            elif method == 'lookupPathCompletions':
-                result = self._lookup_path_completions(params)
-            elif method == 'resolveLookupPath':
-                result = self._resolve_lookup_path(params)
-            else:
-                raise ValueError(f'Unsupported method: {method}')
+            with contextlib.redirect_stdout(sys.stderr):
+                if method == 'initialize':
+                    result = self._initialize(params)
+                elif method == 'health':
+                    result = self._health()
+                elif method == 'relationTargets':
+                    result = self._relation_targets(params)
+                elif method == 'resolveRelationTarget':
+                    result = self._resolve_relation_target(params)
+                elif method == 'resolveExportOrigin':
+                    result = self._resolve_export_origin(params)
+                elif method == 'resolveModule':
+                    result = self._resolve_module(params)
+                elif method == 'lookupPathCompletions':
+                    result = self._lookup_path_completions(params)
+                elif method == 'resolveLookupPath':
+                    result = self._resolve_lookup_path(params)
+                else:
+                    raise ValueError(f'Unsupported method: {method}')
         except Exception as error:  # pragma: no cover - scaffold safety net
             self._write_error(
                 request_id=request_id,
@@ -94,19 +111,57 @@ class DaemonServer:
         self.workspace_root = workspace_root
         self.initialized_at = datetime.now(timezone.utc)
 
-        workspace_profile = discover_workspace(workspace_root, settings_module)
-        static_index = build_static_index(workspace_root)
-        runtime = inspect_runtime(settings_module or workspace_profile.settings_module)
+        source_snapshot = snapshot_python_sources(workspace_root)
+        workspace_profile = discover_workspace(
+            workspace_root,
+            settings_module,
+            python_files=source_snapshot.files,
+        )
+        effective_settings_module = settings_module or workspace_profile.settings_module
+        static_index = load_cached_static_index(workspace_root, source_snapshot)
+        if static_index is None:
+            static_index = build_static_index(
+                workspace_root,
+                python_files=source_snapshot.files,
+            )
+        save_static_index(workspace_root, source_snapshot, static_index)
+
+        runtime_source_fingerprint = _runtime_source_fingerprint(
+            source_snapshot=source_snapshot,
+            static_index=static_index,
+            settings_module=effective_settings_module,
+        )
+
+        runtime = load_cached_runtime_inspection(
+            workspace_root,
+            runtime_source_fingerprint,
+            effective_settings_module,
+        )
+        if runtime is None:
+            runtime = inspect_runtime(effective_settings_module)
+            save_runtime_inspection(
+                workspace_root,
+                runtime_source_fingerprint,
+                effective_settings_module,
+                runtime,
+            )
+        pylance_stubs = generate_pylance_stubs(
+            workspace_root=workspace_root,
+            static_index=static_index,
+            runtime=runtime,
+        )
         semantic_graph = build_semantic_graph(workspace_profile, static_index, runtime)
         self.workspace_profile = workspace_profile
         self.static_index = static_index
         self.runtime_inspection = runtime
         self.semantic_graph = semantic_graph
+        self.pylance_stubs = pylance_stubs
         self.health_snapshot = build_health_snapshot(
             workspace=workspace_profile,
             static_index=static_index,
             runtime=runtime,
             semantic_graph=semantic_graph,
+            pylance_stubs=pylance_stubs,
             initialized_at=self.initialized_at,
         )
 
@@ -159,8 +214,16 @@ class DaemonServer:
             symbol=symbol,
         )
 
-    def _lookup_path_completions(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _resolve_module(self, params: dict[str, Any]) -> dict[str, Any]:
         static_index, _runtime = self._require_feature_state()
+        module_name = _clean_optional_string(params.get('module'))
+        if module_name is None:
+            raise ValueError('`module` is required for resolveModule.')
+
+        return static_index.resolve_module(module_name).to_dict()
+
+    def _lookup_path_completions(self, params: dict[str, Any]) -> dict[str, Any]:
+        static_index, runtime = self._require_feature_state()
         base_model_label = _clean_optional_string(params.get('baseModelLabel'))
         prefix = _clean_optional_string(params.get('prefix')) or ''
         method = _clean_optional_string(params.get('method'))
@@ -171,13 +234,14 @@ class DaemonServer:
 
         return list_lookup_path_completions(
             static_index=static_index,
+            runtime=runtime,
             base_model_label=base_model_label,
             prefix=prefix,
             method=method,
         )
 
     def _resolve_lookup_path(self, params: dict[str, Any]) -> dict[str, Any]:
-        static_index, _runtime = self._require_feature_state()
+        static_index, runtime = self._require_feature_state()
         base_model_label = _clean_optional_string(params.get('baseModelLabel'))
         value = _clean_optional_string(params.get('value'))
         method = _clean_optional_string(params.get('method'))
@@ -188,6 +252,7 @@ class DaemonServer:
 
         return resolve_lookup_path(
             static_index=static_index,
+            runtime=runtime,
             base_model_label=base_model_label,
             path=value,
             method=method,
@@ -235,3 +300,47 @@ def _clean_optional_string(value: Any) -> str | None:
 
     text = str(value).strip()
     return text or None
+
+
+def _runtime_source_fingerprint(
+    *,
+    source_snapshot: PythonSourceSnapshot,
+    static_index: StaticIndex,
+    settings_module: str | None,
+) -> str:
+    digest = hashlib.sha256()
+    scope_roots: set[str] = set()
+
+    if settings_module:
+        scope_roots.add(settings_module.split('.', 1)[0])
+
+    for model_candidate in static_index.model_candidates:
+        scope_roots.add(model_candidate.module.split('.', 1)[0])
+
+    if not scope_roots:
+        return str(source_snapshot.fingerprint)
+
+    for scope_root in sorted(scope_roots):
+        digest.update(scope_root.encode('utf-8'))
+        digest.update(b'\0')
+        digest.update(
+            _scope_root_fingerprint(source_snapshot, scope_root).encode('ascii')
+        )
+        digest.update(b'\0')
+
+    return digest.hexdigest()
+
+
+def _scope_root_fingerprint(
+    source_snapshot: PythonSourceSnapshot,
+    scope_root: str,
+) -> str:
+    directory_fingerprint = source_snapshot.directory_fingerprints.get(scope_root)
+    if directory_fingerprint is not None:
+        return str(directory_fingerprint)
+
+    module_entry = source_snapshot.entries_by_path.get(f'{scope_root}.py')
+    if module_entry is not None:
+        return str(module_entry.fingerprint)
+
+    return str(source_snapshot.fingerprint)

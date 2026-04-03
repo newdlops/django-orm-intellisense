@@ -1,4 +1,4 @@
-from blog import AuditLog, Post
+from blog import AuditLog, Company, MultiInheritedLog, Post
 
 
 def lookup_examples():
@@ -13,7 +13,10 @@ def lookup_examples():
         author__profile__time='Asia/Seoul',
     )
     AuditLog.objects.filter(na='entry')
+    MultiInheritedLog.objects.filter(sl='entry')
     Post.objects.values("author__unknown")
     Post.objects.filter(author__profile__timezone__bogus='Asia/Seoul')
     Post.objects.filter(title__name='x')
     Post.objects.select_related("author__profile__timezone")
+    Company.objects.values("corporate_registration__registration_code")
+    Company.objects.filter(corporate_registration__registration_code='ABC123')

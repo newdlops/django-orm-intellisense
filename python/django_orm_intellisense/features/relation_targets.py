@@ -17,7 +17,7 @@ def list_relation_targets(
         target = _runtime_target_dict(model, static_index)
         targets[target['label']] = target
 
-    for model in static_index.model_candidates:
+    for model in static_index.concrete_model_candidates:
         targets.setdefault(model.label, _static_target_dict(model))
 
     values = list(targets.values())
@@ -62,7 +62,7 @@ def resolve_relation_target(
         prefix='',
     )
     static_targets = [
-        _static_target_dict(model) for model in static_index.model_candidates
+        _static_target_dict(model) for model in static_index.concrete_model_candidates
     ]
 
     exact_runtime_match = next(

@@ -1,9 +1,12 @@
+import * as path from 'path';
 import * as vscode from 'vscode';
+import { getExtensionSettings } from '../config/settings';
 import { AnalysisDaemon } from '../daemon/analysisDaemon';
 import type {
   ExportOriginResolution,
   LookupPathItem,
   LookupPathResolution,
+  ModuleResolution,
   RelationTargetItem,
   RelationTargetResolution,
 } from '../protocol';
@@ -32,6 +35,7 @@ const LOOKUP_HOVER_PATTERN = new RegExp(
   String.raw`\.(${LOOKUP_METHOD_PATTERN})\(\s*(['"])([-\w.]+)\2`,
   'g'
 );
+const DJANGO_FIELD_PRIORITY_METHODS = new Set(['filter', 'exclude', 'get']);
 const KEYWORD_LOOKUP_CALLEE_PATTERN = new RegExp(
   String.raw`(${QUERYSET_RECEIVER_PATTERN})\.(${KEYWORD_LOOKUP_METHOD_PATTERN})$`
 );
@@ -60,6 +64,10 @@ interface ImportBindings {
   symbols: Map<string, { moduleName: string; symbolName: string }>;
   modules: Map<string, string>;
 }
+
+type ImportReference =
+  | { kind: 'symbol'; moduleName: string; symbol: string }
+  | { kind: 'module'; moduleName: string };
 
 interface RelationDiagnosticContext {
   value: string;
@@ -273,22 +281,29 @@ export function registerPythonProviders(
             lookupContext.prefix,
             lookupContext.method
           );
+          const sortedItems = prioritizeLookupCompletionItems(
+            result.items,
+            lookupContext.method
+          );
 
-          return result.items.map((item) => {
+          return sortedItems.map((item, index) => {
             const completion = new vscode.CompletionItem(
-              item.name,
-              item.fieldKind === 'lookup_operator'
-                ? vscode.CompletionItemKind.Operator
-                : item.isRelation
-                ? vscode.CompletionItemKind.Field
-                : vscode.CompletionItemKind.Property
+              lookupCompletionLabel(item),
+              lookupCompletionKind(item)
             );
-            completion.detail =
-              item.fieldKind === 'lookup_operator'
-                ? `Django lookup operator on ${item.modelLabel}`
-                : `${item.modelLabel}${item.relatedModelLabel ? ` -> ${item.relatedModelLabel}` : ''}`;
+            completion.detail = lookupCompletionDetail(item);
             completion.insertText = item.name;
             completion.filterText = lookupFilterText(lookupContext.prefix, item.name);
+            completion.sortText = lookupCompletionSortText(
+              lookupContext.method,
+              item,
+              index
+            );
+            completion.preselect = shouldPreselectLookupCompletion(
+              lookupContext.method,
+              item,
+              index
+            );
             completion.range = lookupContext.range;
             completion.documentation = buildLookupItemMarkdown(
               item,
@@ -363,18 +378,17 @@ export function registerPythonProviders(
           }
         }
 
-        const importSpec = importSpecifierAtPosition(document, position);
-        if (!importSpec || importSpec.moduleName.startsWith('.')) {
+        const importReference = importReferenceAtPosition(document, position);
+        if (!importReference) {
           return undefined;
         }
 
         try {
           await daemon.ensureStarted();
-          const resolution = await daemon.resolveExportOrigin(
-            importSpec.moduleName,
-            importSpec.symbol
+          const importHover = await buildImportHover(
+            daemon,
+            importReference
           );
-          const importHover = buildImportHover(resolution);
           if (importHover) {
             return importHover;
           }
@@ -435,18 +449,17 @@ export function registerPythonProviders(
           }
         }
 
-        const importSpec = importSpecifierAtPosition(document, position);
-        if (!importSpec || importSpec.moduleName.startsWith('.')) {
+        const importReference = importReferenceAtPosition(document, position);
+        if (!importReference) {
           return undefined;
         }
 
         try {
           await daemon.ensureStarted();
-          const resolution = await daemon.resolveExportOrigin(
-            importSpec.moduleName,
-            importSpec.symbol
+          const location = await definitionLocationFromImportReference(
+            daemon,
+            importReference
           );
-          const location = definitionLocationFromExportResolution(resolution);
           if (location) {
             return location;
           }
@@ -491,6 +504,91 @@ export function registerPythonProviders(
       diagnosticTimers.clear();
     }),
   ];
+}
+
+function lookupCompletionLabel(
+  item: LookupPathItem
+): string | vscode.CompletionItemLabel {
+  if (item.fieldKind === 'lookup_operator') {
+    return item.name;
+  }
+
+  return {
+    label: item.name,
+    description: 'Django',
+  };
+}
+
+function lookupCompletionKind(item: LookupPathItem): vscode.CompletionItemKind {
+  if (item.fieldKind === 'lookup_operator') {
+    return vscode.CompletionItemKind.Operator;
+  }
+
+  return vscode.CompletionItemKind.Field;
+}
+
+function lookupCompletionDetail(item: LookupPathItem): string {
+  if (item.fieldKind === 'lookup_operator') {
+    return `Django lookup · ${item.modelLabel}`;
+  }
+
+  const fieldType = item.isRelation ? 'Django relation field' : 'Django field';
+  return `${fieldType} · ${item.modelLabel}${item.relatedModelLabel ? ` -> ${item.relatedModelLabel}` : ''}`;
+}
+
+function prioritizeLookupCompletionItems(
+  items: LookupPathItem[],
+  method: string
+): LookupPathItem[] {
+  if (!DJANGO_FIELD_PRIORITY_METHODS.has(method)) {
+    return items;
+  }
+
+  return [...items].sort((left, right) => {
+    const priorityDifference =
+      lookupCompletionPriority(left) - lookupCompletionPriority(right);
+    if (priorityDifference !== 0) {
+      return priorityDifference;
+    }
+
+    return left.name.localeCompare(right.name);
+  });
+}
+
+function lookupCompletionPriority(item: LookupPathItem): number {
+  if (item.fieldKind === 'lookup_operator') {
+    return 2;
+  }
+
+  if (item.isRelation) {
+    return 1;
+  }
+
+  return 0;
+}
+
+function lookupCompletionSortText(
+  method: string,
+  item: LookupPathItem,
+  index: number
+): string | undefined {
+  if (!DJANGO_FIELD_PRIORITY_METHODS.has(method)) {
+    return undefined;
+  }
+
+  return `0-${lookupCompletionPriority(item)}-${index.toString().padStart(4, '0')}-${item.name}`;
+}
+
+function shouldPreselectLookupCompletion(
+  method: string,
+  item: LookupPathItem,
+  index: number
+): boolean {
+  return (
+    DJANGO_FIELD_PRIORITY_METHODS.has(method) &&
+    item.fieldKind !== 'lookup_operator' &&
+    index === 0
+  );
 }
 
 function relationCompletionContext(
@@ -713,17 +811,78 @@ function relationHoverLiteral(
   return undefined;
 }
 
-function importSpecifierAtPosition(
+function importReferenceAtPosition(
   document: vscode.TextDocument,
   position: vscode.Position
-): { moduleName: string; symbol: string } | undefined {
+): ImportReference | undefined {
   const lineText = document.lineAt(position.line).text;
   const lineMatch = lineText.match(IMPORT_FROM_PATTERN);
-  if (!lineMatch) {
+  if (lineMatch) {
+    const [, rawModuleName, clauseText] = lineMatch;
+    const moduleName = resolveImportedModuleName(document, rawModuleName);
+    if (!moduleName) {
+      return undefined;
+    }
+
+    const clauseStart = lineText.lastIndexOf(clauseText);
+    if (clauseStart === -1) {
+      return undefined;
+    }
+
+    const wordRange = document.getWordRangeAtPosition(position, /[A-Za-z_][\w]*/);
+    if (!wordRange) {
+      return undefined;
+    }
+
+    const hoveredWord = document.getText(wordRange);
+
+    for (const match of clauseText.matchAll(IMPORT_SPEC_PATTERN)) {
+      const importedName = match[1];
+      const aliasName = match[2];
+      const relativeStart = match.index ?? 0;
+      const importedStart = clauseStart + relativeStart;
+      const importedEnd = importedStart + importedName.length;
+
+      if (
+        hoveredWord === importedName &&
+        position.character >= importedStart &&
+        position.character <= importedEnd
+      ) {
+        return {
+          kind: 'symbol',
+          moduleName,
+          symbol: importedName,
+        };
+      }
+
+      if (aliasName) {
+        const aliasOffset = match[0].lastIndexOf(aliasName);
+        const aliasStart = clauseStart + relativeStart + aliasOffset;
+        const aliasEnd = aliasStart + aliasName.length;
+
+        if (
+          hoveredWord === aliasName &&
+          position.character >= aliasStart &&
+          position.character <= aliasEnd
+        ) {
+          return {
+            kind: 'symbol',
+            moduleName,
+            symbol: importedName,
+          };
+        }
+      }
+    }
+
     return undefined;
   }
 
-  const [, moduleName, clauseText] = lineMatch;
+  const importMatch = lineText.match(IMPORT_MODULE_PATTERN);
+  if (!importMatch) {
+    return undefined;
+  }
+
+  const clauseText = importMatch[1];
   const clauseStart = lineText.lastIndexOf(clauseText);
   if (clauseStart === -1) {
     return undefined;
@@ -736,39 +895,40 @@ function importSpecifierAtPosition(
 
   const hoveredWord = document.getText(wordRange);
 
-  for (const match of clauseText.matchAll(IMPORT_SPEC_PATTERN)) {
-    const importedName = match[1];
+  for (const match of clauseText.matchAll(IMPORT_MODULE_SPEC_PATTERN)) {
+    const importedModule = match[1];
     const aliasName = match[2];
     const relativeStart = match.index ?? 0;
     const importedStart = clauseStart + relativeStart;
-    const importedEnd = importedStart + importedName.length;
+    const importedEnd = importedStart + importedModule.length;
 
     if (
-      hoveredWord === importedName &&
       position.character >= importedStart &&
-      position.character <= importedEnd
+      position.character <= importedEnd &&
+      importedModule.split('.').includes(hoveredWord)
     ) {
       return {
-        moduleName,
-        symbol: importedName,
+        kind: 'module',
+        moduleName: importedModule,
       };
     }
 
-    if (aliasName) {
-      const aliasOffset = match[0].lastIndexOf(aliasName);
-      const aliasStart = clauseStart + relativeStart + aliasOffset;
-      const aliasEnd = aliasStart + aliasName.length;
+    if (!aliasName) {
+      continue;
+    }
 
-      if (
-        hoveredWord === aliasName &&
-        position.character >= aliasStart &&
-        position.character <= aliasEnd
-      ) {
-        return {
-          moduleName,
-          symbol: importedName,
-        };
-      }
+    const aliasOffset = match[0].lastIndexOf(aliasName);
+    const aliasStart = clauseStart + relativeStart + aliasOffset;
+    const aliasEnd = aliasStart + aliasName.length;
+    if (
+      hoveredWord === aliasName &&
+      position.character >= aliasStart &&
+      position.character <= aliasEnd
+    ) {
+      return {
+        kind: 'module',
+        moduleName: importedModule,
+      };
     }
   }
 
@@ -788,29 +948,57 @@ function buildRelationHover(
   return new vscode.Hover(markdown);
 }
 
-function buildImportHover(
+async function buildImportHover(
+  daemon: AnalysisDaemon,
+  reference: ImportReference
+): Promise<vscode.Hover | undefined> {
+  if (reference.kind === 'module') {
+    return buildModuleImportHover(
+      reference.moduleName,
+      await daemon.resolveModule(reference.moduleName)
+    );
+  }
+
+  const target = await resolveImportedSymbolOrModule(
+    daemon,
+    reference.moduleName,
+    reference.symbol
+  );
+  if (!target) {
+    return undefined;
+  }
+
+  if (target.kind === 'module') {
+    return buildModuleImportHover(target.moduleName, target.resolution);
+  }
+
+  return buildSymbolImportHover(target.resolution);
+}
+
+function buildSymbolImportHover(
   resolution: ExportOriginResolution
 ): vscode.Hover | undefined {
   if (!resolution.resolved || !resolution.originModule) {
     return undefined;
   }
 
-  if (
-    resolution.viaModules.length <= 1 &&
-    resolution.originModule === resolution.requestedModule
-  ) {
-    return undefined;
-  }
-
   const markdown = new vscode.MarkdownString(undefined, true);
-  markdown.appendMarkdown(`**Re-export Origin**\n\n`);
-  markdown.appendMarkdown(
-    `Imported from \`${resolution.requestedModule}\`, defined in \`${resolution.originModule}\`.`
-  );
+  markdown.appendMarkdown(`**Imported Symbol**\n\n`);
 
-  if (resolution.originSymbol) {
-    markdown.appendMarkdown(`\n\nOrigin symbol: \`${resolution.originSymbol}\``);
+  const qualifiedSymbol = resolution.originSymbol
+    ? `${resolution.originModule}.${resolution.originSymbol}`
+    : resolution.originModule;
+
+  if (resolution.originModule === resolution.requestedModule) {
+    markdown.appendMarkdown(`Imported from \`${resolution.requestedModule}\`.`);
+  } else {
+    markdown.appendMarkdown(
+      `Imported from \`${resolution.requestedModule}\`, defined in \`${resolution.originModule}\`.`
+    );
   }
+
+  markdown.appendMarkdown(`\n\nResolved symbol: \`${qualifiedSymbol}\``);
+  appendImportFilePath(markdown, resolution.originFilePath);
 
   if (resolution.viaModules.length > 1) {
     markdown.appendMarkdown(
@@ -819,6 +1007,55 @@ function buildImportHover(
   }
 
   return new vscode.Hover(markdown);
+}
+
+function buildModuleImportHover(
+  moduleName: string,
+  resolution: ModuleResolution
+): vscode.Hover | undefined {
+  if (!resolution.resolved) {
+    return undefined;
+  }
+
+  const markdown = new vscode.MarkdownString(undefined, true);
+  markdown.appendMarkdown(`**Imported Module**\n\n`);
+  markdown.appendMarkdown(`Module: \`${moduleName}\``);
+  appendImportFilePath(markdown, resolution.filePath);
+  return new vscode.Hover(markdown);
+}
+
+function appendImportFilePath(
+  markdown: vscode.MarkdownString,
+  filePath: string | undefined
+): void {
+  if (!filePath) {
+    return;
+  }
+
+  markdown.appendMarkdown(`\n\nFile: \`${displayImportFilePath(filePath)}\``);
+}
+
+function displayImportFilePath(filePath: string): string {
+  const configuredRoot = getExtensionSettings().workspaceRoot;
+  const workspaceRoot = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath))
+    ?.uri.fsPath;
+  const candidateRoots = [configuredRoot, workspaceRoot].filter(
+    (value): value is string => Boolean(value)
+  );
+
+  for (const rootPath of candidateRoots) {
+    const relativePath = path.relative(path.resolve(rootPath), path.resolve(filePath));
+    if (
+      relativePath &&
+      relativePath !== '..' &&
+      !relativePath.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relativePath)
+    ) {
+      return relativePath.split(path.sep).join('/');
+    }
+  }
+
+  return vscode.workspace.asRelativePath(filePath, false);
 }
 
 function buildLookupHover(
@@ -935,6 +1172,74 @@ function definitionLocationFromExportResolution(
     resolution.originLine,
     resolution.originColumn
   );
+}
+
+function definitionLocationFromModuleResolution(
+  resolution: ModuleResolution
+): vscode.Location | undefined {
+  if (!resolution.resolved) {
+    return undefined;
+  }
+
+  return locationFromFilePosition(
+    resolution.filePath,
+    resolution.line,
+    resolution.column
+  );
+}
+
+async function definitionLocationFromImportReference(
+  daemon: AnalysisDaemon,
+  reference: ImportReference
+): Promise<vscode.Location | undefined> {
+  if (reference.kind === 'module') {
+    return definitionLocationFromModuleResolution(
+      await daemon.resolveModule(reference.moduleName)
+    );
+  }
+
+  const target = await resolveImportedSymbolOrModule(
+    daemon,
+    reference.moduleName,
+    reference.symbol
+  );
+  if (!target) {
+    return undefined;
+  }
+
+  return target.kind === 'module'
+    ? definitionLocationFromModuleResolution(target.resolution)
+    : definitionLocationFromExportResolution(target.resolution);
+}
+
+async function resolveImportedSymbolOrModule(
+  daemon: AnalysisDaemon,
+  moduleName: string,
+  symbol: string
+): Promise<
+  | { kind: 'symbol'; resolution: ExportOriginResolution }
+  | { kind: 'module'; moduleName: string; resolution: ModuleResolution }
+  | undefined
+> {
+  const exportResolution = await daemon.resolveExportOrigin(moduleName, symbol);
+  if (exportResolution.resolved) {
+    return {
+      kind: 'symbol',
+      resolution: exportResolution,
+    };
+  }
+
+  const importedModuleName = [moduleName, symbol].filter(Boolean).join('.');
+  const moduleResolution = await daemon.resolveModule(importedModuleName);
+  if (!moduleResolution.resolved) {
+    return undefined;
+  }
+
+  return {
+    kind: 'module',
+    moduleName: importedModuleName,
+    resolution: moduleResolution,
+  };
 }
 
 function definitionLocationFromLookupResolution(
@@ -1358,7 +1663,11 @@ async function resolveModelLabelFromImports(
     return undefined;
   }
 
-  const moduleName = bindings.modules.get(parts[0]);
+  const moduleName = await resolveImportedModuleAlias(
+    daemon,
+    bindings,
+    parts[0]
+  );
   if (!moduleName) {
     return undefined;
   }
@@ -1703,23 +2012,39 @@ async function resolveImportedDefinitionDocument(
   const bindings = collectImportBindings(document, beforeOffset);
   const directBinding = bindings.symbols.get(symbol);
   if (directBinding) {
-    const resolution = await daemon.resolveExportOrigin(
+    const target = await resolveImportedSymbolOrModule(
+      daemon,
       directBinding.moduleName,
       directBinding.symbolName
     );
-    if (resolution.resolved && resolution.originFilePath) {
+    if (target?.kind === 'symbol' && target.resolution.originFilePath) {
       return {
         document: await vscode.workspace.openTextDocument(
-          resolution.originFilePath
+          target.resolution.originFilePath
         ),
-        symbolName: resolution.originSymbol ?? directBinding.symbolName,
+        symbolName: target.resolution.originSymbol ?? directBinding.symbolName,
+      };
+    }
+    if (target?.kind === 'module' && target.resolution.filePath) {
+      return {
+        document: await vscode.workspace.openTextDocument(
+          target.resolution.filePath
+        ),
+        symbolName: path.basename(
+          target.resolution.filePath,
+          path.extname(target.resolution.filePath)
+        ),
       };
     }
   }
 
   const parts = symbol.split('.');
   if (parts.length === 2) {
-    const moduleName = bindings.modules.get(parts[0]);
+    const moduleName = await resolveImportedModuleAlias(
+      daemon,
+      bindings,
+      parts[0]
+    );
     if (moduleName) {
       const resolution = await daemon.resolveExportOrigin(moduleName, parts[1]);
       if (resolution.resolved && resolution.originFilePath) {
@@ -2197,6 +2522,26 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
 }
 
+async function resolveImportedModuleAlias(
+  daemon: AnalysisDaemon,
+  bindings: ImportBindings,
+  alias: string
+): Promise<string | undefined> {
+  const directModule = bindings.modules.get(alias);
+  if (directModule) {
+    return directModule;
+  }
+
+  const directSymbol = bindings.symbols.get(alias);
+  if (!directSymbol) {
+    return undefined;
+  }
+
+  const importedModuleName = `${directSymbol.moduleName}.${directSymbol.symbolName}`;
+  const moduleResolution = await daemon.resolveModule(importedModuleName);
+  return moduleResolution.resolved ? importedModuleName : undefined;
+}
+
 function collectImportBindings(
   document: vscode.TextDocument,
   beforeOffset: number
@@ -2213,7 +2558,11 @@ function collectImportBindings(
 
     const fromMatch = lineText.match(IMPORT_FROM_PATTERN);
     if (fromMatch) {
-      const [, moduleName, clauseText] = fromMatch;
+      const [, rawModuleName, clauseText] = fromMatch;
+      const moduleName = resolveImportedModuleName(document, rawModuleName);
+      if (!moduleName) {
+        continue;
+      }
       for (const match of clauseText.matchAll(IMPORT_SPEC_PATTERN)) {
         const importedName = match[1];
         const aliasName = match[2] ?? importedName;
@@ -2241,6 +2590,100 @@ function collectImportBindings(
   }
 
   return { symbols, modules };
+}
+
+function resolveImportedModuleName(
+  document: vscode.TextDocument,
+  moduleName: string
+): string | undefined {
+  if (!moduleName.startsWith('.')) {
+    return moduleName;
+  }
+
+  const currentModuleName = moduleNameForDocument(document);
+  if (!currentModuleName) {
+    return undefined;
+  }
+
+  return resolveRelativeModuleName(
+    currentModuleName,
+    moduleName,
+    path.basename(document.uri.fsPath) === '__init__.py'
+  );
+}
+
+function moduleNameForDocument(
+  document: vscode.TextDocument
+): string | undefined {
+  const configuredRoot = getExtensionSettings().workspaceRoot;
+  const workspaceRoot = vscode.workspace.getWorkspaceFolder(document.uri)?.uri.fsPath;
+  const roots = [configuredRoot, workspaceRoot].filter(
+    (value): value is string => Boolean(value)
+  );
+
+  for (const rootPath of roots) {
+    const resolvedModuleName = moduleNameFromFilePath(rootPath, document.uri.fsPath);
+    if (resolvedModuleName !== undefined) {
+      return resolvedModuleName;
+    }
+  }
+
+  return undefined;
+}
+
+function moduleNameFromFilePath(
+  rootPath: string,
+  filePath: string
+): string | undefined {
+  const relativePath = path.relative(path.resolve(rootPath), path.resolve(filePath));
+  if (
+    !relativePath ||
+    relativePath.startsWith(`..${path.sep}`) ||
+    relativePath === '..' ||
+    path.isAbsolute(relativePath) ||
+    !relativePath.endsWith('.py')
+  ) {
+    return undefined;
+  }
+
+  const normalizedPath = relativePath.split(path.sep).join('/');
+  if (normalizedPath === '__init__.py') {
+    return undefined;
+  }
+
+  if (normalizedPath.endsWith('/__init__.py')) {
+    return normalizedPath.slice(0, -'/__init__.py'.length).split('/').join('.');
+  }
+
+  return normalizedPath.slice(0, -'.py'.length).split('/').join('.');
+}
+
+function resolveRelativeModuleName(
+  currentModule: string,
+  importedModule: string,
+  isPackageInit: boolean
+): string | undefined {
+  const level = importedModule.match(/^\.+/)?.[0].length ?? 0;
+  if (level === 0) {
+    return importedModule;
+  }
+
+  let packageParts = currentModule.split('.');
+  if (!isPackageInit) {
+    packageParts = packageParts.slice(0, -1);
+  }
+
+  if (level > 1) {
+    if (level - 1 > packageParts.length) {
+      return undefined;
+    }
+    packageParts = packageParts.slice(0, packageParts.length - (level - 1));
+  }
+
+  const suffix = importedModule.slice(level);
+  const suffixParts = suffix ? suffix.split('.') : [];
+  const resolvedParts = [...packageParts, ...suffixParts].filter(Boolean);
+  return resolvedParts.length > 0 ? resolvedParts.join('.') : undefined;
 }
 
 function compactPythonExpression(value: string): string {

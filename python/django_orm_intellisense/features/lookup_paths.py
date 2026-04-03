@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ..runtime.inspector import RuntimeInspection, RuntimeModelSummary
 from ..static_index.indexer import FieldCandidate, StaticIndex
 
 RELATION_ONLY_METHODS = {'select_related', 'prefetch_related'}
@@ -39,6 +40,7 @@ LOOKUP_OPERATORS = (
 def list_lookup_path_completions(
     *,
     static_index: StaticIndex,
+    runtime: RuntimeInspection,
     base_model_label: str,
     prefix: str,
     method: str,
@@ -47,6 +49,7 @@ def list_lookup_path_completions(
     completed_segments, current_partial = _split_lookup_prefix(normalized_prefix)
     traversal = _analyze_lookup_completion_context(
         static_index=static_index,
+        runtime=runtime,
         base_model_label=base_model_label,
         segments=completed_segments,
         method=method,
@@ -73,7 +76,11 @@ def list_lookup_path_completions(
         relation_only = method in RELATION_ONLY_METHODS
         items = [
             _lookup_item_dict(field)
-            for field in static_index.fields_for_model(current_model_label)
+            for field in _lookup_fields_for_model(
+                static_index=static_index,
+                runtime=runtime,
+                model_label=current_model_label,
+            )
             if (field.is_relation or not relation_only)
             and field.name.startswith(current_partial)
         ]
@@ -94,6 +101,7 @@ def list_lookup_path_completions(
 def resolve_lookup_path(
     *,
     static_index: StaticIndex,
+    runtime: RuntimeInspection,
     base_model_label: str,
     path: str,
     method: str,
@@ -112,7 +120,12 @@ def resolve_lookup_path(
     lookup_operator: str | None = None
 
     for index, segment in enumerate(segments):
-        field = static_index.find_field(current_model_label, segment)
+        field = _find_lookup_field(
+            static_index=static_index,
+            runtime=runtime,
+            model_label=current_model_label,
+            field_name=segment,
+        )
         if field is None:
             if (
                 method in FILTER_LOOKUP_METHODS
@@ -204,6 +217,7 @@ def resolve_lookup_path(
 def _analyze_lookup_completion_context(
     *,
     static_index: StaticIndex,
+    runtime: RuntimeInspection,
     base_model_label: str,
     segments: list[str],
     method: str,
@@ -212,7 +226,12 @@ def _analyze_lookup_completion_context(
     last_field: FieldCandidate | None = None
 
     for segment in segments:
-        field = static_index.find_field(current_model_label, segment)
+        field = _find_lookup_field(
+            static_index=static_index,
+            runtime=runtime,
+            model_label=current_model_label,
+            field_name=segment,
+        )
         if field is None:
             return {
                 'resolved': False,
@@ -247,6 +266,81 @@ def _analyze_lookup_completion_context(
         'currentModelLabel': current_model_label,
         'completionMode': 'field',
     }
+
+
+def _lookup_fields_for_model(
+    *,
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+    model_label: str,
+) -> list[FieldCandidate]:
+    fields_by_name = {
+        field.name: field
+        for field in static_index.fields_for_model(model_label)
+    }
+    runtime_model = _runtime_model_summary(runtime, model_label)
+    if runtime_model is None:
+        return list(fields_by_name.values())
+
+    model_candidate = static_index.find_model_candidate(model_label)
+    fallback_file_path = model_candidate.file_path if model_candidate else ''
+    fallback_line = model_candidate.line if model_candidate else 1
+    fallback_column = model_candidate.column if model_candidate else 1
+
+    for relation in runtime_model.relations:
+        existing = fields_by_name.get(relation.name)
+        if (
+            existing is not None
+            and existing.is_relation
+            and existing.related_model_label == relation.related_model_label
+        ):
+            continue
+
+        fields_by_name[relation.name] = FieldCandidate(
+            model_label=model_label,
+            name=relation.name,
+            file_path=existing.file_path if existing is not None else fallback_file_path,
+            line=existing.line if existing is not None else fallback_line,
+            column=existing.column if existing is not None else fallback_column,
+            field_kind=relation.field_kind,
+            is_relation=True,
+            relation_direction=relation.direction,
+            related_model_label=relation.related_model_label,
+            declared_model_label=existing.declared_model_label if existing is not None else model_label,
+            related_name=existing.related_name if existing is not None else None,
+            source='runtime',
+        )
+
+    return list(fields_by_name.values())
+
+
+def _find_lookup_field(
+    *,
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+    model_label: str,
+    field_name: str,
+) -> FieldCandidate | None:
+    for field in _lookup_fields_for_model(
+        static_index=static_index,
+        runtime=runtime,
+        model_label=model_label,
+    ):
+        if field.name == field_name:
+            return field
+
+    return None
+
+
+def _runtime_model_summary(
+    runtime: RuntimeInspection,
+    model_label: str,
+) -> RuntimeModelSummary | None:
+    for model in runtime.model_catalog:
+        if model.label == model_label:
+            return model
+
+    return None
 
 
 def _split_lookup_prefix(prefix: str) -> tuple[list[str], str]:

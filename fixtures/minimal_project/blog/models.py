@@ -1,8 +1,17 @@
 from django.db import models
 
+COMPANY_REGISTRATION_RELATED_NAME = 'corporate_registration'
+
 
 class TimeStampedBaseModel(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        abstract = True
+
+
+class SluggedBaseModel(models.Model):
+    slug = models.SlugField(max_length=64)
 
     class Meta:
         abstract = True
@@ -43,6 +52,23 @@ class Post(models.Model):
     published = models.BooleanField(default=False)
 
 
+class Company(models.Model):
+    name = models.CharField(max_length=255)
+
+
+class CorporateRegistration(models.Model):
+    company = models.OneToOneField(
+        Company,
+        related_name=COMPANY_REGISTRATION_RELATED_NAME,
+        on_delete=models.CASCADE,
+    )
+    registration_code = models.CharField(max_length=64)
+
+
 class AuditLog(TimeStampedBaseModel):
     name = models.CharField(max_length=255)
     note = models.TextField(blank=True)
+
+
+class MultiInheritedLog(TimeStampedBaseModel, SluggedBaseModel):
+    title = models.CharField(max_length=255)

@@ -55,6 +55,7 @@ Then press `F5` in VS Code to launch an Extension Development Host.
 
 - `Django ORM Intellisense: Show Status`
 - `Django ORM Intellisense: Restart Daemon`
+- `Django ORM Intellisense: Configure Pylance Diagnostics`
 - `Django ORM Intellisense: Browse Python Interpreter`
 - `Django ORM Intellisense: Select Settings Module`
 - `Django ORM Intellisense: Select Python Interpreter`
@@ -83,6 +84,10 @@ This matters because Django-aware analysis must run inside the same environment 
 If you do not want to type the path manually, run `Django ORM Intellisense: Browse Python Interpreter`. It opens the file explorer, lets you pick either a Python executable or a virtualenv directory, stores the setting, and restarts the daemon.
 
 For multi-environment Django projects that have modules such as `project.settings.local` or `project.settings.dev`, run `Django ORM Intellisense: Select Settings Module`. The extension now discovers `settings.py`, `settings/__init__.py`, and `settings/*.py` candidates and lets you choose which one should be used for `django.setup()`.
+
+If Pylance is still reporting error-level false positives for dynamic Django ORM members that cannot be inferred statically, run `Django ORM Intellisense: Configure Pylance Diagnostics`. The recommended profile downgrades the common dynamic-member rules for the current workspace without overwriting unrelated Pylance overrides.
+
+On every daemon initialization, the extension also generates partial `.pyi` files for indexed Python modules under `.django_orm_intellisense/stubs` inside the selected workspace root. When the workspace does not already define a custom `python.analysis.stubPath`, Django ORM Intellisense automatically points Pylance at that generated stub tree.
 
 ## Manual UI Check
 

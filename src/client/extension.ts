@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { registerBrowsePythonInterpreterCommand } from './commands/browsePythonInterpreter';
+import { registerConfigurePylanceDiagnosticsCommand } from './commands/configurePylanceDiagnostics';
 import { registerRestartDaemonCommand } from './commands/restartDaemon';
 import { registerSelectSettingsModuleCommand } from './commands/selectSettingsModule';
 import { registerSelectPythonInterpreterCommand } from './commands/selectPythonInterpreter';
@@ -44,6 +45,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerShowStatusCommand(daemon, output),
     registerRestartDaemonCommand(daemon),
     registerBrowsePythonInterpreterCommand(daemon, output),
+    registerConfigurePylanceDiagnosticsCommand(output),
     registerSelectSettingsModuleCommand(daemon, output),
     registerSelectPythonInterpreterCommand(daemon, output),
     ...registerPythonProviders(daemon),

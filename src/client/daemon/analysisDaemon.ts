@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as readline from 'readline';
 import * as vscode from 'vscode';
 import { getExtensionSettings } from '../config/settings';
+import { syncManagedPylanceStubPath } from '../pylance/stubPath';
 import {
   resolvePythonInterpreter,
   validatePythonInterpreterPath,
@@ -13,6 +14,7 @@ import type {
   InitializeResult,
   LookupPathCompletionsResult,
   LookupPathResolution,
+  ModuleResolution,
   RelationTargetResolution,
   RelationTargetsResult,
   RequestMessage,
@@ -20,6 +22,7 @@ import type {
 } from '../protocol';
 
 const REQUEST_TIMEOUT_MS = 8_000;
+const RESPONSE_CACHE_LIMIT = 512;
 
 interface PendingRequest {
   resolve: (value: any) => void;
@@ -48,11 +51,13 @@ function mergePythonPath(extensionPythonRoot: string): string {
 export class AnalysisDaemon implements vscode.Disposable {
   private readonly stateEmitter = new vscode.EventEmitter<HealthSnapshot>();
   private readonly pendingRequests = new Map<string, PendingRequest>();
+  private readonly responseCache = new Map<string, Promise<unknown>>();
   private readonly intentionalExitProcessIds = new Set<number>();
   private readonly output: vscode.OutputChannel;
   private process?: ChildProcessWithoutNullStreams;
   private stdoutReader?: readline.Interface;
   private requestSequence = 0;
+  private startPromise?: Promise<HealthSnapshot>;
   private stopRequested = false;
   private lastLaunchContext?: LaunchContext;
   private interpreterCheck?: Promise<void>;
@@ -79,10 +84,171 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   async start(): Promise<HealthSnapshot> {
+    if (this.startPromise) {
+      return this.startPromise;
+    }
+
     if (this.process) {
       return this.refreshHealth();
     }
 
+    const startPromise = this.startProcess();
+    this.startPromise = startPromise;
+
+    try {
+      return await startPromise;
+    } finally {
+      if (this.startPromise === startPromise) {
+        this.startPromise = undefined;
+      }
+    }
+  }
+
+  async refreshHealth(): Promise<HealthSnapshot> {
+    if (this.startPromise) {
+      return this.startPromise;
+    }
+
+    if (!this.process) {
+      return this.currentState;
+    }
+
+    const snapshot = this.decorateSnapshot(
+      await this.request<HealthSnapshot>('health', {})
+    );
+    await this.applyWorkspaceIntegrations(snapshot);
+    this.updateState(snapshot);
+    return snapshot;
+  }
+
+  async ensureStarted(): Promise<void> {
+    if (this.startPromise) {
+      await this.startPromise;
+      return;
+    }
+
+    if (!this.process) {
+      await this.start();
+    }
+  }
+
+  async restart(): Promise<HealthSnapshot> {
+    await this.stop();
+    return this.start();
+  }
+
+  async restartIfInterpreterChanged(): Promise<void> {
+    if (!this.process || this.currentState.phase === 'starting') {
+      return;
+    }
+
+    if (this.interpreterCheck) {
+      await this.interpreterCheck;
+      return;
+    }
+
+    this.interpreterCheck = this.checkForInterpreterChange();
+
+    try {
+      await this.interpreterCheck;
+    } finally {
+      this.interpreterCheck = undefined;
+    }
+  }
+
+  async listRelationTargets(prefix: string): Promise<RelationTargetsResult> {
+    return this.cachedRequest<RelationTargetsResult>('relationTargets', { prefix });
+  }
+
+  async resolveRelationTarget(
+    value: string
+  ): Promise<RelationTargetResolution> {
+    return this.cachedRequest<RelationTargetResolution>('resolveRelationTarget', {
+      value,
+    });
+  }
+
+  async resolveExportOrigin(
+    moduleName: string,
+    symbol: string
+  ): Promise<ExportOriginResolution> {
+    return this.cachedRequest<ExportOriginResolution>('resolveExportOrigin', {
+      module: moduleName,
+      symbol,
+    });
+  }
+
+  async resolveModule(moduleName: string): Promise<ModuleResolution> {
+    return this.cachedRequest<ModuleResolution>('resolveModule', {
+      module: moduleName,
+    });
+  }
+
+  async listLookupPathCompletions(
+    baseModelLabel: string,
+    prefix: string,
+    method: string
+  ): Promise<LookupPathCompletionsResult> {
+    return this.cachedRequest<LookupPathCompletionsResult>('lookupPathCompletions', {
+      baseModelLabel,
+      prefix,
+      method,
+    });
+  }
+
+  async resolveLookupPath(
+    baseModelLabel: string,
+    value: string,
+    method: string
+  ): Promise<LookupPathResolution> {
+    return this.cachedRequest<LookupPathResolution>('resolveLookupPath', {
+      baseModelLabel,
+      value,
+      method,
+    });
+  }
+
+  async stop(): Promise<void> {
+    this.stopRequested = true;
+    this.clearResponseCache();
+    this.rejectAllPending(new Error('Analysis daemon stopped.'));
+
+    const child = this.process;
+    const stdoutReader = this.stdoutReader;
+
+    if (child?.pid !== undefined) {
+      this.intentionalExitProcessIds.add(child.pid);
+    }
+
+    this.disposeProcessHandles(child, stdoutReader);
+
+    if (child && !child.killed) {
+      child.kill();
+    }
+
+    this.updateState({
+      phase: 'stopped',
+      detail: 'Daemon is stopped.',
+      capabilities: this.currentState.capabilities,
+      workspaceRoot: this.lastLaunchContext?.workspaceRoot,
+      pythonPath: this.lastLaunchContext?.pythonPath,
+      pythonSource: this.lastLaunchContext?.pythonSource,
+      pythonSourceDetail: this.lastLaunchContext?.pythonSourceDetail,
+      settingsModule: this.lastLaunchContext?.settingsModule,
+      staticIndex: this.currentState.staticIndex,
+      runtime: this.currentState.runtime,
+      semanticGraph: this.currentState.semanticGraph,
+      startedAt: this.currentState.startedAt,
+    });
+  }
+
+  dispose(): void {
+    void this.stop();
+    this.stateEmitter.dispose();
+  }
+
+  private async startProcess(): Promise<HealthSnapshot> {
+    this.clearResponseCache();
     const launchContext = await this.createLaunchContext();
     this.lastLaunchContext = launchContext;
     this.stopRequested = false;
@@ -144,6 +310,7 @@ export class AnalysisDaemon implements vscode.Disposable {
         'info',
         `Daemon exited with code ${code ?? 'null'} and signal ${signal ?? 'null'}.`
       );
+      this.clearResponseCache();
       this.rejectAllPending(
         new Error(
           !intentional
@@ -184,138 +351,13 @@ export class AnalysisDaemon implements vscode.Disposable {
         settingsModule: launchContext.settingsModule,
       });
       const snapshot = this.decorateSnapshot(initializeResult.health);
+      await this.applyWorkspaceIntegrations(snapshot);
       this.updateState(snapshot);
       return snapshot;
     } catch (error) {
       this.updateStateFromError(error);
       throw error;
     }
-  }
-
-  async refreshHealth(): Promise<HealthSnapshot> {
-    if (!this.process) {
-      return this.currentState;
-    }
-
-    const snapshot = this.decorateSnapshot(
-      await this.request<HealthSnapshot>('health', {})
-    );
-    this.updateState(snapshot);
-    return snapshot;
-  }
-
-  async ensureStarted(): Promise<void> {
-    if (!this.process) {
-      await this.start();
-    }
-  }
-
-  async restart(): Promise<HealthSnapshot> {
-    await this.stop();
-    return this.start();
-  }
-
-  async restartIfInterpreterChanged(): Promise<void> {
-    if (!this.process || this.currentState.phase === 'starting') {
-      return;
-    }
-
-    if (this.interpreterCheck) {
-      await this.interpreterCheck;
-      return;
-    }
-
-    this.interpreterCheck = this.checkForInterpreterChange();
-
-    try {
-      await this.interpreterCheck;
-    } finally {
-      this.interpreterCheck = undefined;
-    }
-  }
-
-  async listRelationTargets(prefix: string): Promise<RelationTargetsResult> {
-    return this.request<RelationTargetsResult>('relationTargets', { prefix });
-  }
-
-  async resolveRelationTarget(
-    value: string
-  ): Promise<RelationTargetResolution> {
-    return this.request<RelationTargetResolution>('resolveRelationTarget', {
-      value,
-    });
-  }
-
-  async resolveExportOrigin(
-    moduleName: string,
-    symbol: string
-  ): Promise<ExportOriginResolution> {
-    return this.request<ExportOriginResolution>('resolveExportOrigin', {
-      module: moduleName,
-      symbol,
-    });
-  }
-
-  async listLookupPathCompletions(
-    baseModelLabel: string,
-    prefix: string,
-    method: string
-  ): Promise<LookupPathCompletionsResult> {
-    return this.request<LookupPathCompletionsResult>('lookupPathCompletions', {
-      baseModelLabel,
-      prefix,
-      method,
-    });
-  }
-
-  async resolveLookupPath(
-    baseModelLabel: string,
-    value: string,
-    method: string
-  ): Promise<LookupPathResolution> {
-    return this.request<LookupPathResolution>('resolveLookupPath', {
-      baseModelLabel,
-      value,
-      method,
-    });
-  }
-
-  async stop(): Promise<void> {
-    this.stopRequested = true;
-    this.rejectAllPending(new Error('Analysis daemon stopped.'));
-
-    const child = this.process;
-    const stdoutReader = this.stdoutReader;
-
-    if (child?.pid !== undefined) {
-      this.intentionalExitProcessIds.add(child.pid);
-    }
-
-    this.disposeProcessHandles(child, stdoutReader);
-
-    if (child && !child.killed) {
-      child.kill();
-    }
-
-    this.updateState({
-      phase: 'stopped',
-      detail: 'Daemon is stopped.',
-      capabilities: this.currentState.capabilities,
-      workspaceRoot: this.lastLaunchContext?.workspaceRoot,
-      pythonPath: this.lastLaunchContext?.pythonPath,
-      pythonSource: this.lastLaunchContext?.pythonSource,
-      pythonSourceDetail: this.lastLaunchContext?.pythonSourceDetail,
-      settingsModule: this.lastLaunchContext?.settingsModule,
-      staticIndex: this.currentState.staticIndex,
-      runtime: this.currentState.runtime,
-      semanticGraph: this.currentState.semanticGraph,
-      startedAt: this.currentState.startedAt,
-    });
-  }
-
-  dispose(): void {
-    void this.stop();
-    this.stateEmitter.dispose();
   }
 
   private async createLaunchContext(): Promise<LaunchContext> {
@@ -379,6 +421,27 @@ export class AnalysisDaemon implements vscode.Disposable {
     });
   }
 
+  private cachedRequest<T>(
+    method: string,
+    params: Record<string, unknown>
+  ): Promise<T> {
+    const cacheKey = JSON.stringify({ method, params });
+    const cached = this.responseCache.get(cacheKey);
+    if (cached) {
+      return cached as Promise<T>;
+    }
+
+    const requestPromise = this.request<T>(method, params);
+    this.responseCache.set(cacheKey, requestPromise);
+    this.evictOldestCachedResponse();
+    requestPromise.catch(() => {
+      if (this.responseCache.get(cacheKey) === requestPromise) {
+        this.responseCache.delete(cacheKey);
+      }
+    });
+    return requestPromise;
+  }
+
   private handleServerMessage(line: string): void {
     const trimmed = line.trim();
     if (!trimmed) {
@@ -387,15 +450,8 @@ export class AnalysisDaemon implements vscode.Disposable {
 
     this.log('debug', `[daemon->client] ${trimmed}`);
 
-    let response: ResponseMessage;
-
-    try {
-      response = JSON.parse(trimmed) as ResponseMessage;
-    } catch (error) {
-      this.log(
-        'info',
-        `Failed to parse daemon response: ${error instanceof Error ? error.message : String(error)}`
-      );
+    const response = this.parseServerResponse(trimmed);
+    if (!response) {
       return;
     }
 
@@ -460,6 +516,7 @@ export class AnalysisDaemon implements vscode.Disposable {
 
   private updateStateFromError(error: unknown): void {
     const message = error instanceof Error ? error.message : String(error);
+    this.clearResponseCache();
     this.updateState({
       phase: 'error',
       detail: message,
@@ -474,6 +531,19 @@ export class AnalysisDaemon implements vscode.Disposable {
       semanticGraph: this.currentState.semanticGraph,
       startedAt: this.currentState.startedAt,
     });
+  }
+
+  private async applyWorkspaceIntegrations(
+    snapshot: HealthSnapshot
+  ): Promise<void> {
+    try {
+      await syncManagedPylanceStubPath(snapshot, this.output);
+    } catch (error) {
+      this.log(
+        'info',
+        `[extension] Failed to sync managed Pylance stubPath: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 
   private async checkForInterpreterChange(): Promise<void> {
@@ -505,4 +575,101 @@ export class AnalysisDaemon implements vscode.Disposable {
 
     this.output.appendLine(message);
   }
+
+  private clearResponseCache(): void {
+    this.responseCache.clear();
+  }
+
+  private evictOldestCachedResponse(): void {
+    while (this.responseCache.size > RESPONSE_CACHE_LIMIT) {
+      const oldestKey = this.responseCache.keys().next().value;
+      if (!oldestKey) {
+        return;
+      }
+      this.responseCache.delete(oldestKey);
+    }
+  }
+
+  private parseServerResponse(line: string): ResponseMessage | undefined {
+    const firstNonWhitespace = line.search(/\S/);
+    if (firstNonWhitespace < 0) {
+      return undefined;
+    }
+
+    if (line[firstNonWhitespace] !== '{') {
+      this.log('info', `[daemon stdout ignored] ${line}`);
+      return undefined;
+    }
+
+    const extracted = extractLeadingJsonObject(line.slice(firstNonWhitespace));
+    const candidate = extracted?.jsonText ?? line.slice(firstNonWhitespace);
+
+    try {
+      if (extracted?.trailingText.trim()) {
+        this.log(
+          'info',
+          `[daemon stdout trailing noise ignored] ${extracted.trailingText.trim()}`
+        );
+      }
+      return JSON.parse(candidate) as ResponseMessage;
+    } catch (error) {
+      this.log(
+        'info',
+        `Failed to parse daemon response: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return undefined;
+    }
+  }
+}
+
+function extractLeadingJsonObject(
+  text: string
+): { jsonText: string; trailingText: string } | undefined {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+
+      if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === '{') {
+      depth += 1;
+      continue;
+    }
+
+    if (char !== '}') {
+      continue;
+    }
+
+    depth -= 1;
+    if (depth === 0) {
+      return {
+        jsonText: text.slice(0, index + 1),
+        trailingText: text.slice(index + 1),
+      };
+    }
+  }
+
+  return undefined;
 }

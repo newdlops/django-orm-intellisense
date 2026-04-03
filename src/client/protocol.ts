@@ -33,6 +33,15 @@ export interface SemanticGraphSnapshot {
   provenanceLayers: string[];
 }
 
+export interface PylanceStubSnapshot {
+  rootPath: string;
+  relativeRoot: string;
+  fileCount: number;
+  moduleCount: number;
+  packageCount: number;
+  generatedAt: string;
+}
+
 export interface RuntimeModelPreview {
   appLabel?: string;
   objectName?: string;
@@ -76,6 +85,14 @@ export interface ExportOriginResolution {
   originColumn?: number;
   viaModules: string[];
   resolutionKind: string;
+}
+
+export interface ModuleResolution {
+  requestedModule: string;
+  resolved: boolean;
+  filePath?: string;
+  line?: number;
+  column?: number;
 }
 
 export interface LookupPathItem {
@@ -122,6 +139,7 @@ export interface HealthSnapshot {
   settingsCandidates?: string[];
   startedAt?: string;
   staticIndex?: StaticIndexSnapshot;
+  pylanceStubs?: PylanceStubSnapshot;
   runtime?: RuntimeInspectionSnapshot;
   semanticGraph?: SemanticGraphSnapshot;
 }

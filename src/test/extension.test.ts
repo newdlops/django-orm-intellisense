@@ -12,9 +12,7 @@ suite('Django ORM Intellisense UI', () => {
     const extension = vscode.extensions.getExtension(EXTENSION_ID);
     assert.ok(extension, `Extension ${EXTENSION_ID} is not available.`);
     await extension.activate();
-    await setPythonInterpreter(
-      process.platform === 'win32' ? 'python' : 'python3'
-    );
+    await setPythonInterpreter('');
   });
 
   test('completes and resolves ORM lookup paths in fixture project', async function () {
@@ -72,7 +70,84 @@ suite('Django ORM Intellisense UI', () => {
       ),
       `Expected lookup definition to target blog/models.py. Received: ${lookupDefinition.uri.fsPath}`
     );
-    assert.strictEqual(lookupDefinition.range.start.line + 1, 28);
+    assert.strictEqual(lookupDefinition.range.start.line + 1, 37);
+  });
+
+  test('resolves runtime-backed reverse lookup paths with non-literal related_name', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const completionPosition = positionAfterTextInContainer(
+      document,
+      'Company.objects.values("corporate_registration__registration_code")',
+      'corporate_registration__reg'
+    );
+    const completionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        completionPosition
+      );
+
+    assert.ok(
+      completionList?.items.some((item) => item.label === 'registration_code'),
+      'Expected reverse lookup completion to include `registration_code`.'
+    );
+
+    const hoverPosition = positionInsideText(
+      document,
+      'Company.objects.values("corporate_registration__registration_code")',
+      'registration_code'
+    );
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      hoverPosition
+    );
+    const hoverText = stringifyHovers(hovers);
+
+    assert.ok(
+      hoverText.includes('Owner model: `blog.CorporateRegistration`'),
+      `Expected reverse lookup hover to mention the resolved owner model. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('Field kind: `CharField`'),
+      `Expected reverse lookup hover to mention the field kind. Received: ${hoverText}`
+    );
+
+    const definitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, hoverPosition);
+    const definitionTarget = firstDefinition(definitions);
+
+    assert.ok(
+      definitionTarget,
+      'Expected a definition target for the runtime-backed reverse lookup path.'
+    );
+    assert.strictEqual(
+      definitionTarget!.range.start.line + 1,
+      65,
+      'Expected reverse lookup definition to target the CorporateRegistration.registration_code field.'
+    );
+
+    const diagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) =>
+        items.some((item) => item.message.includes('author__unknown'))
+    );
+    assert.ok(
+      diagnostics.every(
+        (item) => !item.message.includes('corporate_registration__registration_code')
+      ),
+      `Expected runtime-backed reverse lookup path to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
   });
 
   test('completes and resolves ORM keyword lookup paths in fixture project', async function () {
@@ -126,6 +201,23 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       inheritedBaseCompletionList?.items.some((item) => item.label === 'name'),
       'Expected abstract-base model keyword lookup completion to include `name`.'
+    );
+
+    const multiInheritedCompletionPosition = positionAfterTextInContainer(
+      document,
+      "MultiInheritedLog.objects.filter(sl='entry')",
+      'sl'
+    );
+    const multiInheritedCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        multiInheritedCompletionPosition
+      );
+
+    assert.ok(
+      multiInheritedCompletionList?.items.some((item) => item.label === 'slug'),
+      'Expected multiple-abstract-inheritance keyword lookup completion to include `slug`.'
     );
 
     const multilineCompletionPosition = positionAfterTextInContainer(
@@ -202,7 +294,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      28,
+      37,
       'Expected keyword lookup definition to target the Profile.timezone field.'
     );
   });
@@ -539,6 +631,102 @@ suite('Django ORM Intellisense UI', () => {
     assert.strictEqual(importDefinition.range.start.line + 1, 4);
   });
 
+  test('shows hover and definition for relative symbol imports', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/reexport_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'library/import_examples.py'
+    );
+
+    const hoverPosition = positionInsideText(
+      document,
+      'Book as DirectBook',
+      'DirectBook'
+    );
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      hoverPosition
+    );
+    const hoverText = stringifyHovers(hovers);
+
+    assert.ok(
+      hoverText.includes('Resolved symbol: `library.models.Book`'),
+      `Expected relative import hover to describe the resolved symbol. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('File: `library/models.py`'),
+      `Expected relative import hover to describe the resolved file. Received: ${hoverText}`
+    );
+
+    const definitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, hoverPosition);
+    const definitionTarget = firstDefinition(definitions);
+
+    assert.ok(
+      definitionTarget,
+      'Expected a definition target for the relative imported symbol.'
+    );
+    assert.strictEqual(
+      definitionTarget!.range.start.line + 1,
+      4,
+      'Expected relative import definition to target the Book model.'
+    );
+  });
+
+  test('shows hover and definition for module imports', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/reexport_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'library/import_examples.py'
+    );
+
+    const hoverPosition = positionInsideText(
+      document,
+      'import library.models as library_models',
+      'library_models'
+    );
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      hoverPosition
+    );
+    const hoverText = stringifyHovers(hovers);
+
+    assert.ok(
+      hoverText.includes('Module: `library.models`'),
+      `Expected module import hover to describe the module name. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('File: `library/models.py`'),
+      `Expected module import hover to describe the module file. Received: ${hoverText}`
+    );
+
+    const definitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, hoverPosition);
+    const definitionTarget = firstDefinition(definitions);
+
+    assert.ok(
+      definitionTarget,
+      'Expected a definition target for the imported module.'
+    );
+    assert.strictEqual(
+      definitionTarget!.range.start.line + 1,
+      1,
+      'Expected module import definition to target the module file.'
+    );
+  });
+
   test('infers base models from package re-export imports', async function () {
     this.timeout(20_000);
 
@@ -617,6 +805,148 @@ suite('Django ORM Intellisense UI', () => {
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });
+
+  test('configures and restores managed Pylance diagnostic overrides', async function () {
+    this.timeout(20_000);
+
+    const tempWorkspace = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-workspace-')
+    );
+
+    await removeWorkspaceFoldersFrom(0);
+    await addWorkspaceFolder(tempWorkspace);
+
+    const originalSettings = readWorkspaceSettings(tempWorkspace);
+    const originalOverrides =
+      (originalSettings['python.analysis.diagnosticSeverityOverrides'] as
+        | Record<string, string>
+        | undefined) ?? {};
+
+    try {
+      writeWorkspaceSettings(tempWorkspace, {
+        ...originalSettings,
+        'python.analysis.diagnosticSeverityOverrides': {
+          ...originalOverrides,
+          reportUnusedImport: 'warning',
+        },
+      });
+
+      await vscode.commands.executeCommand(
+        'djangoOrmIntellisense.configurePylanceDiagnostics',
+        'recommended'
+      );
+
+      const recommendedOverrides =
+        (readWorkspaceSettings(tempWorkspace)[
+          'python.analysis.diagnosticSeverityOverrides'
+        ] as Record<string, string> | undefined) ?? {};
+      assert.strictEqual(
+        recommendedOverrides.reportAttributeAccessIssue,
+        'warning'
+      );
+      assert.strictEqual(recommendedOverrides.reportCallIssue, 'warning');
+      assert.strictEqual(
+        recommendedOverrides.reportUnknownMemberType,
+        'information'
+      );
+      assert.strictEqual(recommendedOverrides.reportUnusedImport, 'warning');
+
+      await vscode.commands.executeCommand(
+        'djangoOrmIntellisense.configurePylanceDiagnostics',
+        'restore'
+      );
+
+      const restoredOverrides =
+        (readWorkspaceSettings(tempWorkspace)[
+          'python.analysis.diagnosticSeverityOverrides'
+        ] as Record<string, string> | undefined) ?? {};
+      assert.strictEqual(
+        restoredOverrides.reportAttributeAccessIssue,
+        undefined
+      );
+      assert.strictEqual(restoredOverrides.reportCallIssue, undefined);
+      assert.strictEqual(restoredOverrides.reportUnusedImport, 'warning');
+    } finally {
+      writeWorkspaceSettings(tempWorkspace, originalSettings);
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test('generates managed Pylance stubs and wires stubPath for the workspace', async function () {
+    this.timeout(30_000);
+
+    const tempWorkspace = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-stubs-')
+    );
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    fs.cpSync(fixtureRoot, tempWorkspace, { recursive: true });
+
+    await removeWorkspaceFoldersFrom(0);
+    await addWorkspaceFolder(tempWorkspace);
+    await setWorkspaceRoot(tempWorkspace);
+    await setPythonInterpreter('');
+
+    try {
+      const stubRoot = path.join(
+        tempWorkspace,
+        '.django_orm_intellisense',
+        'stubs'
+      );
+      const modelStubPath = path.join(stubRoot, 'blog', 'models.pyi');
+      const supportStubPath = path.join(
+        stubRoot,
+        '_django_orm_intellisense_support.pyi'
+      );
+      const versionFilePath = path.join(stubRoot, '.stub-version');
+
+      await waitForCondition(() => {
+        const settings = readWorkspaceSettings(tempWorkspace);
+        return (
+          settings['python.analysis.stubPath'] ===
+            '.django_orm_intellisense/stubs' &&
+          fs.existsSync(modelStubPath) &&
+          fs.existsSync(supportStubPath) &&
+          fs.existsSync(versionFilePath)
+        );
+      }, 20_000);
+
+      const settings = readWorkspaceSettings(tempWorkspace);
+      assert.strictEqual(
+        settings['python.analysis.stubPath'],
+        '.django_orm_intellisense/stubs'
+      );
+
+      const modelStub = fs.readFileSync(modelStubPath, 'utf8');
+      assert.ok(
+        modelStub.includes('class Post(models.Model):'),
+        `Expected generated model stub to include Post. Received: ${modelStub}`
+      );
+      assert.ok(
+        modelStub.includes('objects: ClassVar[DjangoManager[Post]]'),
+        `Expected generated model stub to include a typed manager. Received: ${modelStub}`
+      );
+      assert.ok(
+        modelStub.includes('author: Author'),
+        `Expected generated model stub to type ForeignKey relations. Received: ${modelStub}`
+      );
+      assert.ok(
+        modelStub.includes('class AuditLog(TimeStampedBaseModel):'),
+        `Expected inherited model stub to preserve base classes. Received: ${modelStub}`
+      );
+      assert.ok(
+        fs.existsSync(path.join(stubRoot, 'blog', 'py.typed')),
+        'Expected generated stubs to include py.typed for the top-level package.'
+      );
+      assert.ok(
+        fs.readFileSync(versionFilePath, 'utf8').trim().length > 0,
+        'Expected generated stubs to include a stub schema version marker.'
+      );
+    } finally {
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempWorkspace, { recursive: true, force: true });
+    }
+  });
 });
 
 async function setWorkspaceRoot(rootPath: string): Promise<void> {
@@ -625,7 +955,7 @@ async function setWorkspaceRoot(rootPath: string): Promise<void> {
     .update(
       'workspaceRoot',
       rootPath,
-      vscode.ConfigurationTarget.Workspace
+      configurationTarget()
     );
   await delay(1200);
 }
@@ -636,9 +966,23 @@ async function setPythonInterpreter(interpreter: string): Promise<void> {
     .update(
       'pythonInterpreter',
       interpreter,
-      vscode.ConfigurationTarget.Workspace
+      configurationTarget()
     );
   await delay(1200);
+}
+
+function configurationTarget(): vscode.ConfigurationTarget {
+  return vscode.workspace.workspaceFolders?.length
+    ? vscode.ConfigurationTarget.Workspace
+    : vscode.ConfigurationTarget.Global;
+}
+
+function defaultTestInterpreter(): string {
+  if (process.platform === 'win32') {
+    return 'python';
+  }
+
+  return fs.existsSync('/usr/bin/python3') ? '/usr/bin/python3' : 'python3';
 }
 
 async function openFixtureDocument(
@@ -744,6 +1088,71 @@ async function waitForDiagnostics(
   return vscode.languages.getDiagnostics(uri);
 }
 
+async function waitForCondition(
+  predicate: () => boolean,
+  timeoutMs = 10_000
+): Promise<void> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) {
+      return;
+    }
+    await delay(200);
+  }
+
+  assert.fail(`Condition was not satisfied within ${timeoutMs}ms.`);
+}
+
 function stringifyDiagnostics(items: readonly vscode.Diagnostic[]): string {
   return items.map((item) => item.message).join(' | ');
+}
+
+async function addWorkspaceFolder(rootPath: string): Promise<void> {
+  const updated = vscode.workspace.updateWorkspaceFolders(
+    0,
+    0,
+    {
+      uri: vscode.Uri.file(rootPath),
+      name: path.basename(rootPath),
+    }
+  );
+  assert.ok(updated, `Failed to add workspace folder: ${rootPath}`);
+  await delay(500);
+}
+
+async function removeWorkspaceFoldersFrom(startIndex: number): Promise<void> {
+  const currentCount = vscode.workspace.workspaceFolders?.length ?? 0;
+  if (currentCount <= startIndex) {
+    return;
+  }
+
+  const updated = vscode.workspace.updateWorkspaceFolders(
+    startIndex,
+    currentCount - startIndex
+  );
+  assert.ok(updated, 'Failed to remove temporary workspace folders.');
+  await delay(500);
+}
+
+function workspaceSettingsPath(rootPath: string): string {
+  return path.join(rootPath, '.vscode', 'settings.json');
+}
+
+function readWorkspaceSettings(rootPath: string): Record<string, unknown> {
+  const settingsPath = workspaceSettingsPath(rootPath);
+  if (!fs.existsSync(settingsPath)) {
+    return {};
+  }
+
+  return JSON.parse(fs.readFileSync(settingsPath, 'utf8')) as Record<string, unknown>;
+}
+
+function writeWorkspaceSettings(
+  rootPath: string,
+  settings: Record<string, unknown>
+): void {
+  const settingsPath = workspaceSettingsPath(rootPath);
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
 }

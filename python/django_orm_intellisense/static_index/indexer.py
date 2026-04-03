@@ -20,6 +20,14 @@ class DefinitionLocation:
             'column': self.column,
         }
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> DefinitionLocation:
+        return cls(
+            file_path=str(payload['filePath']),
+            line=int(payload['line']),
+            column=int(payload['column']),
+        )
+
 
 @dataclass(frozen=True)
 class ModelCandidate:
@@ -30,9 +38,11 @@ class ModelCandidate:
     file_path: str
     line: int
     column: int
+    is_abstract: bool = False
+    base_class_refs: tuple[str, ...] = ()
     source: str = 'static'
 
-    def to_dict(self) -> dict[str, str | int]:
+    def to_dict(self) -> dict[str, str | int | bool | list[str]]:
         return {
             'appLabel': self.app_label,
             'objectName': self.object_name,
@@ -41,8 +51,27 @@ class ModelCandidate:
             'filePath': self.file_path,
             'line': self.line,
             'column': self.column,
+            'isAbstract': self.is_abstract,
+            'baseClassRefs': list(self.base_class_refs),
             'source': self.source,
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> ModelCandidate:
+        return cls(
+            app_label=str(payload['appLabel']),
+            object_name=str(payload['objectName']),
+            label=str(payload['label']),
+            module=str(payload['module']),
+            file_path=str(payload['filePath']),
+            line=int(payload['line']),
+            column=int(payload['column']),
+            is_abstract=bool(payload.get('isAbstract', False)),
+            base_class_refs=tuple(
+                str(base_ref) for base_ref in payload.get('baseClassRefs', [])
+            ),
+            source=str(payload.get('source', 'static')),
+        )
 
 
 @dataclass(frozen=True)
@@ -60,6 +89,39 @@ class PendingFieldCandidate:
     related_model_ref_value: str | None
     related_name: str | None
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            'modelLabel': self.model_label,
+            'modelModule': self.model_module,
+            'appLabel': self.app_label,
+            'name': self.name,
+            'filePath': self.file_path,
+            'line': self.line,
+            'column': self.column,
+            'fieldKind': self.field_kind,
+            'isRelation': self.is_relation,
+            'relatedModelRefKind': self.related_model_ref_kind,
+            'relatedModelRefValue': self.related_model_ref_value,
+            'relatedName': self.related_name,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> PendingFieldCandidate:
+        return cls(
+            model_label=str(payload['modelLabel']),
+            model_module=str(payload['modelModule']),
+            app_label=str(payload['appLabel']),
+            name=str(payload['name']),
+            file_path=str(payload['filePath']),
+            line=int(payload['line']),
+            column=int(payload['column']),
+            field_kind=str(payload['fieldKind']),
+            is_relation=bool(payload['isRelation']),
+            related_model_ref_kind=_string_or_none(payload.get('relatedModelRefKind')),
+            related_model_ref_value=_string_or_none(payload.get('relatedModelRefValue')),
+            related_name=_string_or_none(payload.get('relatedName')),
+        )
+
 
 @dataclass(frozen=True)
 class FieldCandidate:
@@ -72,6 +134,8 @@ class FieldCandidate:
     is_relation: bool
     relation_direction: str | None
     related_model_label: str | None
+    declared_model_label: str | None = None
+    related_name: str | None = None
     source: str = 'static'
 
     def to_dict(self) -> dict[str, str | int | bool | None]:
@@ -96,6 +160,23 @@ class ImportBinding:
     alias: str
     is_star: bool
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            'module': self.module,
+            'symbol': self.symbol,
+            'alias': self.alias,
+            'isStar': self.is_star,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> ImportBinding:
+        return cls(
+            module=str(payload['module']),
+            symbol=_string_or_none(payload.get('symbol')),
+            alias=str(payload['alias']),
+            is_star=bool(payload['isStar']),
+        )
+
 
 @dataclass(frozen=True)
 class ModuleIndex:
@@ -108,6 +189,66 @@ class ModuleIndex:
     explicit_all: list[str] | None
     model_candidates: list[ModelCandidate]
     pending_fields: list[PendingFieldCandidate]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            'moduleName': self.module_name,
+            'filePath': self.file_path,
+            'isPackageInit': self.is_package_init,
+            'definedSymbols': sorted(self.defined_symbols),
+            'symbolDefinitions': {
+                symbol: location.to_dict()
+                for symbol, location in self.symbol_definitions.items()
+            },
+            'importBindings': [binding.to_dict() for binding in self.import_bindings],
+            'explicitAll': list(self.explicit_all) if self.explicit_all is not None else None,
+            'modelCandidates': [candidate.to_dict() for candidate in self.model_candidates],
+            'pendingFields': [field.to_dict() for field in self.pending_fields],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> ModuleIndex:
+        raw_symbol_definitions = payload.get('symbolDefinitions') or {}
+        raw_import_bindings = payload.get('importBindings') or []
+        raw_model_candidates = payload.get('modelCandidates') or []
+        raw_pending_fields = payload.get('pendingFields') or []
+        raw_explicit_all = payload.get('explicitAll')
+
+        if not isinstance(raw_symbol_definitions, dict):
+            raise ValueError('Invalid static index cache payload: symbolDefinitions.')
+
+        return cls(
+            module_name=str(payload['moduleName']),
+            file_path=str(payload['filePath']),
+            is_package_init=bool(payload['isPackageInit']),
+            defined_symbols={str(symbol) for symbol in payload.get('definedSymbols', [])},
+            symbol_definitions={
+                str(symbol): DefinitionLocation.from_dict(dict(location))
+                for symbol, location in raw_symbol_definitions.items()
+                if isinstance(location, dict)
+            },
+            import_bindings=[
+                ImportBinding.from_dict(dict(binding))
+                for binding in raw_import_bindings
+                if isinstance(binding, dict)
+            ],
+            explicit_all=[
+                str(symbol)
+                for symbol in raw_explicit_all
+            ]
+            if isinstance(raw_explicit_all, list)
+            else None,
+            model_candidates=[
+                ModelCandidate.from_dict(dict(candidate))
+                for candidate in raw_model_candidates
+                if isinstance(candidate, dict)
+            ],
+            pending_fields=[
+                PendingFieldCandidate.from_dict(dict(field))
+                for field in raw_pending_fields
+                if isinstance(field, dict)
+            ],
+        )
 
 
 @dataclass(frozen=True)
@@ -138,6 +279,24 @@ class ExportResolution:
         }
 
 
+@dataclass(frozen=True)
+class ModuleResolution:
+    requested_module: str
+    resolved: bool
+    file_path: str | None
+    line: int | None
+    column: int | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            'requestedModule': self.requested_module,
+            'resolved': self.resolved,
+            'filePath': self.file_path,
+            'line': self.line,
+            'column': self.column,
+        }
+
+
 @dataclass
 class StaticIndex:
     python_file_count: int
@@ -150,6 +309,9 @@ class StaticIndex:
 
     def __post_init__(self) -> None:
         self._module_export_cache: dict[str, dict[str, ExportResolution]] = {}
+        self._concrete_model_candidates = [
+            candidate for candidate in self.model_candidates if not candidate.is_abstract
+        ]
         self._model_candidates_by_label = {
             candidate.label: candidate for candidate in self.model_candidates
         }
@@ -178,7 +340,11 @@ class StaticIndex:
 
     @property
     def model_candidate_count(self) -> int:
-        return len(self.model_candidates)
+        return len(self._concrete_model_candidates)
+
+    @property
+    def concrete_model_candidates(self) -> list[ModelCandidate]:
+        return list(self._concrete_model_candidates)
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -189,6 +355,48 @@ class StaticIndex:
             'explicitAllCount': self.explicit_all_count,
             'modelCandidateCount': self.model_candidate_count,
         }
+
+    def to_cache_dict(self) -> dict[str, object]:
+        return {
+            'pythonFileCount': self.python_file_count,
+            'packageInitCount': self.package_init_count,
+            'reexportModuleCount': self.reexport_module_count,
+            'starImportCount': self.star_import_count,
+            'explicitAllCount': self.explicit_all_count,
+            'modules': {
+                module_name: module.to_dict()
+                for module_name, module in self.modules.items()
+            },
+            'modelCandidates': [
+                candidate.to_dict() for candidate in self.model_candidates
+            ],
+        }
+
+    @classmethod
+    def from_cache_dict(cls, payload: dict[str, object]) -> StaticIndex:
+        raw_modules = payload.get('modules') or {}
+        raw_model_candidates = payload.get('modelCandidates') or []
+
+        if not isinstance(raw_modules, dict):
+            raise ValueError('Invalid static index cache payload: modules.')
+
+        return cls(
+            python_file_count=int(payload['pythonFileCount']),
+            package_init_count=int(payload['packageInitCount']),
+            reexport_module_count=int(payload['reexportModuleCount']),
+            star_import_count=int(payload['starImportCount']),
+            explicit_all_count=int(payload['explicitAllCount']),
+            modules={
+                str(module_name): ModuleIndex.from_dict(dict(module_payload))
+                for module_name, module_payload in raw_modules.items()
+                if isinstance(module_payload, dict)
+            },
+            model_candidates=[
+                ModelCandidate.from_dict(dict(candidate))
+                for candidate in raw_model_candidates
+                if isinstance(candidate, dict)
+            ],
+        )
 
     def resolve_export_origin(
         self,
@@ -210,6 +418,16 @@ class StaticIndex:
             origin_column=None,
             via_modules=[module_name],
             resolution_kind='unresolved',
+        )
+
+    def resolve_module(self, module_name: str) -> ModuleResolution:
+        location = self.locate_symbol(module_name, None)
+        return ModuleResolution(
+            requested_module=module_name,
+            resolved=location is not None,
+            file_path=location.file_path if location else None,
+            line=location.line if location else None,
+            column=location.column if location else None,
         )
 
     def locate_symbol(
@@ -349,8 +567,7 @@ class StaticIndex:
         return exports
 
     def _resolve_fields(self) -> list[FieldCandidate]:
-        fields: list[FieldCandidate] = []
-
+        direct_fields_by_model: dict[str, list[FieldCandidate]] = {}
         for module in self.modules.values():
             for pending in module.pending_fields:
                 related_model_label = (
@@ -358,7 +575,7 @@ class StaticIndex:
                     if pending.is_relation
                     else None
                 )
-                fields.append(
+                direct_fields_by_model.setdefault(pending.model_label, []).append(
                     FieldCandidate(
                         model_label=pending.model_label,
                         name=pending.name,
@@ -369,38 +586,165 @@ class StaticIndex:
                         is_relation=pending.is_relation,
                         relation_direction='forward' if pending.is_relation else None,
                         related_model_label=related_model_label,
+                        declared_model_label=pending.model_label,
+                        related_name=pending.related_name,
                     )
                 )
+
+        inherited_forward_cache: dict[str, list[FieldCandidate]] = {}
+
+        def expanded_forward_fields(
+            model_label: str,
+            stack: tuple[str, ...] = (),
+        ) -> list[FieldCandidate]:
+            cached = inherited_forward_cache.get(model_label)
+            if cached is not None:
+                return cached
+
+            if model_label in stack:
+                return []
+
+            candidate = self._model_candidates_by_label.get(model_label)
+            direct_fields = list(direct_fields_by_model.get(model_label, []))
+            direct_names = {field.name for field in direct_fields}
+            inherited_fields: list[FieldCandidate] = []
+            inherited_names: set[str] = set()
+
+            if candidate is not None:
+                for base_model_label in self._resolve_model_base_labels(candidate):
+                    for base_field in expanded_forward_fields(
+                        base_model_label,
+                        stack + (model_label,),
+                    ):
+                        if (
+                            base_field.name in direct_names
+                            or base_field.name in inherited_names
+                        ):
+                            continue
+
+                        inherited_names.add(base_field.name)
+                        inherited_fields.append(
+                            _clone_field_for_model(base_field, model_label)
+                        )
+
+            resolved_fields = inherited_fields + direct_fields
+            inherited_forward_cache[model_label] = resolved_fields
+            return resolved_fields
+
+        forward_fields: list[FieldCandidate] = []
+        for candidate in self.model_candidates:
+            forward_fields.extend(expanded_forward_fields(candidate.label))
 
         reverse_fields: list[FieldCandidate] = []
-        for module in self.modules.values():
-            for pending in module.pending_fields:
-                if not pending.is_relation:
+        reverse_keys: set[tuple[str, str, str]] = set()
+        for candidate in self._concrete_model_candidates:
+            for field in expanded_forward_fields(candidate.label):
+                if not field.is_relation or field.related_model_label is None:
                     continue
 
-                related_model_label = self._resolve_related_model_label(pending)
-                if related_model_label is None:
-                    continue
-
-                reverse_name = pending.related_name or _default_reverse_name(
-                    pending.field_kind,
-                    pending.model_label,
+                reverse_name = field.related_name or _default_reverse_name(
+                    field.field_kind,
+                    candidate.label,
                 )
+                reverse_key = (
+                    field.related_model_label,
+                    reverse_name,
+                    candidate.label,
+                )
+                if reverse_key in reverse_keys:
+                    continue
+
+                reverse_keys.add(reverse_key)
                 reverse_fields.append(
                     FieldCandidate(
-                        model_label=related_model_label,
+                        model_label=field.related_model_label,
                         name=reverse_name,
-                        file_path=pending.file_path,
-                        line=pending.line,
-                        column=pending.column,
-                        field_kind=f'reverse_{pending.field_kind}',
+                        file_path=field.file_path,
+                        line=field.line,
+                        column=field.column,
+                        field_kind=f'reverse_{field.field_kind}',
                         is_relation=True,
                         relation_direction='reverse',
-                        related_model_label=pending.model_label,
+                        related_model_label=candidate.label,
+                        declared_model_label=field.declared_model_label,
                     )
                 )
 
-        return fields + reverse_fields
+        return forward_fields + reverse_fields
+
+    def _resolve_model_base_labels(self, candidate: ModelCandidate) -> list[str]:
+        resolved_labels: list[str] = []
+        for base_ref in candidate.base_class_refs:
+            resolved_label = self._resolve_model_base_label(
+                module_name=candidate.module,
+                app_label=candidate.app_label,
+                base_ref=base_ref,
+            )
+            if resolved_label is None or resolved_label in resolved_labels:
+                continue
+            resolved_labels.append(resolved_label)
+
+        return resolved_labels
+
+    def _resolve_model_base_label(
+        self,
+        *,
+        module_name: str,
+        app_label: str,
+        base_ref: str,
+    ) -> str | None:
+        if not base_ref or _is_builtin_model_base_name(base_ref):
+            return None
+
+        local_candidate = self._model_candidates_by_module_and_name.get(
+            (module_name, base_ref)
+        )
+        if local_candidate is not None:
+            return local_candidate.label
+
+        if '.' in base_ref:
+            base_parts = base_ref.split('.')
+            symbol_name = base_parts[-1]
+            container_name = '.'.join(base_parts[:-1])
+
+            direct_candidate = self._model_candidates_by_module_and_name.get(
+                (container_name, symbol_name)
+            )
+            if direct_candidate is not None:
+                return direct_candidate.label
+
+            resolution = self.resolve_export_origin(module_name, container_name)
+            if resolution.resolved and resolution.origin_module is not None:
+                imported_candidate = self._model_candidates_by_module_and_name.get(
+                    (resolution.origin_module, symbol_name)
+                )
+                if imported_candidate is not None:
+                    return imported_candidate.label
+
+        resolution = self.resolve_export_origin(module_name, base_ref)
+        if (
+            resolution.resolved
+            and resolution.origin_module is not None
+            and resolution.origin_symbol is not None
+        ):
+            imported_candidate = self._model_candidates_by_module_and_name.get(
+                (resolution.origin_module, resolution.origin_symbol)
+            )
+            if imported_candidate is not None:
+                return imported_candidate.label
+
+        same_app_matches = self._model_candidates_by_app_and_name.get(
+            (app_label, base_ref),
+            [],
+        )
+        if len(same_app_matches) == 1:
+            return same_app_matches[0].label
+
+        global_matches = self._model_candidates_by_name.get(base_ref, [])
+        if len(global_matches) == 1:
+            return global_matches[0].label
+
+        return None
 
     def _resolve_related_model_label(
         self,
@@ -463,22 +807,22 @@ class StaticIndex:
         return None
 
 
-def build_static_index(root: Path) -> StaticIndex:
-    python_file_count = 0
-    package_init_count = 0
-    reexport_module_count = 0
-    star_import_count = 0
-    explicit_all_count = 0
+def build_static_index(
+    root: Path,
+    python_files: list[Path] | tuple[Path, ...] | None = None,
+    cached_module_indices: dict[str, ModuleIndex] | None = None,
+) -> StaticIndex:
     modules: dict[str, ModuleIndex] = {}
-    model_candidates: list[ModelCandidate] = []
+    source_files = list(python_files) if python_files is not None else iter_python_files(root)
+    cached_modules = cached_module_indices or {}
 
-    for python_file in iter_python_files(root):
-        python_file_count += 1
-
-        if python_file.name == '__init__.py':
-            package_init_count += 1
-
+    for python_file in source_files:
+        relative_path = python_file.relative_to(root).as_posix()
         module_name = _module_name_from_path(root, python_file)
+        cached_module = cached_modules.get(relative_path)
+        if cached_module is not None:
+            modules[module_name] = cached_module
+            continue
 
         try:
             file_text = python_file.read_text(encoding='utf-8')
@@ -488,32 +832,10 @@ def build_static_index(root: Path) -> StaticIndex:
 
         module_index = _build_module_index(root, python_file, module_name, parsed_module)
         modules[module_name] = module_index
-        model_candidates.extend(module_index.model_candidates)
 
-        module_star_imports = sum(
-            1 for binding in module_index.import_bindings if binding.is_star
-        )
-        module_has_reexport = any(
-            binding.is_star or binding.symbol is not None
-            for binding in module_index.import_bindings
-        )
-
-        star_import_count += module_star_imports
-        explicit_all_count += 1 if module_index.explicit_all is not None else 0
-
-        if module_index.is_package_init and (
-            module_has_reexport or module_index.explicit_all is not None
-        ):
-            reexport_module_count += 1
-
-    return StaticIndex(
-        python_file_count=python_file_count,
-        package_init_count=package_init_count,
-        reexport_module_count=reexport_module_count,
-        star_import_count=star_import_count,
-        explicit_all_count=explicit_all_count,
+    return _static_index_from_modules(
+        python_file_count=len(source_files),
         modules=modules,
-        model_candidates=model_candidates,
     )
 
 
@@ -539,7 +861,7 @@ def _build_module_index(
                 _definition_location(str(python_file), node.lineno, node.col_offset),
             )
 
-            if _looks_like_model_candidate(node) and not _is_abstract_model_class(node):
+            if _looks_like_model_candidate(node):
                 model_candidates.append(
                     _model_candidate_from_class(
                         python_file=python_file,
@@ -661,6 +983,12 @@ def _model_candidate_from_class(
         file_path=str(python_file),
         line=node.lineno,
         column=node.col_offset + 1,
+        is_abstract=_is_abstract_model_class(node),
+        base_class_refs=tuple(
+            base_name
+            for base_name in (_dotted_name(base) for base in node.bases)
+            if base_name
+        ),
     )
 
 
@@ -831,10 +1159,20 @@ def _is_abstract_model_class(node: ast.ClassDef) -> bool:
 
 def _is_model_base(expression: ast.expr) -> bool:
     dotted_name = _dotted_name(expression)
+    return _is_model_base_name(dotted_name)
+
+
+def _is_builtin_model_base_name(dotted_name: str) -> bool:
     return (
         dotted_name.endswith('models.Model')
         or dotted_name.endswith('.Model')
         or dotted_name == 'Model'
+    )
+
+
+def _is_model_base_name(dotted_name: str) -> bool:
+    return (
+        _is_builtin_model_base_name(dotted_name)
         or dotted_name.endswith('BaseModel')
         or dotted_name.endswith('JobModel')
     )
@@ -900,9 +1238,78 @@ def _prepend_module(
 
 def _default_reverse_name(field_kind: str, source_model_label: str) -> str:
     source_model_name = source_model_label.split('.', 1)[1]
-    source_model_name_lower = source_model_name[:1].lower() + source_model_name[1:]
+    source_model_name_lower = source_model_name.lower()
 
     if field_kind == 'OneToOneField':
         return source_model_name_lower
 
     return f'{source_model_name_lower}_set'
+
+
+def _string_or_none(value: object) -> str | None:
+    if value is None:
+        return None
+
+    return str(value)
+
+
+def _clone_field_for_model(field: FieldCandidate, model_label: str) -> FieldCandidate:
+    return FieldCandidate(
+        model_label=model_label,
+        name=field.name,
+        file_path=field.file_path,
+        line=field.line,
+        column=field.column,
+        field_kind=field.field_kind,
+        is_relation=field.is_relation,
+        relation_direction=field.relation_direction,
+        related_model_label=field.related_model_label,
+        declared_model_label=field.declared_model_label,
+        related_name=field.related_name,
+        source=field.source,
+    )
+
+
+def _static_index_from_modules(
+    *,
+    python_file_count: int,
+    modules: dict[str, ModuleIndex],
+) -> StaticIndex:
+    package_init_count = 0
+    reexport_module_count = 0
+    star_import_count = 0
+    explicit_all_count = 0
+    model_candidates: list[ModelCandidate] = []
+
+    for module_index in modules.values():
+        if module_index.is_package_init:
+            package_init_count += 1
+
+        module_star_imports = sum(
+            1 for binding in module_index.import_bindings if binding.is_star
+        )
+        module_has_reexport = any(
+            binding.is_star or binding.symbol is not None
+            for binding in module_index.import_bindings
+        )
+
+        if module_index.explicit_all is not None:
+            explicit_all_count += 1
+
+        if module_index.is_package_init and (
+            module_has_reexport or module_index.explicit_all is not None
+        ):
+            reexport_module_count += 1
+
+        star_import_count += module_star_imports
+        model_candidates.extend(module_index.model_candidates)
+
+    return StaticIndex(
+        python_file_count=python_file_count,
+        package_init_count=package_init_count,
+        reexport_module_count=reexport_module_count,
+        star_import_count=star_import_count,
+        explicit_all_count=explicit_all_count,
+        modules=modules,
+        model_candidates=model_candidates,
+    )

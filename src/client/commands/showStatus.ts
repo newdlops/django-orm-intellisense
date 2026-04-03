@@ -55,6 +55,12 @@ function buildStatusMessage(snapshot: HealthSnapshot): string {
     );
   }
 
+  if (snapshot.pylanceStubs) {
+    lines.push(
+      `Pylance stubs: ${snapshot.pylanceStubs.fileCount} files in ${snapshot.pylanceStubs.relativeRoot}`
+    );
+  }
+
   if (snapshot.semanticGraph) {
     lines.push(
       `Semantic graph: ${snapshot.semanticGraph.coverageMode} (${snapshot.semanticGraph.provenanceLayers.join(', ')})`
@@ -88,7 +94,12 @@ export function registerShowStatusCommand(
             ? vscode.window.showWarningMessage
             : vscode.window.showInformationMessage;
 
-      const choice = await prompt(message, 'Open Output', 'Restart Daemon');
+      const choice = await prompt(
+        message,
+        'Open Output',
+        'Restart Daemon',
+        'Configure Pylance'
+      );
 
       if (choice === 'Open Output') {
         output.show(true);
@@ -97,6 +108,13 @@ export function registerShowStatusCommand(
 
       if (choice === 'Restart Daemon') {
         await daemon.restart();
+        return;
+      }
+
+      if (choice === 'Configure Pylance') {
+        await vscode.commands.executeCommand(
+          'djangoOrmIntellisense.configurePylanceDiagnostics'
+        );
       }
     }
   );

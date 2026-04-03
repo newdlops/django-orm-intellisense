@@ -5,6 +5,14 @@
   "version": "0.0.1",
   "publisher": "newdlops",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/newdlops/django-orm-intellisense.git"
+  },
+  "homepage": "https://github.com/newdlops/django-orm-intellisense",
+  "bugs": {
+    "url": "https://github.com/newdlops/django-orm-intellisense/issues"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -17,6 +25,7 @@
     "onLanguage:python",
     "onCommand:djangoOrmIntellisense.showStatus",
     "onCommand:djangoOrmIntellisense.restartDaemon",
+    "onCommand:djangoOrmIntellisense.configurePylanceDiagnostics",
     "onCommand:djangoOrmIntellisense.browsePythonInterpreter",
     "onCommand:djangoOrmIntellisense.selectSettingsModule",
     "onCommand:djangoOrmIntellisense.selectPythonInterpreter"
@@ -31,6 +40,10 @@
       {
         "command": "djangoOrmIntellisense.restartDaemon",
         "title": "Django ORM Intellisense: Restart Daemon"
+      },
+      {
+        "command": "djangoOrmIntellisense.configurePylanceDiagnostics",
+        "title": "Django ORM Intellisense: Configure Pylance Diagnostics"
       },
       {
         "command": "djangoOrmIntellisense.browsePythonInterpreter",
