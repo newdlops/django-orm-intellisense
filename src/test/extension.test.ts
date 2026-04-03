@@ -353,6 +353,106 @@ suite('Django ORM Intellisense UI', () => {
     assert.strictEqual(definitionTarget!.range.start.line + 1, 6);
   });
 
+  test('infers helper, self, cls, and super queryset receivers', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const helperCompletionPosition = positionAfterTextInContainer(
+      document,
+      "build_products().filter(category__sl='chairs')",
+      'category__sl'
+    );
+    const helperCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        helperCompletionPosition
+      );
+
+    assert.ok(
+      helperCompletionList?.items.some((item) => item.label === 'slug'),
+      'Expected helper function queryset completion to include `slug`.'
+    );
+
+    const selfCompletionPosition = positionAfterTextInContainer(
+      document,
+      "self.local_queryset().filter(category__sl='chairs')",
+      'category__sl'
+    );
+    const selfCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        selfCompletionPosition
+      );
+
+    assert.ok(
+      selfCompletionList?.items.some((item) => item.label === 'slug'),
+      'Expected self receiver queryset completion to include `slug`.'
+    );
+
+    const superCompletionPosition = positionAfterTextInContainer(
+      document,
+      "super().base_queryset().filter(category__sl='chairs')",
+      'category__sl'
+    );
+    const superCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        superCompletionPosition
+      );
+
+    assert.ok(
+      superCompletionList?.items.some((item) => item.label === 'slug'),
+      'Expected super receiver queryset completion to include `slug`.'
+    );
+
+    const clsCompletionPosition = positionAfterTextInContainer(
+      document,
+      "return cls.available_products().filter(category__sl='chairs')",
+      'category__sl'
+    );
+    const clsCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        clsCompletionPosition
+      );
+
+    assert.ok(
+      clsCompletionList?.items.some((item) => item.label === 'slug'),
+      'Expected cls receiver queryset completion to include `slug`.'
+    );
+
+    const hoverPosition = positionInsideText(
+      document,
+      'self.local_queryset().values("category__title")',
+      'title'
+    );
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      hoverPosition
+    );
+    const hoverText = stringifyHovers(hovers);
+
+    assert.ok(
+      hoverText.includes('Owner model: `catalog.Category`'),
+      `Expected helper receiver hover to mention catalog.Category. Received: ${hoverText}`
+    );
+  });
+
   test('reports diagnostics for invalid ORM lookup paths', async function () {
     this.timeout(20_000);
 

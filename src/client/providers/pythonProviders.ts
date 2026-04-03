@@ -38,6 +38,10 @@ const KEYWORD_LOOKUP_CALLEE_PATTERN = new RegExp(
 const STRING_LOOKUP_CALLEE_PATTERN = new RegExp(
   String.raw`(${QUERYSET_RECEIVER_PATTERN})\.(${LOOKUP_METHOD_PATTERN})$`
 );
+const CLASS_DEFINITION_PATTERN =
+  /^(\s*)class\s+([A-Za-z_][\w]*)\s*(?:\((.*)\))?\s*:/;
+const FUNCTION_DEFINITION_PATTERN =
+  /^(\s*)(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)\s*(?:->\s*[^:]+)?\s*:/;
 
 interface LookupContext {
   receiverExpression: string;
@@ -65,6 +69,37 @@ interface RelationDiagnosticContext {
 interface LookupDiagnosticContext extends LookupLiteral {
   range: vscode.Range;
 }
+
+interface PythonClassDefinition {
+  name: string;
+  baseExpressions: string[];
+  line: number;
+  indent: number;
+  endLine: number;
+}
+
+interface PythonFunctionDefinition {
+  name: string;
+  line: number;
+  indent: number;
+  endLine: number;
+}
+
+interface ClassDefinitionSource {
+  document: vscode.TextDocument;
+  classDef: PythonClassDefinition;
+  beforeOffset: number;
+}
+
+interface FunctionDefinitionSource {
+  document: vscode.TextDocument;
+  functionDef: PythonFunctionDefinition;
+  beforeOffset: number;
+}
+
+type ParsedCallExpression =
+  | { kind: 'function'; functionName: string }
+  | { kind: 'member'; objectExpression: string; memberName: string };
 
 export function registerPythonProviders(
   daemon: AnalysisDaemon
@@ -1115,12 +1150,12 @@ async function resolveBaseModelLabelForReceiverAtOffset(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<string | undefined> {
-  const normalizedExpression = receiverExpression.trim();
+  const normalizedExpression = normalizeReceiverExpression(receiverExpression);
   if (!normalizedExpression) {
     return undefined;
   }
 
-  const visitKey = `${normalizedExpression}@${beforeOffset}`;
+  const visitKey = `${document.uri.toString()}:${normalizedExpression}@${beforeOffset}`;
   if (visited.has(visitKey) || visited.size > 8) {
     return undefined;
   }
@@ -1136,6 +1171,17 @@ async function resolveBaseModelLabelForReceiverAtOffset(
     if (resolvedLabel) {
       return resolvedLabel;
     }
+  }
+
+  const callResolvedLabel = await resolveModelLabelFromCallExpression(
+    daemon,
+    document,
+    normalizedExpression,
+    beforeOffset,
+    visited
+  );
+  if (callResolvedLabel) {
+    return callResolvedLabel;
   }
 
   const rootIdentifier = receiverRootIdentifier(normalizedExpression);
@@ -1157,6 +1203,102 @@ async function resolveBaseModelLabelForReceiverAtOffset(
     document,
     assignment.expression,
     assignment.offset,
+    visited
+  );
+}
+
+async function resolveModelLabelFromCallExpression(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  expression: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<string | undefined> {
+  const parsedCall = parseCalledExpression(expression);
+  if (!parsedCall) {
+    return undefined;
+  }
+
+  if (parsedCall.kind === 'function') {
+    const functionSource = await resolveFunctionDefinitionSource(
+      daemon,
+      document,
+      parsedCall.functionName,
+      beforeOffset
+    );
+    if (!functionSource) {
+      return undefined;
+    }
+    return resolveModelLabelFromFunctionSource(
+      daemon,
+      functionSource,
+      visited
+    );
+  }
+
+  if (parsedCall.objectExpression === 'self' || parsedCall.objectExpression === 'cls') {
+    const classDef = findEnclosingClassDefinition(document, beforeOffset);
+    if (!classDef) {
+      return undefined;
+    }
+
+    return resolveModelLabelFromClassMethodSource(
+      daemon,
+      {
+        document,
+        classDef,
+        beforeOffset: document.offsetAt(new vscode.Position(classDef.line, 0)),
+      },
+      parsedCall.memberName,
+      visited
+    );
+  }
+
+  if (parsedCall.objectExpression === 'super()') {
+    const classDef = findEnclosingClassDefinition(document, beforeOffset);
+    if (!classDef) {
+      return undefined;
+    }
+
+    return resolveModelLabelFromBaseClasses(
+      daemon,
+      {
+        document,
+        classDef,
+        beforeOffset: document.offsetAt(new vscode.Position(classDef.line, 0)),
+      },
+      parsedCall.memberName,
+      visited,
+      new Set()
+    );
+  }
+
+  const objectResolvedLabel = await resolveBaseModelLabelForReceiverAtOffset(
+    daemon,
+    document,
+    parsedCall.objectExpression,
+    beforeOffset,
+    visited
+  );
+  if (objectResolvedLabel) {
+    return objectResolvedLabel;
+  }
+
+  const classSource = await resolveClassDefinitionForExpression(
+    daemon,
+    document,
+    parsedCall.objectExpression,
+    beforeOffset,
+    visited
+  );
+  if (!classSource) {
+    return undefined;
+  }
+
+  return resolveModelLabelFromClassMethodSource(
+    daemon,
+    classSource,
+    parsedCall.memberName,
     visited
   );
 }
@@ -1252,6 +1394,734 @@ async function resolveModelLabelFromImportedSymbol(
   return undefined;
 }
 
+async function resolveModelLabelFromFunctionSource(
+  daemon: AnalysisDaemon,
+  functionSource: FunctionDefinitionSource,
+  visited: Set<string>
+): Promise<string | undefined> {
+  const returnExpressions = collectReturnExpressions(
+    functionSource.document,
+    functionSource.functionDef
+  );
+  if (returnExpressions.length === 0) {
+    return undefined;
+  }
+
+  const resolvedLabels = new Set<string>();
+  for (const returnExpression of returnExpressions) {
+    const resolvedLabel = await resolveBaseModelLabelForReceiverAtOffset(
+      daemon,
+      functionSource.document,
+      returnExpression.expression,
+      returnExpression.offset,
+      visited
+    );
+    if (resolvedLabel) {
+      resolvedLabels.add(resolvedLabel);
+    }
+  }
+
+  return resolvedLabels.size === 1 ? [...resolvedLabels][0] : undefined;
+}
+
+async function resolveModelLabelFromClassMethodSource(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  methodName: string,
+  visited: Set<string>
+): Promise<string | undefined> {
+  const methodSource = await resolveMethodDefinitionInClassHierarchy(
+    daemon,
+    classSource,
+    methodName,
+    new Set()
+  );
+  if (!methodSource) {
+    return undefined;
+  }
+
+  return resolveModelLabelFromFunctionSource(daemon, methodSource, visited);
+}
+
+async function resolveMethodDefinitionInClassHierarchy(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  methodName: string,
+  visitedClasses: Set<string>
+): Promise<FunctionDefinitionSource | undefined> {
+  const visitKey = `${classSource.document.uri.toString()}:${classSource.classDef.name}`;
+  if (visitedClasses.has(visitKey)) {
+    return undefined;
+  }
+  visitedClasses.add(visitKey);
+
+  const methodDef = findMethodDefinition(
+    classSource.document,
+    classSource.classDef,
+    methodName
+  );
+  if (methodDef) {
+    return {
+      document: classSource.document,
+      functionDef: methodDef,
+      beforeOffset: classSource.document.offsetAt(
+        new vscode.Position(methodDef.line, 0)
+      ),
+    };
+  }
+
+  return resolveMethodDefinitionFromBaseClasses(
+    daemon,
+    classSource,
+    methodName,
+    visitedClasses
+  );
+}
+
+async function resolveMethodDefinitionFromBaseClasses(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  methodName: string,
+  visitedClasses: Set<string>
+): Promise<FunctionDefinitionSource | undefined> {
+  for (const baseExpression of classSource.classDef.baseExpressions) {
+    const baseClassSource = await resolveClassDefinitionSource(
+      daemon,
+      classSource.document,
+      baseExpression,
+      classSource.beforeOffset
+    );
+    if (!baseClassSource) {
+      continue;
+    }
+
+    const methodSource = await resolveMethodDefinitionInClassHierarchy(
+      daemon,
+      baseClassSource,
+      methodName,
+      visitedClasses
+    );
+    if (!methodSource) {
+      continue;
+    }
+    return methodSource;
+  }
+
+  return undefined;
+}
+
+async function resolveModelLabelFromBaseClasses(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  methodName: string,
+  visited: Set<string>,
+  visitedClasses: Set<string>
+): Promise<string | undefined> {
+  const methodSource = await resolveMethodDefinitionFromBaseClasses(
+    daemon,
+    classSource,
+    methodName,
+    visitedClasses
+  );
+  if (!methodSource) {
+    return undefined;
+  }
+
+  return resolveModelLabelFromFunctionSource(daemon, methodSource, visited);
+}
+
+async function resolveClassDefinitionForExpression(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  expression: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<ClassDefinitionSource | undefined> {
+  const normalizedExpression = stripWrappingParentheses(expression.trim());
+  if (!normalizedExpression) {
+    return undefined;
+  }
+
+  if (normalizedExpression === 'self' || normalizedExpression === 'cls') {
+    const classDef = findEnclosingClassDefinition(document, beforeOffset);
+    if (!classDef) {
+      return undefined;
+    }
+    return {
+      document,
+      classDef,
+      beforeOffset: document.offsetAt(new vscode.Position(classDef.line, 0)),
+    };
+  }
+
+  if (/^[A-Za-z_][\w]*$/.test(normalizedExpression)) {
+    return resolveClassDefinitionSource(
+      daemon,
+      document,
+      normalizedExpression,
+      beforeOffset
+    );
+  }
+
+  const parsedCall = parseCalledExpression(normalizedExpression);
+  if (
+    parsedCall &&
+    parsedCall.kind === 'function' &&
+    /^[A-Za-z_][\w]*$/.test(parsedCall.functionName)
+  ) {
+    return resolveClassDefinitionSource(
+      daemon,
+      document,
+      parsedCall.functionName,
+      beforeOffset
+    );
+  }
+
+  const rootIdentifier = receiverRootIdentifier(normalizedExpression);
+  if (!rootIdentifier) {
+    return undefined;
+  }
+
+  const assignment = findNearestAssignedExpression(
+    document,
+    rootIdentifier,
+    beforeOffset
+  );
+  if (!assignment) {
+    return undefined;
+  }
+
+  const visitKey = `${document.uri.toString()}:class:${normalizedExpression}@${beforeOffset}`;
+  if (visited.has(visitKey)) {
+    return undefined;
+  }
+  visited.add(visitKey);
+
+  return resolveClassDefinitionForExpression(
+    daemon,
+    document,
+    assignment.expression,
+    assignment.offset,
+    visited
+  );
+}
+
+async function resolveClassDefinitionSource(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  symbol: string,
+  beforeOffset: number
+): Promise<ClassDefinitionSource | undefined> {
+  const sameDocumentClass = findClassDefinition(document, symbol);
+  if (sameDocumentClass) {
+    return {
+      document,
+      classDef: sameDocumentClass,
+      beforeOffset: document.offsetAt(
+        new vscode.Position(sameDocumentClass.line, 0)
+      ),
+    };
+  }
+
+  const importedDefinition = await resolveImportedDefinitionDocument(
+    daemon,
+    document,
+    symbol,
+    beforeOffset
+  );
+  if (!importedDefinition) {
+    return undefined;
+  }
+
+  const importedClass = findClassDefinition(
+    importedDefinition.document,
+    importedDefinition.symbolName
+  );
+  if (!importedClass) {
+    return undefined;
+  }
+
+  return {
+    document: importedDefinition.document,
+    classDef: importedClass,
+    beforeOffset: importedDefinition.document.offsetAt(
+      new vscode.Position(importedClass.line, 0)
+    ),
+  };
+}
+
+async function resolveFunctionDefinitionSource(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  symbol: string,
+  beforeOffset: number
+): Promise<FunctionDefinitionSource | undefined> {
+  const sameDocumentFunction = findTopLevelFunctionDefinition(document, symbol);
+  if (sameDocumentFunction) {
+    return {
+      document,
+      functionDef: sameDocumentFunction,
+      beforeOffset: document.offsetAt(
+        new vscode.Position(sameDocumentFunction.line, 0)
+      ),
+    };
+  }
+
+  const importedDefinition = await resolveImportedDefinitionDocument(
+    daemon,
+    document,
+    symbol,
+    beforeOffset
+  );
+  if (!importedDefinition) {
+    return undefined;
+  }
+
+  const importedFunction = findTopLevelFunctionDefinition(
+    importedDefinition.document,
+    importedDefinition.symbolName
+  );
+  if (!importedFunction) {
+    return undefined;
+  }
+
+  return {
+    document: importedDefinition.document,
+    functionDef: importedFunction,
+    beforeOffset: importedDefinition.document.offsetAt(
+      new vscode.Position(importedFunction.line, 0)
+    ),
+  };
+}
+
+async function resolveImportedDefinitionDocument(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  symbol: string,
+  beforeOffset: number
+): Promise<{ document: vscode.TextDocument; symbolName: string } | undefined> {
+  const bindings = collectImportBindings(document, beforeOffset);
+  const directBinding = bindings.symbols.get(symbol);
+  if (directBinding) {
+    const resolution = await daemon.resolveExportOrigin(
+      directBinding.moduleName,
+      directBinding.symbolName
+    );
+    if (resolution.resolved && resolution.originFilePath) {
+      return {
+        document: await vscode.workspace.openTextDocument(
+          resolution.originFilePath
+        ),
+        symbolName: resolution.originSymbol ?? directBinding.symbolName,
+      };
+    }
+  }
+
+  const parts = symbol.split('.');
+  if (parts.length === 2) {
+    const moduleName = bindings.modules.get(parts[0]);
+    if (moduleName) {
+      const resolution = await daemon.resolveExportOrigin(moduleName, parts[1]);
+      if (resolution.resolved && resolution.originFilePath) {
+        return {
+          document: await vscode.workspace.openTextDocument(
+            resolution.originFilePath
+          ),
+          symbolName: resolution.originSymbol ?? parts[1],
+        };
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function findEnclosingClassDefinition(
+  document: vscode.TextDocument,
+  beforeOffset: number
+): PythonClassDefinition | undefined {
+  const targetLine = document.positionAt(beforeOffset).line;
+
+  for (let line = targetLine; line >= 0; line -= 1) {
+    const match = document.lineAt(line).text.match(CLASS_DEFINITION_PATTERN);
+    if (!match) {
+      continue;
+    }
+
+    const classDef = buildClassDefinition(document, line, match);
+    if (targetLine > classDef.line && targetLine <= classDef.endLine) {
+      return classDef;
+    }
+  }
+
+  return undefined;
+}
+
+function findClassDefinition(
+  document: vscode.TextDocument,
+  className: string
+): PythonClassDefinition | undefined {
+  for (let line = 0; line < document.lineCount; line += 1) {
+    const match = document.lineAt(line).text.match(CLASS_DEFINITION_PATTERN);
+    if (!match || match[2] !== className) {
+      continue;
+    }
+
+    return buildClassDefinition(document, line, match);
+  }
+
+  return undefined;
+}
+
+function buildClassDefinition(
+  document: vscode.TextDocument,
+  line: number,
+  match: RegExpMatchArray
+): PythonClassDefinition {
+  const indent = match[1].length;
+  return {
+    name: match[2],
+    baseExpressions: splitTopLevelExpressions(match[3] ?? ''),
+    line,
+    indent,
+    endLine: findBlockEndLine(document, line, indent),
+  };
+}
+
+function findMethodDefinition(
+  document: vscode.TextDocument,
+  classDef: PythonClassDefinition,
+  methodName: string
+): PythonFunctionDefinition | undefined {
+  for (let line = classDef.line + 1; line <= classDef.endLine; line += 1) {
+    const text = document.lineAt(line).text;
+    const match = text.match(FUNCTION_DEFINITION_PATTERN);
+    if (!match || match[2] !== methodName) {
+      continue;
+    }
+
+    const indent = match[1].length;
+    if (indent <= classDef.indent) {
+      continue;
+    }
+
+    return buildFunctionDefinition(document, line, match);
+  }
+
+  return undefined;
+}
+
+function findTopLevelFunctionDefinition(
+  document: vscode.TextDocument,
+  functionName: string
+): PythonFunctionDefinition | undefined {
+  for (let line = 0; line < document.lineCount; line += 1) {
+    const match = document.lineAt(line).text.match(FUNCTION_DEFINITION_PATTERN);
+    if (!match || match[2] !== functionName || match[1].length !== 0) {
+      continue;
+    }
+
+    return buildFunctionDefinition(document, line, match);
+  }
+
+  return undefined;
+}
+
+function buildFunctionDefinition(
+  document: vscode.TextDocument,
+  line: number,
+  match: RegExpMatchArray
+): PythonFunctionDefinition {
+  const indent = match[1].length;
+  return {
+    name: match[2],
+    line,
+    indent,
+    endLine: findBlockEndLine(document, line, indent),
+  };
+}
+
+function findBlockEndLine(
+  document: vscode.TextDocument,
+  startLine: number,
+  indent: number
+): number {
+  for (let line = startLine + 1; line < document.lineCount; line += 1) {
+    const text = document.lineAt(line).text;
+    if (!text.trim()) {
+      continue;
+    }
+
+    const trimmed = text.trim();
+    if (trimmed.startsWith('#')) {
+      continue;
+    }
+
+    if (indentationWidth(text) <= indent) {
+      return line - 1;
+    }
+  }
+
+  return document.lineCount - 1;
+}
+
+function collectReturnExpressions(
+  document: vscode.TextDocument,
+  functionDef: PythonFunctionDefinition
+): Array<{ expression: string; offset: number }> {
+  const expressions: Array<{ expression: string; offset: number }> = [];
+
+  for (let line = functionDef.line + 1; line <= functionDef.endLine; line += 1) {
+    const text = document.lineAt(line).text;
+    if (!text.trim() || indentationWidth(text) <= functionDef.indent) {
+      continue;
+    }
+
+    const trimmed = stripTrailingComment(text).trim();
+    if (!trimmed.startsWith('return')) {
+      continue;
+    }
+
+    const initialExpression = trimmed.slice('return'.length).trim();
+    if (!initialExpression) {
+      continue;
+    }
+
+    const collected = collectMultilineExpression(
+      document,
+      line,
+      functionDef.endLine,
+      initialExpression
+    );
+    if (!collected.expression) {
+      continue;
+    }
+
+    expressions.push({
+      expression: collected.expression,
+      offset: document.offsetAt(new vscode.Position(line, 0)),
+    });
+    line = collected.endLine;
+  }
+
+  return expressions;
+}
+
+function collectMultilineExpression(
+  document: vscode.TextDocument,
+  startLine: number,
+  endLine: number,
+  initialExpression: string
+): { expression: string; endLine: number } {
+  const parts = [initialExpression];
+  let currentLine = startLine;
+  let depth = bracketBalance(initialExpression);
+
+  while (currentLine < endLine && depth > 0) {
+    currentLine += 1;
+    const nextLine = stripTrailingComment(document.lineAt(currentLine).text).trim();
+    if (!nextLine) {
+      continue;
+    }
+    parts.push(nextLine);
+    depth += bracketBalance(nextLine);
+  }
+
+  return {
+    expression: stripWrappingParentheses(parts.join(' ').trim()),
+    endLine: currentLine,
+  };
+}
+
+function parseCalledExpression(expression: string): ParsedCallExpression | undefined {
+  const normalizedExpression = stripWrappingParentheses(expression.trim());
+  if (!normalizedExpression.endsWith(')')) {
+    return undefined;
+  }
+
+  const openParenIndex = findMatchingOpeningDelimiter(
+    normalizedExpression,
+    normalizedExpression.length - 1,
+    '(',
+    ')'
+  );
+  if (openParenIndex === undefined) {
+    return undefined;
+  }
+
+  const calleeExpression = normalizedExpression.slice(0, openParenIndex);
+  if (!calleeExpression) {
+    return undefined;
+  }
+
+  const memberAccess = splitTopLevelMemberAccess(calleeExpression);
+  if (memberAccess) {
+    return {
+      kind: 'member',
+      objectExpression: memberAccess.objectExpression,
+      memberName: memberAccess.memberName,
+    };
+  }
+
+  if (/^[A-Za-z_][\w]*$/.test(calleeExpression)) {
+    return {
+      kind: 'function',
+      functionName: calleeExpression,
+    };
+  }
+
+  return undefined;
+}
+
+function splitTopLevelMemberAccess(
+  expression: string
+): { objectExpression: string; memberName: string } | undefined {
+  let depth = 0;
+
+  for (let index = expression.length - 1; index >= 0; index -= 1) {
+    const char = expression[index];
+    if (char === ')' || char === ']' || char === '}') {
+      depth += 1;
+      continue;
+    }
+
+    if (char === '(' || char === '[' || char === '{') {
+      if (depth > 0) {
+        depth -= 1;
+      }
+      continue;
+    }
+
+    if (char !== '.' || depth !== 0) {
+      continue;
+    }
+
+    const objectExpression = expression.slice(0, index);
+    const memberName = expression.slice(index + 1);
+    if (!objectExpression || !/^[A-Za-z_][\w]*$/.test(memberName)) {
+      return undefined;
+    }
+
+    return {
+      objectExpression,
+      memberName,
+    };
+  }
+
+  return undefined;
+}
+
+function splitTopLevelExpressions(value: string): string[] {
+  const expressions: string[] = [];
+  let current = '';
+  let depth = 0;
+
+  for (const char of value) {
+    if (char === ',' && depth === 0) {
+      const trimmed = current.trim();
+      if (trimmed) {
+        expressions.push(trimmed);
+      }
+      current = '';
+      continue;
+    }
+
+    if (char === '(' || char === '[' || char === '{') {
+      depth += 1;
+    } else if ((char === ')' || char === ']' || char === '}') && depth > 0) {
+      depth -= 1;
+    }
+
+    current += char;
+  }
+
+  const trailing = current.trim();
+  if (trailing) {
+    expressions.push(trailing);
+  }
+
+  return expressions;
+}
+
+function stripWrappingParentheses(value: string): string {
+  let current = value.trim();
+
+  while (
+    current.startsWith('(') &&
+    current.endsWith(')') &&
+    findMatchingOpeningDelimiter(current, current.length - 1, '(', ')') === 0
+  ) {
+    current = current.slice(1, -1).trim();
+  }
+
+  return current;
+}
+
+function normalizeReceiverExpression(value: string): string {
+  let current = stripWrappingParentheses(value.trim());
+
+  for (const prefix of ['return', 'await']) {
+    if (!current.startsWith(prefix) || current.length === prefix.length) {
+      continue;
+    }
+
+    const candidate = current.slice(prefix.length);
+    if (!candidate || !/[A-Za-z_(]/.test(candidate[0])) {
+      continue;
+    }
+
+    current = stripWrappingParentheses(candidate);
+  }
+
+  return current;
+}
+
+function findMatchingOpeningDelimiter(
+  text: string,
+  closingIndex: number,
+  openingDelimiter: string,
+  closingDelimiter: string
+): number | undefined {
+  let depth = 0;
+
+  for (let index = closingIndex; index >= 0; index -= 1) {
+    const char = text[index];
+    if (char === closingDelimiter) {
+      depth += 1;
+      continue;
+    }
+
+    if (char !== openingDelimiter) {
+      continue;
+    }
+
+    depth -= 1;
+    if (depth === 0) {
+      return index;
+    }
+  }
+
+  return undefined;
+}
+
+function bracketBalance(value: string): number {
+  let balance = 0;
+
+  for (const char of value) {
+    if (char === '(' || char === '[' || char === '{') {
+      balance += 1;
+    } else if (char === ')' || char === ']' || char === '}') {
+      balance -= 1;
+    }
+  }
+
+  return balance;
+}
+
+function indentationWidth(lineText: string): number {
+  return lineText.match(/^\s*/)?.[0].length ?? 0;
+}
+
 function directModelSymbolCandidates(receiverExpression: string): string[] {
   const normalizedExpression = receiverExpression.trim();
   const candidates: string[] = [];
@@ -1275,7 +2145,7 @@ function receiverRootIdentifier(receiverExpression: string): string | undefined 
   }
 
   const identifier = match[1];
-  if (identifier === 'self' || identifier === 'cls') {
+  if (identifier === 'self' || identifier === 'cls' || identifier === 'super') {
     return undefined;
   }
 
