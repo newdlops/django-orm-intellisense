@@ -8,8 +8,19 @@ function buildStatusMessage(snapshot: HealthSnapshot): string {
     `Detail: ${snapshot.detail}`,
     `Workspace: ${snapshot.workspaceRoot ?? 'Unavailable'}`,
     `Python: ${snapshot.pythonPath ?? 'Unavailable'}`,
+    `Python source: ${snapshot.pythonSource ?? 'Unavailable'}`,
     `Settings: ${snapshot.settingsModule ?? 'Not set'}`,
   ];
+
+  if (snapshot.pythonSourceDetail) {
+    lines.push(`Interpreter resolution: ${snapshot.pythonSourceDetail}`);
+  }
+
+  if (snapshot.settingsCandidates && snapshot.settingsCandidates.length > 0) {
+    lines.push(
+      `Settings candidates: ${snapshot.settingsCandidates.join(', ')}`
+    );
+  }
 
   if (snapshot.runtime) {
     lines.push(
@@ -19,6 +30,23 @@ function buildStatusMessage(snapshot: HealthSnapshot): string {
           : 'not importable'
       }`
     );
+    lines.push(`Bootstrap: ${snapshot.runtime.bootstrapStatus}`);
+
+    if (snapshot.runtime.modelCount !== undefined) {
+      lines.push(
+        `Runtime ORM: ${snapshot.runtime.appCount ?? 0} apps, ${snapshot.runtime.modelCount} models, ${snapshot.runtime.fieldCount ?? 0} fields, ${snapshot.runtime.relationCount ?? 0} forward relations, ${snapshot.runtime.reverseRelationCount ?? 0} reverse relations`
+      );
+    }
+
+    if (snapshot.runtime.modelPreview && snapshot.runtime.modelPreview.length > 0) {
+      lines.push(
+        `Model preview: ${snapshot.runtime.modelPreview.map((model) => model.label).join(', ')}`
+      );
+    }
+
+    if (snapshot.runtime.bootstrapError) {
+      lines.push(`Runtime error: ${snapshot.runtime.bootstrapError}`);
+    }
   }
 
   if (snapshot.staticIndex) {

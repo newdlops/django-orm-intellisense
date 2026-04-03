@@ -26,7 +26,11 @@ def main() -> None:
         parser.error('Only --stdio mode is currently supported.')
 
     server = DaemonServer(Path(args.workspace).resolve())
-    server.run_stdio()
+
+    try:
+        server.run_stdio()
+    except KeyboardInterrupt:
+        return
 
 
 if __name__ == '__main__':

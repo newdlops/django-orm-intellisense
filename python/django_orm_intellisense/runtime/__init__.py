@@ -1,3 +1,3 @@
-from .inspector import RuntimeInspection, inspect_runtime
+from .inspector import RuntimeInspection, RuntimeModelSummary, inspect_runtime
 
-__all__ = ['RuntimeInspection', 'inspect_runtime']
+__all__ = ['RuntimeInspection', 'RuntimeModelSummary', 'inspect_runtime']

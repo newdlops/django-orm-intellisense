@@ -61,26 +61,51 @@ def iter_python_files(root: Path) -> list[Path]:
 def discover_workspace(
     root: Path, settings_override: str | None = None
 ) -> WorkspaceProfile:
-    manage_py_path: str | None = None
+    manage_py_file = root / 'manage.py'
+    manage_py_path = str(manage_py_file) if manage_py_file.exists() else None
     settings_candidates: list[str] = []
     pyproject_path = root / 'pyproject.toml'
 
-    for python_file in iter_python_files(root):
-        if python_file.name == 'manage.py' and manage_py_path is None:
-            manage_py_path = str(python_file)
-
-        if python_file.stem == 'settings':
-            settings_candidates.append(_module_name_from_path(root, python_file))
+    if manage_py_path is not None or settings_override is not None:
+        settings_candidates.extend(_discover_settings_candidates(root))
 
     deduped_settings = list(dict.fromkeys(settings_candidates))
+    inferred_settings = _choose_default_settings_module(deduped_settings)
 
     return WorkspaceProfile(
-      root=str(root),
-      manage_py_path=manage_py_path,
-      pyproject_path=str(pyproject_path) if pyproject_path.exists() else None,
-      settings_module=settings_override or (deduped_settings[0] if deduped_settings else None),
-      settings_candidates=deduped_settings,
+        root=str(root),
+        manage_py_path=manage_py_path,
+        pyproject_path=str(pyproject_path) if pyproject_path.exists() else None,
+        settings_module=settings_override or inferred_settings,
+        settings_candidates=deduped_settings,
     )
+
+
+def _discover_settings_candidates(root: Path) -> list[str]:
+    candidates: list[str] = []
+
+    for python_file in iter_python_files(root):
+        if python_file.name == 'settings.py':
+            candidates.append(_module_name_from_path(root, python_file))
+            continue
+
+        if python_file.parent.name != 'settings':
+            continue
+
+        if python_file.name == '__init__.py':
+            candidates.append(_module_name_from_path(root, python_file.parent))
+            continue
+
+        candidates.append(_module_name_from_path(root, python_file))
+
+    return candidates
+
+
+def _choose_default_settings_module(settings_candidates: list[str]) -> str | None:
+    if len(settings_candidates) == 1:
+        return settings_candidates[0]
+
+    return None
 
 
 def _module_name_from_path(root: Path, file_path: Path) -> str:

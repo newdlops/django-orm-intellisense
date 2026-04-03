@@ -14,8 +14,12 @@
   ],
   "activationEvents": [
     "onStartupFinished",
+    "onLanguage:python",
     "onCommand:djangoOrmIntellisense.showStatus",
-    "onCommand:djangoOrmIntellisense.restartDaemon"
+    "onCommand:djangoOrmIntellisense.restartDaemon",
+    "onCommand:djangoOrmIntellisense.browsePythonInterpreter",
+    "onCommand:djangoOrmIntellisense.selectSettingsModule",
+    "onCommand:djangoOrmIntellisense.selectPythonInterpreter"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -27,6 +31,18 @@
       {
         "command": "djangoOrmIntellisense.restartDaemon",
         "title": "Django ORM Intellisense: Restart Daemon"
+      },
+      {
+        "command": "djangoOrmIntellisense.browsePythonInterpreter",
+        "title": "Django ORM Intellisense: Browse Python Interpreter"
+      },
+      {
+        "command": "djangoOrmIntellisense.selectSettingsModule",
+        "title": "Django ORM Intellisense: Select Settings Module"
+      },
+      {
+        "command": "djangoOrmIntellisense.selectPythonInterpreter",
+        "title": "Django ORM Intellisense: Select Python Interpreter"
       }
     ],
     "configuration": {
@@ -37,15 +53,29 @@
           "default": true,
           "description": "Automatically start the Python analysis daemon when the extension activates."
         },
+        "djangoOrmIntellisense.pythonInterpreter": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Optional Python interpreter used by the analysis daemon. You can point it either at the executable itself or at a virtualenv root such as .venv. Use the command 'Django ORM Intellisense: Browse Python Interpreter' to select it from the file explorer. If empty, the extension follows the Python extension selected interpreter before falling back to python.defaultInterpreterPath and then python3."
+        },
         "djangoOrmIntellisense.pythonPath": {
           "type": "string",
           "default": "",
-          "description": "Python executable used to launch the Django ORM Intellisense analysis daemon."
+          "scope": "resource",
+          "description": "Legacy alias for the Python executable used to launch the Django ORM Intellisense analysis daemon. Prefer djangoOrmIntellisense.pythonInterpreter."
         },
         "djangoOrmIntellisense.settingsModule": {
           "type": "string",
           "default": "",
-          "description": "Optional DJANGO_SETTINGS_MODULE override passed to the analysis daemon."
+          "scope": "resource",
+          "description": "Optional DJANGO_SETTINGS_MODULE override passed to the analysis daemon. Use the command 'Django ORM Intellisense: Select Settings Module' to choose from discovered candidates."
+        },
+        "djangoOrmIntellisense.workspaceRoot": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Optional workspace root override for the Python analysis daemon. Useful when the VS Code workspace is a larger monorepo and the Django project lives in a subdirectory."
         },
         "djangoOrmIntellisense.logLevel": {
           "type": "string",
@@ -55,6 +85,7 @@
             "debug"
           ],
           "default": "info",
+          "scope": "window",
           "description": "Controls how much daemon lifecycle logging is written to the extension output channel."
         }
       }

@@ -7,11 +7,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..discovery.workspace import discover_workspace
+from ..discovery.workspace import WorkspaceProfile, discover_workspace
 from ..features.health import build_health_snapshot
+from ..features.lookup_paths import (
+    list_lookup_path_completions,
+    resolve_lookup_path,
+)
+from ..features.reexports import resolve_export_origin
+from ..features.relation_targets import (
+    list_relation_targets,
+    resolve_relation_target,
+)
 from ..runtime.inspector import inspect_runtime
-from ..semantic.graph import build_semantic_graph
-from ..static_index.indexer import build_static_index
+from ..semantic.graph import SemanticGraphSummary, build_semantic_graph
+from ..static_index.indexer import StaticIndex, build_static_index
+from ..runtime.inspector import RuntimeInspection
 
 
 class DaemonServer:
@@ -19,6 +29,10 @@ class DaemonServer:
         self.workspace_root = workspace_root
         self.initialized_at = datetime.now(timezone.utc)
         self.health_snapshot: dict[str, Any] | None = None
+        self.workspace_profile: WorkspaceProfile | None = None
+        self.static_index: StaticIndex | None = None
+        self.runtime_inspection: RuntimeInspection | None = None
+        self.semantic_graph: SemanticGraphSummary | None = None
 
     def run_stdio(self) -> None:
         for raw_line in sys.stdin:
@@ -49,6 +63,16 @@ class DaemonServer:
                 result = self._initialize(params)
             elif method == 'health':
                 result = self._health()
+            elif method == 'relationTargets':
+                result = self._relation_targets(params)
+            elif method == 'resolveRelationTarget':
+                result = self._resolve_relation_target(params)
+            elif method == 'resolveExportOrigin':
+                result = self._resolve_export_origin(params)
+            elif method == 'lookupPathCompletions':
+                result = self._lookup_path_completions(params)
+            elif method == 'resolveLookupPath':
+                result = self._resolve_lookup_path(params)
             else:
                 raise ValueError(f'Unsupported method: {method}')
         except Exception as error:  # pragma: no cover - scaffold safety net
@@ -74,6 +98,10 @@ class DaemonServer:
         static_index = build_static_index(workspace_root)
         runtime = inspect_runtime(settings_module or workspace_profile.settings_module)
         semantic_graph = build_semantic_graph(workspace_profile, static_index, runtime)
+        self.workspace_profile = workspace_profile
+        self.static_index = static_index
+        self.runtime_inspection = runtime
+        self.semantic_graph = semantic_graph
         self.health_snapshot = build_health_snapshot(
             workspace=workspace_profile,
             static_index=static_index,
@@ -93,6 +121,86 @@ class DaemonServer:
             return self._initialize({})
 
         return self.health_snapshot
+
+    def _relation_targets(self, params: dict[str, Any]) -> dict[str, Any]:
+        static_index, runtime = self._require_feature_state()
+        prefix = _clean_optional_string(params.get('prefix'))
+        targets = list_relation_targets(
+            static_index=static_index,
+            runtime=runtime,
+            prefix=prefix,
+        )
+        return {
+            'items': targets,
+        }
+
+    def _resolve_relation_target(self, params: dict[str, Any]) -> dict[str, Any]:
+        static_index, runtime = self._require_feature_state()
+        value = _clean_optional_string(params.get('value'))
+        if value is None:
+            raise ValueError('`value` is required for resolveRelationTarget.')
+
+        return resolve_relation_target(
+            static_index=static_index,
+            runtime=runtime,
+            value=value,
+        )
+
+    def _resolve_export_origin(self, params: dict[str, Any]) -> dict[str, Any]:
+        static_index, _runtime = self._require_feature_state()
+        module_name = _clean_optional_string(params.get('module'))
+        symbol = _clean_optional_string(params.get('symbol'))
+        if module_name is None or symbol is None:
+            raise ValueError('`module` and `symbol` are required for resolveExportOrigin.')
+
+        return resolve_export_origin(
+            static_index=static_index,
+            module_name=module_name,
+            symbol=symbol,
+        )
+
+    def _lookup_path_completions(self, params: dict[str, Any]) -> dict[str, Any]:
+        static_index, _runtime = self._require_feature_state()
+        base_model_label = _clean_optional_string(params.get('baseModelLabel'))
+        prefix = _clean_optional_string(params.get('prefix')) or ''
+        method = _clean_optional_string(params.get('method'))
+        if base_model_label is None or method is None:
+            raise ValueError(
+                '`baseModelLabel` and `method` are required for lookupPathCompletions.'
+            )
+
+        return list_lookup_path_completions(
+            static_index=static_index,
+            base_model_label=base_model_label,
+            prefix=prefix,
+            method=method,
+        )
+
+    def _resolve_lookup_path(self, params: dict[str, Any]) -> dict[str, Any]:
+        static_index, _runtime = self._require_feature_state()
+        base_model_label = _clean_optional_string(params.get('baseModelLabel'))
+        value = _clean_optional_string(params.get('value'))
+        method = _clean_optional_string(params.get('method'))
+        if base_model_label is None or value is None or method is None:
+            raise ValueError(
+                '`baseModelLabel`, `value`, and `method` are required for resolveLookupPath.'
+            )
+
+        return resolve_lookup_path(
+            static_index=static_index,
+            base_model_label=base_model_label,
+            path=value,
+            method=method,
+        )
+
+    def _require_feature_state(self) -> tuple[StaticIndex, RuntimeInspection]:
+        if self.static_index is None or self.runtime_inspection is None:
+            self._initialize({})
+
+        if self.static_index is None or self.runtime_inspection is None:
+            raise RuntimeError('Daemon state is unavailable.')
+
+        return self.static_index, self.runtime_inspection
 
     def _write_response(self, request_id: Any, result: Any) -> None:
         payload = {

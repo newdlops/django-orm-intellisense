@@ -36,7 +36,11 @@ export class HealthStatusView implements vscode.Disposable {
       `Detail: ${snapshot.detail}`,
       `Workspace: ${snapshot.workspaceRoot ?? 'Unavailable'}`,
       `Python: ${snapshot.pythonPath ?? 'Unavailable'}`,
+      `Python source: ${snapshot.pythonSource ?? 'Unavailable'}`,
       `Settings: ${snapshot.settingsModule ?? 'Not set'}`,
+      `Settings candidates: ${(snapshot.settingsCandidates ?? []).join(', ') || 'None'}`,
+      `Bootstrap: ${snapshot.runtime?.bootstrapStatus ?? 'Not started'}`,
+      `Runtime models: ${snapshot.runtime?.modelCount ?? 0}`,
     ].join('\n');
   }
 

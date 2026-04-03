@@ -3,9 +3,18 @@ import * as path from 'path';
 import * as readline from 'readline';
 import * as vscode from 'vscode';
 import { getExtensionSettings } from '../config/settings';
+import {
+  resolvePythonInterpreter,
+  validatePythonInterpreterPath,
+} from '../python/interpreter';
 import type {
+  ExportOriginResolution,
   HealthSnapshot,
   InitializeResult,
+  LookupPathCompletionsResult,
+  LookupPathResolution,
+  RelationTargetResolution,
+  RelationTargetsResult,
   RequestMessage,
   ResponseMessage,
 } from '../protocol';
@@ -21,6 +30,8 @@ interface PendingRequest {
 interface LaunchContext {
   workspaceRoot: string;
   pythonPath: string;
+  pythonSource: string;
+  pythonSourceDetail: string;
   settingsModule?: string;
 }
 
@@ -37,12 +48,14 @@ function mergePythonPath(extensionPythonRoot: string): string {
 export class AnalysisDaemon implements vscode.Disposable {
   private readonly stateEmitter = new vscode.EventEmitter<HealthSnapshot>();
   private readonly pendingRequests = new Map<string, PendingRequest>();
+  private readonly intentionalExitProcessIds = new Set<number>();
   private readonly output: vscode.OutputChannel;
   private process?: ChildProcessWithoutNullStreams;
   private stdoutReader?: readline.Interface;
   private requestSequence = 0;
   private stopRequested = false;
   private lastLaunchContext?: LaunchContext;
+  private interpreterCheck?: Promise<void>;
   private currentState: HealthSnapshot = {
     phase: 'stopped',
     detail: 'Daemon has not been started yet.',
@@ -70,15 +83,17 @@ export class AnalysisDaemon implements vscode.Disposable {
       return this.refreshHealth();
     }
 
-    const launchContext = this.createLaunchContext();
+    const launchContext = await this.createLaunchContext();
     this.lastLaunchContext = launchContext;
     this.stopRequested = false;
     this.updateState({
       phase: 'starting',
-      detail: `Starting analysis daemon with ${launchContext.pythonPath}.`,
+      detail: `Starting analysis daemon with ${launchContext.pythonPath} (${launchContext.pythonSource}).`,
       capabilities: [],
       workspaceRoot: launchContext.workspaceRoot,
       pythonPath: launchContext.pythonPath,
+      pythonSource: launchContext.pythonSource,
+      pythonSourceDetail: launchContext.pythonSourceDetail,
       settingsModule: launchContext.settingsModule,
     });
 
@@ -104,7 +119,8 @@ export class AnalysisDaemon implements vscode.Disposable {
     );
 
     this.process = child;
-    this.stdoutReader = readline.createInterface({ input: child.stdout });
+    const stdoutReader = readline.createInterface({ input: child.stdout });
+    this.stdoutReader = stdoutReader;
 
     child.once('spawn', () => {
       this.log('info', `Daemon process spawned with pid ${child.pid ?? 'unknown'}.`);
@@ -113,32 +129,39 @@ export class AnalysisDaemon implements vscode.Disposable {
     child.once('error', (error) => {
       this.log('info', `Daemon failed to spawn: ${error.message}`);
       this.rejectAllPending(error);
-      this.disposeProcessHandles();
+      this.disposeProcessHandles(child, stdoutReader);
       this.updateStateFromError(error);
     });
 
     child.once('exit', (code, signal) => {
-      const unexpected = !this.stopRequested;
+      const intentional =
+        (child.pid !== undefined && this.intentionalExitProcessIds.has(child.pid)) ||
+        this.stopRequested;
+      if (child.pid !== undefined) {
+        this.intentionalExitProcessIds.delete(child.pid);
+      }
       this.log(
         'info',
         `Daemon exited with code ${code ?? 'null'} and signal ${signal ?? 'null'}.`
       );
       this.rejectAllPending(
         new Error(
-          unexpected
+          !intentional
             ? `Analysis daemon exited unexpectedly (${code ?? 'null'}/${signal ?? 'null'}).`
             : 'Analysis daemon stopped.'
         )
       );
-      this.disposeProcessHandles();
+      this.disposeProcessHandles(child, stdoutReader);
 
-      if (unexpected) {
+      if (!intentional) {
         this.updateState({
           phase: 'error',
           detail: 'Analysis daemon exited unexpectedly.',
           capabilities: this.currentState.capabilities,
           workspaceRoot: this.lastLaunchContext?.workspaceRoot,
           pythonPath: this.lastLaunchContext?.pythonPath,
+          pythonSource: this.lastLaunchContext?.pythonSource,
+          pythonSourceDetail: this.lastLaunchContext?.pythonSourceDetail,
           settingsModule: this.lastLaunchContext?.settingsModule,
         });
       }
@@ -151,7 +174,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       }
     });
 
-    this.stdoutReader.on('line', (line) => {
+    stdoutReader.on('line', (line) => {
       this.handleServerMessage(line);
     });
 
@@ -160,8 +183,9 @@ export class AnalysisDaemon implements vscode.Disposable {
         workspaceRoot: launchContext.workspaceRoot,
         settingsModule: launchContext.settingsModule,
       });
-      this.updateState(initializeResult.health);
-      return initializeResult.health;
+      const snapshot = this.decorateSnapshot(initializeResult.health);
+      this.updateState(snapshot);
+      return snapshot;
     } catch (error) {
       this.updateStateFromError(error);
       throw error;
@@ -173,9 +197,17 @@ export class AnalysisDaemon implements vscode.Disposable {
       return this.currentState;
     }
 
-    const snapshot = await this.request<HealthSnapshot>('health', {});
+    const snapshot = this.decorateSnapshot(
+      await this.request<HealthSnapshot>('health', {})
+    );
     this.updateState(snapshot);
     return snapshot;
+  }
+
+  async ensureStarted(): Promise<void> {
+    if (!this.process) {
+      await this.start();
+    }
   }
 
   async restart(): Promise<HealthSnapshot> {
@@ -183,12 +215,83 @@ export class AnalysisDaemon implements vscode.Disposable {
     return this.start();
   }
 
+  async restartIfInterpreterChanged(): Promise<void> {
+    if (!this.process || this.currentState.phase === 'starting') {
+      return;
+    }
+
+    if (this.interpreterCheck) {
+      await this.interpreterCheck;
+      return;
+    }
+
+    this.interpreterCheck = this.checkForInterpreterChange();
+
+    try {
+      await this.interpreterCheck;
+    } finally {
+      this.interpreterCheck = undefined;
+    }
+  }
+
+  async listRelationTargets(prefix: string): Promise<RelationTargetsResult> {
+    return this.request<RelationTargetsResult>('relationTargets', { prefix });
+  }
+
+  async resolveRelationTarget(
+    value: string
+  ): Promise<RelationTargetResolution> {
+    return this.request<RelationTargetResolution>('resolveRelationTarget', {
+      value,
+    });
+  }
+
+  async resolveExportOrigin(
+    moduleName: string,
+    symbol: string
+  ): Promise<ExportOriginResolution> {
+    return this.request<ExportOriginResolution>('resolveExportOrigin', {
+      module: moduleName,
+      symbol,
+    });
+  }
+
+  async listLookupPathCompletions(
+    baseModelLabel: string,
+    prefix: string,
+    method: string
+  ): Promise<LookupPathCompletionsResult> {
+    return this.request<LookupPathCompletionsResult>('lookupPathCompletions', {
+      baseModelLabel,
+      prefix,
+      method,
+    });
+  }
+
+  async resolveLookupPath(
+    baseModelLabel: string,
+    value: string,
+    method: string
+  ): Promise<LookupPathResolution> {
+    return this.request<LookupPathResolution>('resolveLookupPath', {
+      baseModelLabel,
+      value,
+      method,
+    });
+  }
+
   async stop(): Promise<void> {
     this.stopRequested = true;
     this.rejectAllPending(new Error('Analysis daemon stopped.'));
 
     const child = this.process;
-    this.disposeProcessHandles();
+    const stdoutReader = this.stdoutReader;
+
+    if (child?.pid !== undefined) {
+      this.intentionalExitProcessIds.add(child.pid);
+    }
+
+    this.disposeProcessHandles(child, stdoutReader);
 
     if (child && !child.killed) {
       child.kill();
@@ -200,6 +303,8 @@ export class AnalysisDaemon implements vscode.Disposable {
       capabilities: this.currentState.capabilities,
       workspaceRoot: this.lastLaunchContext?.workspaceRoot,
       pythonPath: this.lastLaunchContext?.pythonPath,
+      pythonSource: this.lastLaunchContext?.pythonSource,
+      pythonSourceDetail: this.lastLaunchContext?.pythonSourceDetail,
       settingsModule: this.lastLaunchContext?.settingsModule,
       staticIndex: this.currentState.staticIndex,
       runtime: this.currentState.runtime,
@@ -213,14 +318,26 @@ export class AnalysisDaemon implements vscode.Disposable {
     this.stateEmitter.dispose();
   }
 
-  private createLaunchContext(): LaunchContext {
+  private async createLaunchContext(): Promise<LaunchContext> {
     const settings = getExtensionSettings();
     const workspaceRoot =
-      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? this.context.extensionPath;
+      settings.workspaceRoot ??
+      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ??
+      this.context.extensionPath;
+    const interpreter = await resolvePythonInterpreter(settings);
+    const validation = validatePythonInterpreterPath(interpreter.path);
+
+    if (!validation.valid) {
+      throw new Error(
+        `${validation.reason}. Set \`djangoOrmIntellisense.pythonInterpreter\` to the actual Python executable, or clear it so the extension can follow the Python extension selected interpreter.`
+      );
+    }
 
     return {
       workspaceRoot,
-      pythonPath: settings.pythonPath ?? 'python3',
+      pythonPath: validation.normalizedPath,
+      pythonSource: interpreter.source,
+      pythonSourceDetail: interpreter.detail,
       settingsModule: settings.settingsModule,
     };
   }
@@ -306,16 +423,39 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
   }
 
-  private disposeProcessHandles(): void {
-    this.stdoutReader?.removeAllListeners();
-    this.stdoutReader?.close();
-    this.stdoutReader = undefined;
-    this.process = undefined;
+  private disposeProcessHandles(
+    targetProcess?: ChildProcessWithoutNullStreams,
+    targetReader?: readline.Interface
+  ): void {
+    targetReader?.removeAllListeners();
+    try {
+      targetReader?.close();
+    } catch {
+      // Ignore reader shutdown races during restart.
+    }
+
+    if (!targetProcess || this.process === targetProcess) {
+      this.process = undefined;
+    }
+
+    if (!targetReader || this.stdoutReader === targetReader) {
+      this.stdoutReader = undefined;
+    }
   }
 
   private updateState(snapshot: HealthSnapshot): void {
     this.currentState = snapshot;
     this.stateEmitter.fire(snapshot);
+  }
+
+  private decorateSnapshot(snapshot: HealthSnapshot): HealthSnapshot {
+    return {
+      ...snapshot,
+      workspaceRoot: snapshot.workspaceRoot ?? this.lastLaunchContext?.workspaceRoot,
+      pythonSource: this.lastLaunchContext?.pythonSource,
+      pythonSourceDetail: this.lastLaunchContext?.pythonSourceDetail,
+      settingsModule: snapshot.settingsModule ?? this.lastLaunchContext?.settingsModule,
+    };
   }
 
   private updateStateFromError(error: unknown): void {
@@ -326,12 +466,31 @@ export class AnalysisDaemon implements vscode.Disposable {
       capabilities: this.currentState.capabilities,
       workspaceRoot: this.lastLaunchContext?.workspaceRoot,
       pythonPath: this.lastLaunchContext?.pythonPath,
+      pythonSource: this.lastLaunchContext?.pythonSource,
+      pythonSourceDetail: this.lastLaunchContext?.pythonSourceDetail,
       settingsModule: this.lastLaunchContext?.settingsModule,
       staticIndex: this.currentState.staticIndex,
       runtime: this.currentState.runtime,
       semanticGraph: this.currentState.semanticGraph,
       startedAt: this.currentState.startedAt,
     });
+  }
+
+  private async checkForInterpreterChange(): Promise<void> {
+    if (!this.lastLaunchContext) {
+      return;
+    }
+
+    const nextLaunchContext = await this.createLaunchContext();
+    if (nextLaunchContext.pythonPath === this.lastLaunchContext.pythonPath) {
+      return;
+    }
+
+    this.log(
+      'info',
+      `Detected Python interpreter change (${this.lastLaunchContext.pythonPath} -> ${nextLaunchContext.pythonPath}). Restarting analysis daemon.`
+    );
+    await this.restart();
   }
 
   private log(level: 'info' | 'debug', message: string): void {

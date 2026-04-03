@@ -14,6 +14,14 @@ export interface RuntimeInspectionSnapshot {
   djangoVersion?: string;
   bootstrapStatus: string;
   settingsModule?: string;
+  bootstrapError?: string;
+  appCount?: number;
+  modelCount?: number;
+  fieldCount?: number;
+  relationCount?: number;
+  reverseRelationCount?: number;
+  managerCount?: number;
+  modelPreview?: RuntimeModelPreview[];
 }
 
 export interface SemanticGraphSnapshot {
@@ -25,6 +33,82 @@ export interface SemanticGraphSnapshot {
   provenanceLayers: string[];
 }
 
+export interface RuntimeModelPreview {
+  appLabel?: string;
+  objectName?: string;
+  label: string;
+  module: string;
+  filePath?: string;
+  line?: number;
+  column?: number;
+  fieldNames: string[];
+  relationNames: string[];
+  reverseRelationNames: string[];
+  managerNames: string[];
+}
+
+export interface RelationTargetItem extends RuntimeModelPreview {
+  appLabel: string;
+  objectName: string;
+  source: string;
+}
+
+export interface RelationTargetsResult {
+  items: RelationTargetItem[];
+}
+
+export interface RelationTargetResolution {
+  resolved: boolean;
+  matchKind?: string;
+  reason?: string;
+  target?: RelationTargetItem;
+  candidates?: RelationTargetItem[];
+}
+
+export interface ExportOriginResolution {
+  requestedModule: string;
+  symbol: string;
+  resolved: boolean;
+  originModule?: string;
+  originSymbol?: string;
+  originFilePath?: string;
+  originLine?: number;
+  originColumn?: number;
+  viaModules: string[];
+  resolutionKind: string;
+}
+
+export interface LookupPathItem {
+  name: string;
+  modelLabel: string;
+  relatedModelLabel?: string;
+  filePath?: string;
+  line?: number;
+  column?: number;
+  fieldKind: string;
+  isRelation: boolean;
+  relationDirection?: string;
+  source: string;
+  lookupOperator?: string;
+}
+
+export interface LookupPathCompletionsResult {
+  items: LookupPathItem[];
+  resolved: boolean;
+  reason?: string;
+  currentModelLabel?: string;
+}
+
+export interface LookupPathResolution {
+  resolved: boolean;
+  reason?: string;
+  missingSegment?: string;
+  target?: LookupPathItem;
+  resolvedSegments?: LookupPathItem[];
+  baseModelLabel?: string;
+  lookupOperator?: string;
+}
+
 export interface HealthSnapshot {
   phase: ServerPhase;
   detail: string;
@@ -32,7 +116,10 @@ export interface HealthSnapshot {
   workspaceRoot?: string;
   managePyPath?: string;
   pythonPath?: string;
+  pythonSource?: string;
+  pythonSourceDetail?: string;
   settingsModule?: string;
+  settingsCandidates?: string[];
   startedAt?: string;
   staticIndex?: StaticIndexSnapshot;
   runtime?: RuntimeInspectionSnapshot;
