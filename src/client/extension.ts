@@ -22,6 +22,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const daemon = new AnalysisDaemon(context, output);
   const statusView = new HealthStatusView();
   const diagnostics = new HealthDiagnostics();
+  const autoRestartsEnabled = process.env.DJLS_DISABLE_AUTO_RESTARTS !== '1';
 
   activeDaemon = daemon;
 
@@ -56,6 +57,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerSelectPythonInterpreterCommand(daemon, output),
     ...registerPythonProviders(daemon),
     vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!autoRestartsEnabled) {
+        return;
+      }
       if (!isRelevantConfigurationChange(event)) {
         return;
       }
@@ -68,6 +72,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       });
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      if (!autoRestartsEnabled) {
+        return;
+      }
       output.appendLine('[extension] Workspace folders changed. Restarting analysis daemon.');
       void daemon.restart().catch((error) => {
         output.appendLine(`[extension] Failed to restart daemon: ${String(error)}`);

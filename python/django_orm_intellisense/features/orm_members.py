@@ -727,7 +727,10 @@ def _runtime_callable_member_items(
                 if callable_member is None:
                     continue
 
-                source_file = inspect.getsourcefile(callable_member)
+                try:
+                    source_file = inspect.getsourcefile(callable_member)
+                except (OSError, TypeError):
+                    source_file = None
                 if source_file is None or str(Path(source_file).resolve()) not in workspace_files:
                     continue
 
@@ -774,7 +777,7 @@ def _callable_member_target(raw_member: object) -> tuple[object | None, str]:
     if isinstance(raw_member, classmethod):
         return raw_member.__func__, 'Django class method'
 
-    if inspect.isfunction(raw_member) or inspect.ismethoddescriptor(raw_member):
+    if inspect.isfunction(raw_member):
         return raw_member, 'Django method'
 
     return None, ''

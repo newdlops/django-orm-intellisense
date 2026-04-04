@@ -47,8 +47,8 @@ const LOOKUP_RECEIVER_KINDS = new Set<OrmReceiverKind>([
 ]);
 const LOOKUP_OPERATOR_PRIORITY = new Map(
   [
-    'exact',
     'in',
+    'exact',
     'icontains',
     'contains',
     'iexact',
@@ -221,7 +221,7 @@ export function registerPythonProviders(
     document: vscode.TextDocument,
     delayMs = 200
   ): void => {
-    if (!isPythonDocument(document)) {
+    if (!shouldAnalyzeDocument(document, daemon.getState().workspaceRoot)) {
       return;
     }
 
@@ -240,6 +240,11 @@ export function registerPythonProviders(
 
   const refreshAllDiagnostics = (): void => {
     for (const document of vscode.workspace.textDocuments) {
+      if (!shouldAnalyzeDocument(document, daemon.getState().workspaceRoot)) {
+        diagnosticCollection.delete(document.uri);
+        continue;
+      }
+
       scheduleDiagnosticsRefresh(document, 0);
     }
   };
@@ -247,7 +252,7 @@ export function registerPythonProviders(
   const refreshDiagnostics = async (
     document: vscode.TextDocument
   ): Promise<void> => {
-    if (!isPythonDocument(document)) {
+    if (!shouldAnalyzeDocument(document, daemon.getState().workspaceRoot)) {
       diagnosticCollection.delete(document.uri);
       return;
     }
@@ -1754,6 +1759,28 @@ function locationFromFilePosition(
 
 function isPythonDocument(document: vscode.TextDocument): boolean {
   return document.languageId === 'python' && document.uri.scheme === 'file';
+}
+
+function shouldAnalyzeDocument(
+  document: vscode.TextDocument,
+  workspaceRoot: string | undefined
+): boolean {
+  if (!isPythonDocument(document)) {
+    return false;
+  }
+
+  if (!workspaceRoot) {
+    return true;
+  }
+
+  const relativePath = path.relative(
+    path.resolve(workspaceRoot),
+    path.resolve(document.uri.fsPath)
+  );
+  return (
+    relativePath.length === 0 ||
+    (!relativePath.startsWith('..') && !path.isAbsolute(relativePath))
+  );
 }
 
 function findRelationDiagnosticContexts(

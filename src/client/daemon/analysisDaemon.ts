@@ -111,6 +111,8 @@ export class AnalysisDaemon implements vscode.Disposable {
   private requestSequence = 0;
   private startPromise?: Promise<HealthSnapshot>;
   private restartPromise?: Promise<HealthSnapshot>;
+  private restartQueued = false;
+  private queuedRestartScope?: vscode.ConfigurationScope;
   private stopRequested = false;
   private lastLaunchContext?: LaunchContext;
   private interpreterCheck?: Promise<void>;
@@ -199,12 +201,50 @@ export class AnalysisDaemon implements vscode.Disposable {
 
   async restart(scope?: vscode.ConfigurationScope): Promise<HealthSnapshot> {
     if (this.restartPromise) {
+      this.restartQueued = true;
+      if (scope !== undefined) {
+        this.queuedRestartScope = scope;
+      }
       return this.restartPromise;
     }
 
     const restartPromise = (async () => {
-      await this.stop();
-      return this.start(scope);
+      let nextScope = scope;
+      let lastSnapshot: HealthSnapshot | undefined;
+      let lastError: unknown;
+
+      while (true) {
+        this.restartQueued = false;
+        const restartScope = nextScope;
+        nextScope = undefined;
+
+        await this.stop();
+        if (this.startPromise) {
+          try {
+            await this.startPromise;
+          } catch {
+            // Ignore the terminated start attempt and continue with the queued restart.
+          }
+        }
+
+        try {
+          lastSnapshot = await this.start(restartScope);
+          lastError = undefined;
+        } catch (error) {
+          lastSnapshot = undefined;
+          lastError = error;
+        }
+
+        if (!this.restartQueued) {
+          if (lastSnapshot) {
+            return lastSnapshot;
+          }
+          throw lastError;
+        }
+
+        nextScope = this.queuedRestartScope;
+        this.queuedRestartScope = undefined;
+      }
     })();
     this.restartPromise = restartPromise;
 
@@ -402,12 +442,24 @@ export class AnalysisDaemon implements vscode.Disposable {
 
     child.once('error', (error) => {
       this.log('info', `Daemon failed to spawn: ${error.message}`);
+      if (this.process !== child) {
+        this.disposeProcessHandles(child, stdoutReader);
+        return;
+      }
       this.rejectAllPending(error);
       this.disposeProcessHandles(child, stdoutReader);
       this.updateStateFromError(error);
     });
 
     child.once('exit', (code, signal) => {
+      if (this.process !== child) {
+        this.disposeProcessHandles(child, stdoutReader);
+        if (child.pid !== undefined) {
+          this.intentionalExitProcessIds.delete(child.pid);
+        }
+        return;
+      }
+
       const intentional =
         (child.pid !== undefined && this.intentionalExitProcessIds.has(child.pid)) ||
         this.stopRequested;

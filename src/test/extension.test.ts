@@ -39,9 +39,9 @@ const FIXTURE_E2E_PROJECTS: Record<string, FixtureE2EProjectConfig> = {
 };
 
 const fixtureE2EEnvironmentCache = new Map<string, FixtureE2EEnvironment>();
-const fixtureWorkspaceCache = new Map<string, string>();
 let django5BaseInterpreterCache: string | undefined;
 let testCacheRoot: string | undefined;
+let fixtureHarnessWorkspacePath: string | undefined;
 
 suite('Django ORM Intellisense UI', () => {
   suiteSetup(async () => {
@@ -49,6 +49,7 @@ suite('Django ORM Intellisense UI', () => {
       path.join(os.tmpdir(), 'django-orm-intellisense-test-cache-')
     );
     process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR = testCacheRoot;
+    process.env.DJLS_DISABLE_AUTO_RESTARTS = '1';
     const extension = vscode.extensions.getExtension(EXTENSION_ID);
     assert.ok(extension, `Extension ${EXTENSION_ID} is not available.`);
     await extension.activate();
@@ -59,11 +60,12 @@ suite('Django ORM Intellisense UI', () => {
     await clearExtensionSetting('workspaceRoot');
     await clearExtensionSetting('pythonInterpreter');
     await clearExtensionSetting('settingsModule');
-    for (const workspacePath of fixtureWorkspaceCache.values()) {
-      fs.rmSync(workspacePath, { recursive: true, force: true });
+    if (fixtureHarnessWorkspacePath) {
+      fs.rmSync(fixtureHarnessWorkspacePath, { recursive: true, force: true });
+      fixtureHarnessWorkspacePath = undefined;
     }
-    fixtureWorkspaceCache.clear();
     delete process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR;
+    delete process.env.DJLS_DISABLE_AUTO_RESTARTS;
     if (testCacheRoot) {
       fs.rmSync(testCacheRoot, { recursive: true, force: true });
       testCacheRoot = undefined;
@@ -245,7 +247,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      70,
+      83,
       'Expected reverse lookup definition to target the CorporateRegistration.registration_code field.'
     );
 
@@ -2409,12 +2411,15 @@ async function setWorkspaceRoot(rootPath: string): Promise<void> {
   }
 
   const fixtureWorkspace = ensureFixtureWorkspace(rootPath, e2eEnvironment);
-  await removeWorkspaceFoldersFrom(0);
-  await addWorkspaceFolder(fixtureWorkspace);
   const daemon = getActiveDaemonForTesting();
   assert.ok(daemon, 'Expected the analysis daemon to be active after extension activation.');
-  await daemon.ensureStarted(vscode.Uri.file(fixtureWorkspace));
-  const snapshot = await daemon.refreshHealth();
+  const activeWorkspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (activeWorkspaceFolder !== fixtureWorkspace) {
+    await removeWorkspaceFoldersFrom(0);
+    await addWorkspaceFolder(fixtureWorkspace);
+  }
+  await applyFixtureWorkspaceSettings(fixtureWorkspace, rootPath, e2eEnvironment);
+  const snapshot = await daemon.restart(vscode.Uri.file(fixtureWorkspace));
   assertFixtureE2EHealth(snapshot, rootPath, e2eEnvironment);
   await delay(300);
 }
@@ -2547,19 +2552,14 @@ function ensureFixtureWorkspace(
   rootPath: string,
   environment: FixtureE2EEnvironment
 ): string {
-  const cachedWorkspace = fixtureWorkspaceCache.get(rootPath);
-  if (cachedWorkspace) {
-    writeFixtureWorkspaceSettings(cachedWorkspace, rootPath, environment);
-    return cachedWorkspace;
+  if (!fixtureHarnessWorkspacePath) {
+    fixtureHarnessWorkspacePath = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-e2e-workspace-')
+    );
   }
 
-  const fixtureName = fixtureProjectName(rootPath) ?? path.basename(rootPath);
-  const workspacePath = fs.mkdtempSync(
-    path.join(os.tmpdir(), `django-orm-intellisense-${fixtureName}-workspace-`)
-  );
-  writeFixtureWorkspaceSettings(workspacePath, rootPath, environment);
-  fixtureWorkspaceCache.set(rootPath, workspacePath);
-  return workspacePath;
+  writeFixtureWorkspaceSettings(fixtureHarnessWorkspacePath, rootPath, environment);
+  return fixtureHarnessWorkspacePath;
 }
 
 function writeFixtureWorkspaceSettings(
@@ -2572,6 +2572,33 @@ function writeFixtureWorkspaceSettings(
     'djangoOrmIntellisense.pythonInterpreter': environment.interpreterPath,
     'djangoOrmIntellisense.settingsModule': environment.settingsModule,
   });
+}
+
+async function applyFixtureWorkspaceSettings(
+  workspacePath: string,
+  rootPath: string,
+  environment: FixtureE2EEnvironment
+): Promise<void> {
+  const configuration = vscode.workspace.getConfiguration(
+    'djangoOrmIntellisense',
+    vscode.Uri.file(workspacePath)
+  );
+
+  await configuration.update(
+    'workspaceRoot',
+    rootPath,
+    vscode.ConfigurationTarget.WorkspaceFolder
+  );
+  await configuration.update(
+    'pythonInterpreter',
+    environment.interpreterPath,
+    vscode.ConfigurationTarget.WorkspaceFolder
+  );
+  await configuration.update(
+    'settingsModule',
+    environment.settingsModule,
+    vscode.ConfigurationTarget.WorkspaceFolder
+  );
 }
 
 function fixtureProjectName(rootPath: string): string | undefined {

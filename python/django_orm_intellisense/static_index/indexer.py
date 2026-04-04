@@ -853,7 +853,7 @@ def _build_module_index(
     pending_fields: list[PendingFieldCandidate] = []
     is_package_init = python_file.name == '__init__.py'
 
-    for node in parsed_module.body:
+    for node in _iter_indexable_module_nodes(parsed_module.body):
         if isinstance(node, ast.ClassDef):
             defined_symbols.add(node.name)
             symbol_definitions.setdefault(
@@ -966,6 +966,33 @@ def _build_module_index(
         model_candidates=model_candidates,
         pending_fields=pending_fields,
     )
+
+
+def _iter_indexable_module_nodes(
+    nodes: list[ast.stmt],
+) -> list[ast.stmt]:
+    collected: list[ast.stmt] = []
+
+    for node in nodes:
+        collected.append(node)
+        if isinstance(node, ast.If) and _is_type_checking_guard(node.test):
+            collected.extend(_iter_indexable_module_nodes(node.body))
+
+    return collected
+
+
+def _is_type_checking_guard(node: ast.expr) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == 'TYPE_CHECKING'
+
+    if isinstance(node, ast.Attribute):
+        return (
+            isinstance(node.value, ast.Name)
+            and node.value.id == 'typing'
+            and node.attr == 'TYPE_CHECKING'
+        )
+
+    return False
 
 
 def _model_candidate_from_class(
