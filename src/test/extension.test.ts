@@ -7,6 +7,7 @@ import type { HealthSnapshot } from '../client/protocol';
 import { syncManagedPylanceStubPath } from '../client/pylance/stubPath';
 import {
   resolvePythonInterpreter,
+  savePythonInterpreterSetting,
   validatePythonInterpreterPath,
 } from '../client/python/interpreter';
 
@@ -132,7 +133,7 @@ suite('Django ORM Intellisense UI', () => {
       ),
       `Expected lookup definition to target blog/models.py. Received: ${lookupDefinition.uri.fsPath}`
     );
-    assert.strictEqual(lookupDefinition.range.start.line + 1, 37);
+    assert.strictEqual(lookupDefinition.range.start.line + 1, 38);
   });
 
   test('resolves runtime-backed reverse lookup paths with non-literal related_name', async function () {
@@ -851,8 +852,80 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      37,
+      38,
       'Expected keyword lookup definition to target the Profile.timezone field.'
+    );
+  });
+
+  test('prioritizes lowest-class model fields for inherited instance receivers', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const auditLogCompletionPosition = positionAfterTextInContainer(
+      document,
+      'audit_log.',
+      'audit_log.'
+    );
+    const auditLogCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        auditLogCompletionPosition
+      );
+
+    const auditLogLabels = (auditLogCompletionList?.items ?? []).map((item) =>
+      completionItemLabel(item)
+    );
+    assert.deepStrictEqual(
+      auditLogLabels.slice(0, 3),
+      ['name', 'note', 'created_at'],
+      `Expected AuditLog direct fields to come before inherited fields. Received: ${auditLogLabels
+        .slice(0, 8)
+        .join(', ')}`
+    );
+    const auditLogNameCompletionItem = findCompletionItemByLabel(
+      auditLogCompletionList?.items,
+      'name'
+    );
+    assert.strictEqual(
+      completionItemDisplayLabel(auditLogNameCompletionItem!),
+      'name (CharField)',
+      'Expected inherited-instance field completion to show the Django field kind inline in the suggestion label.'
+    );
+    assert.strictEqual(
+      completionItemDescription(auditLogNameCompletionItem!),
+      'Django model',
+      'Expected inherited-instance field completion to be marked as a Django model suggestion.'
+    );
+
+    const multiInheritedCompletionPosition = positionAfterTextInContainer(
+      document,
+      'multi_inherited_log.',
+      'multi_inherited_log.'
+    );
+    const multiInheritedCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        multiInheritedCompletionPosition
+      );
+
+    const multiInheritedLabels = (multiInheritedCompletionList?.items ?? []).map(
+      (item) => completionItemLabel(item)
+    );
+    assert.deepStrictEqual(
+      multiInheritedLabels.slice(0, 3),
+      ['title', 'created_at', 'slug'],
+      `Expected MultiInheritedLog direct fields to come before inherited fields. Received: ${multiInheritedLabels
+        .slice(0, 8)
+        .join(', ')}`
     );
   });
 
@@ -1103,6 +1176,92 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
+  test('isolates manager queryset and instance receiver handling in advanced fixture project', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const managerCompletionPosition = positionAfterTextInContainer(
+      document,
+      'manager.ac',
+      'manager.ac'
+    );
+    const managerCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        managerCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(managerCompletionList?.items, 'active'),
+      'Expected manager receiver completion to keep custom manager methods.'
+    );
+
+    const querysetLookupPosition = positionAfterTextInContainer(
+      document,
+      "active_products.filter(category__sl='chairs')",
+      'category__sl'
+    );
+    const querysetLookupList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        querysetLookupPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(querysetLookupList?.items, 'slug'),
+      'Expected queryset receiver lookup completion to keep related field suggestions.'
+    );
+
+    const blankInstanceCompletionPosition = positionAfterTextInContainer(
+      document,
+      'instance.',
+      'instance.'
+    );
+    const blankInstanceCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        blankInstanceCompletionPosition
+      );
+
+    const blankInstanceLabels = (blankInstanceCompletionList?.items ?? []).map((item) =>
+      completionItemLabel(item)
+    );
+    assert.deepStrictEqual(
+      blankInstanceLabels.slice(0, 3),
+      ['category', 'name', 'is_active'],
+      `Expected instance receiver completions to keep Django fields at the top. Received: ${blankInstanceLabels
+        .slice(0, 10)
+        .join(', ')}`
+    );
+    const nameCompletionItem = findCompletionItemByLabel(
+      blankInstanceCompletionList?.items,
+      'name'
+    );
+    assert.strictEqual(
+      completionItemDisplayLabel(nameCompletionItem!),
+      'name (CharField)',
+      'Expected instance receiver completions to expose the Django field kind inline.'
+    );
+    assert.strictEqual(
+      completionItemDescription(nameCompletionItem!),
+      'Django model',
+      'Expected instance receiver completions to be marked as Django model suggestions.'
+    );
+  });
+
   test('completes manager, queryset, and model instance members without stubs', async function () {
     this.timeout(20_000);
 
@@ -1189,6 +1348,64 @@ suite('Django ORM Intellisense UI', () => {
       'Expected queryset completion to include the custom `with_line_count` method.'
     );
 
+    const blankInstanceCompletionPosition = positionAfterTextInContainer(
+      document,
+      'instance.',
+      'instance.'
+    );
+    const blankInstanceCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        blankInstanceCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(blankInstanceCompletionList?.items, 'name'),
+      'Expected blank model instance completion to include the `name` field.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(blankInstanceCompletionList?.items, 'category'),
+      'Expected blank model instance completion to include the relation field `category`.'
+    );
+    const blankInstanceLabels = (blankInstanceCompletionList?.items ?? []).map((item) =>
+      completionItemLabel(item)
+    );
+    assert.ok(
+      blankInstanceLabels.slice(0, 5).includes('name'),
+      `Expected model fields to be prioritized when completing after \`instance.\`. Received: ${blankInstanceLabels
+        .slice(0, 10)
+        .join(', ')}`
+    );
+    assert.ok(
+      blankInstanceLabels.slice(0, 5).includes('category'),
+      `Expected relation fields to be prioritized when completing after \`instance.\`. Received: ${blankInstanceLabels
+        .slice(0, 10)
+        .join(', ')}`
+    );
+    assert.deepStrictEqual(
+      blankInstanceLabels.slice(0, 3),
+      ['category', 'name', 'is_active'],
+      `Expected Django model fields to occupy the first completion slots after \`instance.\`. Received: ${blankInstanceLabels
+        .slice(0, 10)
+        .join(', ')}`
+    );
+
+    const blankNameCompletionItem = findCompletionItemByLabel(
+      blankInstanceCompletionList?.items,
+      'name'
+    );
+    assert.strictEqual(
+      completionItemDisplayLabel(blankNameCompletionItem!),
+      'name (CharField)',
+      'Expected blank model instance suggestions to expose the Django field kind inline in the suggestion label.'
+    );
+    assert.strictEqual(
+      completionItemDescription(blankNameCompletionItem!),
+      'Django model',
+      'Expected blank model instance suggestions to be marked as Django model completions.'
+    );
+
     const instanceCompletionPosition = positionAfterTextInContainer(
       document,
       'instance.na',
@@ -1211,6 +1428,40 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hasCompletionItemLabel(instanceCompletionList?.items, 'category'),
       'Expected model instance completion to include the relation field `category`.'
+    );
+    const instanceCompletionLabels = (instanceCompletionList?.items ?? []).map((item) =>
+      completionItemLabel(item)
+    );
+    assert.ok(
+      instanceCompletionLabels.slice(0, 4).includes('name'),
+      `Expected model instance fields to appear near the top of completion results. Received: ${instanceCompletionLabels
+        .slice(0, 8)
+        .join(', ')}`
+    );
+    assert.ok(
+      instanceCompletionLabels.slice(0, 4).includes('category'),
+      `Expected relation fields to remain near the top of model instance completions. Received: ${instanceCompletionLabels
+        .slice(0, 8)
+        .join(', ')}`
+    );
+
+    const nameCompletionItem = findCompletionItemByLabel(
+      instanceCompletionList?.items,
+      'name'
+    );
+    assert.strictEqual(
+      completionItemDisplayLabel(nameCompletionItem!),
+      'name (CharField)',
+      'Expected model instance field completions to expose the Django field kind inline in the suggestion label.'
+    );
+    assert.strictEqual(
+      completionItemDescription(nameCompletionItem!),
+      'Django model',
+      'Expected model instance field completions to be labeled as Django model suggestions.'
+    );
+    assert.ok(
+      nameCompletionItem?.detail?.startsWith('Django model field · CharField'),
+      `Expected model instance field detail to describe a Django model field. Received: ${nameCompletionItem?.detail}`
     );
 
     const relationCompletionPosition = positionAfterTextInContainer(
@@ -1245,6 +1496,89 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hasCompletionItemLabel(firstRelationCompletionList?.items, 'title'),
       'Expected queryset-to-instance result-shape completion to keep related field suggestions.'
+    );
+  });
+
+  test('infers loop target receivers from querysets and typed collections', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const querysetLoopCompletionPosition = positionAfterTextInContainer(
+      document,
+      'loop_product.category.ti',
+      'loop_product.category.ti'
+    );
+    const querysetLoopCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        querysetLoopCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(querysetLoopCompletionList?.items, 'title'),
+      'Expected queryset loop targets to keep related model member completion.'
+    );
+
+    const typedCollectionCompletionPosition = positionAfterTextInContainer(
+      document,
+      'typed_product.category.ti',
+      'typed_product.category.ti'
+    );
+    const typedCollectionCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typedCollectionCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(typedCollectionCompletionList?.items, 'title'),
+      'Expected typed collection loop targets to resolve as model instances.'
+    );
+
+    const typedQuerysetCompletionPosition = positionAfterTextInContainer(
+      document,
+      'typed_queryset.with_li',
+      'typed_queryset.with_li'
+    );
+    const typedQuerysetCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typedQuerysetCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(typedQuerysetCompletionList?.items, 'with_line_count'),
+      'Expected typed queryset loop targets to resolve as queryset receivers.'
+    );
+
+    const typedQuerysetLookupPosition = positionAfterTextInContainer(
+      document,
+      'typed_queryset.values("category__ti")',
+      'category__ti'
+    );
+    const typedQuerysetLookupList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typedQuerysetLookupPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(typedQuerysetLookupList?.items, 'title'),
+      'Expected typed queryset loop targets to keep queryset lookup completion.'
     );
   });
 
@@ -1591,6 +1925,156 @@ suite('Django ORM Intellisense UI', () => {
     }
   });
 
+  test('preserves explicit interpreter executable paths without collapsing symlinks', async () => {
+    if (process.platform === 'win32') {
+      return;
+    }
+
+    const tempRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-interpreter-symlink-')
+    );
+
+    try {
+      const baseInterpreter = path.join(tempRoot, 'base', 'python3.11');
+      const selectedInterpreter = path.join(tempRoot, 'venv', 'bin', 'python');
+
+      fs.mkdirSync(path.dirname(baseInterpreter), { recursive: true });
+      fs.mkdirSync(path.dirname(selectedInterpreter), { recursive: true });
+      fs.writeFileSync(baseInterpreter, '#!/usr/bin/env python3\n');
+      fs.chmodSync(baseInterpreter, 0o755);
+      fs.symlinkSync(baseInterpreter, selectedInterpreter);
+
+      const interpreter = await resolvePythonInterpreter({
+        pythonInterpreter: selectedInterpreter,
+        workspaceRoot: tempRoot,
+        settingsModule: undefined,
+        logLevel: 'off',
+        autoStart: false,
+      });
+
+      assert.strictEqual(interpreter.path, selectedInterpreter);
+
+      const validation = validatePythonInterpreterPath(selectedInterpreter);
+      assert.ok(validation.valid, 'Expected the selected symlink interpreter to remain valid.');
+      assert.strictEqual(validation.normalizedPath, selectedInterpreter);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('stores the exact interpreter path selected from browse', async function () {
+    this.timeout(20_000);
+
+    const tempWorkspace = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-interpreter-store-')
+    );
+
+    await removeWorkspaceFoldersFrom(0);
+    await addWorkspaceFolder(tempWorkspace);
+
+    try {
+      const selectedInterpreter = path.join(tempWorkspace, 'venv', 'bin', 'python');
+      fs.mkdirSync(path.dirname(selectedInterpreter), { recursive: true });
+      fs.writeFileSync(selectedInterpreter, '#!/usr/bin/env python3\n');
+
+      if (process.platform !== 'win32') {
+        fs.chmodSync(selectedInterpreter, 0o755);
+      }
+
+      const storedValue = await savePythonInterpreterSetting(selectedInterpreter, {
+        workspaceRoot: tempWorkspace,
+        settingsModule: undefined,
+        logLevel: 'off',
+        autoStart: false,
+      });
+
+      assert.strictEqual(storedValue, selectedInterpreter);
+      assert.strictEqual(
+        vscode.workspace
+          .getConfiguration('djangoOrmIntellisense', vscode.Uri.file(tempWorkspace))
+          .get<string>('pythonInterpreter'),
+        selectedInterpreter
+      );
+    } finally {
+      await vscode.workspace
+        .getConfiguration('djangoOrmIntellisense', vscode.Uri.file(tempWorkspace))
+        .update(
+          'pythonInterpreter',
+          undefined,
+          vscode.ConfigurationTarget.WorkspaceFolder
+        );
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test('prefers the workspace virtualenv path when the picker resolves a symlinked interpreter target', async function () {
+    this.timeout(20_000);
+
+    const tempWorkspace = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-interpreter-venv-link-')
+    );
+
+    await removeWorkspaceFoldersFrom(0);
+    await addWorkspaceFolder(tempWorkspace);
+
+    try {
+      const externalInterpreter = path.join(
+        tempWorkspace,
+        'pyenv',
+        'versions',
+        '3.11.2',
+        'bin',
+        'python3.11'
+      );
+      const virtualEnvRoot = path.join(tempWorkspace, 'venv');
+      const binDirectory = path.join(virtualEnvRoot, 'bin');
+      const virtualEnvInterpreter = path.join(binDirectory, 'python3.11');
+      const virtualEnvPython = path.join(binDirectory, 'python');
+
+      fs.mkdirSync(path.dirname(externalInterpreter), { recursive: true });
+      fs.mkdirSync(binDirectory, { recursive: true });
+      fs.writeFileSync(externalInterpreter, '#!/usr/bin/env python3\n');
+      fs.writeFileSync(
+        path.join(virtualEnvRoot, 'pyvenv.cfg'),
+        `home = ${path.dirname(externalInterpreter)}\n`,
+        'utf8'
+      );
+
+      if (process.platform !== 'win32') {
+        fs.chmodSync(externalInterpreter, 0o755);
+      }
+
+      fs.symlinkSync(externalInterpreter, virtualEnvPython);
+      fs.symlinkSync('python', virtualEnvInterpreter);
+
+      const storedValue = await savePythonInterpreterSetting(externalInterpreter, {
+        workspaceRoot: tempWorkspace,
+        settingsModule: undefined,
+        logLevel: 'off',
+        autoStart: false,
+      });
+
+      assert.strictEqual(storedValue, virtualEnvInterpreter);
+      assert.strictEqual(
+        vscode.workspace
+          .getConfiguration('djangoOrmIntellisense', vscode.Uri.file(tempWorkspace))
+          .get<string>('pythonInterpreter'),
+        virtualEnvInterpreter
+      );
+    } finally {
+      await vscode.workspace
+        .getConfiguration('djangoOrmIntellisense', vscode.Uri.file(tempWorkspace))
+        .update(
+          'pythonInterpreter',
+          undefined,
+          vscode.ConfigurationTarget.WorkspaceFolder
+        );
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempWorkspace, { recursive: true, force: true });
+    }
+  });
+
   test('normalizes macOS /usr/bin/python3 to a usable developer tools interpreter', () => {
     if (process.platform !== 'darwin') {
       return;
@@ -1607,7 +2091,76 @@ suite('Django ORM Intellisense UI', () => {
 
     const validation = validatePythonInterpreterPath('/usr/bin/python3');
     assert.ok(validation.valid, 'Expected /usr/bin/python3 normalization to remain valid.');
-    assert.strictEqual(validation.normalizedPath, fs.realpathSync(developerPython));
+    assert.strictEqual(validation.normalizedPath, developerPython);
+  });
+
+  test('falls back only when pythonInterpreter is unset', async () => {
+    const interpreter = await resolvePythonInterpreter({
+      settingsModule: undefined,
+      workspaceRoot: undefined,
+      logLevel: 'off',
+      autoStart: false,
+    });
+
+    assert.strictEqual(interpreter.source, 'fallback');
+    assert.ok(interpreter.path.length > 0);
+  });
+
+  test('configures managed Pylance stubPath and extraPaths when stubs are available', async function () {
+    this.timeout(20_000);
+
+    const tempRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-managed-stubs-')
+    );
+    const tempWorkspace = path.join(tempRoot, 'workspace');
+    const stubRoot = path.join(tempWorkspace, '.django_orm_intellisense', 'stubs');
+    fs.mkdirSync(stubRoot, { recursive: true });
+
+    await removeWorkspaceFoldersFrom(0);
+    await addWorkspaceFolder(tempWorkspace);
+
+    try {
+      writeWorkspaceSettings(tempWorkspace, {
+        'python.analysis.extraPaths': ['src'],
+      });
+
+      const snapshot: HealthSnapshot = {
+        phase: 'ready',
+        detail: 'stub sync test',
+        capabilities: ['pylance.stubs'],
+        workspaceRoot: tempWorkspace,
+        pylanceStubs: {
+          rootPath: stubRoot,
+          relativeRoot: '.django_orm_intellisense/stubs',
+          fileCount: 2,
+          moduleCount: 1,
+          packageCount: 1,
+          generatedAt: new Date().toISOString(),
+        },
+      };
+      const output = vscode.window.createOutputChannel(
+        'Django ORM Intellisense Test'
+      );
+
+      try {
+        await syncManagedPylanceStubPath(snapshot, output);
+      } finally {
+        output.dispose();
+      }
+
+      const settings = readWorkspaceSettings(tempWorkspace);
+      assert.strictEqual(
+        settings['python.analysis.stubPath'],
+        '.django_orm_intellisense/stubs'
+      );
+      assert.deepStrictEqual(settings['python.analysis.extraPaths'], [
+        '.django_orm_intellisense/stubs',
+        'src',
+      ]);
+    } finally {
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   test('removes legacy managed Pylance stubPath and stub files when stub generation is disabled', async function () {
@@ -1642,6 +2195,10 @@ suite('Django ORM Intellisense UI', () => {
     try {
       writeWorkspaceSettings(tempWorkspace, {
         'python.analysis.stubPath': '.django_orm_intellisense/stubs',
+        'python.analysis.extraPaths': [
+          '.django_orm_intellisense/stubs',
+          'src',
+        ],
       });
 
       const snapshot: HealthSnapshot = {
@@ -1663,11 +2220,19 @@ suite('Django ORM Intellisense UI', () => {
       const managedStubPath = readWorkspaceSettings(tempWorkspace)[
         'python.analysis.stubPath'
       ];
+      const managedExtraPaths = readWorkspaceSettings(tempWorkspace)[
+        'python.analysis.extraPaths'
+      ];
 
       assert.strictEqual(
         managedStubPath,
         undefined,
         'Expected the legacy managed python.analysis.stubPath to be removed.'
+      );
+      assert.deepStrictEqual(
+        managedExtraPaths,
+        ['src'],
+        'Expected only the managed extraPaths entry to be removed.'
       );
       assert.ok(
         !fs.existsSync(legacyStubRoot),
@@ -1847,7 +2412,23 @@ function positionInsideText(
 }
 
 function completionItemLabel(item: vscode.CompletionItem): string {
+  return completionItemDisplayLabel(item).replace(/\s+\([^)]+\)$/, '');
+}
+
+function completionItemDisplayLabel(item: vscode.CompletionItem): string {
   return typeof item.label === 'string' ? item.label : item.label.label;
+}
+
+function completionItemLabelDetail(
+  item: vscode.CompletionItem
+): string | undefined {
+  return typeof item.label === 'string' ? undefined : item.label.detail;
+}
+
+function completionItemDescription(
+  item: vscode.CompletionItem
+): string | undefined {
+  return typeof item.label === 'string' ? undefined : item.label.description;
 }
 
 function completionItemFilterValue(item: vscode.CompletionItem): string {

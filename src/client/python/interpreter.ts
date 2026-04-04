@@ -8,9 +8,6 @@ import {
   type ExtensionSettings,
 } from '../config/settings';
 
-const PYTHON_EXTENSION_ID = 'ms-python.python';
-const PYTHON_INTERPRETER_COMMAND = 'python.interpreterPath';
-const PYTHON_SELECT_COMMAND = 'python.setInterpreter';
 const DARWIN_PYTHON3_CANDIDATES = [
   '/Applications/Xcode.app/Contents/Developer/usr/bin/python3',
   '/Library/Developer/CommandLineTools/usr/bin/python3',
@@ -18,10 +15,6 @@ const DARWIN_PYTHON3_CANDIDATES = [
 
 export type PythonInterpreterSource =
   | 'djangoOrmIntellisense.pythonInterpreter'
-  | 'djangoOrmIntellisense.pythonPath'
-  | 'python.interpreterPath'
-  | 'python.defaultInterpreterPath'
-  | 'python.pythonPath'
   | 'fallback';
 
 export interface ResolvedPythonInterpreter {
@@ -35,8 +28,6 @@ export interface PythonInterpreterValidation {
   normalizedPath: string;
   reason?: string;
 }
-
-type InterpreterBrowseKind = 'file' | 'folder';
 
 export function getInterpreterResource(
   settings: ExtensionSettings = getExtensionSettings()
@@ -81,72 +72,17 @@ export async function resolvePythonInterpreter(
   const resource = getInterpreterResource(settings);
   const basePath = getInterpreterBasePath(settings);
 
-  const explicitInterpreter = normalizeInterpreterCandidate(
+  const configuredInterpreter = normalizeInterpreterCandidate(
     settings.pythonInterpreter,
     resource,
     basePath
   );
-  if (explicitInterpreter) {
+  if (configuredInterpreter) {
     return {
-      path: explicitInterpreter,
+      path: configuredInterpreter,
       source: 'djangoOrmIntellisense.pythonInterpreter',
       detail:
-        'Using the explicit `djangoOrmIntellisense.pythonInterpreter` setting.',
-    };
-  }
-
-  const legacyInterpreter = normalizeInterpreterCandidate(
-    settings.pythonPath,
-    resource,
-    basePath
-  );
-  if (legacyInterpreter) {
-    return {
-      path: legacyInterpreter,
-      source: 'djangoOrmIntellisense.pythonPath',
-      detail: 'Using the legacy `djangoOrmIntellisense.pythonPath` setting.',
-    };
-  }
-
-  const pythonExtensionInterpreter = normalizeInterpreterCandidate(
-    await getPythonExtensionInterpreter(resource),
-    resource,
-    basePath
-  );
-  if (pythonExtensionInterpreter) {
-    return {
-      path: pythonExtensionInterpreter,
-      source: 'python.interpreterPath',
-      detail:
-        'Following the Python extension selected interpreter (`python.interpreterPath`).',
-    };
-  }
-
-  const pythonConfiguration = vscode.workspace.getConfiguration('python', resource);
-  const defaultInterpreter = normalizeInterpreterCandidate(
-    pythonConfiguration.get<string>('defaultInterpreterPath'),
-    resource,
-    basePath
-  );
-  if (defaultInterpreter) {
-    return {
-      path: defaultInterpreter,
-      source: 'python.defaultInterpreterPath',
-      detail:
-        'Using the `python.defaultInterpreterPath` setting because no active interpreter could be resolved.',
-    };
-  }
-
-  const legacyPythonPath = normalizeInterpreterCandidate(
-    pythonConfiguration.get<string>('pythonPath'),
-    resource,
-    basePath
-  );
-  if (legacyPythonPath) {
-    return {
-      path: legacyPythonPath,
-      source: 'python.pythonPath',
-      detail: 'Using the legacy `python.pythonPath` setting.',
+        'Using the `djangoOrmIntellisense.pythonInterpreter` setting.',
     };
   }
 
@@ -154,42 +90,40 @@ export async function resolvePythonInterpreter(
   return {
     path: fallbackInterpreter,
     source: 'fallback',
-    detail: `Falling back to \`${fallbackInterpreter}\` because no workspace interpreter could be resolved.`,
+    detail:
+      `No \`djangoOrmIntellisense.pythonInterpreter\` is configured. ` +
+      `Falling back to \`${fallbackInterpreter}\`.`,
   };
 }
 
-export async function selectPythonInterpreterFromPythonExtension(
+export async function normalizePythonInterpreterSettings(
   settings: ExtensionSettings = getExtensionSettings()
-): Promise<boolean> {
-  const extension = vscode.extensions.getExtension(PYTHON_EXTENSION_ID);
-  if (!extension) {
-    return false;
-  }
-
-  try {
-    if (!extension.isActive) {
-      await extension.activate();
-    }
-  } catch {
-    // The command may still be available even if activation fails.
-  }
-
+): Promise<'migrated' | 'cleared' | 'noop'> {
   const resource = getInterpreterResource(settings);
+  const configuration = vscode.workspace.getConfiguration(
+    CONFIGURATION_SECTION,
+    resource
+  );
+  const configuredInterpreter = configuration.get<string>('pythonInterpreter')?.trim();
+  const legacyInterpreter = configuration.get<string>('pythonPath')?.trim();
 
-  for (const argument of [resource, resource?.fsPath, undefined]) {
-    try {
-      if (argument === undefined) {
-        await vscode.commands.executeCommand(PYTHON_SELECT_COMMAND);
-      } else {
-        await vscode.commands.executeCommand(PYTHON_SELECT_COMMAND, argument);
-      }
-      return true;
-    } catch {
-      // Try the next invocation shape.
-    }
+  if (!legacyInterpreter) {
+    return 'noop';
   }
 
-  return false;
+  if (!configuredInterpreter) {
+    await configuration.update(
+      'pythonInterpreter',
+      legacyInterpreter,
+      resolveLegacySettingTarget(configuration) ??
+        resolveInterpreterConfigurationTarget(resource)
+    );
+    await clearLegacyPythonPathSetting(configuration);
+    return 'migrated';
+  }
+
+  await clearLegacyPythonPathSetting(configuration);
+  return 'cleared';
 }
 
 export function validatePythonInterpreterPath(
@@ -255,41 +189,48 @@ export function validatePythonInterpreterPath(
 export async function browseForPythonInterpreter(
   settings: ExtensionSettings = getExtensionSettings()
 ): Promise<string | undefined> {
-  const browseKind = await vscode.window.showQuickPick<
-    { label: string; description: string; value: InterpreterBrowseKind }
-  >(
-    [
+  const localCandidates = findWorkspaceVirtualEnvInterpreterCandidates(settings);
+  if (localCandidates.length > 0) {
+    const items: Array<
+      vscode.QuickPickItem & {
+        path?: string;
+        browse?: boolean;
+      }
+    > = [
+      ...localCandidates.map((candidatePath) => ({
+        label: path.basename(candidatePath),
+        description: candidatePath,
+        path: candidatePath,
+      })),
       {
-        label: 'Python Executable',
-        description: 'Select a python executable such as .venv/bin/python',
-        value: 'file',
+        label: 'Browse...',
+        description: 'Choose another Python executable or virtualenv directory',
+        browse: true,
       },
-      {
-        label: 'Virtualenv Directory',
-        description: 'Select an environment root such as .venv',
-        value: 'folder',
-      },
-    ],
-    {
-      placeHolder: 'Choose what you want to browse for',
-      ignoreFocusOut: true,
-    }
-  );
+    ];
 
-  if (!browseKind) {
-    return undefined;
+    const selection = await vscode.window.showQuickPick(items, {
+      placeHolder: 'Select a Python interpreter for this workspace',
+      ignoreFocusOut: true,
+    });
+
+    if (!selection) {
+      return undefined;
+    }
+
+    if (!selection.browse) {
+      return selection.path;
+    }
   }
 
   const basePath = getInterpreterBasePath(settings);
   const selection = await vscode.window.showOpenDialog({
-    canSelectFiles: browseKind.value === 'file',
-    canSelectFolders: browseKind.value === 'folder',
+    canSelectFiles: true,
+    canSelectFolders: true,
     canSelectMany: false,
     defaultUri: basePath ? vscode.Uri.file(basePath) : undefined,
-    openLabel:
-      browseKind.value === 'file'
-        ? 'Select Python Executable'
-        : 'Select Virtualenv Directory',
+    openLabel: 'Select Interpreter',
+    title: 'Select a Python executable or virtualenv directory',
   });
 
   return selection?.[0]?.fsPath;
@@ -300,16 +241,195 @@ export async function savePythonInterpreterSetting(
   settings: ExtensionSettings = getExtensionSettings()
 ): Promise<string> {
   const resource = getInterpreterResource(settings);
-  const value = toPythonInterpreterSettingValue(selectedPath, settings);
-  const target = vscode.workspace.getWorkspaceFolder(resource ?? vscode.Uri.file(selectedPath))
-    ? vscode.ConfigurationTarget.WorkspaceFolder
-    : vscode.ConfigurationTarget.Workspace;
+  const value = resolveStoredInterpreterPath(selectedPath, settings);
+  const target = resolveInterpreterConfigurationTarget(
+    resource ?? vscode.Uri.file(selectedPath)
+  );
+  const configuration = vscode.workspace.getConfiguration(
+    CONFIGURATION_SECTION,
+    resource
+  );
 
-  await vscode.workspace
-    .getConfiguration(CONFIGURATION_SECTION, resource)
-    .update('pythonInterpreter', value, target);
+  await configuration.update('pythonInterpreter', value, target);
+  await clearLegacyPythonPathSetting(configuration);
 
   return value;
+}
+
+function resolveStoredInterpreterPath(
+  selectedPath: string,
+  settings: ExtensionSettings
+): string {
+  const normalizedSelectedPath = path.normalize(selectedPath);
+  const workspaceVirtualEnvPath = findWorkspaceVirtualEnvInterpreterPath(
+    normalizedSelectedPath,
+    settings
+  );
+  return path.normalize(workspaceVirtualEnvPath ?? normalizedSelectedPath);
+}
+
+function findWorkspaceVirtualEnvInterpreterPath(
+  selectedPath: string,
+  settings: ExtensionSettings
+): string | undefined {
+  if (!path.isAbsolute(selectedPath)) {
+    return undefined;
+  }
+
+  const selectedRealPath = safeRealpath(selectedPath);
+  const basePath = getInterpreterBasePath(settings);
+  if (!selectedRealPath || !basePath) {
+    return undefined;
+  }
+
+  for (const virtualEnvName of ['venv', '.venv', 'env', '.env']) {
+    const virtualEnvRoot = path.join(basePath, virtualEnvName);
+    const matchedPath = findMatchingVirtualEnvInterpreterInRoot(
+      virtualEnvRoot,
+      selectedPath,
+      selectedRealPath
+    );
+    if (matchedPath) {
+      return matchedPath;
+    }
+  }
+
+  return undefined;
+}
+
+function findWorkspaceVirtualEnvInterpreterCandidates(
+  settings: ExtensionSettings
+): string[] {
+  const basePath = getInterpreterBasePath(settings);
+  if (!basePath) {
+    return [];
+  }
+
+  const candidates: string[] = [];
+  for (const virtualEnvName of ['venv', '.venv', 'env', '.env']) {
+    candidates.push(
+      ...listVirtualEnvInterpreterCandidates(path.join(basePath, virtualEnvName))
+    );
+  }
+
+  return [...new Set(candidates)];
+}
+
+function listVirtualEnvInterpreterCandidates(virtualEnvRoot: string): string[] {
+  if (!fs.existsSync(path.join(virtualEnvRoot, 'pyvenv.cfg'))) {
+    return [];
+  }
+
+  const executableDirectory = path.join(
+    virtualEnvRoot,
+    process.platform === 'win32' ? 'Scripts' : 'bin'
+  );
+
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(executableDirectory);
+  } catch {
+    return [];
+  }
+
+  const preferredNames = process.platform === 'win32'
+    ? ['python.exe', 'python']
+    : ['python', 'python3'];
+  const candidatePaths = [
+    ...preferredNames.map((name) => path.join(executableDirectory, name)),
+    ...entries
+      .filter((name) => isPythonExecutableName(name))
+      .sort(comparePythonExecutableNames)
+      .map((name) => path.join(executableDirectory, name)),
+  ];
+
+  return [...new Set(candidatePaths)].filter((candidatePath) => {
+    try {
+      return fs.statSync(candidatePath).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
+
+function findMatchingVirtualEnvInterpreterInRoot(
+  virtualEnvRoot: string,
+  selectedPath: string,
+  selectedRealPath: string
+): string | undefined {
+  if (!fs.existsSync(path.join(virtualEnvRoot, 'pyvenv.cfg'))) {
+    return undefined;
+  }
+
+  const executableDirectory = path.join(
+    virtualEnvRoot,
+    process.platform === 'win32' ? 'Scripts' : 'bin'
+  );
+
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(executableDirectory);
+  } catch {
+    return undefined;
+  }
+
+  const preferredNames = [
+    path.basename(selectedPath),
+    ...(process.platform === 'win32'
+      ? ['python.exe', 'python']
+      : ['python', 'python3']),
+  ];
+  const candidatePaths = [
+    ...preferredNames.map((name) => path.join(executableDirectory, name)),
+    ...entries
+      .filter((name) => isPythonExecutableName(name))
+      .map((name) => path.join(executableDirectory, name)),
+  ];
+
+  for (const candidatePath of [...new Set(candidatePaths)]) {
+    try {
+      if (
+        fs.statSync(candidatePath).isFile() &&
+        safeRealpath(candidatePath) === selectedRealPath
+      ) {
+        return candidatePath;
+      }
+    } catch {
+      // Keep searching for a matching local virtualenv executable.
+    }
+  }
+
+  return undefined;
+}
+
+function isPythonExecutableName(name: string): boolean {
+  return process.platform === 'win32'
+    ? /^python(?:\d+(?:\.\d+)*)?(?:\.exe)?$/i.test(name)
+    : /^python(?:\d+(?:\.\d+)*)?$/.test(name);
+}
+
+function comparePythonExecutableNames(left: string, right: string): number {
+  const rank = (name: string): number => {
+    const normalized = name.toLowerCase();
+    if (normalized === 'python' || normalized === 'python.exe') {
+      return 0;
+    }
+    if (normalized === 'python3' || normalized === 'python3.exe') {
+      return 1;
+    }
+    return 2;
+  };
+
+  const rankDifference = rank(left) - rank(right);
+  return rankDifference !== 0 ? rankDifference : left.localeCompare(right);
+}
+
+function safeRealpath(candidate: string): string | undefined {
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return undefined;
+  }
 }
 
 function normalizeInterpreterCandidate(
@@ -364,73 +484,6 @@ function normalizeInterpreterCandidate(
   }
 
   return normalizeFilesystemInterpreterPath(expanded);
-}
-
-async function getPythonExtensionInterpreter(
-  resource?: vscode.Uri
-): Promise<string | undefined> {
-  const extension = vscode.extensions.getExtension(PYTHON_EXTENSION_ID);
-  if (!extension) {
-    return undefined;
-  }
-
-  try {
-    if (!extension.isActive) {
-      await extension.activate();
-    }
-  } catch {
-    // Keep going and try the command directly.
-  }
-
-  for (const argument of [resource, resource?.fsPath, undefined]) {
-    try {
-      const result =
-        argument === undefined
-          ? await vscode.commands.executeCommand<unknown>(
-              PYTHON_INTERPRETER_COMMAND
-            )
-          : await vscode.commands.executeCommand<unknown>(
-              PYTHON_INTERPRETER_COMMAND,
-              argument
-            );
-      const interpreterPath = extractInterpreterPath(result);
-      if (interpreterPath) {
-        return interpreterPath;
-      }
-    } catch {
-      // Try the next invocation shape.
-    }
-  }
-
-  return undefined;
-}
-
-function extractInterpreterPath(value: unknown): string | undefined {
-  if (!value) {
-    return undefined;
-  }
-
-  if (typeof value === 'string') {
-    return value.trim() || undefined;
-  }
-
-  if (value instanceof vscode.Uri) {
-    return value.fsPath || undefined;
-  }
-
-  if (typeof value !== 'object') {
-    return undefined;
-  }
-
-  const candidate = value as Record<string, unknown>;
-  for (const key of ['path', 'interpreterPath', 'fsPath', 'executable', 'uri']) {
-    const extracted = extractInterpreterPath(candidate[key]);
-    if (extracted) {
-      return extracted;
-    }
-  }
-
-  return undefined;
 }
 
 function getWorkspaceFolderPath(resource?: vscode.Uri): string | undefined {
@@ -489,7 +542,7 @@ function normalizeFilesystemInterpreterPath(candidate: string): string {
   try {
     const stat = fs.statSync(normalizedCandidate);
     if (!stat.isDirectory()) {
-      return canonicalExecutablePath(normalizedCandidate);
+      return path.normalize(normalizedCandidate);
     }
   } catch {
     return normalizedCandidate;
@@ -552,7 +605,7 @@ function findFallbackPythonInterpreter(): string {
     try {
       const stat = fs.statSync(candidate);
       if (stat.isFile()) {
-        return canonicalExecutablePath(candidate);
+        return path.normalize(candidate);
       }
     } catch {
       // Keep searching fallback locations.
@@ -564,7 +617,7 @@ function findFallbackPythonInterpreter(): string {
     try {
       const stat = fs.statSync(candidate);
       if (stat.isFile()) {
-        return canonicalExecutablePath(candidate);
+        return path.normalize(candidate);
       }
     } catch {
       // Keep searching PATH entries.
@@ -593,38 +646,70 @@ function remapKnownMacOsPythonStub(candidate: string): string {
   return candidate;
 }
 
-function canonicalExecutablePath(candidate: string): string {
-  try {
-    return fs.realpathSync(candidate);
-  } catch {
-    return candidate;
+function resolveLegacySettingTarget(
+  configuration: vscode.WorkspaceConfiguration
+): vscode.ConfigurationTarget | undefined {
+  const inspected = configuration.inspect<string>('pythonPath');
+  if (inspected?.workspaceFolderValue !== undefined) {
+    return vscode.ConfigurationTarget.WorkspaceFolder;
   }
+
+  if (inspected?.workspaceValue !== undefined) {
+    return vscode.ConfigurationTarget.Workspace;
+  }
+
+  if (inspected?.globalValue !== undefined) {
+    return vscode.ConfigurationTarget.Global;
+  }
+
+  return undefined;
 }
 
-function toPythonInterpreterSettingValue(
-  selectedPath: string,
-  settings: ExtensionSettings
-): string {
-  const normalizedSelectedPath = path.normalize(selectedPath);
-  const basePath = getInterpreterBasePath(settings);
-  if (!basePath) {
-    return normalizedSelectedPath;
+async function clearLegacyPythonPathSetting(
+  configuration: vscode.WorkspaceConfiguration
+): Promise<void> {
+  const inspected = configuration.inspect<string>('pythonPath');
+  const updates: Thenable<void>[] = [];
+
+  if (inspected?.workspaceFolderValue !== undefined) {
+    updates.push(
+      configuration.update(
+        'pythonPath',
+        undefined,
+        vscode.ConfigurationTarget.WorkspaceFolder
+      )
+    );
   }
 
-  const relativePath = path.relative(basePath, normalizedSelectedPath);
-  if (
-    relativePath &&
-    !relativePath.startsWith('..') &&
-    !path.isAbsolute(relativePath)
-  ) {
-    return normalizeSettingPath(relativePath);
+  if (inspected?.workspaceValue !== undefined) {
+    updates.push(
+      configuration.update(
+        'pythonPath',
+        undefined,
+        vscode.ConfigurationTarget.Workspace
+      )
+    );
   }
 
-  return normalizedSelectedPath;
+  if (inspected?.globalValue !== undefined) {
+    updates.push(
+      configuration.update(
+        'pythonPath',
+        undefined,
+        vscode.ConfigurationTarget.Global
+      )
+    );
+  }
+
+  await Promise.all(updates);
 }
 
-function normalizeSettingPath(value: string): string {
-  return value.split(path.sep).join('/');
+function resolveInterpreterConfigurationTarget(
+  resource?: vscode.Uri
+): vscode.ConfigurationTarget {
+  return vscode.workspace.getWorkspaceFolder(resource ?? vscode.Uri.file(process.cwd()))
+    ? vscode.ConfigurationTarget.WorkspaceFolder
+    : vscode.ConfigurationTarget.Workspace;
 }
 
 function resolveWorkspaceRootSetting(workspaceRoot: string): string {

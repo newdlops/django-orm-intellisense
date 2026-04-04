@@ -56,7 +56,6 @@ Then press `F5` in VS Code to launch an Extension Development Host.
 - `Django ORM Intellisense: Show Status`
 - `Django ORM Intellisense: Restart Daemon`
 - `Django ORM Intellisense: Configure Pylance Diagnostics`
-- `Django ORM Intellisense: Browse Python Interpreter`
 - `Django ORM Intellisense: Select Settings Module`
 - `Django ORM Intellisense: Select Python Interpreter`
 
@@ -64,34 +63,30 @@ Then press `F5` in VS Code to launch an Extension Development Host.
 
 - `djangoOrmIntellisense.pythonInterpreter`
 - `djangoOrmIntellisense.autoStart`
-- `djangoOrmIntellisense.pythonPath`
 - `djangoOrmIntellisense.settingsModule`
 - `djangoOrmIntellisense.workspaceRoot`
 - `djangoOrmIntellisense.logLevel`
 
-By default the extension now resolves the daemon interpreter in this order:
+By default the extension resolves the daemon interpreter like this:
 
 1. `djangoOrmIntellisense.pythonInterpreter`
-2. `djangoOrmIntellisense.pythonPath` (legacy alias)
-3. the Python extension selected interpreter via `python.interpreterPath`
-4. `python.defaultInterpreterPath`
-5. `python3` (or `python` on Windows)
+2. `python3` (or `python` on Windows)
 
 This matters because Django-aware analysis must run inside the same environment that has Django and your project dependencies installed. If the daemon falls back to the OS global interpreter, relation and ORM metadata bootstrap will usually degrade.
 
 `djangoOrmIntellisense.pythonInterpreter` can point either to the executable itself, such as `.venv/bin/python`, or to the environment directory, such as `.venv`. The extension now normalizes common virtualenv layouts automatically.
 
-If you do not want to type the path manually, run `Django ORM Intellisense: Browse Python Interpreter`. It opens the file explorer, lets you pick either a Python executable or a virtualenv directory, stores the setting, and restarts the daemon.
+Run `Django ORM Intellisense: Select Python Interpreter` to choose a Python executable or virtualenv directory for the current workspace. Older `djangoOrmIntellisense.pythonPath` values are migrated automatically into `djangoOrmIntellisense.pythonInterpreter` and then removed.
 
 For multi-environment Django projects that have modules such as `project.settings.local` or `project.settings.dev`, run `Django ORM Intellisense: Select Settings Module`. The extension now discovers `settings.py`, `settings/__init__.py`, and `settings/*.py` candidates and lets you choose which one should be used for `django.setup()`.
 
 If Pylance is still reporting error-level false positives for dynamic Django ORM members that cannot be inferred statically, run `Django ORM Intellisense: Configure Pylance Diagnostics`. The recommended profile downgrades the common dynamic-member rules for the current workspace without overwriting unrelated Pylance overrides.
 
-Django ORM Intellisense no longer generates managed `.pyi` stub trees for the workspace. If an older workspace still has a Django ORM Intellisense-managed `python.analysis.stubPath` or legacy `.django_orm_intellisense/stubs` files, the extension removes that setting and deletes those managed stub files automatically.
+Django ORM Intellisense generates a managed `.pyi` stub tree under `.django_orm_intellisense/stubs` and syncs both `python.analysis.stubPath` and `python.analysis.extraPaths` for the current workspace. This lets Pylance resolve Django model fields, managers, and queryset return shapes against the workspace-specific ORM metadata instead of the generic `models.Model` surface.
 
 ## Manual UI Check
 
-1. Open a Django workspace that already has the correct virtualenv selected in the Python extension.
-2. Run `Django ORM Intellisense: Select Python Interpreter` if you want to re-pick the interpreter from the Python extension UI.
-3. Open `Django ORM Intellisense: Show Status` and confirm the `Python` and `Python source` lines point at the project interpreter instead of the OS global Python.
+1. Open a Django workspace.
+2. Run `Django ORM Intellisense: Select Python Interpreter` and choose the project interpreter.
+3. Open `Django ORM Intellisense: Show Status` and confirm the `Python` line points at the project interpreter instead of the OS global Python.
 4. Open a model or query file and verify relation-string, string lookup-path, keyword lookup-path, and queryset-helper receiver completion still respond.

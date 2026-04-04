@@ -39,6 +39,12 @@ const LOOKUP_HOVER_PATTERN = new RegExp(
   'g'
 );
 const DJANGO_FIELD_PRIORITY_METHODS = new Set(['filter', 'exclude', 'get']);
+const LOOKUP_RECEIVER_KINDS = new Set<OrmReceiverKind>([
+  'model_class',
+  'manager',
+  'queryset',
+  'related_manager',
+]);
 const LOOKUP_OPERATOR_PRIORITY = new Map(
   [
     'exact',
@@ -81,6 +87,46 @@ const CLASS_DEFINITION_PATTERN =
   /^(\s*)class\s+([A-Za-z_][\w]*)\s*(?:\((.*)\))?\s*:/;
 const FUNCTION_DEFINITION_PATTERN =
   /^(\s*)(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)\s*(?:->\s*[^:]+)?\s*:/;
+const ITERABLE_TYPE_NAMES = new Set([
+  'Collection',
+  'Iterable',
+  'Iterator',
+  'List',
+  'Sequence',
+  'Set',
+  'Tuple',
+  'collections.abc.Collection',
+  'collections.abc.Iterable',
+  'collections.abc.Iterator',
+  'collections.abc.Sequence',
+  'frozenset',
+  'list',
+  'set',
+  'tuple',
+  'typing.Collection',
+  'typing.Iterable',
+  'typing.Iterator',
+  'typing.List',
+  'typing.Sequence',
+  'typing.Set',
+  'typing.Tuple',
+]);
+const OPTIONAL_TYPE_NAMES = new Set(['Optional', 'typing.Optional']);
+const QUERYSET_TYPE_NAMES = new Set([
+  'QuerySet',
+  'django.db.models.QuerySet',
+  'models.QuerySet',
+]);
+const MANAGER_TYPE_NAMES = new Set([
+  'BaseManager',
+  'Manager',
+  'django.db.models.Manager',
+  'models.Manager',
+]);
+const RELATED_MANAGER_TYPE_NAMES = new Set([
+  'ManyRelatedManager',
+  'RelatedManager',
+]);
 
 interface LookupContext {
   receiverExpression: string;
@@ -388,16 +434,33 @@ export function registerPythonProviders(
             memberContext.prefix,
             memberContext.receiver.managerName
           );
-          const sortedItems = prioritizeOrmMemberCompletionItems(result.items);
+          const sortedItems = prioritizeOrmMemberCompletionItems(
+            result.items,
+            memberContext.receiver
+          );
 
           return sortedItems.map((item, index) => {
             const completion = new vscode.CompletionItem(
-              item.name,
-              ormMemberCompletionKind(item)
+              ormMemberCompletionLabel(item, memberContext.receiver),
+              ormMemberCompletionKind(item, memberContext.receiver)
             );
-            completion.detail = ormMemberCompletionDetail(item);
+            completion.detail = ormMemberCompletionDetail(
+              item,
+              memberContext.receiver
+            );
+            completion.insertText = item.name;
+            completion.filterText = item.name;
             completion.range = memberContext.range;
-            completion.sortText = ormMemberCompletionSortText(item, index);
+            completion.sortText = ormMemberCompletionSortText(
+              item,
+              memberContext.receiver,
+              index
+            );
+            completion.preselect = shouldPreselectOrmMemberCompletion(
+              item,
+              memberContext.receiver,
+              index
+            );
             completion.documentation = buildOrmMemberMarkdown(
               item,
               memberContext.receiver
@@ -808,20 +871,48 @@ function shouldPreselectLookupCompletion(
 }
 
 function prioritizeOrmMemberCompletionItems(
-  items: OrmMemberItem[]
+  items: OrmMemberItem[],
+  receiver: OrmReceiverInfo
 ): OrmMemberItem[] {
-  return [...items].sort((left, right) => {
-    const priorityDifference =
-      ormMemberCompletionPriority(left) - ormMemberCompletionPriority(right);
-    if (priorityDifference !== 0) {
-      return priorityDifference;
-    }
+  return [...items]
+    .map((item, index) => ({
+      item,
+      index,
+    }))
+    .sort((left, right) => {
+      const priorityDifference =
+        ormMemberCompletionPriority(left.item, receiver) -
+        ormMemberCompletionPriority(right.item, receiver);
+      if (priorityDifference !== 0) {
+        return priorityDifference;
+      }
 
-    return left.name.localeCompare(right.name);
-  });
+      if (receiver.kind === 'instance') {
+        return left.index - right.index;
+      }
+
+      return left.item.name.localeCompare(right.item.name);
+    })
+    .map((entry) => entry.item);
 }
 
-function ormMemberCompletionPriority(item: OrmMemberItem): number {
+function ormMemberCompletionPriority(
+  item: OrmMemberItem,
+  receiver: OrmReceiverInfo
+): number {
+  if (receiver.kind === 'instance') {
+    if (item.memberKind === 'field' || item.memberKind === 'relation') {
+      return 0;
+    }
+    if (item.memberKind === 'reverse_relation') {
+      return 1;
+    }
+    if (item.memberKind === 'manager') {
+      return 2;
+    }
+    return 3;
+  }
+
   if (item.memberKind === 'manager') {
     return 0;
   }
@@ -834,8 +925,28 @@ function ormMemberCompletionPriority(item: OrmMemberItem): number {
   return 3;
 }
 
+function ormMemberCompletionLabel(
+  item: OrmMemberItem,
+  receiver: OrmReceiverInfo
+): string | vscode.CompletionItemLabel {
+  if (
+    receiver.kind === 'instance' &&
+    (item.memberKind === 'field' ||
+      item.memberKind === 'relation' ||
+      item.memberKind === 'reverse_relation')
+  ) {
+    return {
+      label: `${item.name} (${item.fieldKind ?? item.detail})`,
+      description: 'Django model',
+    };
+  }
+
+  return item.name;
+}
+
 function ormMemberCompletionKind(
-  item: OrmMemberItem
+  item: OrmMemberItem,
+  receiver: OrmReceiverInfo
 ): vscode.CompletionItemKind {
   if (item.memberKind === 'method') {
     return vscode.CompletionItemKind.Method;
@@ -843,14 +954,29 @@ function ormMemberCompletionKind(
   if (item.memberKind === 'manager') {
     return vscode.CompletionItemKind.Property;
   }
+  if (receiver.kind === 'instance' && item.memberKind === 'relation') {
+    return vscode.CompletionItemKind.Field;
+  }
   if (item.memberKind === 'relation' || item.memberKind === 'reverse_relation') {
     return vscode.CompletionItemKind.Reference;
   }
   return vscode.CompletionItemKind.Field;
 }
 
-function ormMemberCompletionDetail(item: OrmMemberItem): string {
-  const parts = [item.detail, item.modelLabel];
+function ormMemberCompletionDetail(
+  item: OrmMemberItem,
+  receiver: OrmReceiverInfo
+): string {
+  const parts: string[] = [];
+  if (
+    receiver.kind === 'instance' &&
+    (item.memberKind === 'field' ||
+      item.memberKind === 'relation' ||
+      item.memberKind === 'reverse_relation')
+  ) {
+    parts.push('Django model field');
+  }
+  parts.push(item.detail, item.modelLabel);
   if (item.returnKind && item.returnKind !== 'scalar' && item.returnKind !== 'unknown') {
     const returnLabel = item.returnModelLabel
       ? `${item.returnKind} -> ${item.returnModelLabel}`
@@ -862,11 +988,26 @@ function ormMemberCompletionDetail(item: OrmMemberItem): string {
 
 function ormMemberCompletionSortText(
   item: OrmMemberItem,
+  receiver: OrmReceiverInfo,
   index: number
 ): string {
-  return `0-${ormMemberCompletionPriority(item)}-${index
+  return `${ormMemberCompletionPriority(item, receiver)
+    .toString()
+    .padStart(4, '0')}-${index
     .toString()
     .padStart(4, '0')}-${item.name}`;
+}
+
+function shouldPreselectOrmMemberCompletion(
+  item: OrmMemberItem,
+  receiver: OrmReceiverInfo,
+  index: number
+): boolean {
+  return (
+    receiver.kind === 'instance' &&
+    (item.memberKind === 'field' || item.memberKind === 'relation') &&
+    index === 0
+  );
 }
 
 function relationCompletionContext(
@@ -2036,6 +2177,27 @@ async function resolveOrmReceiverAtOffset(
     return undefined;
   }
 
+  const loopTargetReceiver = await resolveOrmReceiverFromLoopTarget(
+    daemon,
+    document,
+    rootIdentifier,
+    beforeOffset,
+    visited
+  );
+  if (loopTargetReceiver) {
+    return loopTargetReceiver;
+  }
+
+  const annotatedReceiver = await resolveAnnotatedReceiverForIdentifier(
+    daemon,
+    document,
+    rootIdentifier,
+    beforeOffset
+  );
+  if (annotatedReceiver) {
+    return annotatedReceiver;
+  }
+
   const assignment = findNearestAssignedExpression(
     document,
     rootIdentifier,
@@ -2267,6 +2429,73 @@ function receiverFromOrmMemberItem(
   };
 }
 
+async function resolveOrmReceiverFromLoopTarget(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  variableName: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  const loopIterable = findNearestLoopIterableExpression(
+    document,
+    variableName,
+    beforeOffset
+  );
+  if (!loopIterable) {
+    return undefined;
+  }
+
+  const iterableReceiver = await resolveOrmReceiverAtOffset(
+    daemon,
+    document,
+    loopIterable.expression,
+    loopIterable.offset,
+    visited
+  );
+  const resolvedLoopReceiver = receiverFromIterableReceiver(iterableReceiver);
+  if (resolvedLoopReceiver) {
+    return resolvedLoopReceiver;
+  }
+
+  const iterableIdentifier = receiverRootIdentifier(loopIterable.expression);
+  if (!iterableIdentifier) {
+    return undefined;
+  }
+
+  const iterableTypeAnnotation = findTypeAnnotationForIdentifier(
+    document,
+    iterableIdentifier,
+    loopIterable.offset
+  );
+  if (!iterableTypeAnnotation) {
+    return undefined;
+  }
+
+  return resolveIterableElementReceiverFromTypeAnnotation(
+    daemon,
+    document,
+    iterableTypeAnnotation.annotation,
+    iterableTypeAnnotation.offset
+  );
+}
+
+function receiverFromIterableReceiver(
+  receiver: OrmReceiverInfo | undefined
+): OrmReceiverInfo | undefined {
+  if (!receiver) {
+    return undefined;
+  }
+
+  if (receiver.kind === 'queryset' || receiver.kind === 'related_manager') {
+    return {
+      kind: 'instance',
+      modelLabel: receiver.modelLabel,
+    };
+  }
+
+  return undefined;
+}
+
 function receiverInfoKey(receiver: OrmReceiverInfo): string {
   return `${receiver.kind}:${receiver.modelLabel}:${receiver.managerName ?? ''}`;
 }
@@ -2328,7 +2557,7 @@ async function resolveBaseModelLabelForReceiverAtOffset(
     }
   }
 
-  const resolvedReceiver = await resolveOrmReceiverAtOffset(
+  const resolvedReceiver = await resolveLookupReceiverAtOffset(
     daemon,
     document,
     normalizedExpression,
@@ -2370,6 +2599,249 @@ async function resolveBaseModelLabelForReceiverAtOffset(
     assignment.expression,
     assignment.offset,
     visited
+  );
+}
+
+function asLookupReceiver(
+  receiver: OrmReceiverInfo | undefined
+): OrmReceiverInfo | undefined {
+  if (!receiver || !LOOKUP_RECEIVER_KINDS.has(receiver.kind)) {
+    return undefined;
+  }
+
+  return receiver;
+}
+
+async function resolveLookupReceiverAtOffset(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  receiverExpression: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  const normalizedExpression = normalizeReceiverExpression(receiverExpression);
+  if (!normalizedExpression) {
+    return undefined;
+  }
+
+  const visitKey = `${document.uri.toString()}:lookup:${normalizedExpression}@${beforeOffset}`;
+  if (visited.has(visitKey) || visited.size > 12) {
+    return undefined;
+  }
+  visited.add(visitKey);
+
+  if (/^[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?$/.test(normalizedExpression)) {
+    const modelLabel = await resolveModelLabelFromSymbol(
+      daemon,
+      document,
+      normalizedExpression,
+      beforeOffset
+    );
+    if (modelLabel) {
+      return {
+        kind: 'model_class',
+        modelLabel,
+      };
+    }
+  }
+
+  const memberAccess = splitTopLevelMemberAccess(normalizedExpression);
+  if (memberAccess) {
+    const objectReceiver = await resolveLookupReceiverAtOffset(
+      daemon,
+      document,
+      memberAccess.objectExpression,
+      beforeOffset,
+      visited
+    );
+    if (objectReceiver) {
+      const resolution = await daemon.resolveOrmMember(
+        objectReceiver.modelLabel,
+        objectReceiver.kind,
+        memberAccess.memberName,
+        objectReceiver.managerName
+      );
+      const resolvedReceiver = asLookupReceiver(
+        receiverFromOrmMemberResolution(resolution)
+      );
+      if (resolvedReceiver) {
+        return resolvedReceiver;
+      }
+    }
+  }
+
+  const callResolvedReceiver = await resolveLookupReceiverFromCallExpression(
+    daemon,
+    document,
+    normalizedExpression,
+    beforeOffset,
+    visited
+  );
+  if (callResolvedReceiver) {
+    return callResolvedReceiver;
+  }
+
+  const rootIdentifier = receiverRootIdentifier(normalizedExpression);
+  if (!rootIdentifier) {
+    return undefined;
+  }
+
+  const loopTargetReceiver = asLookupReceiver(
+    await resolveOrmReceiverFromLoopTarget(
+      daemon,
+      document,
+      rootIdentifier,
+      beforeOffset,
+      visited
+    )
+  );
+  if (loopTargetReceiver) {
+    return loopTargetReceiver;
+  }
+
+  const annotatedReceiver = asLookupReceiver(
+    await resolveAnnotatedReceiverForIdentifier(
+      daemon,
+      document,
+      rootIdentifier,
+      beforeOffset
+    )
+  );
+  if (annotatedReceiver) {
+    return annotatedReceiver;
+  }
+
+  const assignment = findNearestAssignedExpression(
+    document,
+    rootIdentifier,
+    beforeOffset
+  );
+  if (!assignment) {
+    return undefined;
+  }
+
+  return resolveLookupReceiverAtOffset(
+    daemon,
+    document,
+    assignment.expression,
+    assignment.offset,
+    visited
+  );
+}
+
+async function resolveLookupReceiverFromCallExpression(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  expression: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  const parsedCall = parseCalledExpression(expression);
+  if (!parsedCall) {
+    return undefined;
+  }
+
+  if (parsedCall.kind === 'function') {
+    const functionSource = await resolveFunctionDefinitionSource(
+      daemon,
+      document,
+      parsedCall.functionName,
+      beforeOffset
+    );
+    if (!functionSource) {
+      return undefined;
+    }
+
+    return asLookupReceiver(
+      await resolveOrmReceiverFromFunctionSource(
+        daemon,
+        functionSource,
+        visited
+      )
+    );
+  }
+
+  if (parsedCall.objectExpression === 'self' || parsedCall.objectExpression === 'cls') {
+    const classDef = findEnclosingClassDefinition(document, beforeOffset);
+    if (!classDef) {
+      return undefined;
+    }
+
+    return asLookupReceiver(
+      await resolveOrmReceiverFromClassMethodSource(
+        daemon,
+        {
+          document,
+          classDef,
+          beforeOffset: document.offsetAt(new vscode.Position(classDef.line, 0)),
+        },
+        parsedCall.memberName,
+        visited
+      )
+    );
+  }
+
+  if (parsedCall.objectExpression === 'super()') {
+    const classDef = findEnclosingClassDefinition(document, beforeOffset);
+    if (!classDef) {
+      return undefined;
+    }
+
+    return asLookupReceiver(
+      await resolveOrmReceiverFromBaseClasses(
+        daemon,
+        {
+          document,
+          classDef,
+          beforeOffset: document.offsetAt(new vscode.Position(classDef.line, 0)),
+        },
+        parsedCall.memberName,
+        visited,
+        new Set()
+      )
+    );
+  }
+
+  const objectReceiver = await resolveLookupReceiverAtOffset(
+    daemon,
+    document,
+    parsedCall.objectExpression,
+    beforeOffset,
+    visited
+  );
+  if (objectReceiver) {
+    const resolution = await daemon.resolveOrmMember(
+      objectReceiver.modelLabel,
+      objectReceiver.kind,
+      parsedCall.memberName,
+      objectReceiver.managerName
+    );
+    const resolvedReceiver = asLookupReceiver(
+      receiverFromOrmMemberResolution(resolution)
+    );
+    if (resolvedReceiver) {
+      return resolvedReceiver;
+    }
+  }
+
+  const classSource = await resolveClassDefinitionForExpression(
+    daemon,
+    document,
+    parsedCall.objectExpression,
+    beforeOffset,
+    visited
+  );
+  if (!classSource) {
+    return undefined;
+  }
+
+  return asLookupReceiver(
+    await resolveOrmReceiverFromClassMethodSource(
+      daemon,
+      classSource,
+      parsedCall.memberName,
+      visited
+    )
   );
 }
 
@@ -2943,6 +3415,27 @@ function findEnclosingClassDefinition(
   return undefined;
 }
 
+function findEnclosingFunctionDefinition(
+  document: vscode.TextDocument,
+  beforeOffset: number
+): PythonFunctionDefinition | undefined {
+  const targetLine = document.positionAt(beforeOffset).line;
+
+  for (let line = targetLine; line >= 0; line -= 1) {
+    const match = document.lineAt(line).text.match(FUNCTION_DEFINITION_PATTERN);
+    if (!match) {
+      continue;
+    }
+
+    const functionDef = buildFunctionDefinition(document, line, match);
+    if (targetLine > functionDef.line && targetLine <= functionDef.endLine) {
+      return functionDef;
+    }
+  }
+
+  return undefined;
+}
+
 function findClassDefinition(
   document: vscode.TextDocument,
   className: string
@@ -3338,6 +3831,33 @@ function receiverRootIdentifier(receiverExpression: string): string | undefined 
   return identifier;
 }
 
+function findNearestLoopIterableExpression(
+  document: vscode.TextDocument,
+  variableName: string,
+  beforeOffset: number
+): { expression: string; offset: number } | undefined {
+  const beforePosition = document.positionAt(beforeOffset);
+
+  for (let line = beforePosition.line; line >= 0; line -= 1) {
+    const parsedLoop = parseForLoopHeader(document.lineAt(line).text);
+    if (!parsedLoop || !loopTargetContainsIdentifier(parsedLoop.target, variableName)) {
+      continue;
+    }
+
+    const endLine = findBlockEndLine(document, line, parsedLoop.indent);
+    if (beforePosition.line <= line || beforePosition.line > endLine) {
+      continue;
+    }
+
+    return {
+      expression: parsedLoop.iterable,
+      offset: document.offsetAt(new vscode.Position(line, 0)),
+    };
+  }
+
+  return undefined;
+}
+
 function findNearestAssignedExpression(
   document: vscode.TextDocument,
   variableName: string,
@@ -3365,6 +3885,493 @@ function findNearestAssignedExpression(
       expression: rawExpression,
       offset: expressionOffset,
     };
+  }
+
+  return undefined;
+}
+
+function findTypeAnnotationForIdentifier(
+  document: vscode.TextDocument,
+  variableName: string,
+  beforeOffset: number
+): { annotation: string; offset: number } | undefined {
+  return (
+    findNearestAnnotatedAssignment(document, variableName, beforeOffset) ??
+    findFunctionParameterTypeAnnotation(document, variableName, beforeOffset)
+  );
+}
+
+function findNearestAnnotatedAssignment(
+  document: vscode.TextDocument,
+  variableName: string,
+  beforeOffset: number
+): { annotation: string; offset: number } | undefined {
+  const annotationPattern = new RegExp(
+    String.raw`^\s*${escapeRegExp(variableName)}\s*:\s*(.+)$`
+  );
+  const beforePosition = document.positionAt(beforeOffset);
+
+  for (let line = beforePosition.line; line >= 0; line -= 1) {
+    const lineText = document.lineAt(line).text;
+    const match = lineText.match(annotationPattern);
+    if (!match) {
+      continue;
+    }
+
+    const annotation = stripTypeDefaultValue(
+      stripTrailingComment(match[1]).trim()
+    );
+    if (!annotation) {
+      continue;
+    }
+
+    return {
+      annotation,
+      offset: document.offsetAt(new vscode.Position(line, 0)),
+    };
+  }
+
+  return undefined;
+}
+
+function findFunctionParameterTypeAnnotation(
+  document: vscode.TextDocument,
+  variableName: string,
+  beforeOffset: number
+): { annotation: string; offset: number } | undefined {
+  const functionDef = findEnclosingFunctionDefinition(document, beforeOffset);
+  if (!functionDef) {
+    return undefined;
+  }
+
+  const match = document
+    .lineAt(functionDef.line)
+    .text.match(FUNCTION_DEFINITION_PATTERN);
+  if (!match) {
+    return undefined;
+  }
+
+  for (const parameter of splitTopLevelExpressions(match[3] ?? '')) {
+    const parameterMatch = parameter.match(
+      /^\s*\*{0,2}([A-Za-z_][\w]*)\s*:\s*(.+)$/
+    );
+    if (!parameterMatch || parameterMatch[1] !== variableName) {
+      continue;
+    }
+
+    const annotation = stripTypeDefaultValue(parameterMatch[2].trim());
+    if (!annotation) {
+      continue;
+    }
+
+    return {
+      annotation,
+      offset: document.offsetAt(new vscode.Position(functionDef.line, 0)),
+    };
+  }
+
+  return undefined;
+}
+
+async function resolveAnnotatedReceiverForIdentifier(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  variableName: string,
+  beforeOffset: number
+): Promise<OrmReceiverInfo | undefined> {
+  const typeAnnotation = findTypeAnnotationForIdentifier(
+    document,
+    variableName,
+    beforeOffset
+  );
+  if (!typeAnnotation) {
+    return undefined;
+  }
+
+  return resolveDirectReceiverFromTypeAnnotation(
+    daemon,
+    document,
+    typeAnnotation.annotation,
+    typeAnnotation.offset
+  );
+}
+
+async function resolveDirectReceiverFromTypeAnnotation(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  annotation: string,
+  beforeOffset: number
+): Promise<OrmReceiverInfo | undefined> {
+  for (const candidate of splitTopLevelTypeAlternatives(annotation)) {
+    const resolvedReceiver = await resolveSingleDirectReceiverType(
+      daemon,
+      document,
+      candidate,
+      beforeOffset
+    );
+    if (resolvedReceiver) {
+      return resolvedReceiver;
+    }
+  }
+
+  return undefined;
+}
+
+async function resolveSingleDirectReceiverType(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  annotation: string,
+  beforeOffset: number
+): Promise<OrmReceiverInfo | undefined> {
+  const normalizedAnnotation = normalizeTypeAnnotation(annotation);
+  if (!normalizedAnnotation) {
+    return undefined;
+  }
+
+  const genericType = parseGenericTypeAnnotation(normalizedAnnotation);
+  if (genericType) {
+    if (OPTIONAL_TYPE_NAMES.has(genericType.base) && genericType.args[0]) {
+      return resolveDirectReceiverFromTypeAnnotation(
+        daemon,
+        document,
+        genericType.args[0],
+        beforeOffset
+      );
+    }
+
+    if (QUERYSET_TYPE_NAMES.has(genericType.base) && genericType.args[0]) {
+      const modelLabel = await resolveModelLabelFromTypeAnnotation(
+        daemon,
+        document,
+        genericType.args[0],
+        beforeOffset
+      );
+      if (modelLabel) {
+        return {
+          kind: 'queryset',
+          modelLabel,
+        };
+      }
+    }
+
+    if (MANAGER_TYPE_NAMES.has(genericType.base) && genericType.args[0]) {
+      const modelLabel = await resolveModelLabelFromTypeAnnotation(
+        daemon,
+        document,
+        genericType.args[0],
+        beforeOffset
+      );
+      if (modelLabel) {
+        return {
+          kind: 'manager',
+          modelLabel,
+        };
+      }
+    }
+
+    if (RELATED_MANAGER_TYPE_NAMES.has(genericType.base) && genericType.args[0]) {
+      const modelLabel = await resolveModelLabelFromTypeAnnotation(
+        daemon,
+        document,
+        genericType.args[0],
+        beforeOffset
+      );
+      if (modelLabel) {
+        return {
+          kind: 'related_manager',
+          modelLabel,
+        };
+      }
+    }
+
+    return undefined;
+  }
+
+  const modelLabel = await resolveModelLabelFromTypeAnnotation(
+    daemon,
+    document,
+    normalizedAnnotation,
+    beforeOffset
+  );
+  if (!modelLabel) {
+    return undefined;
+  }
+
+  return {
+    kind: 'instance',
+    modelLabel,
+  };
+}
+
+async function resolveIterableElementReceiverFromTypeAnnotation(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  annotation: string,
+  beforeOffset: number
+): Promise<OrmReceiverInfo | undefined> {
+  for (const candidate of splitTopLevelTypeAlternatives(annotation)) {
+    const resolvedReceiver = await resolveSingleIterableElementType(
+      daemon,
+      document,
+      candidate,
+      beforeOffset
+    );
+    if (resolvedReceiver) {
+      return resolvedReceiver;
+    }
+  }
+
+  return undefined;
+}
+
+async function resolveSingleIterableElementType(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  annotation: string,
+  beforeOffset: number
+): Promise<OrmReceiverInfo | undefined> {
+  const normalizedAnnotation = normalizeTypeAnnotation(annotation);
+  if (!normalizedAnnotation) {
+    return undefined;
+  }
+
+  const genericType = parseGenericTypeAnnotation(normalizedAnnotation);
+  if (!genericType) {
+    return undefined;
+  }
+
+  if (OPTIONAL_TYPE_NAMES.has(genericType.base) && genericType.args[0]) {
+    return resolveIterableElementReceiverFromTypeAnnotation(
+      daemon,
+      document,
+      genericType.args[0],
+      beforeOffset
+    );
+  }
+
+  if (ITERABLE_TYPE_NAMES.has(genericType.base) && genericType.args[0]) {
+    return resolveDirectReceiverFromTypeAnnotation(
+      daemon,
+      document,
+      genericType.args[0],
+      beforeOffset
+    );
+  }
+
+  if (
+    (QUERYSET_TYPE_NAMES.has(genericType.base) ||
+      RELATED_MANAGER_TYPE_NAMES.has(genericType.base)) &&
+    genericType.args[0]
+  ) {
+    const modelLabel = await resolveModelLabelFromTypeAnnotation(
+      daemon,
+      document,
+      genericType.args[0],
+      beforeOffset
+    );
+    if (modelLabel) {
+      return {
+        kind: 'instance',
+        modelLabel,
+      };
+    }
+  }
+
+  return undefined;
+}
+
+async function resolveModelLabelFromTypeAnnotation(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  annotation: string,
+  beforeOffset: number
+): Promise<string | undefined> {
+  const normalizedAnnotation = normalizeTypeAnnotation(annotation);
+  if (!normalizedAnnotation) {
+    return undefined;
+  }
+
+  for (const candidate of splitTopLevelTypeAlternatives(normalizedAnnotation)) {
+    const strippedCandidate = stripStringLiteralQuotes(candidate);
+    if (!strippedCandidate) {
+      continue;
+    }
+
+    const resolvedLabel = await resolveModelLabelFromSymbol(
+      daemon,
+      document,
+      strippedCandidate,
+      beforeOffset
+    );
+    if (resolvedLabel) {
+      return resolvedLabel;
+    }
+  }
+
+  return undefined;
+}
+
+function parseForLoopHeader(
+  lineText: string
+): { indent: number; target: string; iterable: string } | undefined {
+  const match = lineText.match(/^(\s*)(?:async\s+)?for\s+(.+)$/);
+  if (!match) {
+    return undefined;
+  }
+
+  const body = stripTrailingComment(match[2]).trimEnd();
+  if (!body.endsWith(':')) {
+    return undefined;
+  }
+
+  const loopBody = body.slice(0, -1).trimEnd();
+  const inIndex = findTopLevelKeyword(loopBody, ' in ');
+  if (inIndex === undefined) {
+    return undefined;
+  }
+
+  const target = loopBody.slice(0, inIndex).trim();
+  const iterable = loopBody.slice(inIndex + ' in '.length).trim();
+  if (!target || !iterable) {
+    return undefined;
+  }
+
+  return {
+    indent: match[1].length,
+    target,
+    iterable,
+  };
+}
+
+function loopTargetContainsIdentifier(
+  targetExpression: string,
+  identifier: string
+): boolean {
+  const identifiers: string[] = targetExpression.match(/[A-Za-z_][\w]*/g) ?? [];
+  return identifiers.includes(identifier);
+}
+
+function parseGenericTypeAnnotation(
+  annotation: string
+): { base: string; args: string[] } | undefined {
+  if (!annotation.endsWith(']')) {
+    return undefined;
+  }
+
+  const openBracketIndex = findMatchingOpeningDelimiter(
+    annotation,
+    annotation.length - 1,
+    '[',
+    ']'
+  );
+  if (openBracketIndex === undefined || openBracketIndex === 0) {
+    return undefined;
+  }
+
+  const base = annotation.slice(0, openBracketIndex).trim();
+  const argsText = annotation.slice(openBracketIndex + 1, -1).trim();
+  if (!base || !argsText) {
+    return undefined;
+  }
+
+  return {
+    base,
+    args: splitTopLevelExpressions(argsText),
+  };
+}
+
+function splitTopLevelTypeAlternatives(annotation: string): string[] {
+  const candidates = splitTopLevelByDelimiter(annotation, '|');
+  return candidates.length > 0 ? candidates : [annotation];
+}
+
+function splitTopLevelByDelimiter(value: string, delimiter: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let depth = 0;
+
+  for (const char of value) {
+    if (char === delimiter && depth === 0) {
+      const trimmed = current.trim();
+      if (trimmed) {
+        parts.push(trimmed);
+      }
+      current = '';
+      continue;
+    }
+
+    if (char === '(' || char === '[' || char === '{') {
+      depth += 1;
+    } else if ((char === ')' || char === ']' || char === '}') && depth > 0) {
+      depth -= 1;
+    }
+
+    current += char;
+  }
+
+  const trailing = current.trim();
+  if (trailing) {
+    parts.push(trailing);
+  }
+
+  return parts;
+}
+
+function stripTypeDefaultValue(value: string): string {
+  const assignmentIndex = findTopLevelCharacter(value, '=');
+  return (assignmentIndex === undefined ? value : value.slice(0, assignmentIndex)).trim();
+}
+
+function normalizeTypeAnnotation(annotation: string): string {
+  return stripWrappingParentheses(stripStringLiteralQuotes(annotation.trim()));
+}
+
+function stripStringLiteralQuotes(value: string): string {
+  const match = value.match(/^(['"])(.+)\1$/);
+  return match ? match[2].trim() : value;
+}
+
+function findTopLevelKeyword(value: string, keyword: string): number | undefined {
+  let depth = 0;
+
+  for (let index = 0; index <= value.length - keyword.length; index += 1) {
+    const char = value[index];
+    if (char === '(' || char === '[' || char === '{') {
+      depth += 1;
+      continue;
+    }
+
+    if ((char === ')' || char === ']' || char === '}') && depth > 0) {
+      depth -= 1;
+      continue;
+    }
+
+    if (depth === 0 && value.slice(index, index + keyword.length) === keyword) {
+      return index;
+    }
+  }
+
+  return undefined;
+}
+
+function findTopLevelCharacter(value: string, targetCharacter: string): number | undefined {
+  let depth = 0;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (char === '(' || char === '[' || char === '{') {
+      depth += 1;
+      continue;
+    }
+
+    if ((char === ')' || char === ']' || char === '}') && depth > 0) {
+      depth -= 1;
+      continue;
+    }
+
+    if (depth === 0 && char === targetCharacter) {
+      return index;
+    }
   }
 
   return undefined;

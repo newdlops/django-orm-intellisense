@@ -1,10 +1,83 @@
 import * as vscode from 'vscode';
-import { getExtensionSettings } from '../config/settings';
+import {
+  getExtensionSettings,
+  type ExtensionSettings,
+} from '../config/settings';
 import { AnalysisDaemon } from '../daemon/analysisDaemon';
 import {
+  browseForPythonInterpreter,
   resolvePythonInterpreter,
-  selectPythonInterpreterFromPythonExtension,
+  savePythonInterpreterSetting,
 } from '../python/interpreter';
+
+async function openInterpreterSettings(): Promise<void> {
+  await vscode.commands.executeCommand(
+    'workbench.action.openSettings',
+    'djangoOrmIntellisense.pythonInterpreter'
+  );
+}
+
+async function showInterpreterMessage(
+  message: string,
+  output: vscode.OutputChannel
+): Promise<void> {
+  const choice = await vscode.window.showInformationMessage(
+    message,
+    'Show Status',
+    'Open Output',
+    'Open Settings'
+  );
+
+  if (choice === 'Show Status') {
+    await vscode.commands.executeCommand('djangoOrmIntellisense.showStatus');
+    return;
+  }
+
+  if (choice === 'Open Output') {
+    output.show(true);
+    return;
+  }
+
+  if (choice === 'Open Settings') {
+    await openInterpreterSettings();
+  }
+}
+
+function resolveInterpreterConfigurationScope(
+  daemon: AnalysisDaemon
+): vscode.ConfigurationScope | undefined {
+  const workspaceRoot = daemon.getState().workspaceRoot;
+  if (workspaceRoot) {
+    const workspaceUri = vscode.Uri.file(workspaceRoot);
+    return vscode.workspace.getWorkspaceFolder(workspaceUri)?.uri ?? workspaceUri;
+  }
+
+  return (
+    vscode.window.activeTextEditor?.document.uri ??
+    vscode.workspace.workspaceFolders?.[0]?.uri
+  );
+}
+
+function resolveInterpreterSelectionSettings(
+  daemon: AnalysisDaemon
+): {
+  scope: vscode.ConfigurationScope | undefined;
+  settings: ExtensionSettings;
+} {
+  const scope = resolveInterpreterConfigurationScope(daemon);
+  const settings = getExtensionSettings(scope);
+  const workspaceRoot = daemon.getState().workspaceRoot;
+
+  return {
+    scope,
+    settings: workspaceRoot
+      ? {
+          ...settings,
+          workspaceRoot,
+        }
+      : settings,
+  };
+}
 
 export function registerSelectPythonInterpreterCommand(
   daemon: AnalysisDaemon,
@@ -14,145 +87,42 @@ export function registerSelectPythonInterpreterCommand(
     'djangoOrmIntellisense.selectPythonInterpreter',
     async () => {
       try {
-        const settings = getExtensionSettings();
-        if (settings.pythonInterpreter || settings.pythonPath) {
-          const overrideChoice = await vscode.window.showWarningMessage(
-            'Django ORM Intellisense is pinned to an explicit interpreter setting. Clear `djangoOrmIntellisense.pythonInterpreter` or `djangoOrmIntellisense.pythonPath` if you want it to follow the Python extension selection.',
-            'Browse',
-            'Open Settings',
-            'Continue'
-          );
-
-          if (overrideChoice === 'Browse') {
-            await vscode.commands.executeCommand(
-              'djangoOrmIntellisense.browsePythonInterpreter'
-            );
-            return;
-          }
-
-          if (overrideChoice === 'Open Settings') {
-            await vscode.commands.executeCommand(
-              'workbench.action.openSettings',
-              'djangoOrmIntellisense.pythonInterpreter'
-            );
-            return;
-          }
-
-          if (overrideChoice !== 'Continue') {
-            return;
-          }
-        }
-
-        const before = await resolvePythonInterpreter();
-        const opened = await selectPythonInterpreterFromPythonExtension();
-
-        if (!opened) {
-          const choice = await vscode.window.showWarningMessage(
-            'The Python extension is not installed, or its interpreter picker is unavailable. Set `djangoOrmIntellisense.pythonInterpreter` manually in Settings or install/enable the Python extension.',
-            'Browse',
-            'Open Settings'
-          );
-
-          if (choice === 'Browse') {
-            await vscode.commands.executeCommand(
-              'djangoOrmIntellisense.browsePythonInterpreter'
-            );
-            return;
-          }
-
-          if (choice === 'Open Settings') {
-            await vscode.commands.executeCommand(
-              'workbench.action.openSettings',
-              'djangoOrmIntellisense.pythonInterpreter'
-            );
-          }
+        const { scope, settings } = resolveInterpreterSelectionSettings(daemon);
+        const selectedPath = await browseForPythonInterpreter(settings);
+        if (!selectedPath) {
           return;
         }
 
-        const after = await resolvePythonInterpreter();
-        if (
-          after.path === before.path &&
-          after.source === before.source &&
-          daemon.getState().phase !== 'stopped'
-        ) {
-          const choice = await vscode.window.showInformationMessage(
-            `Interpreter selection was unchanged. Django ORM Intellisense is still using ${after.path}.`,
-            'Browse',
-            'Show Status',
-            'Open Settings'
-          );
-
-          if (choice === 'Browse') {
-            await vscode.commands.executeCommand(
-              'djangoOrmIntellisense.browsePythonInterpreter'
-            );
-            return;
-          }
-
-          if (choice === 'Show Status') {
-            await vscode.commands.executeCommand(
-              'djangoOrmIntellisense.showStatus'
-            );
-            return;
-          }
-
-          if (choice === 'Open Settings') {
-            await vscode.commands.executeCommand(
-              'workbench.action.openSettings',
-              'djangoOrmIntellisense.pythonInterpreter'
-            );
-          }
-          return;
-        }
-
-        await daemon.restart();
-
-        const choice = await vscode.window.showInformationMessage(
-          `Django ORM Intellisense now uses ${after.path}.`,
-          'Browse',
-          'Show Status',
-          'Open Settings'
+        const storedValue = await savePythonInterpreterSetting(
+          selectedPath,
+          settings
         );
+        const resolved = await resolvePythonInterpreter({
+          ...getExtensionSettings(scope),
+          ...settings,
+          pythonInterpreter: storedValue,
+        });
 
-        if (choice === 'Browse') {
-          await vscode.commands.executeCommand(
-            'djangoOrmIntellisense.browsePythonInterpreter'
-          );
-          return;
-        }
+        await daemon.restart(scope);
 
-        if (choice === 'Show Status') {
-          await vscode.commands.executeCommand(
-            'djangoOrmIntellisense.showStatus'
-          );
-          return;
-        }
-
-        if (choice === 'Open Settings') {
-          await vscode.commands.executeCommand(
-            'workbench.action.openSettings',
-            'djangoOrmIntellisense.pythonInterpreter'
-          );
-        }
+        output.appendLine(
+          `[interpreter] Set djangoOrmIntellisense.pythonInterpreter=${storedValue} (${resolved.path}).`
+        );
+        await showInterpreterMessage(
+          `Django ORM Intellisense now uses ${resolved.path}.`,
+          output
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         output.appendLine(
-          `[extension] Select Python Interpreter command failed: ${message}`
+          `[interpreter] Select Python Interpreter failed: ${message}`
         );
         const choice = await vscode.window.showErrorMessage(
           `Failed to update the Django ORM Intellisense interpreter: ${message}`,
-          'Browse',
           'Show Status',
           'Open Output',
           'Open Settings'
         );
-
-        if (choice === 'Browse') {
-          await vscode.commands.executeCommand(
-            'djangoOrmIntellisense.browsePythonInterpreter'
-          );
-          return;
-        }
 
         if (choice === 'Show Status') {
           await vscode.commands.executeCommand('djangoOrmIntellisense.showStatus');
@@ -165,10 +135,7 @@ export function registerSelectPythonInterpreterCommand(
         }
 
         if (choice === 'Open Settings') {
-          await vscode.commands.executeCommand(
-            'workbench.action.openSettings',
-            'djangoOrmIntellisense.pythonInterpreter'
-          );
+          await openInterpreterSettings();
         }
       }
     }

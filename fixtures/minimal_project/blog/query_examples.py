@@ -33,3 +33,11 @@ def lookup_examples():
     Company.objects.filter(state__rea='READY')
     Company.objects.filter(state__in=['READY'])
     Company.objects.filter(state__ready='READY')
+
+
+def member_examples():
+    audit_log = AuditLog.objects.get(id=1)
+    audit_log.
+
+    multi_inherited_log = MultiInheritedLog.objects.get(id=1)
+    multi_inherited_log.

@@ -393,10 +393,7 @@ def _render_model_attributes(
 ) -> list[str]:
     attributes: list[str] = []
 
-    fields = sorted(
-        static_index.fields_for_model(model_candidate.label),
-        key=lambda field: (field.line, field.column, field.name),
-    )
+    fields = static_index.fields_for_model(model_candidate.label)
     for field in fields:
         attributes.append(
             f'{field.name}: {_field_annotation(field, static_index=static_index, module_name=module_name)}'

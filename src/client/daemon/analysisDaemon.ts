@@ -26,6 +26,7 @@ import type {
 } from '../protocol';
 
 const REQUEST_TIMEOUT_MS = 8_000;
+const INITIALIZE_REQUEST_TIMEOUT_MS = 60_000;
 const RESPONSE_CACHE_LIMIT = 512;
 
 interface PendingRequest {
@@ -42,14 +43,61 @@ interface LaunchContext {
   settingsModule?: string;
 }
 
-function mergePythonPath(extensionPythonRoot: string): string {
-  const segments = [extensionPythonRoot];
+function buildPythonEnvironment(
+  extensionPythonRoot: string,
+  interpreterPath: string
+): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {
+    ...process.env,
+    DJANGO_ORM_INTELLISENSE: '1',
+    PYTHONPATH: extensionPythonRoot,
+    PYTHONUNBUFFERED: '1',
+  };
 
-  if (process.env.PYTHONPATH) {
-    segments.push(process.env.PYTHONPATH);
+  delete environment.PYTHONHOME;
+  delete environment.__PYVENV_LAUNCHER__;
+  delete environment.VIRTUAL_ENV;
+
+  const virtualEnvironmentRoot = findVirtualEnvironmentRoot(interpreterPath);
+  if (virtualEnvironmentRoot) {
+    environment.VIRTUAL_ENV = virtualEnvironmentRoot;
+    environment.PATH = prependToPath(
+      path.join(
+        virtualEnvironmentRoot,
+        process.platform === 'win32' ? 'Scripts' : 'bin'
+      ),
+      process.env.PATH
+    );
   }
 
-  return segments.join(path.delimiter);
+  return environment;
+}
+
+function findVirtualEnvironmentRoot(interpreterPath: string): string | undefined {
+  const executableDirectory = path.dirname(interpreterPath);
+  const directoryName = path.basename(executableDirectory).toLowerCase();
+  if (directoryName !== 'bin' && directoryName !== 'scripts') {
+    return undefined;
+  }
+
+  const candidateRoot = path.dirname(executableDirectory);
+  return fs.existsSync(path.join(candidateRoot, 'pyvenv.cfg'))
+    ? candidateRoot
+    : undefined;
+}
+
+function prependToPath(
+  segment: string,
+  existingPath: string | undefined
+): string {
+  if (!existingPath) {
+    return segment;
+  }
+
+  const parts = existingPath.split(path.delimiter);
+  return parts.includes(segment)
+    ? existingPath
+    : [segment, existingPath].join(path.delimiter);
 }
 
 export class AnalysisDaemon implements vscode.Disposable {
@@ -62,6 +110,7 @@ export class AnalysisDaemon implements vscode.Disposable {
   private stdoutReader?: readline.Interface;
   private requestSequence = 0;
   private startPromise?: Promise<HealthSnapshot>;
+  private restartPromise?: Promise<HealthSnapshot>;
   private stopRequested = false;
   private lastLaunchContext?: LaunchContext;
   private interpreterCheck?: Promise<void>;
@@ -148,9 +197,24 @@ export class AnalysisDaemon implements vscode.Disposable {
     await this.restartIfInterpreterChanged();
   }
 
-  async restart(): Promise<HealthSnapshot> {
-    await this.stop();
-    return this.start();
+  async restart(scope?: vscode.ConfigurationScope): Promise<HealthSnapshot> {
+    if (this.restartPromise) {
+      return this.restartPromise;
+    }
+
+    const restartPromise = (async () => {
+      await this.stop();
+      return this.start(scope);
+    })();
+    this.restartPromise = restartPromise;
+
+    try {
+      return await restartPromise;
+    } finally {
+      if (this.restartPromise === restartPromise) {
+        this.restartPromise = undefined;
+      }
+    }
   }
 
   async restartIfInterpreterChanged(): Promise<void> {
@@ -310,12 +374,10 @@ export class AnalysisDaemon implements vscode.Disposable {
     });
 
     const serverModuleRoot = path.join(this.context.extensionPath, 'python');
-    const environment: NodeJS.ProcessEnv = {
-      ...process.env,
-      DJANGO_ORM_INTELLISENSE: '1',
-      PYTHONPATH: mergePythonPath(serverModuleRoot),
-      PYTHONUNBUFFERED: '1',
-    };
+    const environment = buildPythonEnvironment(
+      serverModuleRoot,
+      launchContext.pythonPath
+    );
 
     if (launchContext.settingsModule) {
       environment.DJANGO_SETTINGS_MODULE = launchContext.settingsModule;
@@ -392,15 +454,26 @@ export class AnalysisDaemon implements vscode.Disposable {
     });
 
     try {
-      const initializeResult = await this.request<InitializeResult>('initialize', {
-        workspaceRoot: launchContext.workspaceRoot,
-        settingsModule: launchContext.settingsModule,
-      });
+      const initializeResult = await this.request<InitializeResult>(
+        'initialize',
+        {
+          workspaceRoot: launchContext.workspaceRoot,
+          settingsModule: launchContext.settingsModule,
+        },
+        INITIALIZE_REQUEST_TIMEOUT_MS
+      );
       const snapshot = this.decorateSnapshot(initializeResult.health);
       await this.applyWorkspaceIntegrations(snapshot);
       this.updateState(snapshot);
       return snapshot;
     } catch (error) {
+      if (child.pid !== undefined) {
+        this.intentionalExitProcessIds.add(child.pid);
+      }
+      this.disposeProcessHandles(child, stdoutReader);
+      if (!child.killed) {
+        child.kill();
+      }
       this.updateStateFromError(error);
       throw error;
     }
@@ -426,7 +499,7 @@ export class AnalysisDaemon implements vscode.Disposable {
 
     if (!validation.valid) {
       throw new Error(
-        `${validation.reason}. Set \`djangoOrmIntellisense.pythonInterpreter\` to the actual Python executable, or clear it so the extension can follow the Python extension selected interpreter.`
+        `${validation.reason}. Set \`djangoOrmIntellisense.pythonInterpreter\` to a valid Python executable or virtualenv directory.`
       );
     }
 
@@ -441,7 +514,8 @@ export class AnalysisDaemon implements vscode.Disposable {
 
   private request<T>(
     method: string,
-    params: Record<string, unknown>
+    params: Record<string, unknown>,
+    timeoutMs: number = REQUEST_TIMEOUT_MS
   ): Promise<T> {
     if (!this.process || !this.process.stdin.writable) {
       return Promise.reject(new Error('Analysis daemon is not running.'));
@@ -454,7 +528,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(id);
         reject(new Error(`Request "${method}" timed out.`));
-      }, REQUEST_TIMEOUT_MS);
+      }, timeoutMs);
 
       this.pendingRequests.set(id, {
         resolve,

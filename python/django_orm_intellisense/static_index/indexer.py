@@ -627,7 +627,7 @@ class StaticIndex:
                             _clone_field_for_model(base_field, model_label)
                         )
 
-            resolved_fields = inherited_fields + direct_fields
+            resolved_fields = direct_fields + inherited_fields
             inherited_forward_cache[model_label] = resolved_fields
             return resolved_fields
 

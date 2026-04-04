@@ -26,7 +26,6 @@
     "onCommand:djangoOrmIntellisense.showStatus",
     "onCommand:djangoOrmIntellisense.restartDaemon",
     "onCommand:djangoOrmIntellisense.configurePylanceDiagnostics",
-    "onCommand:djangoOrmIntellisense.browsePythonInterpreter",
     "onCommand:djangoOrmIntellisense.selectSettingsModule",
     "onCommand:djangoOrmIntellisense.selectPythonInterpreter"
   ],
@@ -44,10 +43,6 @@
       {
         "command": "djangoOrmIntellisense.configurePylanceDiagnostics",
         "title": "Django ORM Intellisense: Configure Pylance Diagnostics"
-      },
-      {
-        "command": "djangoOrmIntellisense.browsePythonInterpreter",
-        "title": "Django ORM Intellisense: Browse Python Interpreter"
       },
       {
         "command": "djangoOrmIntellisense.selectSettingsModule",
@@ -70,13 +65,7 @@
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "Optional Python interpreter used by the analysis daemon. You can point it either at the executable itself or at a virtualenv root such as .venv. Use the command 'Django ORM Intellisense: Browse Python Interpreter' to select it from the file explorer. If empty, the extension follows the Python extension selected interpreter before falling back to python.defaultInterpreterPath and then python3."
-        },
-        "djangoOrmIntellisense.pythonPath": {
-          "type": "string",
-          "default": "",
-          "scope": "resource",
-          "description": "Legacy alias for the Python executable used to launch the Django ORM Intellisense analysis daemon. Prefer djangoOrmIntellisense.pythonInterpreter."
+          "description": "Python interpreter used by the analysis daemon. You can point it either at the executable itself or at a virtualenv root such as .venv. Use the command 'Django ORM Intellisense: Select Python Interpreter' to choose it. If empty, the extension falls back to python3."
         },
         "djangoOrmIntellisense.settingsModule": {
           "type": "string",

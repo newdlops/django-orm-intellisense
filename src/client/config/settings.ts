@@ -6,7 +6,6 @@ export const CONFIGURATION_SECTION = 'djangoOrmIntellisense';
 
 export interface ExtensionSettings {
   pythonInterpreter?: string;
-  pythonPath?: string;
   settingsModule?: string;
   workspaceRoot?: string;
   logLevel: 'off' | 'info' | 'debug';
@@ -26,7 +25,6 @@ export function getExtensionSettings(
     effectiveScope
   );
   const pythonInterpreter = configuration.get<string>('pythonInterpreter')?.trim();
-  const pythonPath = configuration.get<string>('pythonPath')?.trim();
   const settingsModule = configuration.get<string>('settingsModule')?.trim();
   const workspaceRoot = resolveWorkspaceRootSetting(
     configuration.get<string>('workspaceRoot')?.trim(),
@@ -37,7 +35,6 @@ export function getExtensionSettings(
 
   return {
     pythonInterpreter: pythonInterpreter || undefined,
-    pythonPath: pythonPath || undefined,
     settingsModule: settingsModule || undefined,
     workspaceRoot: workspaceRoot || undefined,
     logLevel,
@@ -132,8 +129,6 @@ export function isRelevantConfigurationChange(
     scopes.some((scope) => event.affectsConfiguration(section, scope));
 
   return (
-    affectsConfiguration(CONFIGURATION_SECTION) ||
-    affectsConfiguration('python.defaultInterpreterPath') ||
-    affectsConfiguration('python.pythonPath')
+    affectsConfiguration(CONFIGURATION_SECTION)
   );
 }

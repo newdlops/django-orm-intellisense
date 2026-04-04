@@ -1,5 +1,4 @@
 import * as vscode from 'vscode';
-import { registerBrowsePythonInterpreterCommand } from './commands/browsePythonInterpreter';
 import { registerConfigurePylanceDiagnosticsCommand } from './commands/configurePylanceDiagnostics';
 import { registerRestartDaemonCommand } from './commands/restartDaemon';
 import { registerSelectSettingsModuleCommand } from './commands/selectSettingsModule';
@@ -9,6 +8,7 @@ import { isRelevantConfigurationChange, getExtensionSettings } from './config/se
 import { AnalysisDaemon } from './daemon/analysisDaemon';
 import { HealthDiagnostics } from './diagnostics/healthDiagnostics';
 import { registerPythonProviders } from './providers/pythonProviders';
+import { normalizePythonInterpreterSettings } from './python/interpreter';
 import { HealthStatusView } from './status/healthStatus';
 
 let activeDaemon: AnalysisDaemon | undefined;
@@ -29,13 +29,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   statusView.update(daemon.getState());
   diagnostics.update(daemon.getState());
 
-  const syncInterpreterSelection = (): void => {
-    void daemon.restartIfInterpreterChanged().catch((error) => {
-      output.appendLine(
-        `[extension] Failed to sync Python interpreter: ${String(error)}`
-      );
-    });
-  };
+  const normalization = await normalizePythonInterpreterSettings();
+  if (normalization === 'migrated') {
+    output.appendLine(
+      '[interpreter] Migrated legacy djangoOrmIntellisense.pythonPath into djangoOrmIntellisense.pythonInterpreter.'
+    );
+  } else if (normalization === 'cleared') {
+    output.appendLine(
+      '[interpreter] Removed legacy djangoOrmIntellisense.pythonPath because djangoOrmIntellisense.pythonInterpreter is already set.'
+    );
+  }
 
   context.subscriptions.push(
     output,
@@ -44,7 +47,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     diagnostics,
     registerShowStatusCommand(daemon, output),
     registerRestartDaemonCommand(daemon),
-    registerBrowsePythonInterpreterCommand(daemon, output),
     registerConfigurePylanceDiagnosticsCommand(output),
     registerSelectSettingsModuleCommand(daemon, output),
     registerSelectPythonInterpreterCommand(daemon, output),
@@ -66,20 +68,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void daemon.restart().catch((error) => {
         output.appendLine(`[extension] Failed to restart daemon: ${String(error)}`);
       });
-    }),
-    vscode.window.onDidChangeActiveTextEditor((editor) => {
-      if (editor?.document.languageId !== 'python') {
-        return;
-      }
-
-      syncInterpreterSelection();
-    }),
-    vscode.window.onDidChangeWindowState((state) => {
-      if (!state.focused) {
-        return;
-      }
-
-      syncInterpreterSelection();
     })
   );
 

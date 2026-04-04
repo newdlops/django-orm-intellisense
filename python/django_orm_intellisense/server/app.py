@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import json
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,7 +36,7 @@ from ..features.relation_targets import (
     list_relation_targets,
     resolve_relation_target,
 )
-from ..pylance import PylanceStubGenerationSummary
+from ..pylance import PylanceStubGenerationSummary, generate_pylance_stubs
 from ..runtime.inspector import RuntimeInspection, inspect_runtime
 from ..semantic.graph import SemanticGraphSummary, build_semantic_graph
 from ..static_index.indexer import StaticIndex, build_static_index
@@ -118,12 +119,26 @@ class DaemonServer:
         settings_module = _clean_optional_string(params.get('settingsModule'))
         self.workspace_root = workspace_root
         self.initialized_at = datetime.now(timezone.utc)
+        started_at = time.perf_counter()
 
+        _log_initialize_step(
+            f'start workspace={workspace_root} settings={settings_module or "<unset>"}'
+        )
         source_snapshot = snapshot_python_sources(workspace_root)
+        _log_initialize_step(
+            f'snapshot_python_sources files={source_snapshot.file_count} elapsed={time.perf_counter() - started_at:.2f}s'
+        )
         workspace_profile = discover_workspace(
             workspace_root,
             settings_module,
             python_files=source_snapshot.files,
+        )
+        _log_initialize_step(
+            'discover_workspace '
+            f'manage_py={workspace_profile.manage_py_path or "<missing>"} '
+            f'settings={workspace_profile.settings_module or "<unset>"} '
+            f'candidates={len(workspace_profile.settings_candidates)} '
+            f'elapsed={time.perf_counter() - started_at:.2f}s'
         )
         effective_settings_module = settings_module or workspace_profile.settings_module
         static_index = load_cached_static_index(workspace_root, source_snapshot)
@@ -131,6 +146,20 @@ class DaemonServer:
             static_index = build_static_index(
                 workspace_root,
                 python_files=source_snapshot.files,
+            )
+            _log_initialize_step(
+                'build_static_index '
+                f'files={static_index.python_file_count} '
+                f'models={static_index.model_candidate_count} '
+                f'reexports={static_index.reexport_module_count} '
+                f'elapsed={time.perf_counter() - started_at:.2f}s'
+            )
+        else:
+            _log_initialize_step(
+                'load_cached_static_index '
+                f'files={static_index.python_file_count} '
+                f'models={static_index.model_candidate_count} '
+                f'elapsed={time.perf_counter() - started_at:.2f}s'
             )
         save_static_index(workspace_root, source_snapshot, static_index)
 
@@ -153,8 +182,36 @@ class DaemonServer:
                 effective_settings_module,
                 runtime,
             )
-        pylance_stubs = None
+            _log_initialize_step(
+                'inspect_runtime '
+                f'status={runtime.bootstrap_status} '
+                f'django_importable={runtime.django_importable} '
+                f'elapsed={time.perf_counter() - started_at:.2f}s'
+            )
+        else:
+            _log_initialize_step(
+                'load_cached_runtime_inspection '
+                f'status={runtime.bootstrap_status} '
+                f'django_importable={runtime.django_importable} '
+                f'elapsed={time.perf_counter() - started_at:.2f}s'
+            )
         semantic_graph = build_semantic_graph(workspace_profile, static_index, runtime)
+        _log_initialize_step(
+            'build_semantic_graph '
+            f'coverage={semantic_graph.coverage_mode} '
+            f'elapsed={time.perf_counter() - started_at:.2f}s'
+        )
+        pylance_stubs = generate_pylance_stubs(
+            workspace_root=workspace_root,
+            static_index=static_index,
+            runtime=runtime,
+        )
+        _log_initialize_step(
+            'generate_pylance_stubs '
+            f'root={pylance_stubs.relative_root} '
+            f'files={pylance_stubs.file_count} '
+            f'elapsed={time.perf_counter() - started_at:.2f}s'
+        )
         self.workspace_profile = workspace_profile
         self.static_index = static_index
         self.runtime_inspection = runtime
@@ -167,6 +224,9 @@ class DaemonServer:
             semantic_graph=semantic_graph,
             pylance_stubs=pylance_stubs,
             initialized_at=self.initialized_at,
+        )
+        _log_initialize_step(
+            f'complete elapsed={time.perf_counter() - started_at:.2f}s'
         )
 
         return {
@@ -344,6 +404,10 @@ def _clean_optional_string(value: Any) -> str | None:
 
     text = str(value).strip()
     return text or None
+
+
+def _log_initialize_step(message: str) -> None:
+    print(f'[initialize] {message}', file=sys.stderr, flush=True)
 
 
 def _runtime_source_fingerprint(

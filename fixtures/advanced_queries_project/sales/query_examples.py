@@ -1,3 +1,5 @@
+from django.db.models import QuerySet
+
 from sales.models import Product
 from sales.services import ProductLookupService
 
@@ -51,6 +53,7 @@ def member_examples():
     queryset.with_li
 
     instance = Product.objects.get(id=1)
+    instance.
     instance.na
     instance.category.ti
 
@@ -59,3 +62,15 @@ def member_examples():
     Product.objects.active().first().category.ti
     Product.objects.active().with_line_co
     Product.objects.active().with_line_count()
+
+
+def loop_examples(products: list[Product], queryset_groups: list[QuerySet[Product]]):
+    for loop_product in Product.objects.active():
+        loop_product.category.ti
+
+    for typed_product in products:
+        typed_product.category.ti
+
+    for typed_queryset in queryset_groups:
+        typed_queryset.with_li
+        typed_queryset.values("category__ti")

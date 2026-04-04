@@ -185,10 +185,7 @@ def _instance_surface(
     items: list[OrmMemberItem] = []
     seen_names: set[str] = set()
 
-    for field in sorted(
-        static_index.fields_for_model(model_label),
-        key=lambda candidate: (candidate.line, candidate.column, candidate.name),
-    ):
+    for field in static_index.fields_for_model(model_label):
         item = _field_member_item(field)
         items.append(item)
         seen_names.add(item.name)

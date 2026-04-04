@@ -99,25 +99,24 @@ def _compute_detail(
 
     if runtime.bootstrap_status == 'ready':
         return (
-            'Architecture scaffold is active. Static indexing, re-export discovery, '
-            'and Django runtime metadata inspection are wired. The semantic layers are '
-            'still summaries rather than full completion or navigation features.'
+            'Runtime ORM inspection is active. Static indexing, re-export discovery, '
+            'and semantic graph summaries are available.'
         )
 
     if runtime.bootstrap_status == 'setup_failed':
         return (
-            'Django is importable, but `django.setup()` failed for the selected settings '
-            f'module. {runtime.bootstrap_error or "No additional error details were captured."}'
+            'Django imports successfully, but `django.setup()` failed for the selected '
+            f'settings module. {runtime.bootstrap_error or "No additional error details were captured."}'
         )
 
     if runtime.bootstrap_status == 'skipped_missing_settings':
         return (
-            'Django is importable, but no unambiguous settings module was selected. '
-            'Set `djangoOrmIntellisense.settingsModule` or use the settings-module picker '
+            'Django is importable, but no settings module is selected. Set '
+            '`djangoOrmIntellisense.settingsModule` or use the settings-module picker '
             'to enable runtime ORM inspection.'
         )
 
     return (
-        'Architecture scaffold is active, but Django is not importable from the '
-        f'selected interpreter ({runtime.python_executable}). Static-only analysis is available.'
+        'The selected interpreter cannot import Django '
+        f'({runtime.python_executable}). Static-only analysis is available.'
     )

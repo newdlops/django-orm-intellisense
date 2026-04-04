@@ -7,6 +7,7 @@ import {
 } from '../settings/workspaceJsonSettings';
 
 const STUB_PATH_SETTING = 'python.analysis.stubPath';
+const EXTRA_PATHS_SETTING = 'python.analysis.extraPaths';
 const LEGACY_MANAGED_STUB_CONTAINER = '.django_orm_intellisense';
 const LEGACY_MANAGED_STUB_RELATIVE_ROOT = '.django_orm_intellisense/stubs';
 
@@ -26,9 +27,14 @@ export async function syncManagedPylanceStubPath(
     STUB_PATH_SETTING,
     workspaceFolder
   );
+  const existingExtraPathsValue = await readWorkspaceSettingValue(
+    EXTRA_PATHS_SETTING,
+    workspaceFolder
+  );
   const currentValue =
     typeof existingValue === 'string' ? existingValue.trim() : '';
   const workspaceFolderPath = workspaceFolder.uri.fsPath;
+  const currentExtraPaths = normalizeExtraPathsSetting(existingExtraPathsValue);
 
   if (!stubSnapshot?.rootPath) {
     if (
@@ -47,6 +53,22 @@ export async function syncManagedPylanceStubPath(
       );
       output.appendLine(
         `[extension] Removed managed ${STUB_PATH_SETTING} for ${workspaceFolder.name}.`
+      );
+    }
+    const nextExtraPaths = removeManagedStubExtraPath(
+      currentExtraPaths,
+      workspaceFolderPath,
+      undefined,
+      [LEGACY_MANAGED_STUB_RELATIVE_ROOT]
+    );
+    if (!areStringArraysEqual(currentExtraPaths, nextExtraPaths)) {
+      await writeWorkspaceSettingValue(
+        EXTRA_PATHS_SETTING,
+        nextExtraPaths.length > 0 ? nextExtraPaths : undefined,
+        workspaceFolder
+      );
+      output.appendLine(
+        `[extension] Removed managed ${EXTRA_PATHS_SETTING} entry for ${workspaceFolder.name}.`
       );
     }
     await cleanupLegacyManagedStubTree(workspaceFolder, output);
@@ -86,6 +108,21 @@ export async function syncManagedPylanceStubPath(
   output.appendLine(
     `[extension] Configured ${STUB_PATH_SETTING} -> ${expectedValue} for ${workspaceFolder.name}.`
   );
+
+  const nextExtraPaths = ensureManagedStubExtraPath(
+    currentExtraPaths,
+    expectedValue
+  );
+  if (!areStringArraysEqual(currentExtraPaths, nextExtraPaths)) {
+    await writeWorkspaceSettingValue(
+      EXTRA_PATHS_SETTING,
+      nextExtraPaths,
+      workspaceFolder
+    );
+    output.appendLine(
+      `[extension] Configured ${EXTRA_PATHS_SETTING} -> [${nextExtraPaths.join(', ')}] for ${workspaceFolder.name}.`
+    );
+  }
 }
 
 async function cleanupLegacyManagedStubTree(
@@ -233,4 +270,53 @@ function normalizePathForComparison(value: string): string {
 
 function toPosixPath(value: string): string {
   return value.split(path.sep).join('/');
+}
+
+function normalizeExtraPathsSetting(value: unknown): string[] {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? [trimmed] : [];
+  }
+
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((entry): entry is string => typeof entry === 'string')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function ensureManagedStubExtraPath(
+  currentExtraPaths: readonly string[],
+  expectedValue: string
+): string[] {
+  if (currentExtraPaths.includes(expectedValue)) {
+    return [...currentExtraPaths];
+  }
+
+  return [expectedValue, ...currentExtraPaths];
+}
+
+function removeManagedStubExtraPath(
+  currentExtraPaths: readonly string[],
+  workspaceFolderPath: string,
+  stubRootPath: string | undefined,
+  relativeRoots: readonly string[]
+): string[] {
+  return currentExtraPaths.filter(
+    (entry) =>
+      !isManagedStubPathValue(entry, workspaceFolderPath, stubRootPath, relativeRoots)
+  );
+}
+
+function areStringArraysEqual(
+  left: readonly string[],
+  right: readonly string[]
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((entry, index) => entry === right[index])
+  );
 }
