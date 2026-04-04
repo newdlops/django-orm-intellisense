@@ -5,7 +5,7 @@ from ..semantic.graph import ModelGraph, build_model_graph
 from ..static_index.indexer import FieldCandidate, StaticIndex
 
 RELATION_ONLY_METHODS = {'select_related', 'prefetch_related'}
-FILTER_LOOKUP_METHODS = {'filter', 'exclude', 'get'}
+FILTER_LOOKUP_METHODS = {'filter', 'exclude', 'get', 'get_or_create', 'update_or_create'}
 MAX_CHAINED_FIELD_COMPLETION_DEPTH = 3
 DEFAULT_LOOKUP_OPERATORS = (
     'exact',
@@ -762,7 +762,10 @@ def _runtime_transform_output_field(field: object, transform_name: str) -> objec
     except Exception:
         return None
 
-    return getattr(transform, 'output_field', None)
+    try:
+        return getattr(transform, 'output_field', None)
+    except Exception:
+        return None
 
 
 class _RuntimeLookupLhs:

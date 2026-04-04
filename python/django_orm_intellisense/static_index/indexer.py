@@ -821,7 +821,12 @@ def build_static_index(
         module_name = _module_name_from_path(root, python_file)
         cached_module = cached_modules.get(relative_path)
         if cached_module is not None:
-            modules[module_name] = cached_module
+            existing_module = modules.get(module_name)
+            if (
+                existing_module is None
+                or _should_replace_module_index(existing_module, cached_module)
+            ):
+                modules[module_name] = cached_module
             continue
 
         try:
@@ -831,12 +836,26 @@ def build_static_index(
             continue
 
         module_index = _build_module_index(root, python_file, module_name, parsed_module)
-        modules[module_name] = module_index
+        existing_module = modules.get(module_name)
+        if existing_module is None or _should_replace_module_index(
+            existing_module,
+            module_index,
+        ):
+            modules[module_name] = module_index
 
     return _static_index_from_modules(
         python_file_count=len(source_files),
         modules=modules,
     )
+
+
+def _should_replace_module_index(existing: ModuleIndex, candidate: ModuleIndex) -> bool:
+    if existing.is_package_init == candidate.is_package_init:
+        return False
+
+    # Match Python import semantics when both `pkg/mod.py` and `pkg/mod/__init__.py`
+    # exist: importing `pkg.mod` resolves to the package, not the sibling module file.
+    return candidate.is_package_init
 
 
 def _build_module_index(

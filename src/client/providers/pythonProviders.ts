@@ -28,7 +28,54 @@ const IMPORT_MODULE_PATTERN = /^\s*import\s+(.+)$/;
 const IMPORT_MODULE_SPEC_PATTERN = /([A-Za-z_][\w.]*)(?:\s+as\s+([A-Za-z_][\w]*))?/g;
 const LOOKUP_METHOD_PATTERN =
   'values|values_list|order_by|only|defer|select_related|prefetch_related';
-const KEYWORD_LOOKUP_METHOD_PATTERN = 'filter|exclude|get';
+const KEYWORD_LOOKUP_METHOD_PATTERN =
+  'filter|exclude|get|get_or_create|update_or_create';
+const DIRECT_FIELD_KEYWORD_METHOD_PATTERN = 'create|update';
+const STRING_LOOKUP_METHODS = new Set([
+  'values',
+  'values_list',
+  'order_by',
+  'only',
+  'defer',
+  'select_related',
+  'prefetch_related',
+]);
+const KEYWORD_LOOKUP_METHODS = new Set([
+  'filter',
+  'exclude',
+  'get',
+  'get_or_create',
+  'update_or_create',
+]);
+const DIRECT_FIELD_KEYWORD_METHODS = new Set(['create', 'update']);
+const BULK_UPDATE_FIELD_LIST_METHODS = new Set(['bulk_update']);
+const EXPRESSION_QUERYSET_METHODS = new Set([
+  'filter',
+  'exclude',
+  'get',
+  'annotate',
+  'alias',
+  'aggregate',
+  'update',
+  'create',
+  'get_or_create',
+  'update_or_create',
+  'values',
+  'values_list',
+  'order_by',
+  'only',
+  'defer',
+  'select_related',
+  'prefetch_related',
+]);
+const SCHEMA_FIELD_LIST_COMPLETION_PATTERN =
+  /\b(?:fields|include)\s*=\s*\[[^\]]*(['"])([-\w]*)$/;
+const BULK_UPDATE_FIELD_LIST_COMPLETION_PATTERN =
+  /\.bulk_update\(\s*[^,\n]+,\s*\[[^\]]*(['"])([-\w]*)$/;
+const BULK_UPDATE_FIELD_LIST_HOVER_PATTERN =
+  /\.bulk_update\(\s*[^,\n]+,\s*\[[^\]]*(['"])([-\w]+)\1/g;
+const EXPRESSION_QUERYSET_METHOD_PATTERN =
+  'filter|exclude|get|annotate|alias|aggregate|update|create|get_or_create|update_or_create|values|values_list|order_by|only|defer|select_related|prefetch_related';
 const QUERYSET_RECEIVER_PATTERN =
   String.raw`[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*|\([^()]*\))*`;
 const LOOKUP_COMPLETION_PATTERN = new RegExp(
@@ -38,12 +85,102 @@ const LOOKUP_HOVER_PATTERN = new RegExp(
   String.raw`\.(${LOOKUP_METHOD_PATTERN})\(\s*(['"])([-\w.]+)\2`,
   'g'
 );
+const F_EXPRESSION_METHOD = 'f_expression';
+const EXPRESSION_PATH_METHOD_PREFIX = 'expression_path:';
+const ANNOTATED_MEMBER_SOURCE = 'annotation_expression';
+const VIRTUAL_LOOKUP_OPERATORS = [
+  'exact',
+  'iexact',
+  'contains',
+  'icontains',
+  'in',
+  'gt',
+  'gte',
+  'lt',
+  'lte',
+  'startswith',
+  'istartswith',
+  'endswith',
+  'iendswith',
+  'range',
+  'isnull',
+  'regex',
+  'iregex',
+  'date',
+  'year',
+  'month',
+  'day',
+  'week',
+  'week_day',
+  'quarter',
+  'time',
+  'hour',
+  'minute',
+  'second',
+] as const;
+const F_EXPRESSION_COMPLETION_PATTERN = new RegExp(
+  String.raw`(?:^|[^\w.])(?:[A-Za-z_][\w.]*\.)?F\(\s*(['"])([-\w.]*)$`
+);
+const F_EXPRESSION_HOVER_PATTERN = new RegExp(
+  String.raw`(?:^|[^\w.])(?:[A-Za-z_][\w.]*\.)?F\(\s*(['"])([-\w.]+)\1`,
+  'g'
+);
+const EXPRESSION_FIELD_FUNCTION_NAMES = new Set([
+  'OuterRef',
+  'Count',
+  'Sum',
+  'Avg',
+  'Min',
+  'Max',
+  'Cast',
+  'Coalesce',
+  'Func',
+]);
+const EXPRESSION_WRAPPER_FUNCTION_NAMES = new Set([
+  'ExpressionWrapper',
+  'Value',
+  'Subquery',
+  'Exists',
+]);
+const EXPRESSION_PATH_COMPLETION_PATTERN = new RegExp(
+  String.raw`(?:^|[^\w.])((?:[A-Za-z_][\w.]*\.)?(?:OuterRef|Count|Sum|Avg|Min|Max|Cast|Coalesce|Func))\(\s*(['"])([-\w.]*)$`
+);
+const EXPRESSION_PATH_HOVER_PATTERN = new RegExp(
+  String.raw`(?:^|[^\w.])((?:[A-Za-z_][\w.]*\.)?(?:OuterRef|Count|Sum|Avg|Min|Max|Cast|Coalesce|Func))\(\s*(['"])([-\w.]+)\2`,
+  'g'
+);
 const DJANGO_FIELD_PRIORITY_METHODS = new Set(['filter', 'exclude', 'get']);
+const LOOKUP_OPERATOR_METHODS = new Set([
+  'filter',
+  'exclude',
+  'get',
+  'get_or_create',
+  'update_or_create',
+]);
 const LOOKUP_RECEIVER_KINDS = new Set<OrmReceiverKind>([
   'model_class',
   'manager',
   'queryset',
   'related_manager',
+]);
+const QUERYSET_ANNOTATION_PRESERVING_METHODS = new Set([
+  'all',
+  'alias',
+  'annotate',
+  'defer',
+  'distinct',
+  'exclude',
+  'filter',
+  'only',
+  'order_by',
+  'prefetch_related',
+  'select_related',
+]);
+const INSTANCE_ANNOTATION_PRESERVING_METHODS = new Set([
+  'create',
+  'first',
+  'get',
+  'last',
 ]);
 const LOOKUP_OPERATOR_PRIORITY = new Map(
   [
@@ -76,12 +213,6 @@ const LOOKUP_OPERATOR_PRIORITY = new Map(
     'regex',
     'iregex',
   ].map((name, index) => [name, index])
-);
-const KEYWORD_LOOKUP_CALLEE_PATTERN = new RegExp(
-  String.raw`(${QUERYSET_RECEIVER_PATTERN})\.(${KEYWORD_LOOKUP_METHOD_PATTERN})$`
-);
-const STRING_LOOKUP_CALLEE_PATTERN = new RegExp(
-  String.raw`(${QUERYSET_RECEIVER_PATTERN})\.(${LOOKUP_METHOD_PATTERN})$`
 );
 const CLASS_DEFINITION_PATTERN =
   /^(\s*)class\s+([A-Za-z_][\w]*)\s*(?:\((.*)\))?\s*:/;
@@ -159,6 +290,52 @@ interface LookupDiagnosticContext extends LookupLiteral {
   range: vscode.Range;
 }
 
+interface DirectFieldKeywordContext {
+  receiverExpression: string;
+  method: string;
+  prefix: string;
+  range: vscode.Range;
+}
+
+interface DirectFieldKeywordLiteral {
+  receiverExpression: string;
+  method: string;
+  value: string;
+}
+
+interface DirectFieldDiagnosticContext extends DirectFieldKeywordLiteral {
+  range: vscode.Range;
+}
+
+interface SchemaFieldContext {
+  prefix: string;
+  range: vscode.Range;
+}
+
+interface SchemaFieldLiteral {
+  value: string;
+}
+
+interface SchemaFieldDiagnosticContext extends SchemaFieldLiteral {
+  range: vscode.Range;
+}
+
+interface BulkUpdateFieldListContext {
+  receiverExpression: string;
+  prefix: string;
+  range: vscode.Range;
+}
+
+interface BulkUpdateFieldListLiteral {
+  receiverExpression: string;
+  value: string;
+}
+
+interface BulkUpdateFieldListDiagnosticContext
+  extends BulkUpdateFieldListLiteral {
+  range: vscode.Range;
+}
+
 interface PythonClassDefinition {
   name: string;
   baseExpressions: string[];
@@ -194,6 +371,19 @@ interface OrmReceiverInfo {
   kind: OrmReceiverKind;
   modelLabel: string;
   managerName?: string;
+  virtualFields?: VirtualOrmField[];
+}
+
+interface VirtualOrmField {
+  name: string;
+  detail: string;
+  fieldKind: string;
+  source: string;
+  instanceAvailable: boolean;
+  expressionName?: string;
+  filePath?: string;
+  line?: number;
+  column?: number;
 }
 
 interface OrmMemberCompletionContext {
@@ -288,6 +478,69 @@ export function registerPythonProviders(
 
     for (const context of findLookupDiagnosticContexts(document)) {
       try {
+        const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
+          daemon,
+          document,
+          context.receiverExpression,
+          context.range.end
+        );
+        if (!lookupReceiver) {
+          continue;
+        }
+
+        const baseModelLabel = lookupReceiver.modelLabel;
+        const resolution =
+          resolveVirtualLookupPath(lookupReceiver, context.value, context.method) ??
+          (await daemon.resolveLookupPath(
+            baseModelLabel,
+            context.value,
+            context.method
+          ));
+        if (!resolution.resolved) {
+          const partialCompletions = {
+            items: mergeLookupCompletionItems(
+              await (async () => {
+                const result = await daemon.listLookupPathCompletions(
+                  baseModelLabel,
+                  context.value,
+                  context.method
+                );
+                return result.items;
+              })(),
+              virtualLookupCompletionItems(
+                lookupReceiver,
+                context.value,
+                context.method
+              )
+            ),
+            resolved: true,
+          };
+          if (partialCompletions.resolved && partialCompletions.items.length > 0) {
+            continue;
+          }
+        }
+        const diagnostic = buildLookupDiagnostic(
+          context,
+          baseModelLabel,
+          resolution
+        );
+        if (!diagnostic) {
+          continue;
+        }
+
+        const key = diagnostic.range.start.toString() + diagnostic.message;
+        if (seenRanges.has(key)) {
+          continue;
+        }
+        seenRanges.add(key);
+        diagnostics.push(diagnostic);
+      } catch {
+        continue;
+      }
+    }
+
+    for (const context of findDirectFieldDiagnosticContexts(document)) {
+      try {
         const baseModelLabel = await resolveBaseModelLabelForReceiver(
           daemon,
           document,
@@ -301,19 +554,82 @@ export function registerPythonProviders(
         const resolution = await daemon.resolveLookupPath(
           baseModelLabel,
           context.value,
-          context.method
+          'filter'
         );
-        if (!resolution.resolved) {
-          const partialCompletions = await daemon.listLookupPathCompletions(
-            baseModelLabel,
-            context.value,
-            context.method
-          );
-          if (partialCompletions.resolved && partialCompletions.items.length > 0) {
-            continue;
-          }
+        const diagnostic = buildDirectFieldDiagnostic(
+          context,
+          baseModelLabel,
+          resolution
+        );
+        if (!diagnostic) {
+          continue;
         }
-        const diagnostic = buildLookupDiagnostic(
+
+        const key = diagnostic.range.start.toString() + diagnostic.message;
+        if (seenRanges.has(key)) {
+          continue;
+        }
+        seenRanges.add(key);
+        diagnostics.push(diagnostic);
+      } catch {
+        continue;
+      }
+    }
+
+    for (const context of findSchemaFieldDiagnosticContexts(document)) {
+      try {
+        const baseModelLabel = await resolveMetaOwnerModelLabel(
+          daemon,
+          document,
+          context.range.end
+        );
+        if (!baseModelLabel) {
+          continue;
+        }
+
+        const resolution = await daemon.resolveLookupPath(
+          baseModelLabel,
+          context.value,
+          'filter'
+        );
+        const diagnostic = buildSchemaFieldDiagnostic(
+          context,
+          baseModelLabel,
+          resolution
+        );
+        if (!diagnostic) {
+          continue;
+        }
+
+        const key = diagnostic.range.start.toString() + diagnostic.message;
+        if (seenRanges.has(key)) {
+          continue;
+        }
+        seenRanges.add(key);
+        diagnostics.push(diagnostic);
+      } catch {
+        continue;
+      }
+    }
+
+    for (const context of findBulkUpdateFieldDiagnosticContexts(document)) {
+      try {
+        const baseModelLabel = await resolveBaseModelLabelForReceiver(
+          daemon,
+          document,
+          context.receiverExpression,
+          context.range.end
+        );
+        if (!baseModelLabel) {
+          continue;
+        }
+
+        const resolution = await daemon.resolveLookupPath(
+          baseModelLabel,
+          context.value,
+          'filter'
+        );
+        const diagnostic = buildBulkUpdateFieldDiagnostic(
           context,
           baseModelLabel,
           resolution
@@ -364,32 +680,51 @@ export function registerPythonProviders(
 
         const lookupContext =
           lookupCompletionContext(document, position) ??
+          expressionPathCompletionContext(document, position) ??
+          fExpressionCompletionContext(document, position) ??
           keywordLookupCompletionContext(document, position);
+        const directFieldContext = directFieldKeywordCompletionContext(
+          document,
+          position
+        );
+        const schemaFieldContext = schemaFieldCompletionContext(document, position);
+        const bulkUpdateFieldContext = bulkUpdateFieldListCompletionContext(
+          document,
+          position
+        );
 
         try {
           await daemon.ensureStarted(document.uri);
           if (lookupContext) {
-            const baseModelLabel = await resolveBaseModelLabelForReceiver(
+            const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
               daemon,
               document,
               lookupContext.receiverExpression,
               position
             );
-            if (!baseModelLabel) {
+            if (!lookupReceiver) {
               return undefined;
             }
 
+            const baseModelLabel = lookupReceiver.modelLabel;
             const result = await daemon.listLookupPathCompletions(
               baseModelLabel,
               lookupContext.prefix,
               lookupContext.method
             );
-            const sortedItems = prioritizeLookupCompletionItems(
+            const mergedLookupItems = mergeLookupCompletionItems(
               result.items,
+              virtualLookupCompletionItems(
+                lookupReceiver,
+                lookupContext.prefix,
+                lookupContext.method
+              )
+            );
+            const sortedItems = prioritizeLookupCompletionItems(
+              mergedLookupItems,
               lookupContext.method
             );
-
-            return sortedItems.map((item, index) => {
+            const completions = sortedItems.map((item, index) => {
               const completion = new vscode.CompletionItem(
                 lookupCompletionLabel(item),
                 lookupCompletionKind(item)
@@ -422,6 +757,139 @@ export function registerPythonProviders(
               );
               return completion;
             });
+
+            return completions;
+          }
+
+          if (directFieldContext) {
+            const baseModelLabel = await resolveBaseModelLabelForReceiver(
+              daemon,
+              document,
+              directFieldContext.receiverExpression,
+              position
+            );
+            if (!baseModelLabel) {
+              return undefined;
+            }
+
+            const result = await daemon.listLookupPathCompletions(
+              baseModelLabel,
+              directFieldContext.prefix,
+              'filter'
+            );
+            const items = result.items.filter(
+              (item) => !item.lookupOperator && !item.name.includes('__')
+            );
+            const sortedItems = prioritizeLookupCompletionItems(items, 'filter');
+
+            return sortedItems.map((item, index) => {
+              const completion = new vscode.CompletionItem(
+                lookupCompletionLabel(item),
+                lookupCompletionKind(item)
+              );
+              completion.detail = lookupCompletionDetail(item);
+              completion.insertText = item.name;
+              completion.filterText = item.name;
+              completion.range = directFieldContext.range;
+              completion.sortText = lookupCompletionSortText(
+                'filter',
+                item,
+                index
+              );
+              completion.documentation = buildLookupItemMarkdown(
+                item,
+                'filter',
+                baseModelLabel
+              );
+              return completion;
+            });
+          }
+
+          if (schemaFieldContext) {
+            const baseModelLabel = await resolveMetaOwnerModelLabel(
+              daemon,
+              document,
+              position
+            );
+            if (!baseModelLabel) {
+              return undefined;
+            }
+
+            const result = await daemon.listLookupPathCompletions(
+              baseModelLabel,
+              schemaFieldContext.prefix,
+              'filter'
+            );
+            const items = result.items.filter(
+              (item) => !item.lookupOperator && !item.name.includes('__')
+            );
+            const sortedItems = prioritizeLookupCompletionItems(items, 'filter');
+
+            return sortedItems.map((item, index) => {
+              const completion = new vscode.CompletionItem(
+                lookupCompletionLabel(item),
+                lookupCompletionKind(item)
+              );
+              completion.detail = lookupCompletionDetail(item);
+              completion.insertText = item.name;
+              completion.filterText = item.name;
+              completion.range = schemaFieldContext.range;
+              completion.sortText = lookupCompletionSortText(
+                'filter',
+                item,
+                index
+              );
+              completion.documentation = buildLookupItemMarkdown(
+                item,
+                'filter',
+                baseModelLabel
+              );
+              return completion;
+            });
+          }
+
+          if (bulkUpdateFieldContext) {
+            const baseModelLabel = await resolveBaseModelLabelForReceiver(
+              daemon,
+              document,
+              bulkUpdateFieldContext.receiverExpression,
+              position
+            );
+            if (!baseModelLabel) {
+              return undefined;
+            }
+
+            const result = await daemon.listLookupPathCompletions(
+              baseModelLabel,
+              bulkUpdateFieldContext.prefix,
+              'filter'
+            );
+            const items = result.items.filter(
+              (item) => !item.lookupOperator && !item.name.includes('__')
+            );
+            const sortedItems = prioritizeLookupCompletionItems(items, 'filter');
+
+            return sortedItems.map((item, index) => {
+              const completion = new vscode.CompletionItem(
+                lookupCompletionLabel(item),
+                lookupCompletionKind(item)
+              );
+              completion.detail = lookupCompletionDetail(item);
+              completion.insertText = item.name;
+              completion.filterText = item.name;
+              completion.range = bulkUpdateFieldContext.range;
+              completion.sortText = lookupCompletionSortText(
+                'filter',
+                item,
+                index
+              );
+              completion.documentation = buildLookupItemMarkdown(
+                item,
+                'filter',
+                baseModelLabel
+              );
+              return completion;
+            });
           }
 
           const memberContext = await resolveOrmMemberCompletionContext(
@@ -439,8 +907,12 @@ export function registerPythonProviders(
             memberContext.prefix,
             memberContext.receiver.managerName
           );
-          const sortedItems = prioritizeOrmMemberCompletionItems(
+          const mergedItems = mergeVirtualOrmMemberItems(
             result.items,
+            memberContext.receiver
+          );
+          const sortedItems = prioritizeOrmMemberCompletionItems(
+            mergedItems,
             memberContext.receiver
           );
 
@@ -505,25 +977,40 @@ export function registerPythonProviders(
 
         const lookupLiteral =
           lookupHoverLiteral(document, position) ??
+          expressionPathHoverLiteral(document, position) ??
+          fExpressionHoverLiteral(document, position) ??
           keywordLookupLiteral(document, position);
+        const directFieldLiteral = directFieldKeywordLiteral(document, position);
+        const schemaFieldLiteral = schemaFieldHoverLiteral(document, position);
+        const bulkUpdateFieldLiteral = bulkUpdateFieldListHoverLiteral(
+          document,
+          position
+        );
         if (lookupLiteral) {
           try {
             await daemon.ensureStarted(document.uri);
-            const baseModelLabel = await resolveBaseModelLabelForReceiver(
+            const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
               daemon,
               document,
               lookupLiteral.receiverExpression,
               position
             );
-            if (!baseModelLabel) {
+            if (!lookupReceiver) {
               return undefined;
             }
 
-            const resolution = await daemon.resolveLookupPath(
-              baseModelLabel,
-              lookupLiteral.value,
-              lookupLiteral.method
-            );
+            const baseModelLabel = lookupReceiver.modelLabel;
+            const resolution =
+              resolveVirtualLookupPath(
+                lookupReceiver,
+                lookupLiteral.value,
+                lookupLiteral.method
+              ) ??
+              (await daemon.resolveLookupPath(
+                baseModelLabel,
+                lookupLiteral.value,
+                lookupLiteral.method
+              ));
             const lookupHover = buildLookupHover(
               lookupLiteral.value,
               lookupLiteral.method,
@@ -538,6 +1025,92 @@ export function registerPythonProviders(
           }
         }
 
+        if (directFieldLiteral) {
+          try {
+            await daemon.ensureStarted(document.uri);
+            const baseModelLabel = await resolveBaseModelLabelForReceiver(
+              daemon,
+              document,
+              directFieldLiteral.receiverExpression,
+              position
+            );
+            if (!baseModelLabel) {
+              return undefined;
+            }
+
+            const resolution = await daemon.resolveLookupPath(
+              baseModelLabel,
+              directFieldLiteral.value,
+              'filter'
+            );
+            return buildLookupHover(
+              directFieldLiteral.value,
+              directFieldLiteral.method,
+              baseModelLabel,
+              resolution
+            );
+          } catch {
+            return undefined;
+          }
+        }
+
+        if (schemaFieldLiteral) {
+          try {
+            await daemon.ensureStarted(document.uri);
+            const baseModelLabel = await resolveMetaOwnerModelLabel(
+              daemon,
+              document,
+              position
+            );
+            if (!baseModelLabel) {
+              return undefined;
+            }
+
+            const resolution = await daemon.resolveLookupPath(
+              baseModelLabel,
+              schemaFieldLiteral.value,
+              'filter'
+            );
+            return buildLookupHover(
+              schemaFieldLiteral.value,
+              'filter',
+              baseModelLabel,
+              resolution
+            );
+          } catch {
+            return undefined;
+          }
+        }
+
+        if (bulkUpdateFieldLiteral) {
+          try {
+            await daemon.ensureStarted(document.uri);
+            const baseModelLabel = await resolveBaseModelLabelForReceiver(
+              daemon,
+              document,
+              bulkUpdateFieldLiteral.receiverExpression,
+              position
+            );
+            if (!baseModelLabel) {
+              return undefined;
+            }
+
+            const resolution = await daemon.resolveLookupPath(
+              baseModelLabel,
+              bulkUpdateFieldLiteral.value,
+              'filter'
+            );
+            return buildLookupHover(
+              bulkUpdateFieldLiteral.value,
+              'filter',
+              baseModelLabel,
+              resolution
+            );
+          } catch {
+            return undefined;
+          }
+        }
+
         try {
           await daemon.ensureStarted(document.uri);
           const memberContext = await resolveOrmMemberAccessContext(
@@ -546,6 +1119,21 @@ export function registerPythonProviders(
             position
           );
           if (memberContext) {
+            const virtualResolution = resolveVirtualOrmMember(
+              memberContext.receiver,
+              memberContext.memberName
+            );
+            if (virtualResolution) {
+              const memberHover = buildOrmMemberHover(
+                memberContext.memberName,
+                memberContext.receiver,
+                virtualResolution
+              );
+              if (memberHover) {
+                return memberHover;
+              }
+            }
+
             const resolution = await daemon.resolveOrmMember(
               memberContext.receiver.modelLabel,
               memberContext.receiver.kind,
@@ -565,13 +1153,16 @@ export function registerPythonProviders(
           return undefined;
         }
 
-        const importReference = importReferenceAtPosition(document, position);
-        if (!importReference) {
-          return undefined;
-        }
-
         try {
           await daemon.ensureStarted(document.uri);
+          const importReference = await resolveImportReferenceAtPosition(
+            daemon,
+            document,
+            position
+          );
+          if (!importReference) {
+            return undefined;
+          }
           const importHover = await buildImportHover(
             daemon,
             importReference
@@ -608,14 +1199,56 @@ export function registerPythonProviders(
 
         const lookupLiteral =
           lookupHoverLiteral(document, position) ??
+          expressionPathHoverLiteral(document, position) ??
+          fExpressionHoverLiteral(document, position) ??
           keywordLookupLiteral(document, position);
+        const directFieldLiteral = directFieldKeywordLiteral(document, position);
+        const schemaFieldLiteral = schemaFieldHoverLiteral(document, position);
+        const bulkUpdateFieldLiteral = bulkUpdateFieldListHoverLiteral(
+          document,
+          position
+        );
         if (lookupLiteral) {
+          try {
+            await daemon.ensureStarted(document.uri);
+            const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
+              daemon,
+              document,
+              lookupLiteral.receiverExpression,
+              position
+            );
+            if (!lookupReceiver) {
+              return undefined;
+            }
+
+            const baseModelLabel = lookupReceiver.modelLabel;
+            const resolution =
+              resolveVirtualLookupPath(
+                lookupReceiver,
+                lookupLiteral.value,
+                lookupLiteral.method
+              ) ??
+              (await daemon.resolveLookupPath(
+                baseModelLabel,
+                lookupLiteral.value,
+                lookupLiteral.method
+              ));
+            const location = definitionLocationFromLookupResolution(resolution);
+            if (location) {
+              return location;
+            }
+          } catch {
+            return undefined;
+          }
+        }
+
+        if (directFieldLiteral) {
           try {
             await daemon.ensureStarted(document.uri);
             const baseModelLabel = await resolveBaseModelLabelForReceiver(
               daemon,
               document,
-              lookupLiteral.receiverExpression,
+              directFieldLiteral.receiverExpression,
               position
             );
             if (!baseModelLabel) {
@@ -624,13 +1257,57 @@ export function registerPythonProviders(
 
             const resolution = await daemon.resolveLookupPath(
               baseModelLabel,
-              lookupLiteral.value,
-              lookupLiteral.method
+              directFieldLiteral.value,
+              'filter'
             );
-            const location = definitionLocationFromLookupResolution(resolution);
-            if (location) {
-              return location;
+            return definitionLocationFromLookupResolution(resolution);
+          } catch {
+            return undefined;
+          }
+        }
+
+        if (schemaFieldLiteral) {
+          try {
+            await daemon.ensureStarted(document.uri);
+            const baseModelLabel = await resolveMetaOwnerModelLabel(
+              daemon,
+              document,
+              position
+            );
+            if (!baseModelLabel) {
+              return undefined;
             }
+
+            const resolution = await daemon.resolveLookupPath(
+              baseModelLabel,
+              schemaFieldLiteral.value,
+              'filter'
+            );
+            return definitionLocationFromLookupResolution(resolution);
+          } catch {
+            return undefined;
+          }
+        }
+
+        if (bulkUpdateFieldLiteral) {
+          try {
+            await daemon.ensureStarted(document.uri);
+            const baseModelLabel = await resolveBaseModelLabelForReceiver(
+              daemon,
+              document,
+              bulkUpdateFieldLiteral.receiverExpression,
+              position
+            );
+            if (!baseModelLabel) {
+              return undefined;
+            }
+
+            const resolution = await daemon.resolveLookupPath(
+              baseModelLabel,
+              bulkUpdateFieldLiteral.value,
+              'filter'
+            );
+            return definitionLocationFromLookupResolution(resolution);
           } catch {
             return undefined;
           }
@@ -644,6 +1321,19 @@ export function registerPythonProviders(
             position
           );
           if (memberContext) {
+            const virtualResolution = resolveVirtualOrmMember(
+              memberContext.receiver,
+              memberContext.memberName
+            );
+            if (virtualResolution) {
+              const virtualLocation = definitionLocationFromOrmMemberResolution(
+                virtualResolution
+              );
+              if (virtualLocation) {
+                return virtualLocation;
+              }
+            }
+
             const resolution = await daemon.resolveOrmMember(
               memberContext.receiver.modelLabel,
               memberContext.receiver.kind,
@@ -659,13 +1349,16 @@ export function registerPythonProviders(
           return undefined;
         }
 
-        const importReference = importReferenceAtPosition(document, position);
-        if (!importReference) {
-          return undefined;
-        }
-
         try {
           await daemon.ensureStarted(document.uri);
+          const importReference = await resolveImportReferenceAtPosition(
+            daemon,
+            document,
+            position
+          );
+          if (!importReference) {
+            return undefined;
+          }
           const location = await definitionLocationFromImportReference(
             daemon,
             importReference
@@ -1079,6 +1772,78 @@ function lookupCompletionContext(
   };
 }
 
+function fExpressionCompletionContext(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): LookupContext | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const prefixText = lineText.slice(0, position.character);
+  const match = prefixText.match(F_EXPRESSION_COMPLETION_PATTERN);
+  if (!match) {
+    return undefined;
+  }
+
+  const currentValue = match[2] ?? '';
+  const callContext = fExpressionCallContext(
+    document.getText(),
+    document.offsetAt(position)
+  );
+  if (!callContext) {
+    return undefined;
+  }
+
+  const replacementLength = lookupReplacementLength(currentValue);
+  const range = new vscode.Range(
+    position.line,
+    position.character - replacementLength,
+    position.line,
+    position.character
+  );
+
+  return {
+    receiverExpression: callContext.receiverExpression,
+    method: F_EXPRESSION_METHOD,
+    prefix: currentValue,
+    range,
+  };
+}
+
+function expressionPathCompletionContext(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): LookupContext | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const prefixText = lineText.slice(0, position.character);
+  const match = prefixText.match(EXPRESSION_PATH_COMPLETION_PATTERN);
+  if (!match) {
+    return undefined;
+  }
+
+  const currentValue = match[3] ?? '';
+  const callContext = expressionPathCallContext(
+    document.getText(),
+    document.offsetAt(position)
+  );
+  if (!callContext) {
+    return undefined;
+  }
+
+  const replacementLength = lookupReplacementLength(currentValue);
+  const range = new vscode.Range(
+    position.line,
+    position.character - replacementLength,
+    position.line,
+    position.character
+  );
+
+  return {
+    receiverExpression: callContext.receiverExpression,
+    method: expressionPathMethodName(callContext.expressionName),
+    prefix: currentValue,
+    range,
+  };
+}
+
 function keywordLookupCompletionContext(
   document: vscode.TextDocument,
   position: vscode.Position
@@ -1088,7 +1853,6 @@ function keywordLookupCompletionContext(
   const prefixText = fullText.slice(0, cursorOffset);
   const tokenStartOffset = scanKeywordTokenStart(prefixText);
   const currentValue = prefixText.slice(tokenStartOffset);
-
   if (!isLookupKeywordCandidate(currentValue)) {
     return undefined;
   }
@@ -1107,6 +1871,93 @@ function keywordLookupCompletionContext(
     method: callContext.method,
     prefix: currentValue,
     range,
+  };
+}
+
+function directFieldKeywordCompletionContext(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): DirectFieldKeywordContext | undefined {
+  const fullText = document.getText();
+  const cursorOffset = document.offsetAt(position);
+  const prefixText = fullText.slice(0, cursorOffset);
+  const tokenStartOffset = scanKeywordTokenStart(prefixText);
+  const currentValue = prefixText.slice(tokenStartOffset);
+
+  if (!isDirectFieldKeywordCandidate(currentValue)) {
+    return undefined;
+  }
+
+  const callContext = querysetDirectFieldKeywordCallContext(
+    fullText,
+    tokenStartOffset,
+    cursorOffset
+  );
+  if (!callContext) {
+    return undefined;
+  }
+
+  const rangeStart = document.positionAt(cursorOffset - currentValue.length);
+  return {
+    receiverExpression: callContext.receiverExpression,
+    method: callContext.method,
+    prefix: currentValue,
+    range: new vscode.Range(rangeStart, position),
+  };
+}
+
+function schemaFieldCompletionContext(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): SchemaFieldContext | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const prefixText = lineText.slice(0, position.character);
+  const match = prefixText.match(SCHEMA_FIELD_LIST_COMPLETION_PATTERN);
+  if (!match) {
+    return undefined;
+  }
+
+  const currentValue = match[2] ?? '';
+  return {
+    prefix: currentValue,
+    range: new vscode.Range(
+      position.line,
+      position.character - currentValue.length,
+      position.line,
+      position.character
+    ),
+  };
+}
+
+function bulkUpdateFieldListCompletionContext(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): BulkUpdateFieldListContext | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const prefixText = lineText.slice(0, position.character);
+  const match = prefixText.match(BULK_UPDATE_FIELD_LIST_COMPLETION_PATTERN);
+  if (!match) {
+    return undefined;
+  }
+
+  const callContext = bulkUpdateFieldListCallContext(
+    document.getText(),
+    document.offsetAt(position)
+  );
+  if (!callContext) {
+    return undefined;
+  }
+
+  const currentValue = match[2] ?? '';
+  return {
+    receiverExpression: callContext.receiverExpression,
+    prefix: currentValue,
+    range: new vscode.Range(
+      position.line,
+      position.character - currentValue.length,
+      position.line,
+      position.character
+    ),
   };
 }
 
@@ -1139,6 +1990,78 @@ function lookupHoverLiteral(
         value,
       };
     }
+  }
+
+  return undefined;
+}
+
+function fExpressionHoverLiteral(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): LookupLiteral | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const lineStartOffset = document.offsetAt(new vscode.Position(position.line, 0));
+
+  for (const match of lineText.matchAll(F_EXPRESSION_HOVER_PATTERN)) {
+    const value = match[2];
+    const prefix = match[0];
+    const localOffset = prefix.lastIndexOf(value);
+    const start = (match.index ?? 0) + localOffset;
+    const end = start + value.length;
+
+    if (position.character < start || position.character > end) {
+      continue;
+    }
+
+    const callContext = fExpressionCallContext(
+      document.getText(),
+      lineStartOffset + start
+    );
+    if (!callContext) {
+      return undefined;
+    }
+
+    return {
+      receiverExpression: callContext.receiverExpression,
+      method: F_EXPRESSION_METHOD,
+      value,
+    };
+  }
+
+  return undefined;
+}
+
+function expressionPathHoverLiteral(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): LookupLiteral | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const lineStartOffset = document.offsetAt(new vscode.Position(position.line, 0));
+
+  for (const match of lineText.matchAll(EXPRESSION_PATH_HOVER_PATTERN)) {
+    const value = match[3];
+    const prefix = match[0];
+    const localOffset = prefix.lastIndexOf(value);
+    const start = (match.index ?? 0) + localOffset;
+    const end = start + value.length;
+
+    if (position.character < start || position.character > end) {
+      continue;
+    }
+
+    const callContext = expressionPathCallContext(
+      document.getText(),
+      lineStartOffset + start
+    );
+    if (!callContext) {
+      return undefined;
+    }
+
+    return {
+      receiverExpression: callContext.receiverExpression,
+      method: expressionPathMethodName(callContext.expressionName),
+      value,
+    };
   }
 
   return undefined;
@@ -1203,6 +2126,122 @@ function keywordLookupLiteral(
     method: callContext.method,
     value: trimmedKey,
   };
+}
+
+function directFieldKeywordLiteral(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): DirectFieldKeywordLiteral | undefined {
+  const fullText = document.getText();
+  const wordRange = document.getWordRangeAtPosition(position, /[A-Za-z_][\w]*/);
+  if (!wordRange) {
+    return undefined;
+  }
+
+  const value = document.getText(wordRange);
+  if (!isDirectFieldKeywordCandidate(value)) {
+    return undefined;
+  }
+
+  const startOffset = document.offsetAt(wordRange.start);
+  const endOffset = document.offsetAt(wordRange.end);
+  const callContext = querysetDirectFieldKeywordCallContext(
+    fullText,
+    startOffset,
+    endOffset
+  );
+  if (!callContext) {
+    return undefined;
+  }
+
+  const argumentText = fullText.slice(
+    callContext.argumentStartOffset,
+    callContext.argumentEndOffset
+  );
+  const equalsIndex = findTopLevelEqualsIndex(argumentText);
+  if (equalsIndex < 0) {
+    return undefined;
+  }
+
+  const rawKey = argumentText.slice(0, equalsIndex);
+  const trimmedKey = rawKey.trim();
+  const rawKeyOffset = rawKey.indexOf(trimmedKey);
+  if (!trimmedKey || rawKeyOffset < 0 || value !== trimmedKey) {
+    return undefined;
+  }
+
+  const keyStartOffset = callContext.argumentStartOffset + rawKeyOffset;
+  const keyEndOffset = keyStartOffset + trimmedKey.length;
+  if (startOffset < keyStartOffset || endOffset > keyEndOffset) {
+    return undefined;
+  }
+
+  return {
+    receiverExpression: callContext.receiverExpression,
+    method: callContext.method,
+    value: trimmedKey,
+  };
+}
+
+function schemaFieldHoverLiteral(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): SchemaFieldLiteral | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const wordRange = document.getWordRangeAtPosition(position, /[-A-Za-z_][\w-]*/);
+  if (!wordRange) {
+    return undefined;
+  }
+
+  const word = document.getText(wordRange);
+  const start = wordRange.start.character;
+  const end = wordRange.end.character;
+  const quote = lineText[start - 1];
+  if ((quote !== "'" && quote !== '"') || lineText[end] !== quote) {
+    return undefined;
+  }
+
+  const prefixText = lineText.slice(0, start - 1);
+  if (!/\b(?:fields|include)\s*=\s*\[[^\]]*$/.test(prefixText)) {
+    return undefined;
+  }
+
+  return { value: word };
+}
+
+function bulkUpdateFieldListHoverLiteral(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): BulkUpdateFieldListLiteral | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const lineStartOffset = document.offsetAt(new vscode.Position(position.line, 0));
+
+  for (const match of lineText.matchAll(BULK_UPDATE_FIELD_LIST_HOVER_PATTERN)) {
+    const value = match[2];
+    const prefix = match[0];
+    const localOffset = prefix.lastIndexOf(value);
+    const start = (match.index ?? 0) + localOffset;
+    const end = start + value.length;
+
+    if (position.character < start || position.character > end) {
+      continue;
+    }
+
+    const callContext = bulkUpdateFieldListCallContext(
+      document.getText(),
+      lineStartOffset + start
+    );
+    if (!callContext) {
+      return undefined;
+    }
+
+    return {
+      receiverExpression: callContext.receiverExpression,
+      value,
+    };
+  }
+
+  return undefined;
 }
 
 function relationHoverLiteral(
@@ -1357,6 +2396,102 @@ function importReferenceAtPosition(
   }
 
   return undefined;
+}
+
+async function resolveImportReferenceAtPosition(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  position: vscode.Position
+): Promise<ImportReference | undefined> {
+  const directReference = importReferenceAtPosition(document, position);
+  if (directReference) {
+    return directReference;
+  }
+
+  const wordRange = document.getWordRangeAtPosition(position, /[A-Za-z_][\w]*/);
+  if (!wordRange) {
+    return undefined;
+  }
+
+  const hoveredWord = document.getText(wordRange);
+  const beforeOffset = document.offsetAt(wordRange.start);
+  const bindings = collectImportBindings(document, beforeOffset);
+
+  const moduleMemberReference = await resolveImportedModuleMemberReference(
+    daemon,
+    document,
+    wordRange,
+    bindings,
+    hoveredWord
+  );
+  if (moduleMemberReference) {
+    return moduleMemberReference;
+  }
+
+  const moduleName = await resolveImportedModuleAlias(
+    daemon,
+    bindings,
+    hoveredWord
+  );
+  if (moduleName) {
+    return {
+      kind: 'module',
+      moduleName,
+    };
+  }
+
+  const directBinding = bindings.symbols.get(hoveredWord);
+  if (!directBinding) {
+    return undefined;
+  }
+
+  return {
+    kind: 'symbol',
+    moduleName: directBinding.moduleName,
+    symbol: directBinding.symbolName,
+  };
+}
+
+async function resolveImportedModuleMemberReference(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  wordRange: vscode.Range,
+  bindings: ImportBindings,
+  memberName: string
+): Promise<ImportReference | undefined> {
+  const lineText = document.lineAt(wordRange.start.line).text;
+  if (
+    wordRange.start.character === 0 ||
+    lineText[wordRange.start.character - 1] !== '.'
+  ) {
+    return undefined;
+  }
+
+  let objectEnd = wordRange.start.character - 1;
+  let objectStart = objectEnd;
+  while (objectStart > 0 && /[A-Za-z0-9_]/.test(lineText[objectStart - 1] ?? '')) {
+    objectStart -= 1;
+  }
+
+  const objectName = lineText.slice(objectStart, objectEnd);
+  if (!/^[A-Za-z_][\w]*$/.test(objectName)) {
+    return undefined;
+  }
+
+  const moduleName = await resolveImportedModuleAlias(
+    daemon,
+    bindings,
+    objectName
+  );
+  if (!moduleName) {
+    return undefined;
+  }
+
+  return {
+    kind: 'symbol',
+    moduleName,
+    symbol: memberName,
+  };
 }
 
 function buildRelationHover(
@@ -1549,7 +2684,7 @@ function buildLookupItemMarkdown(
 ): vscode.MarkdownString {
   const markdown = new vscode.MarkdownString(undefined, true);
   markdown.appendMarkdown(`**${item.name}**\n\n`);
-  markdown.appendMarkdown(`Method: \`${method}\`\n\n`);
+  markdown.appendMarkdown(`Method: \`${lookupMethodLabel(method)}\`\n\n`);
   markdown.appendMarkdown(`Base model: \`${baseModelLabel}\`\n\n`);
   markdown.appendMarkdown(`Owner model: \`${item.modelLabel}\`\n\n`);
   if (item.fieldKind === 'lookup_operator') {
@@ -1572,6 +2707,201 @@ function buildLookupItemMarkdown(
   }
 
   return markdown;
+}
+
+function mergeLookupCompletionItems(
+  baseItems: LookupPathItem[],
+  additionalItems: LookupPathItem[]
+): LookupPathItem[] {
+  if (additionalItems.length === 0) {
+    return baseItems;
+  }
+
+  const merged = [...baseItems];
+  const seenKeys = new Set(
+    baseItems.map((item) => `${item.name}:${item.lookupOperator ?? ''}`)
+  );
+  for (const item of additionalItems) {
+    const key = `${item.name}:${item.lookupOperator ?? ''}`;
+    if (seenKeys.has(key)) {
+      continue;
+    }
+    seenKeys.add(key);
+    merged.push(item);
+  }
+
+  return merged;
+}
+
+function virtualLookupCompletionItems(
+  receiver: OrmReceiverInfo,
+  prefix: string,
+  method: string
+): LookupPathItem[] {
+  const virtualFields = receiver.virtualFields ?? [];
+  if (virtualFields.length === 0) {
+    return [];
+  }
+
+  const normalizedPrefix = normalizeVirtualLookupPrefix(prefix, method);
+  const segments = normalizedPrefix.split('__').filter(Boolean);
+  const endsWithSeparator = normalizedPrefix.endsWith('__');
+
+  if (segments.length === 0) {
+    return virtualFields
+      .filter((field) => field.name.startsWith(''))
+      .map((field) => virtualFieldToLookupPathItem(field, receiver.modelLabel));
+  }
+
+  if (segments.length === 1 && !endsWithSeparator) {
+    return virtualFields
+      .filter((field) => field.name.startsWith(segments[0]))
+      .map((field) => virtualFieldToLookupPathItem(field, receiver.modelLabel));
+  }
+
+  const fieldName = segments[0];
+  const virtualField = virtualFields.find((field) => field.name === fieldName);
+  if (!virtualField) {
+    return [];
+  }
+
+  if (!supportsVirtualLookupOperators(method)) {
+    return [];
+  }
+
+  const operatorPrefix =
+    segments.length <= 1
+      ? ''
+      : endsWithSeparator
+        ? ''
+        : segments.slice(1).join('__');
+  if (segments.length > 2) {
+    return [];
+  }
+
+  return [...VIRTUAL_LOOKUP_OPERATORS]
+    .filter((operator) => operator.startsWith(operatorPrefix))
+    .map((operator) =>
+      virtualLookupOperatorItem(
+        receiver.modelLabel,
+        virtualField,
+        operator
+      )
+    );
+}
+
+function resolveVirtualLookupPath(
+  receiver: OrmReceiverInfo,
+  value: string,
+  method: string
+): LookupPathResolution | undefined {
+  const virtualFields = receiver.virtualFields ?? [];
+  if (virtualFields.length === 0) {
+    return undefined;
+  }
+
+  const normalizedValue = normalizeVirtualLookupPrefix(value, method).trim();
+  if (!normalizedValue) {
+    return undefined;
+  }
+
+  const segments = normalizedValue.split('__').filter(Boolean);
+  if (segments.length === 0) {
+    return undefined;
+  }
+
+  const virtualField = virtualFields.find((field) => field.name === segments[0]);
+  if (!virtualField) {
+    return undefined;
+  }
+
+  const target = virtualFieldToLookupPathItem(virtualField, receiver.modelLabel);
+  const resolvedSegments = [target];
+
+  if (segments.length === 1) {
+    return {
+      resolved: true,
+      target,
+      resolvedSegments,
+      baseModelLabel: receiver.modelLabel,
+    };
+  }
+
+  if (!supportsVirtualLookupOperators(method)) {
+    return {
+      resolved: false,
+      reason: 'non_relation_intermediate',
+      resolvedSegments,
+      missingSegment: segments[1],
+      baseModelLabel: receiver.modelLabel,
+    };
+  }
+
+  if (segments.length > 2) {
+    return {
+      resolved: false,
+      reason: 'invalid_lookup_operator',
+      resolvedSegments,
+      missingSegment: segments[2],
+      baseModelLabel: receiver.modelLabel,
+    };
+  }
+
+  const operator = segments[1];
+  if (![...VIRTUAL_LOOKUP_OPERATORS].includes(operator as (typeof VIRTUAL_LOOKUP_OPERATORS)[number])) {
+    return {
+      resolved: false,
+      reason: 'invalid_lookup_operator',
+      resolvedSegments,
+      missingSegment: operator,
+      baseModelLabel: receiver.modelLabel,
+    };
+  }
+
+  return {
+    resolved: true,
+    target,
+    resolvedSegments,
+    baseModelLabel: receiver.modelLabel,
+    lookupOperator: operator,
+  };
+}
+
+function normalizeVirtualLookupPrefix(value: string, method: string): string {
+  const trimmed = value.trim();
+  if (method === 'order_by' && trimmed.startsWith('-')) {
+    return trimmed.slice(1);
+  }
+  return trimmed;
+}
+
+function supportsVirtualLookupOperators(method: string): boolean {
+  return LOOKUP_OPERATOR_METHODS.has(method);
+}
+
+function virtualLookupOperatorItem(
+  ownerModelLabel: string,
+  field: VirtualOrmField,
+  operator: string
+): LookupPathItem {
+  return {
+    ...virtualFieldToLookupPathItem(field, ownerModelLabel),
+    name: operator,
+    fieldKind: 'lookup_operator',
+    lookupOperator: operator,
+  };
+}
+
+function lookupMethodLabel(method: string): string {
+  if (method === F_EXPRESSION_METHOD) {
+    return 'F() expression';
+  }
+
+  if (method.startsWith(EXPRESSION_PATH_METHOD_PREFIX)) {
+    return `${method.slice(EXPRESSION_PATH_METHOD_PREFIX.length)}() expression`;
+  }
+
+  return method;
 }
 
 function buildOrmMemberHover(
@@ -1618,6 +2948,89 @@ function buildOrmMemberMarkdown(
 
   markdown.appendMarkdown(`\n\nSource: \`${item.source}\``);
   return markdown;
+}
+
+function mergeVirtualOrmMemberItems(
+  items: OrmMemberItem[],
+  receiver: OrmReceiverInfo
+): OrmMemberItem[] {
+  const virtualItems = virtualOrmMemberItems(receiver);
+  if (virtualItems.length === 0) {
+    return items;
+  }
+
+  const merged = [...items];
+  const existingNames = new Set(items.map((item) => item.name));
+  for (const item of virtualItems) {
+    if (existingNames.has(item.name)) {
+      continue;
+    }
+    merged.push(item);
+  }
+
+  return merged;
+}
+
+function virtualOrmMemberItems(receiver: OrmReceiverInfo): OrmMemberItem[] {
+  const virtualFields = receiver.virtualFields ?? [];
+  if (virtualFields.length === 0) {
+    return [];
+  }
+
+  return virtualFields
+    .filter((field) => receiver.kind === 'instance' ? field.instanceAvailable : false)
+    .map((field) => virtualFieldToOrmMemberItem(field, receiver.modelLabel));
+}
+
+function resolveVirtualOrmMember(
+  receiver: OrmReceiverInfo,
+  memberName: string
+): OrmMemberResolution | undefined {
+  const item = virtualOrmMemberItems(receiver).find((entry) => entry.name === memberName);
+  if (!item) {
+    return undefined;
+  }
+
+  return {
+    resolved: true,
+    item,
+  };
+}
+
+function virtualFieldToOrmMemberItem(
+  field: VirtualOrmField,
+  modelLabel: string
+): OrmMemberItem {
+  return {
+    name: field.name,
+    memberKind: 'field',
+    modelLabel,
+    receiverKind: 'instance',
+    detail: field.detail,
+    source: field.source,
+    returnKind: 'scalar',
+    fieldKind: field.fieldKind,
+    filePath: field.filePath,
+    line: field.line,
+    column: field.column,
+    isRelation: false,
+  };
+}
+
+function virtualFieldToLookupPathItem(
+  field: VirtualOrmField,
+  modelLabel: string
+): LookupPathItem {
+  return {
+    name: field.name,
+    modelLabel,
+    filePath: field.filePath,
+    line: field.line,
+    column: field.column,
+    fieldKind: field.fieldKind,
+    isRelation: false,
+    source: field.source,
+  };
 }
 
 function definitionLocationFromRelationResolution(
@@ -1841,6 +3254,59 @@ function findLookupDiagnosticContexts(
       });
     }
 
+    for (const match of lineText.matchAll(F_EXPRESSION_HOVER_PATTERN)) {
+      const value = match[2];
+      const prefix = match[0];
+      const localOffset = prefix.lastIndexOf(value);
+      const start = (match.index ?? 0) + localOffset;
+      const absoluteStart = lineStartOffset + start;
+      const callContext = fExpressionCallContext(document.getText(), absoluteStart);
+      if (!callContext) {
+        continue;
+      }
+
+      const range = new vscode.Range(line, start, line, start + value.length);
+      const key = `${range.start.line}:${range.start.character}:${value}:${F_EXPRESSION_METHOD}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+
+      contexts.push({
+        receiverExpression: callContext.receiverExpression,
+        method: F_EXPRESSION_METHOD,
+        value,
+        range,
+      });
+    }
+
+    for (const match of lineText.matchAll(EXPRESSION_PATH_HOVER_PATTERN)) {
+      const value = match[3];
+      const prefix = match[0];
+      const localOffset = prefix.lastIndexOf(value);
+      const start = (match.index ?? 0) + localOffset;
+      const absoluteStart = lineStartOffset + start;
+      const callContext = expressionPathCallContext(document.getText(), absoluteStart);
+      if (!callContext) {
+        continue;
+      }
+
+      const method = expressionPathMethodName(callContext.expressionName);
+      const range = new vscode.Range(line, start, line, start + value.length);
+      const key = `${range.start.line}:${range.start.character}:${value}:${method}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+
+      contexts.push({
+        receiverExpression: callContext.receiverExpression,
+        method,
+        value,
+        range,
+      });
+    }
+
     for (const match of lineText.matchAll(/[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/g)) {
       const start = match.index ?? 0;
       const value = match[0];
@@ -1863,6 +3329,112 @@ function findLookupDiagnosticContexts(
       contexts.push({
         ...context,
         range,
+      });
+    }
+  }
+
+  return contexts;
+}
+
+function findDirectFieldDiagnosticContexts(
+  document: vscode.TextDocument
+): DirectFieldDiagnosticContext[] {
+  const contexts: DirectFieldDiagnosticContext[] = [];
+  const seen = new Set<string>();
+
+  for (let line = 0; line < document.lineCount; line += 1) {
+    const lineText = document.lineAt(line).text;
+
+    for (const match of lineText.matchAll(/[A-Za-z_][\w]*/g)) {
+      const start = match.index ?? 0;
+      const value = match[0];
+      const position = new vscode.Position(
+        line,
+        start + Math.floor(value.length / 2)
+      );
+      const context = directFieldKeywordLiteral(document, position);
+      if (!context) {
+        continue;
+      }
+
+      const range = new vscode.Range(line, start, line, start + value.length);
+      const key = `${range.start.line}:${range.start.character}:${context.value}:${context.method}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      contexts.push({
+        ...context,
+        range,
+      });
+    }
+  }
+
+  return contexts;
+}
+
+function findSchemaFieldDiagnosticContexts(
+  document: vscode.TextDocument
+): SchemaFieldDiagnosticContext[] {
+  const contexts: SchemaFieldDiagnosticContext[] = [];
+  const seen = new Set<string>();
+
+  for (let line = 0; line < document.lineCount; line += 1) {
+    const lineText = document.lineAt(line).text;
+    for (const match of lineText.matchAll(/[-A-Za-z_][\w-]*/g)) {
+      const value = match[0];
+      const start = match.index ?? 0;
+      const context = schemaFieldHoverLiteral(
+        document,
+        new vscode.Position(line, start + Math.floor(value.length / 2))
+      );
+      if (!context) {
+        continue;
+      }
+
+      const key = `${line}:${start}:${context.value}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      contexts.push({
+        value: context.value,
+        range: new vscode.Range(line, start, line, start + context.value.length),
+      });
+    }
+  }
+
+  return contexts;
+}
+
+function findBulkUpdateFieldDiagnosticContexts(
+  document: vscode.TextDocument
+): BulkUpdateFieldListDiagnosticContext[] {
+  const contexts: BulkUpdateFieldListDiagnosticContext[] = [];
+  const seen = new Set<string>();
+
+  for (let line = 0; line < document.lineCount; line += 1) {
+    const lineText = document.lineAt(line).text;
+    for (const match of lineText.matchAll(/[-A-Za-z_][\w-]*/g)) {
+      const value = match[0];
+      const start = match.index ?? 0;
+      const context = bulkUpdateFieldListHoverLiteral(
+        document,
+        new vscode.Position(line, start + Math.floor(value.length / 2))
+      );
+      if (!context) {
+        continue;
+      }
+
+      const key = `${line}:${start}:${context.value}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      contexts.push({
+        receiverExpression: context.receiverExpression,
+        value: context.value,
+        range: new vscode.Range(line, start, line, start + context.value.length),
       });
     }
   }
@@ -1937,6 +3509,75 @@ function buildLookupDiagnostic(
   const diagnostic = new vscode.Diagnostic(
     context.range,
     message,
+    vscode.DiagnosticSeverity.Error
+  );
+  diagnostic.source = 'Django ORM Intellisense';
+  return diagnostic;
+}
+
+function buildDirectFieldDiagnostic(
+  context: DirectFieldDiagnosticContext,
+  baseModelLabel: string,
+  resolution: LookupPathResolution
+): vscode.Diagnostic | undefined {
+  if (
+    resolution.resolved &&
+    resolution.target &&
+    !resolution.lookupOperator &&
+    !context.value.includes('__')
+  ) {
+    return undefined;
+  }
+
+  const diagnostic = new vscode.Diagnostic(
+    context.range,
+    `Unknown model field \`${context.value}\` for \`${baseModelLabel}\` in \`${context.method}()\`.`,
+    vscode.DiagnosticSeverity.Error
+  );
+  diagnostic.source = 'Django ORM Intellisense';
+  return diagnostic;
+}
+
+function buildSchemaFieldDiagnostic(
+  context: SchemaFieldDiagnosticContext,
+  baseModelLabel: string,
+  resolution: LookupPathResolution
+): vscode.Diagnostic | undefined {
+  if (
+    resolution.resolved &&
+    resolution.target &&
+    !resolution.lookupOperator &&
+    !context.value.includes('__')
+  ) {
+    return undefined;
+  }
+
+  const diagnostic = new vscode.Diagnostic(
+    context.range,
+    `Unknown schema field \`${context.value}\` for \`${baseModelLabel}\`.`,
+    vscode.DiagnosticSeverity.Error
+  );
+  diagnostic.source = 'Django ORM Intellisense';
+  return diagnostic;
+}
+
+function buildBulkUpdateFieldDiagnostic(
+  context: BulkUpdateFieldListDiagnosticContext,
+  baseModelLabel: string,
+  resolution: LookupPathResolution
+): vscode.Diagnostic | undefined {
+  if (
+    resolution.resolved &&
+    resolution.target &&
+    !resolution.lookupOperator &&
+    !context.value.includes('__')
+  ) {
+    return undefined;
+  }
+
+  const diagnostic = new vscode.Diagnostic(
+    context.range,
+    `Unknown bulk_update field \`${context.value}\` for \`${baseModelLabel}\`.`,
     vscode.DiagnosticSeverity.Error
   );
   diagnostic.source = 'Django ORM Intellisense';
@@ -2099,13 +3740,10 @@ function ormMemberExpressionCandidates(
   );
   const localTokenStart = tokenStartOffset - windowStartOffset;
   const localEndOffset = endOffset - windowStartOffset;
-  const candidateStarts = new Set<number>([0]);
-
-  for (let index = 0; index < localTokenStart; index += 1) {
-    if ('\n;=,:([{'.includes(rawWindow[index] ?? '')) {
-      candidateStarts.add(index + 1);
-    }
-  }
+  const candidateStarts = topLevelExpressionCandidateStarts(
+    rawWindow,
+    localTokenStart
+  );
 
   return [...candidateStarts]
     .sort((left, right) => right - left)
@@ -2120,6 +3758,97 @@ function ormMemberExpressionCandidates(
       )
     )
     .filter((candidate, index, values) => candidate.length > 0 && values.indexOf(candidate) === index);
+}
+
+function topLevelExpressionCandidateStarts(
+  text: string,
+  beforeOffset: number
+): Set<number> {
+  const starts = new Set<number>([0]);
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let activeQuote: '"' | "'" | undefined;
+  let escaped = false;
+
+  for (let index = 0; index < beforeOffset; index += 1) {
+    const char = text[index];
+    if (!char) {
+      continue;
+    }
+
+    if (activeQuote) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+
+      if (char === activeQuote) {
+        activeQuote = undefined;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      activeQuote = char;
+      continue;
+    }
+
+    if (char === '(') {
+      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+        starts.add(index + 1);
+      }
+      parenDepth += 1;
+      continue;
+    }
+
+    if (char === '[') {
+      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+        starts.add(index + 1);
+      }
+      bracketDepth += 1;
+      continue;
+    }
+
+    if (char === '{') {
+      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+        starts.add(index + 1);
+      }
+      braceDepth += 1;
+      continue;
+    }
+
+    if (char === ')' && parenDepth > 0) {
+      parenDepth -= 1;
+      continue;
+    }
+
+    if (char === ']' && bracketDepth > 0) {
+      bracketDepth -= 1;
+      continue;
+    }
+
+    if (char === '}' && braceDepth > 0) {
+      braceDepth -= 1;
+      continue;
+    }
+
+    if (
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0 &&
+      '\n;=,:'.includes(char)
+    ) {
+      starts.add(index + 1);
+    }
+  }
+
+  return starts;
 }
 
 function parseTrailingMemberAccessCandidate(
@@ -2187,13 +3916,32 @@ async function resolveOrmReceiverAtOffset(
       dynamicObjectReceiver
     );
     if (objectReceiver) {
+      const virtualResolution = resolveVirtualOrmMember(
+        objectReceiver,
+        memberAccess.memberName
+      );
+      if (virtualResolution) {
+        const resolvedReceiver = receiverFromOrmMemberResolution(
+          virtualResolution,
+          objectReceiver,
+          memberAccess.memberName
+        );
+        if (resolvedReceiver) {
+          return resolvedReceiver;
+        }
+      }
+
       const resolution = await daemon.resolveOrmMember(
         objectReceiver.modelLabel,
         objectReceiver.kind,
         memberAccess.memberName,
         objectReceiver.managerName
       );
-      const resolvedReceiver = receiverFromOrmMemberResolution(resolution);
+      const resolvedReceiver = receiverFromOrmMemberResolution(
+        resolution,
+        objectReceiver,
+        memberAccess.memberName
+      );
       if (resolvedReceiver) {
         return resolvedReceiver;
       }
@@ -2252,6 +4000,17 @@ async function resolveOrmReceiverAtOffset(
     return annotatedReceiver;
   }
 
+  const tupleAssignedReceiver = await resolveTupleAssignedReceiverAtOffset(
+    daemon,
+    document,
+    rootIdentifier,
+    beforeOffset,
+    visited
+  );
+  if (tupleAssignedReceiver) {
+    return tupleAssignedReceiver;
+  }
+
   const assignment = findNearestAssignedExpression(
     document,
     rootIdentifier,
@@ -2274,6 +4033,10 @@ function preferMemberReceiver(
   staticReceiver: OrmReceiverInfo | undefined,
   dynamicReceiver: OrmReceiverInfo | undefined
 ): OrmReceiverInfo | undefined {
+  if (staticReceiver?.virtualFields?.length) {
+    return staticReceiver;
+  }
+
   if (
     staticReceiver &&
     staticReceiver.kind !== 'instance' &&
@@ -2325,13 +4088,32 @@ async function resolveDynamicInstanceReceiverAtOffset(
       dynamicObjectReceiver
     );
     if (objectReceiver) {
+      const virtualResolution = resolveVirtualOrmMember(
+        objectReceiver,
+        memberAccess.memberName
+      );
+      if (virtualResolution) {
+        const resolvedReceiver = receiverFromOrmMemberResolution(
+          virtualResolution,
+          objectReceiver,
+          memberAccess.memberName
+        );
+        if (resolvedReceiver) {
+          return resolvedReceiver;
+        }
+      }
+
       const resolution = await daemon.resolveOrmMember(
         objectReceiver.modelLabel,
         objectReceiver.kind,
         memberAccess.memberName,
         objectReceiver.managerName
       );
-      const resolvedReceiver = receiverFromOrmMemberResolution(resolution);
+      const resolvedReceiver = receiverFromOrmMemberResolution(
+        resolution,
+        objectReceiver,
+        memberAccess.memberName
+      );
       if (resolvedReceiver) {
         return resolvedReceiver;
       }
@@ -2430,15 +4212,41 @@ async function resolveOrmReceiverFromCallExpression(
     visited
   );
   if (objectReceiver) {
+    const virtualResolution = resolveVirtualOrmMember(
+      objectReceiver,
+      parsedCall.memberName
+    );
+    if (virtualResolution) {
+      const resolvedReceiver = receiverFromOrmMemberResolution(
+        virtualResolution,
+        objectReceiver,
+        parsedCall.memberName,
+        expression
+      );
+      if (resolvedReceiver) {
+        return resolvedReceiver;
+      }
+    }
+
     const resolution = await daemon.resolveOrmMember(
       objectReceiver.modelLabel,
       objectReceiver.kind,
       parsedCall.memberName,
       objectReceiver.managerName
     );
-    const resolvedReceiver = receiverFromOrmMemberResolution(resolution);
+    const resolvedReceiver = receiverFromOrmMemberResolution(
+      resolution,
+      objectReceiver,
+      parsedCall.memberName,
+      expression
+    );
     if (resolvedReceiver) {
-      return resolvedReceiver;
+      const sourceResolvedReceiver = await resolveReceiverFromOrmMemberSource(
+        daemon,
+        resolution.item,
+        visited
+      );
+      return mergeReceiverVirtualFields(resolvedReceiver, sourceResolvedReceiver);
     }
   }
 
@@ -2534,17 +4342,28 @@ async function resolveOrmReceiverFromBaseClasses(
 }
 
 function receiverFromOrmMemberResolution(
-  resolution: OrmMemberResolution
+  resolution: OrmMemberResolution,
+  sourceReceiver?: OrmReceiverInfo,
+  memberName?: string,
+  expression?: string
 ): OrmReceiverInfo | undefined {
   if (!resolution.resolved || !resolution.item) {
     return undefined;
   }
 
-  return receiverFromOrmMemberItem(resolution.item);
+  return receiverFromOrmMemberItem(
+    resolution.item,
+    sourceReceiver,
+    memberName,
+    expression
+  );
 }
 
 function receiverFromOrmMemberItem(
-  item: OrmMemberItem
+  item: OrmMemberItem,
+  sourceReceiver?: OrmReceiverInfo,
+  memberName?: string,
+  expression?: string
 ): OrmReceiverInfo | undefined {
   if (!item.returnKind || !isOrmReceiverKind(item.returnKind)) {
     return undefined;
@@ -2565,7 +4384,398 @@ function receiverFromOrmMemberItem(
       item.returnKind === 'manager'
         ? item.managerName ?? item.name
         : item.managerName,
+    virtualFields: propagateVirtualFields(
+      sourceReceiver,
+      item.returnKind,
+      memberName,
+      expression
+    ),
   };
+}
+
+function mergeReceiverVirtualFields(
+  baseReceiver: OrmReceiverInfo,
+  sourceReceiver: OrmReceiverInfo | undefined
+): OrmReceiverInfo {
+  if (!sourceReceiver?.virtualFields?.length) {
+    return baseReceiver;
+  }
+
+  return {
+    ...baseReceiver,
+    virtualFields: dedupeVirtualFields([
+      ...(baseReceiver.virtualFields ?? []),
+      ...sourceReceiver.virtualFields,
+    ]),
+  };
+}
+
+async function resolveReceiverFromOrmMemberSource(
+  daemon: AnalysisDaemon,
+  item: OrmMemberItem | undefined,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  if (!item?.filePath || !item.line) {
+    return undefined;
+  }
+
+  const source = await resolveFunctionDefinitionSourceFromFile(
+    item.filePath,
+    item.name,
+    item.line
+  );
+  if (!source) {
+    return undefined;
+  }
+
+  const directAnnotatedReceiver = resolveDirectAnnotatedReceiverFromFunctionSource(
+    item,
+    source
+  );
+  if (directAnnotatedReceiver) {
+    return directAnnotatedReceiver;
+  }
+
+  return resolveOrmReceiverFromFunctionSource(daemon, source, visited);
+}
+
+function propagateVirtualFields(
+  sourceReceiver: OrmReceiverInfo | undefined,
+  returnKind: OrmReceiverKind,
+  memberName: string | undefined,
+  expression: string | undefined
+): VirtualOrmField[] | undefined {
+  const inheritedFields = sourceReceiver?.virtualFields ?? [];
+  const nextFields = [...inheritedFields];
+
+  if (memberName === 'annotate' || memberName === 'alias') {
+    nextFields.push(
+      ...parseVirtualFieldsFromAnnotatedCall(expression, memberName === 'annotate')
+    );
+  }
+
+  const mergedFields = dedupeVirtualFields(nextFields);
+  if (mergedFields.length === 0) {
+    return undefined;
+  }
+
+  if (
+    returnKind === 'queryset' &&
+    memberName &&
+    QUERYSET_ANNOTATION_PRESERVING_METHODS.has(memberName)
+  ) {
+    return mergedFields;
+  }
+
+  if (
+    returnKind === 'instance' &&
+    memberName &&
+    INSTANCE_ANNOTATION_PRESERVING_METHODS.has(memberName)
+  ) {
+    return mergedFields.filter((field) => field.instanceAvailable);
+  }
+
+  return undefined;
+}
+
+function dedupeVirtualFields(fields: VirtualOrmField[]): VirtualOrmField[] {
+  const byName = new Map<string, VirtualOrmField>();
+  for (const field of fields) {
+    const existing = byName.get(field.name);
+    if (!existing) {
+      byName.set(field.name, field);
+      continue;
+    }
+
+    byName.set(field.name, {
+      ...field,
+      instanceAvailable: existing.instanceAvailable || field.instanceAvailable,
+    });
+  }
+
+  return [...byName.values()];
+}
+
+function parseVirtualFieldsFromAnnotatedCall(
+  expression: string | undefined,
+  instanceAvailable: boolean
+): VirtualOrmField[] {
+  if (!expression) {
+    return [];
+  }
+
+  const callDetails = parseCallExpressionDetails(expression);
+  if (!callDetails || callDetails.parsedCall.kind !== 'member') {
+    return [];
+  }
+
+  if (
+    callDetails.parsedCall.memberName !== 'annotate' &&
+    callDetails.parsedCall.memberName !== 'alias'
+  ) {
+    return [];
+  }
+
+  const fields: VirtualOrmField[] = [];
+  for (const argument of splitTopLevelExpressions(callDetails.argsText)) {
+    const equalsIndex = findTopLevelEqualsIndex(argument);
+    if (equalsIndex <= 0) {
+      continue;
+    }
+
+    const name = argument.slice(0, equalsIndex).trim();
+    const value = argument.slice(equalsIndex + 1).trim();
+    if (!/^[A-Za-z_][\w]*$/.test(name) || !value) {
+      continue;
+    }
+
+    fields.push(buildVirtualFieldFromExpression(name, value, instanceAvailable));
+  }
+
+  return fields;
+}
+
+function buildVirtualFieldFromExpression(
+  name: string,
+  expression: string,
+  instanceAvailable: boolean
+): VirtualOrmField {
+  const call = parseCallExpressionDetails(expression);
+  const expressionName =
+    call?.parsedCall.kind === 'function'
+      ? call.parsedCall.functionName
+      : call?.parsedCall.kind === 'member'
+        ? call.parsedCall.memberName
+        : undefined;
+
+  return {
+    name,
+    detail: expressionName
+      ? `Annotated ${expressionName}() expression`
+      : 'Annotated expression',
+    fieldKind: inferVirtualFieldKind(expressionName),
+    source: ANNOTATED_MEMBER_SOURCE,
+    instanceAvailable,
+    expressionName,
+  };
+}
+
+function inferVirtualFieldKind(expressionName: string | undefined): string {
+  switch (expressionName) {
+    case 'Count':
+      return 'IntegerField';
+    case 'Exists':
+      return 'BooleanField';
+    case 'Avg':
+    case 'Sum':
+    case 'Min':
+    case 'Max':
+      return 'annotation';
+    default:
+      return 'annotation';
+  }
+}
+
+async function resolveFunctionDefinitionSourceFromFile(
+  filePath: string,
+  functionName: string,
+  line: number
+): Promise<FunctionDefinitionSource | undefined> {
+  try {
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+    const targetLine = Math.max(0, line - 1);
+    const directMatch = findFunctionDefinitionAtLine(document, functionName, targetLine);
+    const functionDef = directMatch ?? findNearestNamedFunctionDefinition(document, functionName, targetLine);
+    if (!functionDef) {
+      return undefined;
+    }
+
+    return {
+      document,
+      functionDef,
+      beforeOffset: document.offsetAt(new vscode.Position(functionDef.line, 0)),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function findFunctionDefinitionAtLine(
+  document: vscode.TextDocument,
+  functionName: string,
+  line: number
+): PythonFunctionDefinition | undefined {
+  if (line < 0 || line >= document.lineCount) {
+    return undefined;
+  }
+
+  const match = document.lineAt(line).text.match(FUNCTION_DEFINITION_PATTERN);
+  if (!match || match[2] !== functionName) {
+    return undefined;
+  }
+
+  return buildFunctionDefinition(document, line, match);
+}
+
+function findNearestNamedFunctionDefinition(
+  document: vscode.TextDocument,
+  functionName: string,
+  line: number
+): PythonFunctionDefinition | undefined {
+  for (let radius = 1; radius <= 4; radius += 1) {
+    const before = findFunctionDefinitionAtLine(document, functionName, line - radius);
+    if (before) {
+      return before;
+    }
+
+    const after = findFunctionDefinitionAtLine(document, functionName, line + radius);
+    if (after) {
+      return after;
+    }
+  }
+
+  return undefined;
+}
+
+function resolveDirectAnnotatedReceiverFromFunctionSource(
+  item: OrmMemberItem,
+  source: FunctionDefinitionSource
+): OrmReceiverInfo | undefined {
+  const returnExpressions = collectReturnExpressions(
+    source.document,
+    source.functionDef
+  );
+  if (returnExpressions.length !== 1) {
+    return undefined;
+  }
+
+  const expression = normalizeReceiverExpression(returnExpressions[0].expression);
+  const parsedCall = parseCalledExpression(expression);
+  if (!parsedCall || parsedCall.kind !== 'member') {
+    return undefined;
+  }
+
+  if (
+    parsedCall.objectExpression !== 'self' &&
+    parsedCall.objectExpression !== 'cls' &&
+    parsedCall.objectExpression !== 'super()'
+  ) {
+    return undefined;
+  }
+
+  if (parsedCall.memberName !== 'annotate' && parsedCall.memberName !== 'alias') {
+    return undefined;
+  }
+
+  return {
+    kind: 'queryset',
+    modelLabel: item.modelLabel,
+    virtualFields: parseVirtualFieldsFromAnnotatedCall(
+      expression,
+      parsedCall.memberName === 'annotate'
+    ),
+  };
+}
+
+async function resolveTupleAssignedReceiverAtOffset(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  variableName: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  const assignment = findNearestTupleAssignedExpression(
+    document,
+    variableName,
+    beforeOffset
+  );
+  if (!assignment || assignment.tupleIndex !== 0) {
+    return undefined;
+  }
+
+  const parsedCall = parseCalledExpression(
+    normalizeReceiverExpression(assignment.expression)
+  );
+  if (!parsedCall || parsedCall.kind !== 'member') {
+    return undefined;
+  }
+
+  if (
+    parsedCall.memberName !== 'get_or_create' &&
+    parsedCall.memberName !== 'update_or_create'
+  ) {
+    return undefined;
+  }
+
+  const sourceReceiver = await resolveOrmReceiverAtOffset(
+    daemon,
+    document,
+    parsedCall.objectExpression,
+    assignment.offset,
+    visited
+  );
+  if (!sourceReceiver) {
+    return undefined;
+  }
+
+  return {
+    kind: 'instance',
+    modelLabel: sourceReceiver.modelLabel,
+  };
+}
+
+async function resolveBulkCreateIterableElementReceiverAtOffset(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  expression: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  const normalizedExpression = normalizeReceiverExpression(expression);
+  if (!normalizedExpression) {
+    return undefined;
+  }
+
+  const parsedCall = parseCalledExpression(normalizedExpression);
+  if (parsedCall?.kind === 'member' && parsedCall.memberName === 'bulk_create') {
+    const sourceReceiver = await resolveOrmReceiverAtOffset(
+      daemon,
+      document,
+      parsedCall.objectExpression,
+      beforeOffset,
+      visited
+    );
+    if (!sourceReceiver) {
+      return undefined;
+    }
+
+    return {
+      kind: 'instance',
+      modelLabel: sourceReceiver.modelLabel,
+    };
+  }
+
+  const rootIdentifier = receiverRootIdentifier(normalizedExpression);
+  if (!rootIdentifier) {
+    return undefined;
+  }
+
+  const assignment = findNearestAssignedExpression(
+    document,
+    rootIdentifier,
+    beforeOffset
+  );
+  if (!assignment) {
+    return undefined;
+  }
+
+  return resolveBulkCreateIterableElementReceiverAtOffset(
+    daemon,
+    document,
+    assignment.expression,
+    assignment.offset,
+    visited
+  );
 }
 
 async function resolveOrmReceiverFromLoopTarget(
@@ -2594,6 +4804,18 @@ async function resolveOrmReceiverFromLoopTarget(
   const resolvedLoopReceiver = receiverFromIterableReceiver(iterableReceiver);
   if (resolvedLoopReceiver) {
     return resolvedLoopReceiver;
+  }
+
+  const bulkCreateLoopReceiver =
+    await resolveBulkCreateIterableElementReceiverAtOffset(
+      daemon,
+      document,
+      loopIterable.expression,
+      loopIterable.offset,
+      visited
+    );
+  if (bulkCreateLoopReceiver) {
+    return bulkCreateLoopReceiver;
   }
 
   const iterableIdentifier = receiverRootIdentifier(loopIterable.expression);
@@ -2636,7 +4858,10 @@ function receiverFromIterableReceiver(
 }
 
 function receiverInfoKey(receiver: OrmReceiverInfo): string {
-  return `${receiver.kind}:${receiver.modelLabel}:${receiver.managerName ?? ''}`;
+  return `${receiver.kind}:${receiver.modelLabel}:${receiver.managerName ?? ''}:${(receiver.virtualFields ?? [])
+    .map((field) => field.name)
+    .sort()
+    .join(',')}`;
 }
 
 function isOrmReceiverKind(value: string): value is OrmReceiverKind {
@@ -2664,6 +4889,56 @@ async function resolveBaseModelLabelForReceiver(
     document.offsetAt(position),
     new Set()
   );
+}
+
+async function resolveLookupReceiverInfoForReceiver(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  receiverExpression: string,
+  position: vscode.Position
+): Promise<OrmReceiverInfo | undefined> {
+  return resolveLookupReceiverInfoForReceiverAtOffset(
+    daemon,
+    document,
+    receiverExpression,
+    document.offsetAt(position),
+    new Set()
+  );
+}
+
+async function resolveLookupReceiverInfoForReceiverAtOffset(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  receiverExpression: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  const resolvedReceiver = await resolveLookupReceiverAtOffset(
+    daemon,
+    document,
+    receiverExpression,
+    beforeOffset,
+    visited
+  );
+  if (resolvedReceiver) {
+    return resolvedReceiver;
+  }
+
+  const modelLabel = await resolveBaseModelLabelForReceiverAtOffset(
+    daemon,
+    document,
+    receiverExpression,
+    beforeOffset,
+    new Set()
+  );
+  if (!modelLabel) {
+    return undefined;
+  }
+
+  return {
+    kind: 'model_class',
+    modelLabel,
+  };
 }
 
 async function resolveBaseModelLabelForReceiverAtOffset(
@@ -2956,10 +5231,22 @@ async function resolveLookupReceiverFromCallExpression(
       objectReceiver.managerName
     );
     const resolvedReceiver = asLookupReceiver(
-      receiverFromOrmMemberResolution(resolution)
+      receiverFromOrmMemberResolution(
+        resolution,
+        objectReceiver,
+        parsedCall.memberName,
+        expression
+      )
     );
     if (resolvedReceiver) {
-      return resolvedReceiver;
+      const sourceResolvedReceiver = asLookupReceiver(
+        await resolveReceiverFromOrmMemberSource(
+          daemon,
+          resolution.item,
+          visited
+        )
+      );
+      return mergeReceiverVirtualFields(resolvedReceiver, sourceResolvedReceiver);
     }
   }
 
@@ -3554,6 +5841,52 @@ function findEnclosingClassDefinition(
   return undefined;
 }
 
+function findEnclosingParentClassDefinition(
+  document: vscode.TextDocument,
+  childClass: PythonClassDefinition
+): PythonClassDefinition | undefined {
+  for (let line = childClass.line - 1; line >= 0; line -= 1) {
+    const match = document.lineAt(line).text.match(CLASS_DEFINITION_PATTERN);
+    if (!match) {
+      continue;
+    }
+
+    const classDef = buildClassDefinition(document, line, match);
+    if (
+      classDef.indent < childClass.indent &&
+      classDef.line < childClass.line &&
+      classDef.endLine >= childClass.endLine
+    ) {
+      return classDef;
+    }
+  }
+
+  return undefined;
+}
+
+async function resolveMetaOwnerModelLabel(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  position: vscode.Position
+): Promise<string | undefined> {
+  const metaClass = findEnclosingClassDefinition(document, document.offsetAt(position));
+  if (!metaClass || metaClass.name !== 'Meta') {
+    return undefined;
+  }
+
+  const ownerClass = findEnclosingParentClassDefinition(document, metaClass);
+  if (!ownerClass) {
+    return undefined;
+  }
+
+  return resolveModelLabelFromSymbol(
+    daemon,
+    document,
+    ownerClass.name,
+    document.offsetAt(new vscode.Position(ownerClass.line, 0))
+  );
+}
+
 function findEnclosingFunctionDefinition(
   document: vscode.TextDocument,
   beforeOffset: number
@@ -3791,6 +6124,35 @@ function parseCalledExpression(expression: string): ParsedCallExpression | undef
   return undefined;
 }
 
+function parseCallExpressionDetails(
+  expression: string
+): { parsedCall: ParsedCallExpression; argsText: string } | undefined {
+  const normalizedExpression = stripWrappingParentheses(expression.trim());
+  if (!normalizedExpression.endsWith(')')) {
+    return undefined;
+  }
+
+  const openParenIndex = findMatchingOpeningDelimiter(
+    normalizedExpression,
+    normalizedExpression.length - 1,
+    '(',
+    ')'
+  );
+  if (openParenIndex === undefined) {
+    return undefined;
+  }
+
+  const parsedCall = parseCalledExpression(normalizedExpression);
+  if (!parsedCall) {
+    return undefined;
+  }
+
+  return {
+    parsedCall,
+    argsText: normalizedExpression.slice(openParenIndex + 1, -1),
+  };
+}
+
 function splitTopLevelMemberAccess(
   expression: string
 ): { objectExpression: string; memberName: string } | undefined {
@@ -3922,6 +6284,34 @@ function findMatchingOpeningDelimiter(
   return undefined;
 }
 
+function findMatchingClosingDelimiter(
+  text: string,
+  openingIndex: number,
+  openingDelimiter: string,
+  closingDelimiter: string
+): number | undefined {
+  let depth = 0;
+
+  for (let index = openingIndex; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === openingDelimiter) {
+      depth += 1;
+      continue;
+    }
+
+    if (char !== closingDelimiter) {
+      continue;
+    }
+
+    depth -= 1;
+    if (depth === 0) {
+      return index;
+    }
+  }
+
+  return undefined;
+}
+
 function bracketBalance(value: string): number {
   let balance = 0;
 
@@ -4023,6 +6413,46 @@ function findNearestAssignedExpression(
     return {
       expression: rawExpression,
       offset: expressionOffset,
+    };
+  }
+
+  return undefined;
+}
+
+function findNearestTupleAssignedExpression(
+  document: vscode.TextDocument,
+  variableName: string,
+  beforeOffset: number
+): { expression: string; offset: number; tupleIndex: number } | undefined {
+  const beforePosition = document.positionAt(beforeOffset);
+
+  for (let line = beforePosition.line; line >= 0; line -= 1) {
+    const lineText = document.lineAt(line).text;
+    const equalsIndex = findTopLevelEqualsIndex(lineText);
+    if (equalsIndex <= 0) {
+      continue;
+    }
+
+    const assignmentTarget = lineText.slice(0, equalsIndex).trim();
+    if (!assignmentTarget.includes(',')) {
+      continue;
+    }
+
+    const targets = splitTopLevelExpressions(assignmentTarget);
+    const tupleIndex = targets.findIndex((target) => target.trim() === variableName);
+    if (tupleIndex < 0) {
+      continue;
+    }
+
+    const rawExpression = stripTrailingComment(lineText.slice(equalsIndex + 1)).trim();
+    if (!rawExpression) {
+      continue;
+    }
+
+    return {
+      expression: rawExpression,
+      offset: document.offsetAt(new vscode.Position(line, 0)),
+      tupleIndex,
     };
   }
 
@@ -4697,6 +7127,33 @@ function compactPythonExpression(value: string): string {
   return value.replace(/\s+/g, '');
 }
 
+function trimLeadingUnmatchedOpeningDelimiters(value: string): string {
+  let current = value;
+
+  while (current.length > 0) {
+    const firstChar = current[0];
+    const closingDelimiter =
+      firstChar === '(' ? ')'
+      : firstChar === '[' ? ']'
+      : firstChar === '{' ? '}'
+      : undefined;
+    if (!closingDelimiter) {
+      return current;
+    }
+
+    if (
+      findMatchingClosingDelimiter(current, 0, firstChar, closingDelimiter) !==
+      undefined
+    ) {
+      return current;
+    }
+
+    current = current.slice(1);
+  }
+
+  return current;
+}
+
 function lookupReplacementLength(value: string): number {
   const segmentStartOffset = value.lastIndexOf('__');
   if (segmentStartOffset >= 0) {
@@ -4714,15 +7171,25 @@ function lookupFilterText(
   prefix: string,
   item: LookupPathItem
 ): string | undefined {
+  const normalizedPrefix = prefix.startsWith('-') ? prefix.slice(1) : prefix;
+  const prefixSegments = normalizedPrefix.split('__');
+
+  if (prefixSegments.length > 1) {
+    const leadingSegments = prefixSegments.slice(0, -1).filter(Boolean);
+    const baseFilterText = [...leadingSegments, item.name]
+      .filter(Boolean)
+      .join('__');
+    return prefix.startsWith('-') ? `-${baseFilterText}` : baseFilterText;
+  }
+
   if (
-    !prefix.includes('__') &&
     (item.fieldKind === 'lookup_operator' || item.fieldKind === 'lookup_transform') &&
     item.name.includes('__')
   ) {
     return item.name.split('__', 1)[0];
   }
 
-  return undefined;
+  return item.name;
 }
 
 function scanKeywordTokenStart(textBefore: string): number {
@@ -4740,6 +7207,10 @@ function isLookupKeywordCandidate(value: string): boolean {
   );
 }
 
+function isDirectFieldKeywordCandidate(value: string): boolean {
+  return value.length === 0 || /^[A-Za-z_][\w]*$/.test(value);
+}
+
 function querysetKeywordCallContext(
   text: string,
   tokenStartOffset: number,
@@ -4752,29 +7223,32 @@ function querysetKeywordCallContext(
       argumentEndOffset: number;
     }
   | undefined {
-  const openParenOffset = findEnclosingCallOpenParenOffset(
-    text,
-    tokenStartOffset
-  );
+  const openParenOffset = findEnclosingCallOpenParenOffset(text, tokenStartOffset);
   if (openParenOffset === undefined) {
     return undefined;
   }
 
-  const calleeMatch = parseQuerysetCallee(
+  const argumentStartOffset = findCurrentArgumentStartOffset(
     text,
     openParenOffset,
-    KEYWORD_LOOKUP_CALLEE_PATTERN
+    tokenStartOffset
+  );
+  const argumentEndOffset = findCurrentArgumentEndOffset(text, tokenEndOffset);
+
+  const directCalleeMatch = parseQuerysetCallee(
+    text,
+    openParenOffset,
+    KEYWORD_LOOKUP_METHODS
+  );
+  const calleeMatch = directCalleeMatch ?? resolveKeywordEnclosingQuerysetCallContext(
+    text,
+    openParenOffset
   );
   if (!calleeMatch) {
     return undefined;
   }
 
   const { receiverExpression, method } = calleeMatch;
-  const argumentStartOffset = findCurrentArgumentStartOffset(
-    text,
-    openParenOffset,
-    tokenStartOffset
-  );
   const argumentPrefix = text.slice(argumentStartOffset, tokenStartOffset);
   if (hasTopLevelEquals(argumentPrefix)) {
     return undefined;
@@ -4784,7 +7258,139 @@ function querysetKeywordCallContext(
     receiverExpression,
     method,
     argumentStartOffset,
-    argumentEndOffset: findCurrentArgumentEndOffset(text, tokenEndOffset),
+    argumentEndOffset,
+  };
+}
+
+function querysetDirectFieldKeywordCallContext(
+  text: string,
+  tokenStartOffset: number,
+  tokenEndOffset: number
+):
+  | {
+      receiverExpression: string;
+      method: string;
+      argumentStartOffset: number;
+      argumentEndOffset: number;
+    }
+  | undefined {
+  const openParenOffset = findEnclosingCallOpenParenOffset(text, tokenStartOffset);
+  if (openParenOffset === undefined) {
+    return undefined;
+  }
+
+  const argumentStartOffset = findCurrentArgumentStartOffset(
+    text,
+    openParenOffset,
+    tokenStartOffset
+  );
+  const argumentEndOffset = findCurrentArgumentEndOffset(text, tokenEndOffset);
+  const calleeMatch = parseQuerysetCallee(
+    text,
+    openParenOffset,
+    DIRECT_FIELD_KEYWORD_METHODS
+  );
+  if (!calleeMatch) {
+    return undefined;
+  }
+
+  const argumentPrefix = text.slice(argumentStartOffset, tokenStartOffset);
+  if (hasTopLevelEquals(argumentPrefix)) {
+    return undefined;
+  }
+
+  return {
+    receiverExpression: calleeMatch.receiverExpression,
+    method: calleeMatch.method,
+    argumentStartOffset,
+    argumentEndOffset,
+  };
+}
+
+function resolveKeywordEnclosingQuerysetCallContext(
+  text: string,
+  openParenOffset: number
+): { receiverExpression: string; method: string } | undefined {
+  if (
+    !isQExpressionCall(text, openParenOffset) &&
+    !isWhenExpressionCall(text, openParenOffset)
+  ) {
+    return undefined;
+  }
+
+  const directContext = resolveEnclosingQuerysetCallContext(
+    text,
+    openParenOffset,
+    KEYWORD_LOOKUP_METHODS,
+    (candidateText, candidateOpenParenOffset) =>
+      isQExpressionCall(candidateText, candidateOpenParenOffset) ||
+      isWhenExpressionCall(candidateText, candidateOpenParenOffset)
+  );
+  if (directContext) {
+    return directContext;
+  }
+
+  const expressionContext = resolveEnclosingQuerysetCallContext(
+    text,
+    openParenOffset,
+    EXPRESSION_QUERYSET_METHODS,
+    (candidateText, candidateOpenParenOffset) =>
+      isQExpressionCall(candidateText, candidateOpenParenOffset) ||
+      isWhenExpressionCall(candidateText, candidateOpenParenOffset) ||
+      isCaseExpressionCall(candidateText, candidateOpenParenOffset)
+  );
+  if (!expressionContext) {
+    return undefined;
+  }
+
+  return {
+    receiverExpression: expressionContext.receiverExpression,
+    method: 'filter',
+  };
+}
+
+function fExpressionCallContext(
+  text: string,
+  beforeOffset: number
+): { receiverExpression: string; method: string } | undefined {
+  const openParenOffset = findEnclosingCallOpenParenOffset(text, beforeOffset);
+  if (openParenOffset === undefined || !isFExpressionCall(text, openParenOffset)) {
+    return undefined;
+  }
+
+  const callContext = resolveExpressionQuerysetCallContext(text, openParenOffset);
+  if (!callContext) {
+    return undefined;
+  }
+
+  return {
+    receiverExpression: callContext.receiverExpression,
+    method: F_EXPRESSION_METHOD,
+  };
+}
+
+function expressionPathCallContext(
+  text: string,
+  beforeOffset: number
+): { receiverExpression: string; expressionName: string } | undefined {
+  const openParenOffset = findEnclosingCallOpenParenOffset(text, beforeOffset);
+  if (openParenOffset === undefined || !isExpressionPathCall(text, openParenOffset)) {
+    return undefined;
+  }
+
+  const expressionName = normalizedEnclosingCallName(text, openParenOffset);
+  if (!expressionName) {
+    return undefined;
+  }
+
+  const callContext = resolveExpressionQuerysetCallContext(text, openParenOffset);
+  if (!callContext) {
+    return undefined;
+  }
+
+  return {
+    receiverExpression: callContext.receiverExpression,
+    expressionName,
   };
 }
 
@@ -4797,24 +7403,250 @@ function querysetStringCallContext(
     return undefined;
   }
 
-  return parseQuerysetCallee(text, openParenOffset, STRING_LOOKUP_CALLEE_PATTERN);
+  return parseQuerysetCallee(text, openParenOffset, STRING_LOOKUP_METHODS);
+}
+
+function bulkUpdateFieldListCallContext(
+  text: string,
+  beforeOffset: number
+): { receiverExpression: string; method: string } | undefined {
+  const openParenOffset = findEnclosingCallOpenParenOffset(text, beforeOffset);
+  if (openParenOffset === undefined) {
+    return undefined;
+  }
+
+  return parseQuerysetCallee(
+    text,
+    openParenOffset,
+    BULK_UPDATE_FIELD_LIST_METHODS
+  );
 }
 
 function parseQuerysetCallee(
   text: string,
   openParenOffset: number,
-  pattern: RegExp
+  allowedMethods: ReadonlySet<string>
 ): { receiverExpression: string; method: string } | undefined {
-  const calleeText = compactPythonExpression(text.slice(0, openParenOffset));
-  const calleeMatch = calleeText.match(pattern);
-  if (!calleeMatch) {
+  const calleeText = trimLeadingUnmatchedOpeningDelimiters(
+    compactPythonExpression(trailingTopLevelExpression(text.slice(0, openParenOffset)))
+  );
+  const memberAccess = splitTopLevelMemberAccess(calleeText);
+  if (!memberAccess || !allowedMethods.has(memberAccess.memberName)) {
     return undefined;
   }
 
   return {
-    receiverExpression: calleeMatch[1],
-    method: calleeMatch[2],
+    receiverExpression: memberAccess.objectExpression,
+    method: memberAccess.memberName,
   };
+}
+
+function trailingTopLevelExpression(text: string): string {
+  const starts = [...topLevelStatementStarts(text, text.length)];
+  const start = starts.length > 0 ? Math.max(...starts) : 0;
+  return text.slice(start).trim();
+}
+
+function topLevelStatementStarts(
+  text: string,
+  beforeOffset: number
+): Set<number> {
+  const starts = new Set<number>([0]);
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let activeQuote: '"' | "'" | undefined;
+  let escaped = false;
+
+  for (let index = 0; index < beforeOffset; index += 1) {
+    const char = text[index];
+    if (!char) {
+      continue;
+    }
+
+    if (activeQuote) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+
+      if (char === activeQuote) {
+        activeQuote = undefined;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      activeQuote = char;
+      continue;
+    }
+
+    if (char === '(') {
+      parenDepth += 1;
+      continue;
+    }
+
+    if (char === '[') {
+      bracketDepth += 1;
+      continue;
+    }
+
+    if (char === '{') {
+      braceDepth += 1;
+      continue;
+    }
+
+    if (char === ')' && parenDepth > 0) {
+      parenDepth -= 1;
+      continue;
+    }
+
+    if (char === ']' && bracketDepth > 0) {
+      bracketDepth -= 1;
+      continue;
+    }
+
+    if (char === '}' && braceDepth > 0) {
+      braceDepth -= 1;
+      continue;
+    }
+
+    if (
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0 &&
+      '\n;=:'.includes(char)
+    ) {
+      if (char === '\n' && continuesTopLevelExpression(text, index + 1)) {
+        continue;
+      }
+      starts.add(index + 1);
+    }
+  }
+
+  return starts;
+}
+
+function continuesTopLevelExpression(
+  text: string,
+  startIndex: number
+): boolean {
+  let index = startIndex;
+  while (index < text.length && (text[index] === ' ' || text[index] === '\t')) {
+    index += 1;
+  }
+
+  return text[index] === '.';
+}
+
+function resolveEnclosingQuerysetCallContext(
+  text: string,
+  searchBeforeOffset: number,
+  allowedMethods: ReadonlySet<string>,
+  isWrapperCall: (
+    text: string,
+    openParenOffset: number
+  ) => boolean
+): { receiverExpression: string; method: string } | undefined {
+  let currentBeforeOffset = searchBeforeOffset;
+
+  while (true) {
+    const openParenOffset = findEnclosingCallOpenParenOffset(
+      text,
+      currentBeforeOffset
+    );
+    if (openParenOffset === undefined) {
+      return undefined;
+    }
+
+    const calleeMatch = parseQuerysetCallee(text, openParenOffset, allowedMethods);
+    if (calleeMatch) {
+      return calleeMatch;
+    }
+
+    if (!isWrapperCall(text, openParenOffset)) {
+      return undefined;
+    }
+
+    currentBeforeOffset = openParenOffset;
+  }
+}
+
+function resolveExpressionQuerysetCallContext(
+  text: string,
+  searchBeforeOffset: number
+): { receiverExpression: string; method: string } | undefined {
+  return resolveEnclosingQuerysetCallContext(
+    text,
+    searchBeforeOffset,
+    EXPRESSION_QUERYSET_METHODS,
+    (candidateText, candidateOpenParenOffset) =>
+      isQExpressionCall(candidateText, candidateOpenParenOffset) ||
+      isFExpressionCall(candidateText, candidateOpenParenOffset) ||
+      isWhenExpressionCall(candidateText, candidateOpenParenOffset) ||
+      isCaseExpressionCall(candidateText, candidateOpenParenOffset) ||
+      isExpressionWrapperCall(candidateText, candidateOpenParenOffset) ||
+      isExpressionPathCall(candidateText, candidateOpenParenOffset)
+  );
+}
+
+function isQExpressionCall(text: string, openParenOffset: number): boolean {
+  return normalizedEnclosingCallName(text, openParenOffset) === 'Q';
+}
+
+function isFExpressionCall(text: string, openParenOffset: number): boolean {
+  return normalizedEnclosingCallName(text, openParenOffset) === 'F';
+}
+
+function isWhenExpressionCall(text: string, openParenOffset: number): boolean {
+  return normalizedEnclosingCallName(text, openParenOffset) === 'When';
+}
+
+function isCaseExpressionCall(text: string, openParenOffset: number): boolean {
+  return normalizedEnclosingCallName(text, openParenOffset) === 'Case';
+}
+
+function isExpressionPathCall(text: string, openParenOffset: number): boolean {
+  const callName = normalizedEnclosingCallName(text, openParenOffset);
+  return callName ? EXPRESSION_FIELD_FUNCTION_NAMES.has(callName) : false;
+}
+
+function isExpressionWrapperCall(
+  text: string,
+  openParenOffset: number
+): boolean {
+  const callName = normalizedEnclosingCallName(text, openParenOffset);
+  return callName ? EXPRESSION_WRAPPER_FUNCTION_NAMES.has(callName) : false;
+}
+
+function expressionPathMethodName(expressionName: string): string {
+  return `${EXPRESSION_PATH_METHOD_PREFIX}${expressionName}`;
+}
+
+function normalizedEnclosingCallName(
+  text: string,
+  openParenOffset: number
+): string | undefined {
+  const calleeExpression = parseEnclosingCallExpression(text, openParenOffset);
+  if (!calleeExpression) {
+    return undefined;
+  }
+
+  return calleeExpression.replace(/^~/, '').split('.').at(-1);
+}
+
+function parseEnclosingCallExpression(
+  text: string,
+  openParenOffset: number
+): string | undefined {
+  const calleeText = compactPythonExpression(text.slice(0, openParenOffset));
+  const match = calleeText.match(/(?:^|[^\w.])(~?[A-Za-z_][\w.]*)$/);
+  return match?.[1];
 }
 
 function findEnclosingCallOpenParenOffset(
