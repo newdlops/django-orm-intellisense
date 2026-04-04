@@ -6,6 +6,7 @@ from ..static_index.indexer import FieldCandidate, StaticIndex
 
 RELATION_ONLY_METHODS = {'select_related', 'prefetch_related'}
 FILTER_LOOKUP_METHODS = {'filter', 'exclude', 'get'}
+MAX_CHAINED_FIELD_COMPLETION_DEPTH = 3
 DEFAULT_LOOKUP_OPERATORS = (
     'exact',
     'iexact',
@@ -63,25 +64,68 @@ def list_lookup_path_completions(
             'reason': traversal['reason'],
         }
 
+    include_prefixed_lookup_items = (
+        method in FILTER_LOOKUP_METHODS
+        and (bool(current_partial) or not completed_segments)
+    )
+
     items: list[dict[str, object]]
     if traversal['completionMode'] == 'field':
         current_model_label = str(traversal['currentModelLabel'])
         relation_only = method in RELATION_ONLY_METHODS
-        items = [
-            _lookup_item_dict(field)
+        matching_fields = [
+            field
             for field in model_graph.fields_for_model(current_model_label)
             if (field.is_relation or not relation_only)
             and field.name.startswith(current_partial)
         ]
+        items = [
+            _lookup_item_dict(field)
+            for field in matching_fields
+        ]
+        if include_prefixed_lookup_items:
+            items.extend(
+                _prefixed_lookup_chain_completion_items(
+                    runtime=runtime,
+                    fields=matching_fields,
+                )
+            )
+        items.extend(
+            _lookup_descendant_completion_items(
+                model_graph=model_graph,
+                model_label=current_model_label,
+                current_partial=current_partial,
+                relation_only=relation_only,
+            )
+        )
     elif traversal['completionMode'] == 'field_and_lookup':
         current_model_label = str(traversal['currentModelLabel'])
         relation_only = method in RELATION_ONLY_METHODS
-        items = [
-            _lookup_item_dict(field)
+        matching_fields = [
+            field
             for field in model_graph.fields_for_model(current_model_label)
             if (field.is_relation or not relation_only)
             and field.name.startswith(current_partial)
         ]
+        items = [
+            _lookup_item_dict(field)
+            for field in matching_fields
+        ]
+        if include_prefixed_lookup_items:
+            items.extend(
+                _prefixed_lookup_chain_completion_items(
+                    runtime=runtime,
+                    fields=matching_fields,
+                )
+            )
+        items.extend(
+            _lookup_descendant_completion_items(
+                model_graph=model_graph,
+                model_label=current_model_label,
+                current_partial=current_partial,
+                relation_only=relation_only,
+            )
+        )
         items.extend(
             _lookup_chain_completion_items(
                 runtime=runtime,
@@ -99,7 +143,8 @@ def list_lookup_path_completions(
 
     items.sort(
         key=lambda item: (
-            2 if item.get('fieldKind') == 'lookup_operator' else 1 if item.get('fieldKind') == 'lookup_transform' else 0,
+            _lookup_completion_group(item),
+            str(item['name']).count('__'),
             0 if item.get('isRelation') else 1,
             str(item['name']).lower(),
         )
@@ -386,8 +431,15 @@ def _normalize_lookup_path(path: str, method: str) -> str:
 def _lookup_item_dict(
     field: FieldCandidate,
 ) -> dict[str, object]:
+    return _lookup_path_item_dict(field.name, field)
+
+
+def _lookup_path_item_dict(
+    path_name: str,
+    field: FieldCandidate,
+) -> dict[str, object]:
     return {
-        'name': field.name,
+        'name': path_name,
         'modelLabel': field.model_label,
         'relatedModelLabel': field.related_model_label,
         'filePath': field.file_path,
@@ -399,6 +451,75 @@ def _lookup_item_dict(
         'source': field.source,
         'lookupOperator': None,
     }
+
+
+def _lookup_descendant_completion_items(
+    *,
+    model_graph: ModelGraph,
+    model_label: str,
+    current_partial: str,
+    relation_only: bool,
+) -> list[dict[str, object]]:
+    items_by_name: dict[str, dict[str, object]] = {}
+
+    def walk(
+        current_model_label: str,
+        prefix_parts: list[str],
+        depth: int,
+    ) -> None:
+        if depth >= MAX_CHAINED_FIELD_COMPLETION_DEPTH:
+            return
+
+        for field in model_graph.fields_for_model(current_model_label):
+            path_parts = [*prefix_parts, field.name]
+            path_name = '__'.join(path_parts)
+            if (
+                prefix_parts
+                and path_name.startswith(current_partial)
+                and (field.is_relation or not relation_only)
+            ):
+                items_by_name.setdefault(
+                    path_name,
+                    _lookup_path_item_dict(path_name, field),
+                )
+
+            if field.is_relation and field.related_model_label:
+                walk(field.related_model_label, path_parts, depth + 1)
+
+    walk(model_label, [], 0)
+    return list(items_by_name.values())
+
+
+def _prefixed_lookup_chain_completion_items(
+    *,
+    runtime: RuntimeInspection,
+    fields: list[FieldCandidate],
+) -> list[dict[str, object]]:
+    items_by_name: dict[str, dict[str, object]] = {}
+
+    for field in fields:
+        for item in _lookup_chain_completion_items(
+            runtime=runtime,
+            field=field,
+            current_partial='',
+        ):
+            prefixed_name = f"{field.name}__{item['name']}"
+            prefixed_item = dict(item)
+            prefixed_item['name'] = prefixed_name
+            items_by_name.setdefault(prefixed_name, prefixed_item)
+
+    return list(items_by_name.values())
+
+
+def _lookup_completion_group(item: dict[str, object]) -> int:
+    field_kind = item.get('fieldKind')
+    if field_kind == 'lookup_operator' or field_kind == 'lookup_transform':
+        return 1
+
+    if '__' in str(item.get('name', '')):
+        return 2
+
+    return 0
 
 
 def _lookup_operator_item_dict(

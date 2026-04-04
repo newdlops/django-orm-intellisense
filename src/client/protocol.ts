@@ -126,6 +126,47 @@ export interface LookupPathResolution {
   lookupOperator?: string;
 }
 
+export type OrmReceiverKind =
+  | 'model_class'
+  | 'instance'
+  | 'manager'
+  | 'queryset'
+  | 'related_manager'
+  | 'scalar'
+  | 'unknown';
+
+export interface OrmMemberItem {
+  name: string;
+  memberKind: string;
+  modelLabel: string;
+  receiverKind: string;
+  detail: string;
+  source: string;
+  returnKind?: string;
+  returnModelLabel?: string;
+  managerName?: string;
+  filePath?: string;
+  line?: number;
+  column?: number;
+  fieldKind?: string;
+  isRelation: boolean;
+}
+
+export interface OrmMemberCompletionsResult {
+  items: OrmMemberItem[];
+  resolved: boolean;
+  reason?: string;
+  receiverKind?: string;
+  modelLabel?: string;
+  managerName?: string;
+}
+
+export interface OrmMemberResolution {
+  resolved: boolean;
+  reason?: string;
+  item?: OrmMemberItem;
+}
+
 export interface HealthSnapshot {
   phase: ServerPhase;
   detail: string;

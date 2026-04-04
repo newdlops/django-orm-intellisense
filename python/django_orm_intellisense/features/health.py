@@ -15,7 +15,7 @@ def build_health_snapshot(
     static_index: StaticIndex,
     runtime: RuntimeInspection,
     semantic_graph: SemanticGraphSummary,
-    pylance_stubs: PylanceStubGenerationSummary,
+    pylance_stubs: PylanceStubGenerationSummary | None,
     initialized_at: datetime,
 ) -> dict[str, object]:
     phase = _compute_phase(static_index, runtime)
@@ -31,7 +31,8 @@ def build_health_snapshot(
     if runtime.django_importable:
         capabilities.append('runtime.environment')
 
-    capabilities.append('pylance.stubs')
+    if pylance_stubs is not None:
+        capabilities.append('pylance.stubs')
 
     if runtime.bootstrap_status == 'ready':
         capabilities.extend(
@@ -41,7 +42,7 @@ def build_health_snapshot(
             ]
         )
 
-    return {
+    snapshot: dict[str, object] = {
         'phase': phase,
         'detail': detail,
         'capabilities': capabilities,
@@ -52,7 +53,6 @@ def build_health_snapshot(
         'settingsCandidates': list(workspace.settings_candidates),
         'startedAt': initialized_at.isoformat(),
         'staticIndex': static_index.to_dict(),
-        'pylanceStubs': pylance_stubs.to_dict(),
         'runtime': {
             'djangoImportable': runtime.django_importable,
             'djangoVersion': runtime.django_version,
@@ -69,6 +69,11 @@ def build_health_snapshot(
         },
         'semanticGraph': semantic_graph.to_dict(),
     }
+
+    if pylance_stubs is not None:
+        snapshot['pylanceStubs'] = pylance_stubs.to_dict()
+
+    return snapshot
 
 
 def _compute_phase(

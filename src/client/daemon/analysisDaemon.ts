@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import * as vscode from 'vscode';
@@ -15,6 +16,9 @@ import type {
   LookupPathCompletionsResult,
   LookupPathResolution,
   ModuleResolution,
+  OrmMemberCompletionsResult,
+  OrmMemberResolution,
+  OrmReceiverKind,
   RelationTargetResolution,
   RelationTargetsResult,
   RequestMessage,
@@ -83,7 +87,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     return this.currentState;
   }
 
-  async start(): Promise<HealthSnapshot> {
+  async start(scope?: vscode.ConfigurationScope): Promise<HealthSnapshot> {
     if (this.startPromise) {
       return this.startPromise;
     }
@@ -92,7 +96,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       return this.refreshHealth();
     }
 
-    const startPromise = this.startProcess();
+    const startPromise = this.startProcess(scope);
     this.startPromise = startPromise;
 
     try {
@@ -121,15 +125,27 @@ export class AnalysisDaemon implements vscode.Disposable {
     return snapshot;
   }
 
-  async ensureStarted(): Promise<void> {
+  async ensureStarted(scope?: vscode.ConfigurationScope): Promise<void> {
     if (this.startPromise) {
       await this.startPromise;
+      if (
+        scope &&
+        this.process &&
+        this.lastLaunchContext &&
+        (await this.requiresScopedRestart(scope))
+      ) {
+        await this.stop();
+        await this.start(scope);
+      }
       return;
     }
 
     if (!this.process) {
-      await this.start();
+      await this.start(scope);
+      return;
     }
+
+    await this.restartIfInterpreterChanged();
   }
 
   async restart(): Promise<HealthSnapshot> {
@@ -208,6 +224,34 @@ export class AnalysisDaemon implements vscode.Disposable {
     });
   }
 
+  async listOrmMemberCompletions(
+    modelLabel: string,
+    receiverKind: OrmReceiverKind,
+    prefix: string,
+    managerName?: string
+  ): Promise<OrmMemberCompletionsResult> {
+    return this.cachedRequest<OrmMemberCompletionsResult>('ormMemberCompletions', {
+      modelLabel,
+      receiverKind,
+      prefix,
+      managerName,
+    });
+  }
+
+  async resolveOrmMember(
+    modelLabel: string,
+    receiverKind: OrmReceiverKind,
+    name: string,
+    managerName?: string
+  ): Promise<OrmMemberResolution> {
+    return this.cachedRequest<OrmMemberResolution>('resolveOrmMember', {
+      modelLabel,
+      receiverKind,
+      name,
+      managerName,
+    });
+  }
+
   async stop(): Promise<void> {
     this.stopRequested = true;
     this.clearResponseCache();
@@ -247,9 +291,11 @@ export class AnalysisDaemon implements vscode.Disposable {
     this.stateEmitter.dispose();
   }
 
-  private async startProcess(): Promise<HealthSnapshot> {
+  private async startProcess(
+    scope?: vscode.ConfigurationScope
+  ): Promise<HealthSnapshot> {
     this.clearResponseCache();
-    const launchContext = await this.createLaunchContext();
+    const launchContext = await this.createLaunchContext(scope);
     this.lastLaunchContext = launchContext;
     this.stopRequested = false;
     this.updateState({
@@ -360,10 +406,19 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
   }
 
-  private async createLaunchContext(): Promise<LaunchContext> {
-    const settings = getExtensionSettings();
+  private async createLaunchContext(
+    scope?: vscode.ConfigurationScope
+  ): Promise<LaunchContext> {
+    const settings = getExtensionSettings(
+      scope ?? vscode.workspace.workspaceFolders?.[0]?.uri
+    );
+    const configuredWorkspaceRoot = settings.workspaceRoot
+      ? path.resolve(settings.workspaceRoot)
+      : undefined;
     const workspaceRoot =
-      settings.workspaceRoot ??
+      (configuredWorkspaceRoot && pathExists(configuredWorkspaceRoot)
+        ? configuredWorkspaceRoot
+        : undefined) ??
       vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ??
       this.context.extensionPath;
     const interpreter = await resolvePythonInterpreter(settings);
@@ -563,6 +618,21 @@ export class AnalysisDaemon implements vscode.Disposable {
     await this.restart();
   }
 
+  private async requiresScopedRestart(
+    scope: vscode.ConfigurationScope
+  ): Promise<boolean> {
+    if (!this.lastLaunchContext) {
+      return false;
+    }
+
+    const nextLaunchContext = await this.createLaunchContext(scope);
+    return (
+      nextLaunchContext.workspaceRoot !== this.lastLaunchContext.workspaceRoot ||
+      (nextLaunchContext.settingsModule ?? '') !==
+        (this.lastLaunchContext.settingsModule ?? '')
+    );
+  }
+
   private log(level: 'info' | 'debug', message: string): void {
     const settings = getExtensionSettings();
     if (settings.logLevel === 'off') {
@@ -672,4 +742,12 @@ function extractLeadingJsonObject(
   }
 
   return undefined;
+}
+
+function pathExists(targetPath: string): boolean {
+  try {
+    return fs.existsSync(targetPath);
+  } catch {
+    return false;
+  }
 }

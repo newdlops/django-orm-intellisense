@@ -84,8 +84,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   const settings = getExtensionSettings();
-  if (settings.autoStart) {
-    void daemon.start().catch((error) => {
+  const initialEditor = vscode.window.activeTextEditor;
+  if (settings.autoStart && initialEditor?.document.languageId === 'python') {
+    void daemon.start(initialEditor.document.uri).catch((error) => {
       output.appendLine(`[extension] Failed to start daemon: ${String(error)}`);
     });
   }

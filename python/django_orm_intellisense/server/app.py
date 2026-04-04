@@ -26,12 +26,16 @@ from ..features.lookup_paths import (
     list_lookup_path_completions,
     resolve_lookup_path,
 )
+from ..features.orm_members import (
+    list_orm_member_completions,
+    resolve_orm_member,
+)
 from ..features.reexports import resolve_export_origin
 from ..features.relation_targets import (
     list_relation_targets,
     resolve_relation_target,
 )
-from ..pylance import PylanceStubGenerationSummary, generate_pylance_stubs
+from ..pylance import PylanceStubGenerationSummary
 from ..runtime.inspector import RuntimeInspection, inspect_runtime
 from ..semantic.graph import SemanticGraphSummary, build_semantic_graph
 from ..static_index.indexer import StaticIndex, build_static_index
@@ -90,6 +94,10 @@ class DaemonServer:
                     result = self._lookup_path_completions(params)
                 elif method == 'resolveLookupPath':
                     result = self._resolve_lookup_path(params)
+                elif method == 'ormMemberCompletions':
+                    result = self._orm_member_completions(params)
+                elif method == 'resolveOrmMember':
+                    result = self._resolve_orm_member(params)
                 else:
                     raise ValueError(f'Unsupported method: {method}')
         except Exception as error:  # pragma: no cover - scaffold safety net
@@ -145,11 +153,7 @@ class DaemonServer:
                 effective_settings_module,
                 runtime,
             )
-        pylance_stubs = generate_pylance_stubs(
-            workspace_root=workspace_root,
-            static_index=static_index,
-            runtime=runtime,
-        )
+        pylance_stubs = None
         semantic_graph = build_semantic_graph(workspace_profile, static_index, runtime)
         self.workspace_profile = workspace_profile
         self.static_index = static_index
@@ -256,6 +260,46 @@ class DaemonServer:
             base_model_label=base_model_label,
             path=value,
             method=method,
+        )
+
+    def _orm_member_completions(self, params: dict[str, Any]) -> dict[str, Any]:
+        static_index, runtime = self._require_feature_state()
+        model_label = _clean_optional_string(params.get('modelLabel'))
+        receiver_kind = _clean_optional_string(params.get('receiverKind'))
+        prefix = _clean_optional_string(params.get('prefix')) or ''
+        manager_name = _clean_optional_string(params.get('managerName'))
+        if model_label is None or receiver_kind is None:
+            raise ValueError(
+                '`modelLabel` and `receiverKind` are required for ormMemberCompletions.'
+            )
+
+        return list_orm_member_completions(
+            static_index=static_index,
+            runtime=runtime,
+            model_label=model_label,
+            receiver_kind=receiver_kind,
+            prefix=prefix,
+            manager_name=manager_name,
+        )
+
+    def _resolve_orm_member(self, params: dict[str, Any]) -> dict[str, Any]:
+        static_index, runtime = self._require_feature_state()
+        model_label = _clean_optional_string(params.get('modelLabel'))
+        receiver_kind = _clean_optional_string(params.get('receiverKind'))
+        name = _clean_optional_string(params.get('name'))
+        manager_name = _clean_optional_string(params.get('managerName'))
+        if model_label is None or receiver_kind is None or name is None:
+            raise ValueError(
+                '`modelLabel`, `receiverKind`, and `name` are required for resolveOrmMember.'
+            )
+
+        return resolve_orm_member(
+            static_index=static_index,
+            runtime=runtime,
+            model_label=model_label,
+            receiver_kind=receiver_kind,
+            name=name,
+            manager_name=manager_name,
         )
 
     def _require_feature_state(self) -> tuple[StaticIndex, RuntimeInspection]:

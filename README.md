@@ -87,7 +87,7 @@ For multi-environment Django projects that have modules such as `project.setting
 
 If Pylance is still reporting error-level false positives for dynamic Django ORM members that cannot be inferred statically, run `Django ORM Intellisense: Configure Pylance Diagnostics`. The recommended profile downgrades the common dynamic-member rules for the current workspace without overwriting unrelated Pylance overrides.
 
-On every daemon initialization, the extension also generates partial `.pyi` files for indexed Python modules under `.django_orm_intellisense/stubs` inside the selected workspace root. When the workspace does not already define a custom `python.analysis.stubPath`, Django ORM Intellisense automatically points Pylance at that generated stub tree.
+Django ORM Intellisense no longer generates managed `.pyi` stub trees for the workspace. If an older workspace still has a Django ORM Intellisense-managed `python.analysis.stubPath` or legacy `.django_orm_intellisense/stubs` files, the extension removes that setting and deletes those managed stub files automatically.
 
 ## Manual UI Check
 

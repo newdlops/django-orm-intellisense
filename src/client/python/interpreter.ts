@@ -11,6 +11,10 @@ import {
 const PYTHON_EXTENSION_ID = 'ms-python.python';
 const PYTHON_INTERPRETER_COMMAND = 'python.interpreterPath';
 const PYTHON_SELECT_COMMAND = 'python.setInterpreter';
+const DARWIN_PYTHON3_CANDIDATES = [
+  '/Applications/Xcode.app/Contents/Developer/usr/bin/python3',
+  '/Library/Developer/CommandLineTools/usr/bin/python3',
+];
 
 export type PythonInterpreterSource =
   | 'djangoOrmIntellisense.pythonInterpreter'
@@ -37,8 +41,11 @@ type InterpreterBrowseKind = 'file' | 'folder';
 export function getInterpreterResource(
   settings: ExtensionSettings = getExtensionSettings()
 ): vscode.Uri | undefined {
-  if (settings.workspaceRoot) {
-    return vscode.Uri.file(resolveWorkspaceRootSetting(settings.workspaceRoot));
+  const configuredWorkspaceRoot = resolveExistingWorkspaceRootSetting(
+    settings.workspaceRoot
+  );
+  if (configuredWorkspaceRoot) {
+    return vscode.Uri.file(configuredWorkspaceRoot);
   }
 
   const activeDocument = vscode.window.activeTextEditor?.document;
@@ -52,8 +59,11 @@ export function getInterpreterResource(
 export function getInterpreterBasePath(
   settings: ExtensionSettings = getExtensionSettings()
 ): string | undefined {
-  if (settings.workspaceRoot) {
-    return resolveWorkspaceRootSetting(settings.workspaceRoot);
+  const configuredWorkspaceRoot = resolveExistingWorkspaceRootSetting(
+    settings.workspaceRoot
+  );
+  if (configuredWorkspaceRoot) {
+    return configuredWorkspaceRoot;
   }
 
   const resource = getInterpreterResource(settings);
@@ -140,7 +150,7 @@ export async function resolvePythonInterpreter(
     };
   }
 
-  const fallbackInterpreter = process.platform === 'win32' ? 'python' : 'python3';
+  const fallbackInterpreter = findFallbackPythonInterpreter();
   return {
     path: fallbackInterpreter,
     source: 'fallback',
@@ -471,20 +481,21 @@ function isFilesystemInterpreterCandidate(candidate: string): boolean {
 }
 
 function normalizeFilesystemInterpreterPath(candidate: string): string {
-  if (!isFilesystemInterpreterCandidate(candidate)) {
-    return candidate;
+  const normalizedCandidate = remapKnownMacOsPythonStub(candidate);
+  if (!isFilesystemInterpreterCandidate(normalizedCandidate)) {
+    return normalizedCandidate;
   }
 
   try {
-    const stat = fs.statSync(candidate);
+    const stat = fs.statSync(normalizedCandidate);
     if (!stat.isDirectory()) {
-      return candidate;
+      return canonicalExecutablePath(normalizedCandidate);
     }
   } catch {
-    return candidate;
+    return normalizedCandidate;
   }
 
-  const candidates = buildDirectoryExecutableCandidates(candidate);
+  const candidates = buildDirectoryExecutableCandidates(normalizedCandidate);
   for (const executableCandidate of candidates) {
     try {
       const stat = fs.statSync(executableCandidate);
@@ -496,7 +507,7 @@ function normalizeFilesystemInterpreterPath(candidate: string): string {
     }
   }
 
-  return candidate;
+  return normalizedCandidate;
 }
 
 function buildDirectoryExecutableCandidates(directory: string): string[] {
@@ -525,6 +536,69 @@ function buildDirectoryExecutableCandidates(directory: string): string[] {
   }
 
   return [...new Set(candidates)];
+}
+
+function findFallbackPythonInterpreter(): string {
+  if (process.platform === 'win32') {
+    return 'python';
+  }
+
+  for (const candidate of [
+    ...DARWIN_PYTHON3_CANDIDATES,
+    '/opt/homebrew/bin/python3',
+    '/usr/local/bin/python3',
+    '/usr/bin/python3',
+  ]) {
+    try {
+      const stat = fs.statSync(candidate);
+      if (stat.isFile()) {
+        return canonicalExecutablePath(candidate);
+      }
+    } catch {
+      // Keep searching fallback locations.
+    }
+  }
+
+  for (const segment of (process.env.PATH ?? '').split(path.delimiter)) {
+    const candidate = path.join(segment, 'python3');
+    try {
+      const stat = fs.statSync(candidate);
+      if (stat.isFile()) {
+        return canonicalExecutablePath(candidate);
+      }
+    } catch {
+      // Keep searching PATH entries.
+    }
+  }
+
+  return 'python3';
+}
+
+function remapKnownMacOsPythonStub(candidate: string): string {
+  if (process.platform !== 'darwin' || candidate !== '/usr/bin/python3') {
+    return candidate;
+  }
+
+  for (const developerPython of DARWIN_PYTHON3_CANDIDATES) {
+    try {
+      const stat = fs.statSync(developerPython);
+      if (stat.isFile()) {
+        return developerPython;
+      }
+    } catch {
+      // Keep searching for a usable developer tools Python.
+    }
+  }
+
+  return candidate;
+}
+
+function canonicalExecutablePath(candidate: string): string {
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return candidate;
+  }
 }
 
 function toPythonInterpreterSettingValue(
@@ -560,6 +634,17 @@ function resolveWorkspaceRootSetting(workspaceRoot: string): string {
 
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   return path.resolve(workspaceFolder ?? process.cwd(), workspaceRoot);
+}
+
+function resolveExistingWorkspaceRootSetting(
+  workspaceRoot: string | undefined
+): string | undefined {
+  if (!workspaceRoot) {
+    return undefined;
+  }
+
+  const resolvedWorkspaceRoot = resolveWorkspaceRootSetting(workspaceRoot);
+  return fs.existsSync(resolvedWorkspaceRoot) ? resolvedWorkspaceRoot : undefined;
 }
 
 function replaceToken(

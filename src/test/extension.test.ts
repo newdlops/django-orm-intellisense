@@ -3,16 +3,21 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { resolvePythonInterpreter } from '../client/python/interpreter';
+import type { HealthSnapshot } from '../client/protocol';
+import { syncManagedPylanceStubPath } from '../client/pylance/stubPath';
+import {
+  resolvePythonInterpreter,
+  validatePythonInterpreterPath,
+} from '../client/python/interpreter';
 
 const EXTENSION_ID = 'newdlops.django-orm-intellisense';
 
 suite('Django ORM Intellisense UI', () => {
   suiteSetup(async () => {
+    await setPythonInterpreter(defaultTestInterpreter());
     const extension = vscode.extensions.getExtension(EXTENSION_ID);
     assert.ok(extension, `Extension ${EXTENSION_ID} is not available.`);
     await extension.activate();
-    await setPythonInterpreter('');
   });
 
   test('completes and resolves ORM lookup paths in fixture project', async function () {
@@ -40,8 +45,8 @@ suite('Django ORM Intellisense UI', () => {
       'Expected lookup path completion to include `profile`.'
     );
     assert.ok(
-      !hasCompletionItemLabel(completionList.items, 'profile__timezone'),
-      'Expected lookup path completion to suggest only the next lookup segment.'
+      hasCompletionItemLabel(completionList.items, 'profile__timezone'),
+      'Expected lookup path completion to include chained lookup suggestions.'
     );
     const relationCompletionItem = findCompletionItemByLabel(
       completionList.items,
@@ -56,6 +61,20 @@ suite('Django ORM Intellisense UI', () => {
       relationCompletionItem?.command?.command,
       'editor.action.triggerSuggest',
       'Expected string lookup relation completion to reopen suggestions.'
+    );
+    const chainedCompletionItem = findCompletionItemByLabel(
+      completionList.items,
+      'profile__timezone'
+    );
+    assert.strictEqual(
+      chainedCompletionItem?.insertText,
+      'profile__timezone',
+      'Expected string lookup chained completion to insert the full lookup path.'
+    );
+    assert.strictEqual(
+      completionItemFilterValue(chainedCompletionItem!),
+      'profile__timezone',
+      'Expected string lookup chained completion to match its visible chained label.'
     );
 
     const operatorCompletionPosition = positionAfterTextInContainer(
@@ -290,6 +309,344 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
+  test('supports foreign key attname aliases in keyword lookups', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const fieldCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Post.objects.filter(author_i=1)',
+      'author_i'
+    );
+    const fieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        fieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(fieldCompletionList?.items, 'author_id'),
+      'Expected foreign-key attname completion to include `author_id`.'
+    );
+    const attnameCompletionItem = findCompletionItemByLabel(
+      fieldCompletionList?.items,
+      'author_id'
+    );
+    assert.strictEqual(
+      attnameCompletionItem?.insertText,
+      'author_id__',
+      'Expected foreign-key attname completion to continue lookup operators.'
+    );
+    assert.ok(
+      Boolean(attnameCompletionItem?.detail) &&
+        !attnameCompletionItem!.detail!.startsWith('Django field'),
+      `Expected foreign-key attname completion detail to mention a concrete field kind. Received: ${attnameCompletionItem?.detail}`
+    );
+
+    const hoverPosition = positionInsideText(
+      document,
+      'Post.objects.filter(author_id__in=[1, 2])',
+      'author_id__in'
+    );
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      hoverPosition
+    );
+    const hoverText = stringifyHovers(hovers);
+
+    assert.ok(
+      hoverText.includes('Owner model: `blog.Post`'),
+      `Expected foreign-key attname hover to mention blog.Post. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('Field kind: `'),
+      `Expected foreign-key attname hover to mention a field kind. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('Lookup operator: `in`'),
+      `Expected foreign-key attname hover to mention the lookup operator. Received: ${hoverText}`
+    );
+
+    const definitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, hoverPosition);
+    const definitionTarget = firstDefinition(definitions);
+
+    assert.ok(
+      definitionTarget,
+      'Expected a definition target for the foreign-key attname lookup path.'
+    );
+    assert.strictEqual(
+      definitionTarget!.range.start.line + 1,
+      62,
+      'Expected foreign-key attname definition to target the Post.author field.'
+    );
+
+    const diagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) =>
+        items.some((item) => item.message.includes('author__unknown'))
+    );
+    assert.ok(
+      diagnostics.every((item) => !item.message.includes('author_id__in')),
+      `Expected foreign-key attname lookup to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+  });
+
+  test('surfaces lookup operators after a foreign key segment', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const relationFieldOperatorCompletionPosition = positionAfterTextInContainer(
+      document,
+      "filter(author__='mentor')",
+      'author__'
+    );
+    const relationFieldOperatorCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relationFieldOperatorCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(relationFieldOperatorCompletionList?.items, 'in'),
+      'Expected keyword lookup completion to include `in` after a ForeignKey segment.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(relationFieldOperatorCompletionList?.items, 'exact'),
+      'Expected keyword lookup completion to include `exact` after a ForeignKey segment.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(relationFieldOperatorCompletionList?.items, 'profile'),
+      'Expected keyword lookup completion to still include related model fields after a ForeignKey segment.'
+    );
+    const relationFieldOperatorLabels = (
+      relationFieldOperatorCompletionList?.items ?? []
+    ).map((item) => completionItemLabel(item));
+    assert.ok(
+      relationFieldOperatorLabels.slice(0, 8).includes('profile'),
+      `Expected \`profile\` to stay near the top after a ForeignKey segment. Received: ${relationFieldOperatorLabels.slice(0, 8).join(', ')}`
+    );
+  });
+
+  test('surfaces lookup operators before typing separators', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const relationCompletionPosition = positionAfterTextInContainer(
+      document,
+      "filter(auth='mentor')",
+      'auth'
+    );
+    const relationCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relationCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(relationCompletionList?.items, 'author__in'),
+      'Expected field-prefix completion to include `author__in` before typing `__`.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(relationCompletionList?.items, 'author__exact'),
+      'Expected field-prefix completion to include `author__exact` before typing `__`.'
+    );
+    const relationCompletionLabels = (relationCompletionList?.items ?? []).map(
+      (item) => completionItemLabel(item)
+    );
+    assert.ok(
+      relationCompletionLabels.slice(0, 8).includes('author__in'),
+      `Expected \`author__in\` to appear near the top of the initial suggestions. Received: ${relationCompletionLabels.slice(0, 8).join(', ')}`
+    );
+
+    const fieldCompletionPosition = positionAfterTextInContainer(
+      document,
+      "filter(tit='x')",
+      'tit'
+    );
+    const fieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        fieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(fieldCompletionList?.items, 'title__in'),
+      'Expected field-prefix completion to include `title__in` before typing `__`.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(fieldCompletionList?.items, 'title__endswith'),
+      'Expected field-prefix completion to include `title__endswith` before typing `__`.'
+    );
+    const fieldCompletionLabels = (fieldCompletionList?.items ?? []).map((item) =>
+      completionItemLabel(item)
+    );
+    assert.ok(
+      fieldCompletionLabels.slice(0, 8).includes('title__in'),
+      `Expected \`title__in\` to appear near the top of the initial suggestions. Received: ${fieldCompletionLabels.slice(0, 8).join(', ')}`
+    );
+  });
+
+  test('surfaces lookup operators when completion opens on an empty keyword', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const blankCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Post.objects.filter()',
+      'filter('
+    );
+    const blankCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        blankCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(blankCompletionList?.items, 'author__in'),
+      'Expected empty keyword completion to include `author__in`.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(blankCompletionList?.items, 'title__endswith'),
+      'Expected empty keyword completion to include `title__endswith`.'
+    );
+    const blankCompletionLabels = (blankCompletionList?.items ?? []).map((item) =>
+      completionItemLabel(item)
+    );
+    assert.ok(
+      blankCompletionLabels.slice(0, 12).includes('author__in'),
+      `Expected \`author__in\` to appear in the initial empty-prefix suggestions. Received: ${blankCompletionLabels.slice(0, 12).join(', ')}`
+    );
+  });
+
+  test('filters nested lookup completions by the visible segment prefix', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const stringCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Post.objects.values("author__pro")',
+      'author__pro'
+    );
+    const stringCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        stringCompletionPosition
+      );
+    const stringFieldItem = findCompletionItemByLabel(
+      stringCompletionList?.items,
+      'profile'
+    );
+    const stringChainedItem = findCompletionItemByLabel(
+      stringCompletionList?.items,
+      'profile__timezone'
+    );
+
+    assert.ok(stringFieldItem, 'Expected string lookup completion to include `profile`.');
+    assert.ok(
+      completionItemFilterValue(stringFieldItem!).startsWith('pro'),
+      `Expected string lookup field completion to filter by the visible segment. Received: ${completionItemFilterValue(stringFieldItem!)}`
+    );
+    assert.ok(
+      stringChainedItem,
+      'Expected string lookup completion to include `profile__timezone`.'
+    );
+    assert.ok(
+      completionItemFilterValue(stringChainedItem!).startsWith('pro'),
+      `Expected string lookup chained completion to filter by the visible segment. Received: ${completionItemFilterValue(stringChainedItem!)}`
+    );
+
+    const keywordCompletionPosition = positionAfterTextInContainer(
+      document,
+      "filter(author__pro='mentor')",
+      'author__pro'
+    );
+    const keywordCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        keywordCompletionPosition
+      );
+    const keywordFieldItem = findCompletionItemByLabel(
+      keywordCompletionList?.items,
+      'profile'
+    );
+
+    assert.ok(keywordFieldItem, 'Expected keyword lookup completion to include `profile`.');
+    assert.ok(
+      completionItemFilterValue(keywordFieldItem!).startsWith('pro'),
+      `Expected keyword lookup field completion to filter by the visible segment. Received: ${completionItemFilterValue(keywordFieldItem!)}`
+    );
+
+    const operatorCompletionPosition = positionAfterTextInContainer(
+      document,
+      "filter(author__profile__timezone__i='Asia/Seoul')",
+      'author__profile__timezone__i'
+    );
+    const operatorCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        operatorCompletionPosition
+      );
+    const operatorItem = findCompletionItemByLabel(
+      operatorCompletionList?.items,
+      'icontains'
+    );
+
+    assert.ok(
+      operatorItem,
+      'Expected nested operator completion to include `icontains`.'
+    );
+    assert.ok(
+      completionItemFilterValue(operatorItem!).startsWith('i'),
+      `Expected nested operator completion to filter by the operator segment. Received: ${completionItemFilterValue(operatorItem!)}`
+    );
+  });
+
   test('completes and resolves ORM keyword lookup paths in fixture project', async function () {
     this.timeout(20_000);
 
@@ -318,17 +675,17 @@ suite('Django ORM Intellisense UI', () => {
       'Expected keyword lookup completion to include `profile`.'
     );
     assert.ok(
-      !hasCompletionItemLabel(fieldCompletionList?.items, 'profile__timezone'),
-      'Expected keyword lookup completion to suggest only the next lookup segment.'
+      hasCompletionItemLabel(fieldCompletionList?.items, 'profile__timezone'),
+      'Expected keyword lookup completion to include chained lookup suggestions.'
     );
     const fieldCompletionItem = findCompletionItemByLabel(
       fieldCompletionList?.items,
       'profile'
     );
     assert.strictEqual(
-      fieldCompletionItem?.filterText,
-      'author__profile',
-      'Expected keyword lookup field completion to use the full lookup path as filterText.'
+      completionItemFilterValue(fieldCompletionItem!),
+      'profile',
+      'Expected keyword lookup field completion to match its visible label.'
     );
     assert.strictEqual(
       fieldCompletionItem?.insertText,
@@ -339,6 +696,25 @@ suite('Django ORM Intellisense UI', () => {
       fieldCompletionItem?.command?.command,
       'editor.action.triggerSuggest',
       'Expected keyword lookup relation completion to reopen suggestions.'
+    );
+    const chainedFieldCompletionItem = findCompletionItemByLabel(
+      fieldCompletionList?.items,
+      'profile__timezone'
+    );
+    assert.strictEqual(
+      completionItemFilterValue(chainedFieldCompletionItem!),
+      'profile__timezone',
+      'Expected keyword lookup chained completion to match its visible chained label.'
+    );
+    assert.strictEqual(
+      chainedFieldCompletionItem?.insertText,
+      'profile__timezone__',
+      'Expected keyword lookup chained completion to continue lookup operators.'
+    );
+    assert.strictEqual(
+      chainedFieldCompletionItem?.command?.command,
+      'editor.action.triggerSuggest',
+      'Expected keyword lookup chained completion to reopen suggestions.'
     );
 
     const blankOperatorCompletionPosition = positionAfterTextInContainer(
@@ -438,9 +814,9 @@ suite('Django ORM Intellisense UI', () => {
       'icontains'
     );
     assert.strictEqual(
-      operatorCompletionItem?.filterText,
-      'author__profile__timezone__icontains',
-      'Expected keyword lookup operator completion to use the full lookup path as filterText.'
+      completionItemFilterValue(operatorCompletionItem!),
+      'icontains',
+      'Expected keyword lookup operator completion to match its visible operator label.'
     );
 
     const hoverPosition = positionInsideText(
@@ -532,9 +908,9 @@ suite('Django ORM Intellisense UI', () => {
       'slug'
     );
     assert.strictEqual(
-      keywordCompletionItem?.filterText,
-      'category__slug',
-      'Expected queryset variable field completion to use the full lookup path as filterText.'
+      completionItemFilterValue(keywordCompletionItem!),
+      'slug',
+      'Expected queryset variable field completion to match its visible label.'
     );
 
     const multilineKeywordPosition = positionAfterTextInContainer(
@@ -724,6 +1100,233 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hoverText.includes('Owner model: `catalog.Category`'),
       `Expected helper receiver hover to mention catalog.Category. Received: ${hoverText}`
+    );
+  });
+
+  test('completes manager, queryset, and model instance members without stubs', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const managerCompletionPosition = positionAfterTextInContainer(
+      document,
+      'manager.ac',
+      'manager.ac'
+    );
+    const managerCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        managerCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(managerCompletionList?.items, 'active'),
+      'Expected manager completion to include the custom queryset-backed `active` method.'
+    );
+
+    const managerCustomCompletionPosition = positionAfterTextInContainer(
+      document,
+      'manager.with_li',
+      'manager.with_li'
+    );
+    const managerCustomCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        managerCustomCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(managerCustomCompletionList?.items, 'with_line_count'),
+      'Expected manager completion to include the custom queryset-backed `with_line_count` method.'
+    );
+
+    const querysetCompletionPosition = positionAfterTextInContainer(
+      document,
+      'queryset.fi',
+      'queryset.fi'
+    );
+    const querysetCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        querysetCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(querysetCompletionList?.items, 'filter'),
+      'Expected queryset completion to include the built-in `filter` method.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(querysetCompletionList?.items, 'first'),
+      'Expected queryset completion to include the built-in `first` method.'
+    );
+
+    const querysetCustomCompletionPosition = positionAfterTextInContainer(
+      document,
+      'queryset.with_li',
+      'queryset.with_li'
+    );
+    const querysetCustomCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        querysetCustomCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(querysetCustomCompletionList?.items, 'with_line_count'),
+      'Expected queryset completion to include the custom `with_line_count` method.'
+    );
+
+    const instanceCompletionPosition = positionAfterTextInContainer(
+      document,
+      'instance.na',
+      'instance.na'
+    );
+    const instanceCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        instanceCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(instanceCompletionList?.items, 'name'),
+      `Expected model instance completion to include the \`name\` field. Received: ${(instanceCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+    assert.ok(
+      hasCompletionItemLabel(instanceCompletionList?.items, 'category'),
+      'Expected model instance completion to include the relation field `category`.'
+    );
+
+    const relationCompletionPosition = positionAfterTextInContainer(
+      document,
+      'instance.category.ti',
+      'instance.category.ti'
+    );
+    const relationCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relationCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(relationCompletionList?.items, 'title'),
+      'Expected related model completion to include the `title` field.'
+    );
+
+    const firstRelationCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Product.objects.active().first().category.ti',
+      'category.ti'
+    );
+    const firstRelationCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        firstRelationCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(firstRelationCompletionList?.items, 'title'),
+      'Expected queryset-to-instance result-shape completion to keep related field suggestions.'
+    );
+  });
+
+  test('shows hover and definition for custom queryset methods', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const activeHoverPosition = positionInsideText(
+      document,
+      'Product.objects.active().with_line_count()',
+      'active'
+    );
+    const activeHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      activeHoverPosition
+    );
+    const activeHoverText = stringifyHovers(activeHovers);
+
+    assert.ok(
+      activeHoverText.includes('Receiver kind: `manager`'),
+      `Expected custom method hover to mention the manager receiver. Received: ${activeHoverText}`
+    );
+    assert.ok(
+      activeHoverText.includes('Return kind: `queryset`'),
+      `Expected custom method hover to mention queryset return semantics. Received: ${activeHoverText}`
+    );
+    assert.ok(
+      activeHoverText.includes('Source: `runtime`') ||
+        activeHoverText.includes('Source: `static`'),
+      `Expected custom method hover to mention traced member discovery. Received: ${activeHoverText}`
+    );
+
+    const activeDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, activeHoverPosition);
+    const activeDefinitionTarget = firstDefinition(activeDefinitions);
+
+    assert.ok(
+      activeDefinitionTarget,
+      'Expected a definition target for the custom `active` queryset method.'
+    );
+    assert.ok(
+      activeDefinitionTarget!.uri.fsPath.endsWith(
+        path.join('fixtures', 'advanced_queries_project', 'sales', 'managers.py')
+      ),
+      `Expected custom method definition to target sales/managers.py. Received: ${activeDefinitionTarget!.uri.fsPath}`
+    );
+    assert.strictEqual(
+      activeDefinitionTarget!.range.start.line + 1,
+      5,
+      'Expected `active` definition to target ProductQuerySet.active.'
+    );
+
+    const withLineCountHoverPosition = positionInsideText(
+      document,
+      'Product.objects.active().with_line_count()',
+      'with_line_count'
+    );
+    const withLineCountDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, withLineCountHoverPosition);
+    const withLineCountDefinitionTarget = firstDefinition(withLineCountDefinitions);
+
+    assert.ok(
+      withLineCountDefinitionTarget,
+      'Expected a definition target for the custom `with_line_count` queryset method.'
+    );
+    assert.strictEqual(
+      withLineCountDefinitionTarget!.range.start.line + 1,
+      8,
+      'Expected `with_line_count` definition to target ProductQuerySet.with_line_count.'
     );
   });
 
@@ -988,6 +1591,98 @@ suite('Django ORM Intellisense UI', () => {
     }
   });
 
+  test('normalizes macOS /usr/bin/python3 to a usable developer tools interpreter', () => {
+    if (process.platform !== 'darwin') {
+      return;
+    }
+
+    const developerPython = [
+      '/Applications/Xcode.app/Contents/Developer/usr/bin/python3',
+      '/Library/Developer/CommandLineTools/usr/bin/python3',
+    ].find((candidate) => fs.existsSync(candidate));
+
+    if (!developerPython) {
+      return;
+    }
+
+    const validation = validatePythonInterpreterPath('/usr/bin/python3');
+    assert.ok(validation.valid, 'Expected /usr/bin/python3 normalization to remain valid.');
+    assert.strictEqual(validation.normalizedPath, fs.realpathSync(developerPython));
+  });
+
+  test('removes legacy managed Pylance stubPath and stub files when stub generation is disabled', async function () {
+    this.timeout(20_000);
+
+    const tempRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-stub-workspace-')
+    );
+    const tempWorkspace = path.join(tempRoot, 'workspace');
+    fs.mkdirSync(tempWorkspace, { recursive: true });
+    const legacyStubRoot = path.join(
+      tempWorkspace,
+      '.django_orm_intellisense',
+      'stubs'
+    );
+    fs.mkdirSync(path.join(legacyStubRoot, 'blog'), { recursive: true });
+    fs.writeFileSync(path.join(legacyStubRoot, '.stub-version'), '2\n', 'utf8');
+    fs.writeFileSync(
+      path.join(legacyStubRoot, '_django_orm_intellisense_support.pyi'),
+      'class DjangoQuerySet: ...\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(legacyStubRoot, 'blog', 'models.pyi'),
+      'class Post: ...\n',
+      'utf8'
+    );
+
+    await removeWorkspaceFoldersFrom(0);
+    await addWorkspaceFolder(tempWorkspace);
+
+    try {
+      writeWorkspaceSettings(tempWorkspace, {
+        'python.analysis.stubPath': '.django_orm_intellisense/stubs',
+      });
+
+      const snapshot: HealthSnapshot = {
+        phase: 'ready',
+        detail: 'stub sync test',
+        capabilities: [],
+        workspaceRoot: tempWorkspace,
+      };
+      const output = vscode.window.createOutputChannel(
+        'Django ORM Intellisense Test'
+      );
+
+      try {
+        await syncManagedPylanceStubPath(snapshot, output);
+      } finally {
+        output.dispose();
+      }
+
+      const managedStubPath = readWorkspaceSettings(tempWorkspace)[
+        'python.analysis.stubPath'
+      ];
+
+      assert.strictEqual(
+        managedStubPath,
+        undefined,
+        'Expected the legacy managed python.analysis.stubPath to be removed.'
+      );
+      assert.ok(
+        !fs.existsSync(legacyStubRoot),
+        'Expected the legacy managed stub files to be removed.'
+      );
+      assert.ok(
+        !fs.existsSync(path.join(tempWorkspace, '.django_orm_intellisense')),
+        'Expected the empty legacy managed stub directory to be removed.'
+      );
+    } finally {
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   test('configures and restores managed Pylance diagnostic overrides', async function () {
     this.timeout(20_000);
 
@@ -1054,86 +1749,11 @@ suite('Django ORM Intellisense UI', () => {
       fs.rmSync(tempWorkspace, { recursive: true, force: true });
     }
   });
-
-  test('generates managed Pylance stubs and wires stubPath for the workspace', async function () {
-    this.timeout(30_000);
-
-    const tempWorkspace = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'django-orm-intellisense-stubs-')
-    );
-    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
-    fs.cpSync(fixtureRoot, tempWorkspace, { recursive: true });
-
-    await removeWorkspaceFoldersFrom(0);
-    await addWorkspaceFolder(tempWorkspace);
-    await setWorkspaceRoot(tempWorkspace);
-    await setPythonInterpreter('');
-
-    try {
-      const stubRoot = path.join(
-        tempWorkspace,
-        '.django_orm_intellisense',
-        'stubs'
-      );
-      const modelStubPath = path.join(stubRoot, 'blog', 'models.pyi');
-      const supportStubPath = path.join(
-        stubRoot,
-        '_django_orm_intellisense_support.pyi'
-      );
-      const versionFilePath = path.join(stubRoot, '.stub-version');
-
-      await waitForCondition(() => {
-        const settings = readWorkspaceSettings(tempWorkspace);
-        return (
-          settings['python.analysis.stubPath'] ===
-            '.django_orm_intellisense/stubs' &&
-          fs.existsSync(modelStubPath) &&
-          fs.existsSync(supportStubPath) &&
-          fs.existsSync(versionFilePath)
-        );
-      }, 20_000);
-
-      const settings = readWorkspaceSettings(tempWorkspace);
-      assert.strictEqual(
-        settings['python.analysis.stubPath'],
-        '.django_orm_intellisense/stubs'
-      );
-
-      const modelStub = fs.readFileSync(modelStubPath, 'utf8');
-      assert.ok(
-        modelStub.includes('class Post(models.Model):'),
-        `Expected generated model stub to include Post. Received: ${modelStub}`
-      );
-      assert.ok(
-        modelStub.includes('objects: ClassVar[DjangoManager[Post]]'),
-        `Expected generated model stub to include a typed manager. Received: ${modelStub}`
-      );
-      assert.ok(
-        modelStub.includes('author: Author'),
-        `Expected generated model stub to type ForeignKey relations. Received: ${modelStub}`
-      );
-      assert.ok(
-        modelStub.includes('class AuditLog(TimeStampedBaseModel):'),
-        `Expected inherited model stub to preserve base classes. Received: ${modelStub}`
-      );
-      assert.ok(
-        fs.existsSync(path.join(stubRoot, 'blog', 'py.typed')),
-        'Expected generated stubs to include py.typed for the top-level package.'
-      );
-      assert.ok(
-        fs.readFileSync(versionFilePath, 'utf8').trim().length > 0,
-        'Expected generated stubs to include a stub schema version marker.'
-      );
-    } finally {
-      await removeWorkspaceFoldersFrom(0);
-      fs.rmSync(tempWorkspace, { recursive: true, force: true });
-    }
-  });
 });
 
 async function setWorkspaceRoot(rootPath: string): Promise<void> {
   await vscode.workspace
-    .getConfiguration('djangoOrmIntellisense')
+    .getConfiguration('djangoOrmIntellisense', extensionConfigurationScope())
     .update(
       'workspaceRoot',
       rootPath,
@@ -1144,7 +1764,7 @@ async function setWorkspaceRoot(rootPath: string): Promise<void> {
 
 async function setPythonInterpreter(interpreter: string): Promise<void> {
   await vscode.workspace
-    .getConfiguration('djangoOrmIntellisense')
+    .getConfiguration('djangoOrmIntellisense', extensionConfigurationScope())
     .update(
       'pythonInterpreter',
       interpreter,
@@ -1155,8 +1775,12 @@ async function setPythonInterpreter(interpreter: string): Promise<void> {
 
 function configurationTarget(): vscode.ConfigurationTarget {
   return vscode.workspace.workspaceFolders?.length
-    ? vscode.ConfigurationTarget.Workspace
+    ? vscode.ConfigurationTarget.WorkspaceFolder
     : vscode.ConfigurationTarget.Global;
+}
+
+function extensionConfigurationScope(): vscode.ConfigurationScope | undefined {
+  return vscode.workspace.workspaceFolders?.[0]?.uri;
 }
 
 function defaultTestInterpreter(): string {
@@ -1164,7 +1788,17 @@ function defaultTestInterpreter(): string {
     return 'python';
   }
 
-  return fs.existsSync('/usr/bin/python3') ? '/usr/bin/python3' : 'python3';
+  for (const candidate of [
+    '/opt/homebrew/bin/python3',
+    '/usr/local/bin/python3',
+    '/usr/bin/python3',
+  ]) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return 'python3';
 }
 
 async function openFixtureDocument(
@@ -1214,6 +1848,10 @@ function positionInsideText(
 
 function completionItemLabel(item: vscode.CompletionItem): string {
   return typeof item.label === 'string' ? item.label : item.label.label;
+}
+
+function completionItemFilterValue(item: vscode.CompletionItem): string {
+  return item.filterText ?? completionItemLabel(item);
 }
 
 function hasCompletionItemLabel(

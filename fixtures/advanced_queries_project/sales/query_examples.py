@@ -39,3 +39,23 @@ class ReceiverExamples(ProductLookupService):
         self.local_queryset().values("category__ti")
         self.local_queryset().values("category__title")
         super().base_queryset().filter(category__sl='chairs')
+
+
+def member_examples():
+    manager = Product.objects
+    manager.ac
+    manager.with_li
+
+    queryset = Product.objects.active()
+    queryset.fi
+    queryset.with_li
+
+    instance = Product.objects.get(id=1)
+    instance.na
+    instance.category.ti
+
+    Product.objects.first().ca
+    Product.objects.active().first().na
+    Product.objects.active().first().category.ti
+    Product.objects.active().with_line_co
+    Product.objects.active().with_line_count()

@@ -319,7 +319,11 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
 
             field_names.append(field.name)
             field_count += 1
-            runtime_field_registry[(f'{meta.app_label}.{meta.object_name}', str(field.name))] = field
+            _register_runtime_field(
+                runtime_field_registry,
+                model_label=f'{meta.app_label}.{meta.object_name}',
+                field=field,
+            )
             fields.append(
                 RuntimeFieldSummary(
                     name=str(field.name),
@@ -422,9 +426,11 @@ def _ensure_runtime_field_registry(settings_module: str | None) -> None:
                     runtime_field_registry[(model_label, reverse_name)] = field
                 continue
 
-            field_name = getattr(field, 'name', None)
-            if field_name:
-                runtime_field_registry[(model_label, str(field_name))] = field
+            _register_runtime_field(
+                runtime_field_registry,
+                model_label=model_label,
+                field=field,
+            )
 
     _set_runtime_field_registry(settings_module, runtime_field_registry)
 
@@ -460,6 +466,49 @@ def _relation_name(field: object) -> str | None:
 
     name = getattr(field, 'name', None)
     return str(name) if name else None
+
+
+def _register_runtime_field(
+    registry: dict[tuple[str, str], object],
+    *,
+    model_label: str,
+    field: object,
+) -> None:
+    field_name = getattr(field, 'name', None)
+    if field_name:
+        registry[(model_label, str(field_name))] = field
+
+    attname = _relation_attname(field)
+    attname_field = _relation_attname_field(field)
+    if attname and attname_field is not None and (model_label, attname) not in registry:
+        registry[(model_label, attname)] = attname_field
+
+
+def _relation_attname(field: object) -> str | None:
+    if not (
+        getattr(field, 'many_to_one', False)
+        or getattr(field, 'one_to_one', False)
+    ):
+        return None
+
+    attname = getattr(field, 'attname', None)
+    field_name = getattr(field, 'name', None)
+    if not attname or not field_name:
+        return None
+
+    attname_text = str(attname)
+    if attname_text == str(field_name):
+        return None
+
+    return attname_text
+
+
+def _relation_attname_field(field: object) -> object | None:
+    attname = _relation_attname(field)
+    if attname is None:
+        return None
+
+    return getattr(field, 'target_field', None)
 
 
 def _related_model_label(field: object) -> str | None:

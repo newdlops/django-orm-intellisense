@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..discovery.workspace import WorkspaceProfile
-from ..runtime.inspector import RuntimeInspection
+from ..runtime.inspector import RuntimeInspection, get_runtime_field
 from ..static_index.indexer import FieldCandidate
 from ..static_index.indexer import StaticIndex
 
@@ -122,6 +122,12 @@ def build_model_graph(
                     source='runtime',
                 )
 
+        _add_relation_attname_alias_fields(
+            runtime=runtime,
+            model_label=model_label,
+            fields_by_name=fields_by_name,
+        )
+
         if fields_by_name:
             fields_by_model_label[model_label] = fields_by_name
 
@@ -137,3 +143,70 @@ def _runtime_model_summary(
             return model
 
     return None
+
+
+def _add_relation_attname_alias_fields(
+    *,
+    runtime: RuntimeInspection,
+    model_label: str,
+    fields_by_name: dict[str, FieldCandidate],
+) -> None:
+    for field in list(fields_by_name.values()):
+        if not _supports_relation_attname_alias(field):
+            continue
+
+        runtime_relation_field = get_runtime_field(
+            runtime.settings_module,
+            model_label=model_label,
+            field_name=field.name,
+        )
+        alias_name = _relation_attname_alias_name(field, runtime_relation_field)
+        if not alias_name or alias_name in fields_by_name:
+            continue
+
+        runtime_attname_field = get_runtime_field(
+            runtime.settings_module,
+            model_label=model_label,
+            field_name=alias_name,
+        )
+        alias_field_kind = _runtime_attname_field_kind(runtime_attname_field) or field.field_kind
+        fields_by_name[alias_name] = FieldCandidate(
+            model_label=field.model_label,
+            name=alias_name,
+            file_path=field.file_path,
+            line=field.line,
+            column=field.column,
+            field_kind=alias_field_kind,
+            is_relation=False,
+            relation_direction=None,
+            related_model_label=None,
+            declared_model_label=field.declared_model_label,
+            related_name=field.related_name,
+            source='runtime' if runtime_attname_field is not None else field.source,
+        )
+
+
+def _supports_relation_attname_alias(field: FieldCandidate) -> bool:
+    return (
+        field.is_relation
+        and field.relation_direction == 'forward'
+        and field.field_kind in {'ForeignKey', 'OneToOneField'}
+    )
+
+
+def _relation_attname_alias_name(
+    field: FieldCandidate,
+    runtime_relation_field: object | None,
+) -> str | None:
+    attname = getattr(runtime_relation_field, 'attname', None)
+    if isinstance(attname, str) and attname and attname != field.name:
+        return attname
+
+    return f'{field.name}_id'
+
+
+def _runtime_attname_field_kind(runtime_attname_field: object | None) -> str | None:
+    if runtime_attname_field is None:
+        return None
+
+    return runtime_attname_field.__class__.__name__

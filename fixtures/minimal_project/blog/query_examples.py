@@ -3,13 +3,20 @@ from blog import AuditLog, Company, MultiInheritedLog, Post
 
 def lookup_examples():
     Post.objects.values("author__pro")
+    Post.objects.values("author__")
     Post.objects.values("author__profile__timezone")
     Post.objects.select_related("author__profile")
     Post.objects.order_by("author__name")
+    Post.objects.filter(auth='mentor')
+    Post.objects.filter()
     Post.objects.filter(author__pro='mentor')
+    Post.objects.filter(author__='mentor')
     Post.objects.filter(author__profile__timezone='Asia/Seoul')
     Post.objects.filter(author__profile__timezone__='Asia/Seoul')
     Post.objects.filter(author__profile__timezone__i='Asia/Seoul')
+    Post.objects.filter(author_i=1)
+    Post.objects.filter(author_id__in=[1, 2])
+    Post.objects.filter(tit='x')
     Post.objects.filter(title__='x')
     Post.objects.filter(
         author__profile__time='Asia/Seoul',
