@@ -1940,13 +1940,21 @@ async function resolveOrmMemberCompletionContext(
       continue;
     }
 
-    const receiver = await resolveOrmReceiverAtOffset(
+    const dynamicReceiver = await resolveDynamicInstanceReceiverAtOffset(
       daemon,
       document,
       parsedAccess.receiverExpression,
       endOffset,
       new Set()
     );
+    const staticReceiver = await resolveOrmReceiverAtOffset(
+      daemon,
+      document,
+      parsedAccess.receiverExpression,
+      endOffset,
+      new Set()
+    );
+    const receiver = preferMemberReceiver(staticReceiver, dynamicReceiver);
     if (!receiver) {
       continue;
     }
@@ -1993,13 +2001,21 @@ async function resolveOrmMemberAccessContext(
       continue;
     }
 
-    const receiver = await resolveOrmReceiverAtOffset(
+    const dynamicReceiver = await resolveDynamicInstanceReceiverAtOffset(
       daemon,
       document,
       parsedAccess.receiverExpression,
       endOffset,
       new Set()
     );
+    const staticReceiver = await resolveOrmReceiverAtOffset(
+      daemon,
+      document,
+      parsedAccess.receiverExpression,
+      endOffset,
+      new Set()
+    );
+    const receiver = preferMemberReceiver(staticReceiver, dynamicReceiver);
     if (!receiver) {
       continue;
     }
@@ -2123,29 +2139,25 @@ async function resolveOrmReceiverAtOffset(
   }
   visited.add(visitKey);
 
-  if (/^[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?$/.test(normalizedExpression)) {
-    const modelLabel = await resolveModelLabelFromSymbol(
-      daemon,
-      document,
-      normalizedExpression,
-      beforeOffset
-    );
-    if (modelLabel) {
-      return {
-        kind: 'model_class',
-        modelLabel,
-      };
-    }
-  }
-
   const memberAccess = splitTopLevelMemberAccess(normalizedExpression);
   if (memberAccess) {
-    const objectReceiver = await resolveOrmReceiverAtOffset(
+    const dynamicObjectReceiver = await resolveDynamicInstanceReceiverAtOffset(
+      daemon,
+      document,
+      memberAccess.objectExpression,
+      beforeOffset,
+      new Set()
+    );
+    const staticObjectReceiver = await resolveOrmReceiverAtOffset(
       daemon,
       document,
       memberAccess.objectExpression,
       beforeOffset,
       visited
+    );
+    const objectReceiver = preferMemberReceiver(
+      staticObjectReceiver,
+      dynamicObjectReceiver
     );
     if (objectReceiver) {
       const resolution = await daemon.resolveOrmMember(
@@ -2158,6 +2170,21 @@ async function resolveOrmReceiverAtOffset(
       if (resolvedReceiver) {
         return resolvedReceiver;
       }
+    }
+  }
+
+  if (/^[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?$/.test(normalizedExpression)) {
+    const modelLabel = await resolveModelLabelFromSymbol(
+      daemon,
+      document,
+      normalizedExpression,
+      beforeOffset
+    );
+    if (modelLabel) {
+      return {
+        kind: 'model_class',
+        modelLabel,
+      };
     }
   }
 
@@ -2214,6 +2241,91 @@ async function resolveOrmReceiverAtOffset(
     assignment.offset,
     visited
   );
+}
+
+function preferMemberReceiver(
+  staticReceiver: OrmReceiverInfo | undefined,
+  dynamicReceiver: OrmReceiverInfo | undefined
+): OrmReceiverInfo | undefined {
+  if (
+    staticReceiver &&
+    staticReceiver.kind !== 'instance' &&
+    staticReceiver.kind !== 'unknown' &&
+    staticReceiver.kind !== 'scalar'
+  ) {
+    return staticReceiver;
+  }
+
+  return dynamicReceiver ?? staticReceiver;
+}
+
+async function resolveDynamicInstanceReceiverAtOffset(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  receiverExpression: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  const normalizedExpression = normalizeReceiverExpression(receiverExpression);
+  if (!normalizedExpression) {
+    return undefined;
+  }
+
+  const visitKey = `${document.uri.toString()}:dynamic-instance:${normalizedExpression}@${beforeOffset}`;
+  if (visited.has(visitKey) || visited.size > 12) {
+    return undefined;
+  }
+  visited.add(visitKey);
+
+  const memberAccess = splitTopLevelMemberAccess(normalizedExpression);
+  if (memberAccess) {
+    const dynamicObjectReceiver = await resolveDynamicInstanceReceiverAtOffset(
+      daemon,
+      document,
+      memberAccess.objectExpression,
+      beforeOffset,
+      visited
+    );
+    const staticObjectReceiver = await resolveOrmReceiverAtOffset(
+      daemon,
+      document,
+      memberAccess.objectExpression,
+      beforeOffset,
+      new Set()
+    );
+    const objectReceiver = preferMemberReceiver(
+      staticObjectReceiver,
+      dynamicObjectReceiver
+    );
+    if (objectReceiver) {
+      const resolution = await daemon.resolveOrmMember(
+        objectReceiver.modelLabel,
+        objectReceiver.kind,
+        memberAccess.memberName,
+        objectReceiver.managerName
+      );
+      const resolvedReceiver = receiverFromOrmMemberResolution(resolution);
+      if (resolvedReceiver) {
+        return resolvedReceiver;
+      }
+    }
+  }
+
+  const modelLabel = await resolveBaseModelLabelForReceiverAtOffset(
+    daemon,
+    document,
+    normalizedExpression,
+    beforeOffset,
+    new Set()
+  );
+  if (!modelLabel) {
+    return undefined;
+  }
+
+  return {
+    kind: 'instance',
+    modelLabel,
+  };
 }
 
 async function resolveOrmReceiverFromCallExpression(
@@ -2545,18 +2657,6 @@ async function resolveBaseModelLabelForReceiverAtOffset(
   }
   visited.add(visitKey);
 
-  for (const symbolCandidate of directModelSymbolCandidates(normalizedExpression)) {
-    const resolvedLabel = await resolveModelLabelFromSymbol(
-      daemon,
-      document,
-      symbolCandidate,
-      beforeOffset
-    );
-    if (resolvedLabel) {
-      return resolvedLabel;
-    }
-  }
-
   const resolvedReceiver = await resolveLookupReceiverAtOffset(
     daemon,
     document,
@@ -2577,6 +2677,18 @@ async function resolveBaseModelLabelForReceiverAtOffset(
   );
   if (callResolvedLabel) {
     return callResolvedLabel;
+  }
+
+  for (const symbolCandidate of directModelSymbolCandidates(normalizedExpression)) {
+    const resolvedLabel = await resolveModelLabelFromSymbol(
+      daemon,
+      document,
+      symbolCandidate,
+      beforeOffset
+    );
+    if (resolvedLabel) {
+      return resolvedLabel;
+    }
   }
 
   const rootIdentifier = receiverRootIdentifier(normalizedExpression);
@@ -2630,21 +2742,6 @@ async function resolveLookupReceiverAtOffset(
   }
   visited.add(visitKey);
 
-  if (/^[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?$/.test(normalizedExpression)) {
-    const modelLabel = await resolveModelLabelFromSymbol(
-      daemon,
-      document,
-      normalizedExpression,
-      beforeOffset
-    );
-    if (modelLabel) {
-      return {
-        kind: 'model_class',
-        modelLabel,
-      };
-    }
-  }
-
   const memberAccess = splitTopLevelMemberAccess(normalizedExpression);
   if (memberAccess) {
     const objectReceiver = await resolveLookupReceiverAtOffset(
@@ -2667,6 +2764,21 @@ async function resolveLookupReceiverAtOffset(
       if (resolvedReceiver) {
         return resolvedReceiver;
       }
+    }
+  }
+
+  if (/^[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?$/.test(normalizedExpression)) {
+    const modelLabel = await resolveModelLabelFromSymbol(
+      daemon,
+      document,
+      normalizedExpression,
+      beforeOffset
+    );
+    if (modelLabel) {
+      return {
+        kind: 'model_class',
+        modelLabel,
+      };
     }
   }
 

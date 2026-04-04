@@ -1,8 +1,10 @@
 import * as assert from 'assert';
+import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { getActiveDaemonForTesting } from '../client/extension';
 import type { HealthSnapshot } from '../client/protocol';
 import { syncManagedPylanceStubPath } from '../client/pylance/stubPath';
 import {
@@ -12,13 +14,60 @@ import {
 } from '../client/python/interpreter';
 
 const EXTENSION_ID = 'newdlops.django-orm-intellisense';
+const FIXTURES_ROOT = path.resolve(__dirname, '../../fixtures');
+const DJANGO_E2E_MAJOR_VERSION = 5;
+
+interface FixtureE2EProjectConfig {
+  settingsModule: string;
+}
+
+interface FixtureE2EEnvironment extends FixtureE2EProjectConfig {
+  interpreterPath: string;
+  djangoVersion: string;
+}
+
+const FIXTURE_E2E_PROJECTS: Record<string, FixtureE2EProjectConfig> = {
+  minimal_project: {
+    settingsModule: 'project.settings',
+  },
+  advanced_queries_project: {
+    settingsModule: 'core.settings',
+  },
+  reexport_project: {
+    settingsModule: 'config.settings',
+  },
+};
+
+const fixtureE2EEnvironmentCache = new Map<string, FixtureE2EEnvironment>();
+const fixtureWorkspaceCache = new Map<string, string>();
+let django5BaseInterpreterCache: string | undefined;
+let testCacheRoot: string | undefined;
 
 suite('Django ORM Intellisense UI', () => {
   suiteSetup(async () => {
-    await setPythonInterpreter(defaultTestInterpreter());
+    testCacheRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-test-cache-')
+    );
+    process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR = testCacheRoot;
     const extension = vscode.extensions.getExtension(EXTENSION_ID);
     assert.ok(extension, `Extension ${EXTENSION_ID} is not available.`);
     await extension.activate();
+  });
+
+  suiteTeardown(async () => {
+    await removeWorkspaceFoldersFrom(0);
+    await clearExtensionSetting('workspaceRoot');
+    await clearExtensionSetting('pythonInterpreter');
+    await clearExtensionSetting('settingsModule');
+    for (const workspacePath of fixtureWorkspaceCache.values()) {
+      fs.rmSync(workspacePath, { recursive: true, force: true });
+    }
+    fixtureWorkspaceCache.clear();
+    delete process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR;
+    if (testCacheRoot) {
+      fs.rmSync(testCacheRoot, { recursive: true, force: true });
+      testCacheRoot = undefined;
+    }
   });
 
   test('completes and resolves ORM lookup paths in fixture project', async function () {
@@ -1497,6 +1546,40 @@ suite('Django ORM Intellisense UI', () => {
       hasCompletionItemLabel(firstRelationCompletionList?.items, 'title'),
       'Expected queryset-to-instance result-shape completion to keep related field suggestions.'
     );
+
+    const dynamicInstanceCompletionPosition = positionAfterTextInContainer(
+      document,
+      'dynamic_instance.',
+      'dynamic_instance.'
+    );
+    const dynamicInstanceCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        dynamicInstanceCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(dynamicInstanceCompletionList?.items, 'name'),
+      'Expected dynamically resolved instance completion to include the `name` field.'
+    );
+
+    const dynamicRelationCompletionPosition = positionAfterTextInContainer(
+      document,
+      'dynamic_instance.category.ti',
+      'dynamic_instance.category.ti'
+    );
+    const dynamicRelationCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        dynamicRelationCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(dynamicRelationCompletionList?.items, 'title'),
+      'Expected dynamically resolved instance relations to keep related model completion.'
+    );
   });
 
   test('infers loop target receivers from querysets and typed collections', async function () {
@@ -2317,24 +2400,34 @@ suite('Django ORM Intellisense UI', () => {
 });
 
 async function setWorkspaceRoot(rootPath: string): Promise<void> {
-  await vscode.workspace
-    .getConfiguration('djangoOrmIntellisense', extensionConfigurationScope())
-    .update(
-      'workspaceRoot',
-      rootPath,
-      configurationTarget()
-    );
-  await delay(1200);
+  const e2eEnvironment = await ensureFixtureE2EEnvironment(rootPath);
+
+  if (!e2eEnvironment) {
+    await updateExtensionSetting('workspaceRoot', rootPath);
+    await delay(1200);
+    return;
+  }
+
+  const fixtureWorkspace = ensureFixtureWorkspace(rootPath, e2eEnvironment);
+  await removeWorkspaceFoldersFrom(0);
+  await addWorkspaceFolder(fixtureWorkspace);
+  const daemon = getActiveDaemonForTesting();
+  assert.ok(daemon, 'Expected the analysis daemon to be active after extension activation.');
+  await daemon.ensureStarted(vscode.Uri.file(fixtureWorkspace));
+  const snapshot = await daemon.refreshHealth();
+  assertFixtureE2EHealth(snapshot, rootPath, e2eEnvironment);
+  await delay(300);
 }
 
 async function setPythonInterpreter(interpreter: string): Promise<void> {
-  await vscode.workspace
-    .getConfiguration('djangoOrmIntellisense', extensionConfigurationScope())
-    .update(
-      'pythonInterpreter',
-      interpreter,
-      configurationTarget()
-    );
+  await updateExtensionSetting('pythonInterpreter', interpreter);
+  await delay(1200);
+}
+
+async function setSettingsModule(
+  settingsModule: string | undefined
+): Promise<void> {
+  await updateExtensionSetting('settingsModule', settingsModule);
   await delay(1200);
 }
 
@@ -2364,6 +2457,258 @@ function defaultTestInterpreter(): string {
   }
 
   return 'python3';
+}
+
+async function updateExtensionSetting(
+  key: 'workspaceRoot' | 'pythonInterpreter' | 'settingsModule',
+  value: string | undefined
+): Promise<void> {
+  await vscode.workspace
+    .getConfiguration('djangoOrmIntellisense', extensionConfigurationScope())
+    .update(key, value, configurationTarget());
+}
+
+async function clearExtensionSetting(
+  key: 'workspaceRoot' | 'pythonInterpreter' | 'settingsModule'
+): Promise<void> {
+  await updateExtensionSetting(key, undefined);
+}
+
+async function ensureFixtureE2EEnvironment(
+  rootPath: string
+): Promise<FixtureE2EEnvironment | undefined> {
+  const fixtureName = fixtureProjectName(rootPath);
+  if (!fixtureName) {
+    return undefined;
+  }
+
+  const cachedEnvironment = fixtureE2EEnvironmentCache.get(rootPath);
+  if (
+    cachedEnvironment &&
+    fs.existsSync(cachedEnvironment.interpreterPath) &&
+    djangoMajorVersion(cachedEnvironment.djangoVersion) === DJANGO_E2E_MAJOR_VERSION
+  ) {
+    return cachedEnvironment;
+  }
+
+  const projectConfig = FIXTURE_E2E_PROJECTS[fixtureName];
+  assert.ok(
+    projectConfig,
+    `Missing E2E fixture configuration for ${fixtureName}.`
+  );
+
+  const baseInterpreter = await findDjango5BaseInterpreter();
+  const environmentRoot = path.join(
+    os.tmpdir(),
+    'django-orm-intellisense-e2e',
+    fixtureName
+  );
+  const interpreterPath =
+    process.platform === 'win32'
+      ? path.join(environmentRoot, 'Scripts', 'python.exe')
+      : path.join(environmentRoot, 'bin', 'python');
+  const metadataPath = path.join(environmentRoot, '.djls-e2e-base-python');
+  const needsRebuild =
+    !fs.existsSync(interpreterPath) ||
+    readFileIfExists(metadataPath)?.trim() !== baseInterpreter ||
+    djangoMajorVersion((await readDjangoVersion(interpreterPath)) ?? '') !==
+      DJANGO_E2E_MAJOR_VERSION;
+
+  if (needsRebuild) {
+    fs.rmSync(environmentRoot, { recursive: true, force: true });
+    await execFileAsync(
+      baseInterpreter,
+      ['-m', 'venv', '--system-site-packages', environmentRoot],
+    );
+    fs.writeFileSync(metadataPath, `${baseInterpreter}\n`, 'utf8');
+  }
+
+  const djangoVersion = await readDjangoVersion(interpreterPath);
+  assert.ok(
+    djangoVersion,
+    `Expected ${interpreterPath} to import Django after E2E bootstrap.`
+  );
+  assert.strictEqual(
+    djangoMajorVersion(djangoVersion),
+    DJANGO_E2E_MAJOR_VERSION,
+    `Expected ${interpreterPath} to provide Django ${DJANGO_E2E_MAJOR_VERSION}.x, received ${djangoVersion}.`
+  );
+
+  const environment: FixtureE2EEnvironment = {
+    ...projectConfig,
+    interpreterPath,
+    djangoVersion,
+  };
+  fixtureE2EEnvironmentCache.set(rootPath, environment);
+  return environment;
+}
+
+function ensureFixtureWorkspace(
+  rootPath: string,
+  environment: FixtureE2EEnvironment
+): string {
+  const cachedWorkspace = fixtureWorkspaceCache.get(rootPath);
+  if (cachedWorkspace) {
+    writeFixtureWorkspaceSettings(cachedWorkspace, rootPath, environment);
+    return cachedWorkspace;
+  }
+
+  const fixtureName = fixtureProjectName(rootPath) ?? path.basename(rootPath);
+  const workspacePath = fs.mkdtempSync(
+    path.join(os.tmpdir(), `django-orm-intellisense-${fixtureName}-workspace-`)
+  );
+  writeFixtureWorkspaceSettings(workspacePath, rootPath, environment);
+  fixtureWorkspaceCache.set(rootPath, workspacePath);
+  return workspacePath;
+}
+
+function writeFixtureWorkspaceSettings(
+  workspacePath: string,
+  rootPath: string,
+  environment: FixtureE2EEnvironment
+): void {
+  writeWorkspaceSettings(workspacePath, {
+    'djangoOrmIntellisense.workspaceRoot': rootPath,
+    'djangoOrmIntellisense.pythonInterpreter': environment.interpreterPath,
+    'djangoOrmIntellisense.settingsModule': environment.settingsModule,
+  });
+}
+
+function fixtureProjectName(rootPath: string): string | undefined {
+  const resolvedRoot = path.resolve(rootPath);
+  const relativeRoot = path.relative(FIXTURES_ROOT, resolvedRoot);
+  if (
+    relativeRoot.startsWith('..') ||
+    path.isAbsolute(relativeRoot) ||
+    relativeRoot.length === 0
+  ) {
+    return undefined;
+  }
+
+  const [fixtureName] = relativeRoot.split(path.sep);
+  return fixtureName && FIXTURE_E2E_PROJECTS[fixtureName]
+    ? fixtureName
+    : undefined;
+}
+
+async function findDjango5BaseInterpreter(): Promise<string> {
+  if (django5BaseInterpreterCache) {
+    return django5BaseInterpreterCache;
+  }
+
+  for (const candidate of django5BaseInterpreterCandidates()) {
+    const djangoVersion = await readDjangoVersion(candidate);
+    if (djangoMajorVersion(djangoVersion ?? '') !== DJANGO_E2E_MAJOR_VERSION) {
+      continue;
+    }
+
+    django5BaseInterpreterCache = candidate;
+    return candidate;
+  }
+
+  assert.fail(
+    `Could not find a Python interpreter with Django ${DJANGO_E2E_MAJOR_VERSION}.x. ` +
+      'Set DJLS_E2E_BASE_PYTHON or install Django 5 into a discoverable interpreter.'
+  );
+}
+
+function django5BaseInterpreterCandidates(): string[] {
+  const candidates = new Set<string>();
+  const envOverride = process.env.DJLS_E2E_BASE_PYTHON;
+  if (envOverride) {
+    candidates.add(envOverride);
+  }
+
+  const homeDirectory = os.homedir();
+  const pyenvVersionsRoot = path.join(homeDirectory, '.pyenv', 'versions');
+  if (fs.existsSync(pyenvVersionsRoot)) {
+    for (const versionName of fs.readdirSync(pyenvVersionsRoot)) {
+      candidates.add(path.join(pyenvVersionsRoot, versionName, 'bin', 'python'));
+    }
+  }
+
+  const desktopProjectsRoot = path.join(homeDirectory, 'Desktop', 'project');
+  if (fs.existsSync(desktopProjectsRoot)) {
+    for (const projectName of fs.readdirSync(desktopProjectsRoot)) {
+      candidates.add(
+        path.join(desktopProjectsRoot, projectName, 'venv', 'bin', 'python')
+      );
+      candidates.add(
+        path.join(desktopProjectsRoot, projectName, '.venv', 'bin', 'python')
+      );
+    }
+  }
+
+  candidates.add(defaultTestInterpreter());
+  return [...candidates].filter((candidate) => fs.existsSync(candidate));
+}
+
+async function readDjangoVersion(
+  interpreterPath: string
+): Promise<string | undefined> {
+  if (!fs.existsSync(interpreterPath)) {
+    return undefined;
+  }
+
+  try {
+    const output = await execFileAsync(
+      interpreterPath,
+      [
+        '-c',
+        "import importlib.util; spec=importlib.util.find_spec('django'); print(__import__('django').get_version() if spec else '')",
+      ],
+    );
+    return output || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function execFileAsync(
+  file: string,
+  args: readonly string[]
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, [...args], { encoding: 'utf8' }, (error, stdout) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(stdout.trim());
+    });
+  });
+}
+
+function djangoMajorVersion(version: string): number | undefined {
+  const match = version.match(/^(\d+)\./);
+  return match ? Number(match[1]) : undefined;
+}
+
+function readFileIfExists(filePath: string): string | undefined {
+  if (!fs.existsSync(filePath)) {
+    return undefined;
+  }
+
+  return fs.readFileSync(filePath, 'utf8');
+}
+
+function assertFixtureE2EHealth(
+  snapshot: HealthSnapshot,
+  rootPath: string,
+  environment: FixtureE2EEnvironment
+): void {
+  assert.strictEqual(snapshot.workspaceRoot, rootPath);
+  assert.strictEqual(snapshot.pythonPath, environment.interpreterPath);
+  assert.strictEqual(snapshot.settingsModule, environment.settingsModule);
+  assert.strictEqual(snapshot.phase, 'ready');
+  assert.ok(snapshot.runtime, 'Expected runtime inspection details in E2E fixture health.');
+  assert.strictEqual(snapshot.runtime?.djangoImportable, true);
+  assert.strictEqual(snapshot.runtime?.bootstrapStatus, 'ready');
+  assert.strictEqual(snapshot.runtime?.settingsModule, environment.settingsModule);
+  assert.ok(
+    snapshot.runtime?.djangoVersion?.startsWith(`${DJANGO_E2E_MAJOR_VERSION}.`),
+    `Expected Django ${DJANGO_E2E_MAJOR_VERSION}.x in runtime health. Received: ${snapshot.runtime?.djangoVersion}`
+  );
 }
 
 async function openFixtureDocument(

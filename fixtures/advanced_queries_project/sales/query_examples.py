@@ -25,6 +25,10 @@ def build_products():
     return ProductLookupService.available_products()
 
 
+def build_product_instance():
+    return Product.objects.get(id=1)
+
+
 def helper_examples():
     build_products().filter(category__sl='chairs')
     build_products().values("category__ti")
@@ -56,6 +60,10 @@ def member_examples():
     instance.
     instance.na
     instance.category.ti
+
+    dynamic_instance = build_product_instance()
+    dynamic_instance.
+    dynamic_instance.category.ti
 
     Product.objects.first().ca
     Product.objects.active().first().na

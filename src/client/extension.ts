@@ -13,6 +13,10 @@ import { HealthStatusView } from './status/healthStatus';
 
 let activeDaemon: AnalysisDaemon | undefined;
 
+export function getActiveDaemonForTesting(): AnalysisDaemon | undefined {
+  return activeDaemon;
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel('Django ORM Intellisense');
   const daemon = new AnalysisDaemon(context, output);
