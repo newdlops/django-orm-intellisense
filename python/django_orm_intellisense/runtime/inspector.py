@@ -168,12 +168,12 @@ class RuntimeInspection:
         raw_model_preview = payload.get('modelPreview') or []
 
         model_catalog = [
-            RuntimeModelSummary.from_dict(dict(model))
+            _sanitize_runtime_model_summary(RuntimeModelSummary.from_dict(dict(model)))
             for model in raw_model_catalog
             if isinstance(model, dict)
         ]
         model_preview = [
-            RuntimeModelSummary.from_dict(dict(model))
+            _sanitize_runtime_model_summary(RuntimeModelSummary.from_dict(dict(model)))
             for model in raw_model_preview
             if isinstance(model, dict)
         ]
@@ -379,6 +379,31 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
     )
 
 
+def can_defer_runtime_inspection(settings_module: str | None) -> bool:
+    return bool(settings_module) and importlib.util.find_spec('django') is not None
+
+
+def create_pending_runtime_inspection(
+    settings_module: str | None,
+) -> RuntimeInspection:
+    return RuntimeInspection(
+        python_executable=sys.executable,
+        django_importable=importlib.util.find_spec('django') is not None,
+        django_version=None,
+        bootstrap_status='warming_up',
+        settings_module=settings_module,
+        bootstrap_error=None,
+        app_count=0,
+        model_count=0,
+        field_count=0,
+        relation_count=0,
+        reverse_relation_count=0,
+        manager_count=0,
+        model_catalog=[],
+        model_preview=[],
+    )
+
+
 def get_runtime_field(
     settings_module: str | None,
     *,
@@ -459,13 +484,62 @@ def _clear_runtime_field_registry() -> None:
 
 
 def _relation_name(field: object) -> str | None:
+    if getattr(field, 'hidden', False):
+        return None
+
     if hasattr(field, 'get_accessor_name'):
         accessor = field.get_accessor_name()  # type: ignore[call-arg]
-        if accessor:
+        if accessor and not _is_hidden_relation_name(str(accessor)):
             return str(accessor)
 
     name = getattr(field, 'name', None)
-    return str(name) if name else None
+    if not name:
+        return None
+
+    name_text = str(name)
+    return None if _is_hidden_relation_name(name_text) else name_text
+
+
+def _is_hidden_relation_name(name: str) -> bool:
+    return name.endswith('+')
+
+
+def _sanitize_runtime_model_summary(
+    model: RuntimeModelSummary,
+) -> RuntimeModelSummary:
+    visible_fields = [
+        field
+        for field in model.fields
+        if not _is_hidden_relation_name(field.name)
+    ]
+    visible_relations = [
+        relation
+        for relation in model.relations
+        if not _is_hidden_relation_name(relation.name)
+    ]
+
+    return RuntimeModelSummary(
+        label=model.label,
+        module=model.module,
+        field_names=[
+            name
+            for name in model.field_names
+            if not _is_hidden_relation_name(name)
+        ],
+        relation_names=[
+            name
+            for name in model.relation_names
+            if not _is_hidden_relation_name(name)
+        ],
+        reverse_relation_names=[
+            name
+            for name in model.reverse_relation_names
+            if not _is_hidden_relation_name(name)
+        ],
+        fields=visible_fields,
+        relations=visible_relations,
+        manager_names=list(model.manager_names),
+    )
 
 
 def _register_runtime_field(

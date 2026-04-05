@@ -1,8 +1,11 @@
+import typing as t
+from typing import Iterable as TypingIterable, List, Optional as TypingOptional, Sequence as TypingSequence, Union as TypingUnion
+
 from django.db import models
 from django.db.models import Case, QuerySet, Value, When
 
 from sales import expression_helpers as expr
-from sales.models import LineItem, Order, Product
+from sales.models import Fulfillment, FulfillmentDetail, LineItem, Order, Product
 from sales.services import ProductLookupService
 
 
@@ -197,3 +200,48 @@ def loop_examples(products: list[Product], queryset_groups: list[QuerySet[Produc
     for typed_queryset in queryset_groups:
         typed_queryset.with_li
         typed_queryset.values("category__ti")
+
+
+def comprehension_examples(fulfillment_details: list[Product]):
+    {fd.ca for fd in fulfillment_details if fd.ca}
+    {fd.category.ti for fd in Product.objects.active() if fd.ca}
+
+
+def wrapped_comprehension_examples(fulfillment_details: List[Product]):
+    return list({fd.ca for fd in fulfillment_details if fd.ca})
+
+
+def typing_import_examples(products: TypingSequence[Product], fulfillment_details: t.List[FulfillmentDetail], optional_fulfillment_details: TypingOptional[TypingIterable[FulfillmentDetail]], union_fulfillment_details: TypingUnion[t.List[FulfillmentDetail], None]):
+    for sequence_product in products:
+        sequence_product.category.ti
+
+    for typed_list_fd in fulfillment_details:
+        typed_list_fd.de
+
+    {typed_fd.detail_code for typed_fd in fulfillment_details if typed_fd.de}
+
+    if optional_fulfillment_details:
+        for optional_fd in optional_fulfillment_details:
+            optional_fd.fulfillment.re
+
+    if union_fulfillment_details:
+        for union_fd in union_fulfillment_details:
+            union_fd.fulfillment.re
+
+
+def extract_unique_fulfillments(fulfillment_details: List[FulfillmentDetail]) -> List[Fulfillment]:
+    return list({fd.fulfillment for fd in fulfillment_details if fd.fulfillment})
+
+
+class FulfillmentService:
+    def extract_unique_fulfillments(self, fulfillment_details: List[FulfillmentDetail]) -> List[Fulfillment]:
+        return list({fd.fulfillment for fd in fulfillment_details if fd.fulfillment})
+
+    def extract_unique_fulfillments_with_fdd(self, fulfillment_details: List[FulfillmentDetail]) -> List[Fulfillment]:
+        return list({fdd.fulfillment for fdd in fulfillment_details if fdd.fulfillment})
+
+    def extract_unique_fulfillments_completion_probe(self, fulfillment_details: List[FulfillmentDetail]) -> List[Fulfillment]:
+        return list({fd.fulfillment for fd in fulfillment_details if fd.de})
+
+    def extract_unique_fulfillment_references_completion_probe(self, fulfillment_details: List[FulfillmentDetail]) -> List[str]:
+        return list({fd.fulfillment.reference for fd in fulfillment_details if fd.fulfillment.re})

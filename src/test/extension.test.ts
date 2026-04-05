@@ -154,6 +154,43 @@ suite('Django ORM Intellisense UI', () => {
       'Expected lookup operator completion to include `in` after a completed field path.'
     );
 
+    const hiddenReverseCompletionPosition = positionAfterTextInContainer(
+      document,
+      "HiddenReverseTag.objects.filter(_b='hidden')",
+      '_b'
+    );
+    const hiddenReverseCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        hiddenReverseCompletionPosition
+      );
+
+    assert.ok(
+      !hasCompletionItemLabel(
+        hiddenReverseCompletionList?.items,
+        '_blog_hiddenreversepost_tags_+'
+      ),
+      'Expected hidden reverse ManyToMany accessors to stay out of lookup completion.'
+    );
+
+    const hiddenReverseOperatorCompletionPosition = positionAfterTextInContainer(
+      document,
+      "HiddenReverseTag.objects.filter(_blog_hiddenreversepost_tags_+__i=['hidden'])",
+      '_blog_hiddenreversepost_tags_+__i'
+    );
+    const hiddenReverseOperatorCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        hiddenReverseOperatorCompletionPosition
+      );
+
+    assert.ok(
+      !hasCompletionItemLabel(hiddenReverseOperatorCompletionList?.items, 'in'),
+      'Expected hidden reverse ManyToMany accessors to avoid lookup-operator completion.'
+    );
+
     const hoverPosition = positionInsideText(document, 'author__profile__timezone', 'timezone');
     const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
       'vscode.executeHoverProvider',
@@ -247,7 +284,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      83,
+      92,
       'Expected reverse lookup definition to target the CorporateRegistration.registration_code field.'
     );
 
@@ -546,6 +583,30 @@ suite('Django ORM Intellisense UI', () => {
       `Expected relation-string hover to mention the resolved file. Received: ${hoverText}`
     );
 
+    const foreignKeyTailHoverPosition = positionInsideText(
+      document,
+      'models.ForeignKey("blog.Profile", on_delete=models.CASCADE)',
+      'Profile'
+    );
+    const foreignKeyTailHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        foreignKeyTailHoverPosition
+      );
+    const foreignKeyTailHoverText = stringifyHovers(foreignKeyTailHovers);
+
+    assert.ok(
+      foreignKeyTailHoverText.includes('Resolved symbol: `blog.models.Profile`'),
+      `Expected dotted ForeignKey relation-string hover on the tail symbol to resolve as blog.models.Profile. Received: ${foreignKeyTailHoverText}`
+    );
+    assert.ok(
+      foreignKeyTailHoverText.includes(
+        'Resolved from string reference `blog.Profile`.'
+      ),
+      `Expected dotted ForeignKey relation-string hover on the tail symbol to preserve the original string reference. Received: ${foreignKeyTailHoverText}`
+    );
+
     const bareHoverPosition = positionInsideText(
       document,
       'models.ForeignKey("Profile", on_delete=models.CASCADE)',
@@ -603,6 +664,33 @@ suite('Django ORM Intellisense UI', () => {
       definitionTarget!.range.start.line + 1,
       32,
       'Expected relation-string definition to target the Profile model.'
+    );
+
+    const foreignKeyTailDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >(
+      'vscode.executeDefinitionProvider',
+      document.uri,
+      foreignKeyTailHoverPosition
+    );
+    const foreignKeyTailDefinitionTarget = firstDefinition(
+      foreignKeyTailDefinitions
+    );
+
+    assert.ok(
+      foreignKeyTailDefinitionTarget,
+      'Expected dotted ForeignKey relation-string tail symbol to resolve to the target model.'
+    );
+    assert.ok(
+      foreignKeyTailDefinitionTarget!.uri.fsPath.endsWith(
+        path.join('fixtures', 'minimal_project', 'blog', 'models.py')
+      ),
+      `Expected dotted ForeignKey relation-string tail symbol definition to target blog/models.py. Received: ${foreignKeyTailDefinitionTarget!.uri.fsPath}`
+    );
+    assert.strictEqual(
+      foreignKeyTailDefinitionTarget!.range.start.line + 1,
+      32,
+      'Expected dotted ForeignKey relation-string tail symbol definition to target the Profile model.'
     );
 
     const diagnostics = await waitForDiagnostics(
@@ -790,7 +878,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       queryNameDefinitionTarget!.range.start.line + 1,
-      116,
+      125,
       'Expected reverse related_query_name definition to target FaqLink.label.'
     );
 
@@ -1011,7 +1099,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      62,
+      66,
       'Expected foreign-key attname definition to target the Post.author field.'
     );
 
@@ -4290,7 +4378,7 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
-  test('infers loop target receivers from querysets and typed collections', async function () {
+  test('infers loop and comprehension target receivers from querysets and typed collections', async function () {
     this.timeout(20_000);
 
     const fixtureRoot = path.resolve(
@@ -4338,6 +4426,44 @@ suite('Django ORM Intellisense UI', () => {
       'Expected typed collection loop targets to resolve as model instances.'
     );
 
+    const typingSequenceLoopCompletionPosition = positionAfterTextInContainer(
+      document,
+      'sequence_product.category.ti',
+      'sequence_product.category.ti'
+    );
+    const typingSequenceLoopCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typingSequenceLoopCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(typingSequenceLoopCompletionList?.items, 'title'),
+      'Expected `from typing import Sequence as ...` loop targets to resolve as model instances.'
+    );
+
+    const typingModuleLoopCompletionPosition = positionAfterTextInContainer(
+      document,
+      'typed_list_fd.de',
+      'typed_list_fd.de'
+    );
+    const typingModuleLoopCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typingModuleLoopCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(typingModuleLoopCompletionList?.items, 'detail_code'),
+      'Expected `import typing as ...` list annotations to resolve loop targets as FulfillmentDetail.'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(typingModuleLoopCompletionList?.items, 'reference'),
+      'Expected `import typing as ...` list annotations to avoid switching loop targets to Fulfillment.'
+    );
+
     const typedQuerysetCompletionPosition = positionAfterTextInContainer(
       document,
       'typed_queryset.with_li',
@@ -4370,6 +4496,386 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hasCompletionItemLabel(typedQuerysetLookupList?.items, 'title'),
       'Expected typed queryset loop targets to keep queryset lookup completion.'
+    );
+
+    const typedComprehensionElementPosition = positionAfterTextInContainer(
+      document,
+      '{fd.ca for fd in fulfillment_details if fd.ca}',
+      '{fd.ca'
+    );
+    const typedComprehensionElementList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typedComprehensionElementPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(typedComprehensionElementList?.items, 'category'),
+      'Expected typed list-comprehension element receivers to resolve as model instances.'
+    );
+
+    const typedComprehensionFilterPosition = positionAfterTextInContainer(
+      document,
+      '{fd.ca for fd in fulfillment_details if fd.ca}',
+      'if fd.ca'
+    );
+    const typedComprehensionFilterList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typedComprehensionFilterPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(typedComprehensionFilterList?.items, 'category'),
+      'Expected typed list-comprehension filter receivers to resolve as model instances.'
+    );
+
+    const querysetComprehensionPosition = positionAfterTextInContainer(
+      document,
+      '{fd.category.ti for fd in Product.objects.active() if fd.ca}',
+      'fd.category.ti'
+    );
+    const querysetComprehensionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        querysetComprehensionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(querysetComprehensionList?.items, 'title'),
+      'Expected queryset comprehension receivers to keep related model member completion.'
+    );
+
+    const typingModuleComprehensionFilterPosition = positionAfterTextInContainer(
+      document,
+      '{typed_fd.detail_code for typed_fd in fulfillment_details if typed_fd.de}',
+      'if typed_fd.de'
+    );
+    const typingModuleComprehensionFilterList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typingModuleComprehensionFilterPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(typingModuleComprehensionFilterList?.items, 'detail_code'),
+      'Expected `import typing as ...` list annotations to resolve comprehension receivers as FulfillmentDetail.'
+    );
+
+    const typingOptionalLoopCompletionPosition = positionAfterTextInContainer(
+      document,
+      'optional_fd.fulfillment.re',
+      'optional_fd.fulfillment.re'
+    );
+    const typingOptionalLoopCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typingOptionalLoopCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(typingOptionalLoopCompletionList?.items, 'reference'),
+      'Expected `from typing import Optional, Iterable` loop targets to resolve related model members.'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(typingOptionalLoopCompletionList?.items, 'detail_code'),
+      'Expected `from typing import Optional, Iterable` loop targets to avoid leaking source-model fields after following the relation.'
+    );
+
+    const typingUnionLoopCompletionPosition = positionAfterTextInContainer(
+      document,
+      'union_fd.fulfillment.re',
+      'union_fd.fulfillment.re'
+    );
+    const typingUnionLoopCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typingUnionLoopCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(typingUnionLoopCompletionList?.items, 'reference'),
+      'Expected `from typing import Union as ...` loop targets to resolve related model members.'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(typingUnionLoopCompletionList?.items, 'detail_code'),
+      'Expected `from typing import Union as ...` loop targets to avoid leaking source-model fields after following the relation.'
+    );
+
+    const wrappedComprehensionElementPosition = positionAfterTextInContainer(
+      document,
+      'return list({fd.ca for fd in fulfillment_details if fd.ca})',
+      '{fd.ca'
+    );
+    const wrappedComprehensionElementList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        wrappedComprehensionElementPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(wrappedComprehensionElementList?.items, 'category'),
+      'Expected list-wrapped comprehension element receivers to resolve as model instances.'
+    );
+
+    const wrappedComprehensionFilterPosition = positionAfterTextInContainer(
+      document,
+      'return list({fd.ca for fd in fulfillment_details if fd.ca})',
+      'if fd.ca'
+    );
+    const wrappedComprehensionFilterList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        wrappedComprehensionFilterPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(wrappedComprehensionFilterList?.items, 'category'),
+      'Expected list-wrapped comprehension filter receivers to resolve as model instances.'
+    );
+
+    const importedAliasWrappedComprehensionElementPosition =
+      positionAfterTextInContainer(
+        document,
+        'return list({fd.fulfillment for fd in fulfillment_details if fd.fulfillment})',
+        'fd.ful'
+      );
+    const importedAliasWrappedComprehensionElementList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        importedAliasWrappedComprehensionElementPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        importedAliasWrappedComprehensionElementList?.items,
+        'fulfillment'
+      ),
+      'Expected exact List[FulfillmentDetail] comprehension element receivers to resolve as FulfillmentDetail instances.'
+    );
+
+    const importedAliasWrappedComprehensionFilterPosition =
+      positionAfterTextInContainer(
+        document,
+        'return list({fd.fulfillment for fd in fulfillment_details if fd.fulfillment})',
+        'if fd.ful'
+      );
+    const importedAliasWrappedComprehensionFilterList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        importedAliasWrappedComprehensionFilterPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        importedAliasWrappedComprehensionFilterList?.items,
+        'fulfillment'
+      ),
+      'Expected exact List[FulfillmentDetail] comprehension filter receivers to resolve as FulfillmentDetail instances.'
+    );
+
+    const importedAliasWrappedComprehensionHoverPosition =
+      positionInsideText(
+        document,
+        'return list({fd.fulfillment for fd in fulfillment_details if fd.fulfillment})',
+        'if fd.fulfillment'
+      );
+    const importedAliasWrappedComprehensionHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        importedAliasWrappedComprehensionHoverPosition
+      );
+    const importedAliasWrappedComprehensionHoverText = stringifyHovers(
+      importedAliasWrappedComprehensionHovers
+    );
+
+    assert.ok(
+      importedAliasWrappedComprehensionHoverText.includes(
+        'Receiver model: `sales.FulfillmentDetail`'
+      ),
+      `Expected if-clause comprehension member hover to keep the receiver as sales.FulfillmentDetail. Received: ${importedAliasWrappedComprehensionHoverText}`
+    );
+    assert.ok(
+      importedAliasWrappedComprehensionHoverText.includes(
+        'Return model: `sales.Fulfillment`'
+      ),
+      `Expected if-clause comprehension member hover to resolve the member return model as sales.Fulfillment. Received: ${importedAliasWrappedComprehensionHoverText}`
+    );
+
+    const methodWrappedComprehensionContainer = `class FulfillmentService:
+    def extract_unique_fulfillments(self, fulfillment_details: List[FulfillmentDetail]) -> List[Fulfillment]:
+        return list({fd.fulfillment for fd in fulfillment_details if fd.fulfillment})`;
+
+    const methodWrappedComprehensionReceiverPosition =
+      positionAfterTextInContainer(
+        document,
+        methodWrappedComprehensionContainer,
+        'if fd.'
+      );
+    const methodWrappedComprehensionReceiverList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        methodWrappedComprehensionReceiverPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        methodWrappedComprehensionReceiverList?.items,
+        'fulfillment'
+      ),
+      'Expected exact class-method if-clause receiver completion to include FulfillmentDetail fields.'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(
+        methodWrappedComprehensionReceiverList?.items,
+        'reference'
+      ),
+      'Expected exact class-method if-clause receiver completion to avoid switching the receiver to Fulfillment.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(
+        methodWrappedComprehensionReceiverList?.items,
+        'detail_code'
+      ),
+      'Expected exact user-code completion at `if fd.` to keep `fd` typed as FulfillmentDetail and expose FulfillmentDetail-only fields.'
+    );
+
+    const methodWrappedComprehensionHoverPosition =
+      positionInsideText(
+        document,
+        methodWrappedComprehensionContainer,
+        'if fd.fulfillment'
+      );
+    const methodWrappedComprehensionHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        methodWrappedComprehensionHoverPosition
+      );
+    const methodWrappedComprehensionHoverText = stringifyHovers(
+      methodWrappedComprehensionHovers
+    );
+
+    assert.ok(
+      methodWrappedComprehensionHoverText.includes(
+        'Receiver model: `sales.FulfillmentDetail`'
+      ),
+      `Expected exact class-method if-clause member hover to keep the receiver as sales.FulfillmentDetail. Received: ${methodWrappedComprehensionHoverText}`
+    );
+    assert.ok(
+      methodWrappedComprehensionHoverText.includes(
+        'Return model: `sales.Fulfillment`'
+      ),
+      `Expected exact class-method if-clause member hover to keep the return model as sales.Fulfillment. Received: ${methodWrappedComprehensionHoverText}`
+    );
+
+    const exactRepeatedAccessContainer =
+      'return list({fdd.fulfillment for fdd in fulfillment_details if fdd.fulfillment})';
+    const exactRepeatedReceiverDotPosition = positionAfterTextInContainer(
+      document,
+      exactRepeatedAccessContainer,
+      'if fdd.'
+    );
+    const exactRepeatedReceiverDotList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        exactRepeatedReceiverDotPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(exactRepeatedReceiverDotList?.items, 'detail_code'),
+      'Expected the repeated `if fdd.` completion to expose FulfillmentDetail-only fields.'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(exactRepeatedReceiverDotList?.items, 'reference'),
+      'Expected the repeated `if fdd.` completion to avoid switching the receiver to Fulfillment.'
+    );
+
+    const methodReceiverProbeContainer =
+      'return list({fd.fulfillment for fd in fulfillment_details if fd.de})';
+    const methodReceiverProbePosition = positionAfterTextInContainer(
+      document,
+      methodReceiverProbeContainer,
+      'if fd.de'
+    );
+    const methodReceiverProbeList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        methodReceiverProbePosition
+      );
+    const detailCodeCompletionItem = findCompletionItemByLabel(
+      methodReceiverProbeList?.items,
+      'detail_code'
+    );
+
+    assert.ok(
+      detailCodeCompletionItem,
+      'Expected partial completion inside the class-method if-clause to keep `fd` typed as FulfillmentDetail.'
+    );
+    assert.strictEqual(
+      completionItemDisplayLabel(detailCodeCompletionItem!),
+      'detail_code (CharField)',
+      'Expected the `if fd.de` completion probe to expose the FulfillmentDetail field kind inline.'
+    );
+    assert.strictEqual(
+      completionItemDescription(detailCodeCompletionItem!),
+      'Django model',
+      'Expected the `if fd.de` completion probe to stay on Django model instance completion.'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(methodReceiverProbeList?.items, 'reference'),
+      'Expected the `if fd.de` completion probe to reject Fulfillment fields while resolving `fd`.'
+    );
+
+    const methodRelationProbeContainer =
+      'return list({fd.fulfillment.reference for fd in fulfillment_details if fd.fulfillment.re})';
+    const methodRelationProbePosition = positionAfterTextInContainer(
+      document,
+      methodRelationProbeContainer,
+      'if fd.fulfillment.re'
+    );
+    const methodRelationProbeList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        methodRelationProbePosition
+      );
+    const referenceCompletionItem = findCompletionItemByLabel(
+      methodRelationProbeList?.items,
+      'reference'
+    );
+
+    assert.ok(
+      referenceCompletionItem,
+      'Expected partial completion after `if fd.fulfillment.` to switch to the Fulfillment receiver.'
+    );
+    assert.strictEqual(
+      completionItemDisplayLabel(referenceCompletionItem!),
+      'reference (CharField)',
+      'Expected the `if fd.fulfillment.re` completion probe to expose Fulfillment field kinds inline.'
+    );
+    assert.strictEqual(
+      completionItemDescription(referenceCompletionItem!),
+      'Django model',
+      'Expected the `if fd.fulfillment.re` completion probe to stay on Django model instance completion.'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(methodRelationProbeList?.items, 'detail_code'),
+      'Expected the `if fd.fulfillment.re` completion probe to avoid leaking FulfillmentDetail fields after following the relation.'
     );
   });
 
@@ -4452,6 +4958,344 @@ suite('Django ORM Intellisense UI', () => {
       withLineCountDefinitionTarget!.range.start.line + 1,
       8,
       'Expected `with_line_count` definition to target ProductQuerySet.with_line_count.'
+    );
+  });
+
+  test('shows hover for manager and queryset classes at imports, references, and definitions', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const modelsDocument = await openFixtureDocument(
+      fixtureRoot,
+      'sales/models.py'
+    );
+    const managerImportHoverPosition = positionInsideText(
+      modelsDocument,
+      'objects = ProductManager()',
+      'ProductManager'
+    );
+    const managerImportHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      modelsDocument.uri,
+      managerImportHoverPosition
+    );
+    const managerImportHoverText = stringifyHovers(managerImportHovers);
+
+    assert.ok(
+      managerImportHoverText.includes('Resolved symbol: `sales.managers.ProductManager`'),
+      `Expected imported manager hover to resolve ProductManager. Received: ${managerImportHoverText}`
+    );
+    assert.ok(
+      managerImportHoverText.includes('File: `sales/managers.py`'),
+      `Expected imported manager hover to mention sales/managers.py. Received: ${managerImportHoverText}`
+    );
+
+    const managersDocument = await openFixtureDocument(
+      fixtureRoot,
+      'sales/managers.py'
+    );
+
+    const querysetReferenceHoverPosition = positionInsideText(
+      managersDocument,
+      'class ProductManager(models.Manager.from_queryset(ProductQuerySet)):',
+      'ProductQuerySet'
+    );
+    const querysetReferenceHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        managersDocument.uri,
+        querysetReferenceHoverPosition
+      );
+    const querysetReferenceHoverText = stringifyHovers(querysetReferenceHovers);
+
+    assert.ok(
+      querysetReferenceHoverText.includes(
+        'Resolved symbol: `sales.managers.ProductQuerySet`'
+      ),
+      `Expected local queryset class reference hover to resolve ProductQuerySet. Received: ${querysetReferenceHoverText}`
+    );
+    assert.ok(
+      querysetReferenceHoverText.includes('Class kind: `queryset`'),
+      `Expected local queryset class reference hover to mention queryset kind. Received: ${querysetReferenceHoverText}`
+    );
+
+    const querysetDefinitionHoverPosition = positionInsideText(
+      managersDocument,
+      'class ProductQuerySet(models.QuerySet):',
+      'ProductQuerySet'
+    );
+    const querysetDefinitionHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        managersDocument.uri,
+        querysetDefinitionHoverPosition
+      );
+    const querysetDefinitionHoverText = stringifyHovers(
+      querysetDefinitionHovers
+    );
+
+    assert.ok(
+      querysetDefinitionHoverText.includes(
+        'Resolved symbol: `sales.managers.ProductQuerySet`'
+      ),
+      `Expected queryset class definition hover to resolve ProductQuerySet. Received: ${querysetDefinitionHoverText}`
+    );
+    assert.ok(
+      querysetDefinitionHoverText.includes(
+        'Resolved from class definition `ProductQuerySet`.'
+      ),
+      `Expected queryset class definition hover to mention the class definition context. Received: ${querysetDefinitionHoverText}`
+    );
+
+    const managerDefinitionHoverPosition = positionInsideText(
+      managersDocument,
+      'class ProductManager(models.Manager.from_queryset(ProductQuerySet)):',
+      'ProductManager'
+    );
+    const managerDefinitionHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        managersDocument.uri,
+        managerDefinitionHoverPosition
+      );
+    const managerDefinitionHoverText = stringifyHovers(managerDefinitionHovers);
+
+    assert.ok(
+      managerDefinitionHoverText.includes(
+        'Resolved symbol: `sales.managers.ProductManager`'
+      ),
+      `Expected manager class definition hover to resolve ProductManager. Received: ${managerDefinitionHoverText}`
+    );
+    assert.ok(
+      managerDefinitionHoverText.includes('Class kind: `manager`'),
+      `Expected manager class definition hover to mention manager kind. Received: ${managerDefinitionHoverText}`
+    );
+    assert.ok(
+      managerDefinitionHoverText.includes(
+        'Resolved from class definition `ProductManager`.'
+      ),
+      `Expected manager class definition hover to mention the class definition context. Received: ${managerDefinitionHoverText}`
+    );
+  });
+
+  test('shows hover for classes and types inside type hints', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const queryExamplesDocument = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const productTypeHintHoverPosition = positionInsideText(
+      queryExamplesDocument,
+      'def loop_examples(products: list[Product], queryset_groups: list[QuerySet[Product]]):',
+      'Product'
+    );
+    const productTypeHintHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        queryExamplesDocument.uri,
+        productTypeHintHoverPosition
+      );
+    const productTypeHintHoverText = stringifyHovers(productTypeHintHovers);
+
+    assert.ok(
+      productTypeHintHoverText.includes('sales.models.Product'),
+      `Expected type-hint hover on Product to resolve sales.models.Product. Received: ${productTypeHintHoverText}`
+    );
+    assert.ok(
+      productTypeHintHoverText.includes('Class category: `django`'),
+      `Expected type-hint hover on Product to mark the class as django. Received: ${productTypeHintHoverText}`
+    );
+
+    const typingAliasHoverPosition = positionInsideText(
+      queryExamplesDocument,
+      'optional_fulfillment_details: TypingOptional[TypingIterable[FulfillmentDetail]]',
+      'TypingOptional'
+    );
+    const typingAliasHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        queryExamplesDocument.uri,
+        typingAliasHoverPosition
+      );
+    const typingAliasHoverText = stringifyHovers(typingAliasHovers);
+
+    assert.ok(
+      typingAliasHoverText.includes('typing.Optional'),
+      `Expected type-hint hover on TypingOptional to mention typing.Optional. Received: ${typingAliasHoverText}`
+    );
+
+    const returnTypeHoverPosition = positionInsideText(
+      queryExamplesDocument,
+      '-> List[Fulfillment]:',
+      'List'
+    );
+    const returnTypeHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        queryExamplesDocument.uri,
+        returnTypeHoverPosition
+      );
+    const returnTypeHoverText = stringifyHovers(returnTypeHovers);
+
+    assert.ok(
+      returnTypeHoverText.includes('typing.List'),
+      `Expected return type-hint hover on List to mention typing.List. Received: ${returnTypeHoverText}`
+    );
+
+    const managersDocument = await openFixtureDocument(
+      fixtureRoot,
+      'sales/managers.py'
+    );
+    const forwardReferenceHoverPosition = positionInsideText(
+      managersDocument,
+      "def active(self) -> 'ProductQuerySet':",
+      'ProductQuerySet'
+    );
+    const forwardReferenceHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        managersDocument.uri,
+        forwardReferenceHoverPosition
+      );
+    const forwardReferenceHoverText = stringifyHovers(forwardReferenceHovers);
+
+    assert.ok(
+      forwardReferenceHoverText.includes(
+        'sales.managers.ProductQuerySet'
+      ),
+      `Expected forward-reference type-hint hover to resolve ProductQuerySet. Received: ${forwardReferenceHoverText}`
+    );
+    assert.ok(
+      forwardReferenceHoverText.includes(
+        'Resolved from type hint `ProductQuerySet`.'
+      ),
+      `Expected forward-reference type-hint hover to mention the type-hint context. Received: ${forwardReferenceHoverText}`
+    );
+  });
+
+  test('distinguishes general classes from django classes in hover info', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const queryExamplesDocument = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const generalImportHoverPosition = positionInsideText(
+      queryExamplesDocument,
+      'return ProductLookupService.available_products()',
+      'ProductLookupService'
+    );
+    const generalImportHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        queryExamplesDocument.uri,
+        generalImportHoverPosition
+      );
+    const generalImportHoverText = stringifyHovers(generalImportHovers);
+
+    assert.ok(
+      generalImportHoverText.includes(
+        'Resolved symbol: `sales.services.ProductLookupService`'
+      ),
+      `Expected imported general class hover to resolve ProductLookupService. Received: ${generalImportHoverText}`
+    );
+    assert.ok(
+      generalImportHoverText.includes('Defined in `sales.services`'),
+      `Expected imported general class hover to mention the defining module. Received: ${generalImportHoverText}`
+    );
+    assert.ok(
+      generalImportHoverText.includes('File: `sales/services.py`'),
+      `Expected imported general class hover to mention the defining file. Received: ${generalImportHoverText}`
+    );
+    assert.ok(
+      generalImportHoverText.includes('Class category: `general`'),
+      `Expected imported general class hover to mark ProductLookupService as general. Received: ${generalImportHoverText}`
+    );
+
+    const djangoImportHoverPosition = positionInsideText(
+      queryExamplesDocument,
+      'active_products = Product.objects.active()',
+      'Product'
+    );
+    const djangoImportHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        queryExamplesDocument.uri,
+        djangoImportHoverPosition
+      );
+    const djangoImportHoverText = stringifyHovers(djangoImportHovers);
+
+    assert.ok(
+      djangoImportHoverText.includes('Resolved symbol: `sales.models.Product`'),
+      `Expected imported django class hover to resolve Product. Received: ${djangoImportHoverText}`
+    );
+    assert.ok(
+      djangoImportHoverText.includes('Class category: `django`'),
+      `Expected imported django class hover to mark Product as django. Received: ${djangoImportHoverText}`
+    );
+
+    const servicesDocument = await openFixtureDocument(
+      fixtureRoot,
+      'sales/services.py'
+    );
+    const generalDefinitionHoverPosition = positionInsideText(
+      servicesDocument,
+      'class ProductLookupService(BaseProductService):',
+      'ProductLookupService'
+    );
+    const generalDefinitionHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        servicesDocument.uri,
+        generalDefinitionHoverPosition
+      );
+    const generalDefinitionHoverText = stringifyHovers(generalDefinitionHovers);
+
+    assert.ok(
+      generalDefinitionHoverText.includes('Class category: `general`'),
+      `Expected ProductLookupService definition hover to mark the class as general. Received: ${generalDefinitionHoverText}`
+    );
+
+    const modelsDocument = await openFixtureDocument(
+      fixtureRoot,
+      'sales/models.py'
+    );
+    const djangoDefinitionHoverPosition = positionInsideText(
+      modelsDocument,
+      'class Product(models.Model):',
+      'Product'
+    );
+    const djangoDefinitionHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        modelsDocument.uri,
+        djangoDefinitionHoverPosition
+      );
+    const djangoDefinitionHoverText = stringifyHovers(djangoDefinitionHovers);
+
+    assert.ok(
+      djangoDefinitionHoverText.includes('Class category: `django`'),
+      `Expected Product definition hover to mark the class as django. Received: ${djangoDefinitionHoverText}`
     );
   });
 
@@ -4947,6 +5791,56 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(interpreter.path.length > 0);
   });
 
+  test('resolves legacy pythonPath settings before migration completes', async function () {
+    this.timeout(20_000);
+
+    const tempWorkspace = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-legacy-python-path-')
+    );
+
+    await removeWorkspaceFoldersFrom(0);
+    await addWorkspaceFolder(tempWorkspace);
+
+    const originalSettings = readWorkspaceSettings(tempWorkspace);
+
+    try {
+      const legacyInterpreter = path.join(tempWorkspace, 'venv', 'bin', 'python');
+      fs.mkdirSync(path.dirname(legacyInterpreter), { recursive: true });
+      fs.writeFileSync(legacyInterpreter, '#!/usr/bin/env python3\n');
+
+      if (process.platform !== 'win32') {
+        fs.chmodSync(legacyInterpreter, 0o755);
+      }
+
+      writeWorkspaceSettings(tempWorkspace, {
+        ...originalSettings,
+        'djangoOrmIntellisense.pythonPath': legacyInterpreter,
+      });
+      await delay(300);
+
+      const interpreter = await resolvePythonInterpreter({
+        settingsModule: undefined,
+        workspaceRoot: tempWorkspace,
+        logLevel: 'off',
+        autoStart: false,
+      });
+
+      assert.strictEqual(interpreter.path, legacyInterpreter);
+      assert.strictEqual(
+        interpreter.source,
+        'djangoOrmIntellisense.pythonInterpreter'
+      );
+      assert.ok(
+        interpreter.detail.includes('legacy `djangoOrmIntellisense.pythonPath`'),
+        `Expected legacy interpreter detail, received: ${interpreter.detail}`
+      );
+    } finally {
+      writeWorkspaceSettings(tempWorkspace, originalSettings);
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempWorkspace, { recursive: true, force: true });
+    }
+  });
+
   test('configures and restores managed Pylance diagnostic overrides', async function () {
     this.timeout(20_000);
 
@@ -5033,7 +5927,18 @@ async function setWorkspaceRoot(rootPath: string): Promise<void> {
     await addWorkspaceFolder(fixtureWorkspace);
   }
   await applyFixtureWorkspaceSettings(fixtureWorkspace, rootPath, e2eEnvironment);
-  const snapshot = await daemon.restart(vscode.Uri.file(fixtureWorkspace));
+  const initialSnapshot = await daemon.restart(vscode.Uri.file(fixtureWorkspace));
+  const snapshot =
+    initialSnapshot.phase === 'ready' &&
+    initialSnapshot.runtime?.bootstrapStatus === 'ready'
+      ? initialSnapshot
+      : await waitForHealthSnapshot(
+          daemon,
+          (candidate) =>
+            candidate.phase === 'ready' &&
+            candidate.runtime?.bootstrapStatus === 'ready',
+          30_000
+        );
   assertFixtureE2EHealth(snapshot, rootPath, e2eEnvironment);
   await delay(300);
 }
@@ -5505,6 +6410,28 @@ async function waitForDiagnostics(
   }
 
   return vscode.languages.getDiagnostics(uri);
+}
+
+async function waitForHealthSnapshot(
+  daemon: NonNullable<ReturnType<typeof getActiveDaemonForTesting>>,
+  predicate: (snapshot: HealthSnapshot) => boolean,
+  timeoutMs = 10_000
+): Promise<HealthSnapshot> {
+  const startedAt = Date.now();
+  let snapshot = daemon.getState();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate(snapshot)) {
+      return snapshot;
+    }
+
+    await delay(200);
+    snapshot = await daemon.refreshHealth();
+  }
+
+  assert.fail(
+    `Health snapshot was not satisfied within ${timeoutMs}ms. Last snapshot: ${JSON.stringify(snapshot)}`
+  );
 }
 
 async function waitForCondition(

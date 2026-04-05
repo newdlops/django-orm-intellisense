@@ -534,9 +534,14 @@ def _lookup_fields_for_method(
 ) -> list[FieldCandidate]:
     fields = model_graph.fields_for_model(model_label)
     if _allows_related_query_aliases(method):
-        return fields
+        return [field for field in fields if not _is_hidden_lookup_field_name(field.name)]
 
-    return [field for field in fields if field.source != 'related_query_alias']
+    return [
+        field
+        for field in fields
+        if field.source != 'related_query_alias'
+        and not _is_hidden_lookup_field_name(field.name)
+    ]
 
 
 def _lookup_field_for_method(
@@ -552,12 +557,18 @@ def _lookup_field_for_method(
 
     if not _allows_related_query_aliases(method) and field.source == 'related_query_alias':
         return None
+    if _is_hidden_lookup_field_name(field.name):
+        return None
 
     return field
 
 
 def _allows_related_query_aliases(method: str) -> bool:
     return method not in ATTRIBUTE_PATH_METHODS
+
+
+def _is_hidden_lookup_field_name(name: str) -> bool:
+    return name.endswith('+')
 
 
 def _prefixed_lookup_chain_completion_items(
@@ -640,10 +651,10 @@ def _lookup_chain_completion_items(
     runtime_field: object | None = None,
 ) -> list[dict[str, object]]:
     owner_model_label = field.model_label
-    field_object = runtime_field or get_runtime_field(
-        runtime.settings_module,
-        model_label=field.model_label,
-        field_name=field.name,
+    field_object = _runtime_lookup_field(
+        runtime=runtime,
+        field=field,
+        runtime_field=runtime_field,
     )
     if field_object is None:
         return [
@@ -679,10 +690,9 @@ def _resolve_lookup_completion_chain(
     field: FieldCandidate,
     segments: list[str],
 ) -> dict[str, object]:
-    field_object = get_runtime_field(
-        runtime.settings_module,
-        model_label=field.model_label,
-        field_name=field.name,
+    field_object = _runtime_lookup_field(
+        runtime=runtime,
+        field=field,
     )
     if field_object is None:
         if not segments:
@@ -728,10 +738,9 @@ def _resolve_lookup_chain(
     field: FieldCandidate,
     segments: list[str],
 ) -> dict[str, object]:
-    field_object = get_runtime_field(
-        runtime.settings_module,
-        model_label=field.model_label,
-        field_name=field.name,
+    field_object = _runtime_lookup_field(
+        runtime=runtime,
+        field=field,
     )
     if field_object is None:
         if len(segments) == 1 and _is_lookup_operator(segments[0]):
@@ -773,6 +782,25 @@ def _resolve_lookup_chain(
         'resolved': True,
         'lookupOperator': lookup_operator,
     }
+
+
+def _runtime_lookup_field(
+    *,
+    runtime: RuntimeInspection,
+    field: FieldCandidate,
+    runtime_field: object | None = None,
+) -> object | None:
+    if runtime_field is not None:
+        return runtime_field
+
+    if runtime.bootstrap_status != 'ready':
+        return None
+
+    return get_runtime_field(
+        runtime.settings_module,
+        model_label=field.model_label,
+        field_name=field.name,
+    )
 
 
 def _runtime_lookup_names(field: object) -> list[str]:

@@ -22,6 +22,7 @@ import type {
   RelationTargetsResult,
   RequestMessage,
   ResponseMessage,
+  ServerMessage,
 } from '../protocol';
 
 const REQUEST_TIMEOUT_MS = 8_000;
@@ -509,6 +510,7 @@ export class AnalysisDaemon implements vscode.Disposable {
         {
           workspaceRoot: launchContext.workspaceRoot,
           settingsModule: launchContext.settingsModule,
+          deferRuntime: true,
         },
         INITIALIZE_REQUEST_TIMEOUT_MS
       );
@@ -628,25 +630,30 @@ export class AnalysisDaemon implements vscode.Disposable {
 
     this.log('debug', `[daemon->client] ${trimmed}`);
 
-    const response = this.parseServerResponse(trimmed);
-    if (!response) {
+    const message = this.parseServerMessage(trimmed);
+    if (!message) {
       return;
     }
 
-    const pending = this.pendingRequests.get(response.id);
+    if ('event' in message) {
+      this.handleServerNotification(message);
+      return;
+    }
+
+    const pending = this.pendingRequests.get(message.id);
     if (!pending) {
       return;
     }
 
-    this.pendingRequests.delete(response.id);
+    this.pendingRequests.delete(message.id);
     clearTimeout(pending.timeout);
 
-    if (response.error) {
-      pending.reject(new Error(response.error.message));
+    if (message.error) {
+      pending.reject(new Error(message.error.message));
       return;
     }
 
-    pending.resolve(response.result);
+    pending.resolve(message.result);
   }
 
   private rejectAllPending(error: Error): void {
@@ -770,7 +777,18 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
   }
 
-  private parseServerResponse(line: string): ResponseMessage | undefined {
+  private handleServerNotification(
+    message: Extract<ServerMessage, { event: 'healthChanged' }>
+  ): void {
+    if (message.event !== 'healthChanged' || !message.params?.health) {
+      return;
+    }
+
+    this.clearResponseCache();
+    this.updateState(this.decorateSnapshot(message.params.health));
+  }
+
+  private parseServerMessage(line: string): ServerMessage | undefined {
     const firstNonWhitespace = line.search(/\S/);
     if (firstNonWhitespace < 0) {
       return undefined;
@@ -791,7 +809,7 @@ export class AnalysisDaemon implements vscode.Disposable {
           `[daemon stdout trailing noise ignored] ${extracted.trailingText.trim()}`
         );
       }
-      return JSON.parse(candidate) as ResponseMessage;
+      return JSON.parse(candidate) as ServerMessage;
     } catch (error) {
       this.log(
         'info',

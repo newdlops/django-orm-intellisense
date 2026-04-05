@@ -659,7 +659,7 @@ class StaticIndex:
                     field.field_kind,
                     candidate.label,
                 )
-                if reverse_name == '+':
+                if _is_hidden_related_name(reverse_name):
                     continue
 
                 reverse_query_name = _reverse_query_name(
@@ -1342,7 +1342,9 @@ def _reverse_query_name(
     field: FieldCandidate,
     source_model_label: str,
 ) -> str | None:
-    if field.related_name == '+' or field.related_query_name == '+':
+    if _is_hidden_related_name(field.related_name) or _is_hidden_related_name(
+        field.related_query_name
+    ):
         return None
 
     if field.related_query_name:
@@ -1359,6 +1361,10 @@ def _string_or_none(value: object) -> str | None:
         return None
 
     return str(value)
+
+
+def _is_hidden_related_name(value: str | None) -> bool:
+    return bool(value) and value.endswith('+')
 
 
 def _clone_field_for_model(field: FieldCandidate, model_label: str) -> FieldCandidate:

@@ -196,3 +196,14 @@ export interface ResponseMessage {
     data?: unknown;
   };
 }
+
+export interface HealthChangedNotificationMessage {
+  event: 'healthChanged';
+  params?: {
+    health?: HealthSnapshot;
+  };
+}
+
+export type ServerMessage =
+  | ResponseMessage
+  | HealthChangedNotificationMessage;

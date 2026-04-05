@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import json
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime, timezone
@@ -36,7 +37,12 @@ from ..features.relation_targets import (
     list_relation_targets,
     resolve_relation_target,
 )
-from ..runtime.inspector import RuntimeInspection, inspect_runtime
+from ..runtime.inspector import (
+    RuntimeInspection,
+    can_defer_runtime_inspection,
+    create_pending_runtime_inspection,
+    inspect_runtime,
+)
 from ..semantic.graph import SemanticGraphSummary, build_semantic_graph
 from ..static_index.indexer import StaticIndex, build_static_index
 
@@ -50,6 +56,9 @@ class DaemonServer:
         self.static_index: StaticIndex | None = None
         self.runtime_inspection: RuntimeInspection | None = None
         self.semantic_graph: SemanticGraphSummary | None = None
+        self._state_generation = 0
+        self._state_lock = threading.RLock()
+        self._write_lock = threading.Lock()
 
     def run_stdio(self) -> None:
         for raw_line in sys.stdin:
@@ -115,12 +124,19 @@ class DaemonServer:
             str(params.get('workspaceRoot') or self.workspace_root)
         ).resolve()
         settings_module = _clean_optional_string(params.get('settingsModule'))
-        self.workspace_root = workspace_root
-        self.initialized_at = datetime.now(timezone.utc)
+        defer_runtime = bool(params.get('deferRuntime'))
+        initialized_at = datetime.now(timezone.utc)
+        generation = self._reserve_state_generation(
+            workspace_root=workspace_root,
+            initialized_at=initialized_at,
+        )
         started_at = time.perf_counter()
 
         _log_initialize_step(
-            f'start workspace={workspace_root} settings={settings_module or "<unset>"}'
+            'start '
+            f'workspace={workspace_root} '
+            f'settings={settings_module or "<unset>"} '
+            f'defer_runtime={defer_runtime}'
         )
         source_snapshot = snapshot_python_sources(workspace_root)
         _log_initialize_step(
@@ -172,20 +188,32 @@ class DaemonServer:
             runtime_source_fingerprint,
             effective_settings_module,
         )
+        runtime_deferred = False
         if runtime is None:
-            runtime = inspect_runtime(effective_settings_module)
-            save_runtime_inspection(
-                workspace_root,
-                runtime_source_fingerprint,
-                effective_settings_module,
-                runtime,
-            )
-            _log_initialize_step(
-                'inspect_runtime '
-                f'status={runtime.bootstrap_status} '
-                f'django_importable={runtime.django_importable} '
-                f'elapsed={time.perf_counter() - started_at:.2f}s'
-            )
+            if defer_runtime and can_defer_runtime_inspection(effective_settings_module):
+                runtime = create_pending_runtime_inspection(
+                    effective_settings_module
+                )
+                runtime_deferred = True
+                _log_initialize_step(
+                    'defer_runtime_inspection '
+                    f'settings={effective_settings_module or "<unset>"} '
+                    f'elapsed={time.perf_counter() - started_at:.2f}s'
+                )
+            else:
+                runtime = inspect_runtime(effective_settings_module)
+                save_runtime_inspection(
+                    workspace_root,
+                    runtime_source_fingerprint,
+                    effective_settings_module,
+                    runtime,
+                )
+                _log_initialize_step(
+                    'inspect_runtime '
+                    f'status={runtime.bootstrap_status} '
+                    f'django_importable={runtime.django_importable} '
+                    f'elapsed={time.perf_counter() - started_at:.2f}s'
+                )
         else:
             _log_initialize_step(
                 'load_cached_runtime_inspection '
@@ -199,32 +227,50 @@ class DaemonServer:
             f'coverage={semantic_graph.coverage_mode} '
             f'elapsed={time.perf_counter() - started_at:.2f}s'
         )
-        self.workspace_profile = workspace_profile
-        self.static_index = static_index
-        self.runtime_inspection = runtime
-        self.semantic_graph = semantic_graph
-        self.health_snapshot = build_health_snapshot(
+        health_snapshot = build_health_snapshot(
             workspace=workspace_profile,
             static_index=static_index,
             runtime=runtime,
             semantic_graph=semantic_graph,
-            initialized_at=self.initialized_at,
+            initialized_at=initialized_at,
+        )
+        self._apply_state(
+            generation=generation,
+            initialized_at=initialized_at,
+            workspace_profile=workspace_profile,
+            static_index=static_index,
+            runtime=runtime,
+            semantic_graph=semantic_graph,
+            health_snapshot=health_snapshot,
         )
         _log_initialize_step(
             f'complete elapsed={time.perf_counter() - started_at:.2f}s'
         )
+        if runtime_deferred:
+            self._start_runtime_warmup(
+                generation=generation,
+                initialized_at=initialized_at,
+                workspace_root=workspace_root,
+                workspace_profile=workspace_profile,
+                static_index=static_index,
+                runtime_source_fingerprint=runtime_source_fingerprint,
+                settings_module=effective_settings_module,
+            )
 
         return {
             'serverName': 'django-orm-intellisense',
             'protocolVersion': '0.1',
-            'health': self.health_snapshot,
+            'health': health_snapshot,
         }
 
     def _health(self) -> dict[str, Any]:
-        if self.health_snapshot is None:
+        with self._state_lock:
+            snapshot = self.health_snapshot
+
+        if snapshot is None:
             return self._initialize({})
 
-        return self.health_snapshot
+        return snapshot
 
     def _relation_targets(self, params: dict[str, Any]) -> dict[str, Any]:
         static_index, runtime = self._require_feature_state()
@@ -348,21 +394,143 @@ class DaemonServer:
         )
 
     def _require_feature_state(self) -> tuple[StaticIndex, RuntimeInspection]:
-        if self.static_index is None or self.runtime_inspection is None:
+        with self._state_lock:
+            static_index = self.static_index
+            runtime = self.runtime_inspection
+
+        if static_index is None or runtime is None:
             self._initialize({})
 
-        if self.static_index is None or self.runtime_inspection is None:
+        with self._state_lock:
+            static_index = self.static_index
+            runtime = self.runtime_inspection
+
+        if static_index is None or runtime is None:
             raise RuntimeError('Daemon state is unavailable.')
 
-        return self.static_index, self.runtime_inspection
+        return static_index, runtime
+
+    def _reserve_state_generation(
+        self,
+        *,
+        workspace_root: Path,
+        initialized_at: datetime,
+    ) -> int:
+        with self._state_lock:
+            self._state_generation += 1
+            self.workspace_root = workspace_root
+            self.initialized_at = initialized_at
+            return self._state_generation
+
+    def _apply_state(
+        self,
+        *,
+        generation: int,
+        initialized_at: datetime,
+        workspace_profile: WorkspaceProfile,
+        static_index: StaticIndex,
+        runtime: RuntimeInspection,
+        semantic_graph: SemanticGraphSummary,
+        health_snapshot: dict[str, Any],
+    ) -> bool:
+        with self._state_lock:
+            if generation != self._state_generation:
+                return False
+
+            self.initialized_at = initialized_at
+            self.workspace_profile = workspace_profile
+            self.static_index = static_index
+            self.runtime_inspection = runtime
+            self.semantic_graph = semantic_graph
+            self.health_snapshot = health_snapshot
+            return True
+
+    def _start_runtime_warmup(
+        self,
+        *,
+        generation: int,
+        initialized_at: datetime,
+        workspace_root: Path,
+        workspace_profile: WorkspaceProfile,
+        static_index: StaticIndex,
+        runtime_source_fingerprint: str,
+        settings_module: str | None,
+    ) -> None:
+        warmup_thread = threading.Thread(
+            target=self._warm_runtime_state,
+            kwargs={
+                'generation': generation,
+                'initialized_at': initialized_at,
+                'workspace_root': workspace_root,
+                'workspace_profile': workspace_profile,
+                'static_index': static_index,
+                'runtime_source_fingerprint': runtime_source_fingerprint,
+                'settings_module': settings_module,
+            },
+            daemon=True,
+            name='django-orm-intellisense-runtime-warmup',
+        )
+        warmup_thread.start()
+
+    def _warm_runtime_state(
+        self,
+        *,
+        generation: int,
+        initialized_at: datetime,
+        workspace_root: Path,
+        workspace_profile: WorkspaceProfile,
+        static_index: StaticIndex,
+        runtime_source_fingerprint: str,
+        settings_module: str | None,
+    ) -> None:
+        started_at = time.perf_counter()
+        runtime = inspect_runtime(settings_module)
+        save_runtime_inspection(
+            workspace_root,
+            runtime_source_fingerprint,
+            settings_module,
+            runtime,
+        )
+        semantic_graph = build_semantic_graph(workspace_profile, static_index, runtime)
+        health_snapshot = build_health_snapshot(
+            workspace=workspace_profile,
+            static_index=static_index,
+            runtime=runtime,
+            semantic_graph=semantic_graph,
+            initialized_at=initialized_at,
+        )
+        _log_initialize_step(
+            'inspect_runtime(background) '
+            f'status={runtime.bootstrap_status} '
+            f'django_importable={runtime.django_importable} '
+            f'elapsed={time.perf_counter() - started_at:.2f}s'
+        )
+
+        if not self._apply_state(
+            generation=generation,
+            initialized_at=initialized_at,
+            workspace_profile=workspace_profile,
+            static_index=static_index,
+            runtime=runtime,
+            semantic_graph=semantic_graph,
+            health_snapshot=health_snapshot,
+        ):
+            return
+
+        self._write_notification(
+            'healthChanged',
+            {
+                'health': health_snapshot,
+            },
+        )
 
     def _write_response(self, request_id: Any, result: Any) -> None:
-        payload = {
-            'id': request_id,
-            'result': result,
-        }
-        sys.stdout.write(json.dumps(payload, sort_keys=True) + '\n')
-        sys.stdout.flush()
+        self._write_message(
+            {
+                'id': request_id,
+                'result': result,
+            }
+        )
 
     def _write_error(
         self,
@@ -371,16 +539,29 @@ class DaemonServer:
         message: str,
         data: dict[str, Any] | None = None,
     ) -> None:
-        payload = {
-            'id': request_id,
-            'error': {
-                'code': code,
-                'message': message,
-                'data': data or {},
-            },
-        }
-        sys.stdout.write(json.dumps(payload, sort_keys=True) + '\n')
-        sys.stdout.flush()
+        self._write_message(
+            {
+                'id': request_id,
+                'error': {
+                    'code': code,
+                    'message': message,
+                    'data': data or {},
+                },
+            }
+        )
+
+    def _write_notification(self, event: str, params: dict[str, Any]) -> None:
+        self._write_message(
+            {
+                'event': event,
+                'params': params,
+            }
+        )
+
+    def _write_message(self, payload: dict[str, Any]) -> None:
+        with self._write_lock:
+            sys.stdout.write(json.dumps(payload, sort_keys=True) + '\n')
+            sys.stdout.flush()
 
 
 def _clean_optional_string(value: Any) -> str | None:

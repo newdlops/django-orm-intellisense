@@ -2,7 +2,7 @@ from django.db import models as db_models
 from django.db.models import F, Prefetch, Q
 
 from blog import AuditLog, Company, MultiInheritedLog, Post
-from blog.models import Faq
+from blog.models import Faq, HiddenReverseTag
 
 
 def lookup_examples():
@@ -78,6 +78,8 @@ def lookup_examples():
     Company.objects.filter(state__rea='READY')
     Company.objects.filter(state__in=['READY'])
     Company.objects.filter(state__ready='READY')
+    HiddenReverseTag.objects.filter(_b='hidden')
+    HiddenReverseTag.objects.filter(_blog_hiddenreversepost_tags_+__i=['hidden'])
 
 
 def member_examples():

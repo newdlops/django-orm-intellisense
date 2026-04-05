@@ -86,6 +86,20 @@ export async function resolvePythonInterpreter(
     };
   }
 
+  const legacyInterpreter = normalizeInterpreterCandidate(
+    getLegacyPythonInterpreterSetting(resource),
+    resource,
+    basePath
+  );
+  if (legacyInterpreter) {
+    return {
+      path: legacyInterpreter,
+      source: 'djangoOrmIntellisense.pythonInterpreter',
+      detail:
+        'Using legacy `djangoOrmIntellisense.pythonPath` until it is migrated into `djangoOrmIntellisense.pythonInterpreter`.',
+    };
+  }
+
   const fallbackInterpreter = findFallbackPythonInterpreter();
   return {
     path: fallbackInterpreter,
@@ -663,6 +677,13 @@ function resolveLegacySettingTarget(
   }
 
   return undefined;
+}
+
+function getLegacyPythonInterpreterSetting(resource?: vscode.Uri): string | undefined {
+  return vscode.workspace
+    .getConfiguration(CONFIGURATION_SECTION, resource)
+    .get<string>('pythonPath')
+    ?.trim();
 }
 
 async function clearLegacyPythonPathSetting(

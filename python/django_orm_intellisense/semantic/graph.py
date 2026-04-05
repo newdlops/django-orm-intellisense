@@ -124,11 +124,12 @@ def build_model_graph(
                 )
 
         _add_related_query_alias_fields(fields_by_name=fields_by_name)
-        _add_relation_attname_alias_fields(
-            runtime=runtime,
-            model_label=model_label,
-            fields_by_name=fields_by_name,
-        )
+        if runtime.bootstrap_status == 'ready':
+            _add_relation_attname_alias_fields(
+                runtime=runtime,
+                model_label=model_label,
+                fields_by_name=fields_by_name,
+            )
 
         if fields_by_name:
             fields_by_model_label[model_label] = fields_by_name

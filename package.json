@@ -21,7 +21,6 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished",
     "onLanguage:python",
     "onCommand:djangoOrmIntellisense.showStatus",
     "onCommand:djangoOrmIntellisense.restartDaemon",

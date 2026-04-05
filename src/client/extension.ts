@@ -34,17 +34,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   statusView.update(daemon.getState());
   diagnostics.update(daemon.getState());
 
-  const normalization = await normalizePythonInterpreterSettings();
-  if (normalization === 'migrated') {
-    output.appendLine(
-      '[interpreter] Migrated legacy djangoOrmIntellisense.pythonPath into djangoOrmIntellisense.pythonInterpreter.'
-    );
-  } else if (normalization === 'cleared') {
-    output.appendLine(
-      '[interpreter] Removed legacy djangoOrmIntellisense.pythonPath because djangoOrmIntellisense.pythonInterpreter is already set.'
-    );
-  }
-
   context.subscriptions.push(
     output,
     daemon,
@@ -81,6 +70,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       });
     })
   );
+
+  void normalizePythonInterpreterSettings()
+    .then((normalization) => {
+      if (normalization === 'migrated') {
+        output.appendLine(
+          '[interpreter] Migrated legacy djangoOrmIntellisense.pythonPath into djangoOrmIntellisense.pythonInterpreter.'
+        );
+      } else if (normalization === 'cleared') {
+        output.appendLine(
+          '[interpreter] Removed legacy djangoOrmIntellisense.pythonPath because djangoOrmIntellisense.pythonInterpreter is already set.'
+        );
+      }
+    })
+    .catch((error) => {
+      output.appendLine(
+        `[interpreter] Failed to normalize legacy interpreter settings: ${String(error)}`
+      );
+    });
 
   const settings = getExtensionSettings();
   const initialEditor = vscode.window.activeTextEditor;

@@ -100,6 +100,7 @@ const LOOKUP_HOVER_PATTERN = new RegExp(
 const F_EXPRESSION_METHOD = 'f_expression';
 const EXPRESSION_PATH_METHOD_PREFIX = 'expression_path:';
 const ANNOTATED_MEMBER_SOURCE = 'annotation_expression';
+const INITIAL_DIAGNOSTIC_REFRESH_DELAY_MS = 500;
 const VIRTUAL_LOOKUP_OPERATORS = [
   'exact',
   'iexact',
@@ -304,6 +305,7 @@ const ITERABLE_TYPE_NAMES = new Set([
   'typing.Tuple',
 ]);
 const OPTIONAL_TYPE_NAMES = new Set(['Optional', 'typing.Optional']);
+const UNION_TYPE_NAMES = new Set(['Union', 'typing.Union']);
 const QUERYSET_TYPE_NAMES = new Set([
   'QuerySet',
   'django.db.models.QuerySet',
@@ -318,6 +320,62 @@ const MANAGER_TYPE_NAMES = new Set([
 const RELATED_MANAGER_TYPE_NAMES = new Set([
   'ManyRelatedManager',
   'RelatedManager',
+]);
+const BUILTIN_TYPE_HINT_NAMES = new Set([
+  'None',
+  'bool',
+  'bytes',
+  'dict',
+  'float',
+  'frozenset',
+  'int',
+  'list',
+  'object',
+  'set',
+  'str',
+  'tuple',
+]);
+const TYPING_TYPE_HINT_NAMES = new Set([
+  'Any',
+  'Callable',
+  'Collection',
+  'Iterable',
+  'Iterator',
+  'List',
+  'Literal',
+  'Optional',
+  'Sequence',
+  'Set',
+  'Tuple',
+  'Union',
+  'typing.Any',
+  'typing.Callable',
+  'typing.Collection',
+  'typing.Iterable',
+  'typing.Iterator',
+  'typing.List',
+  'typing.Literal',
+  'typing.Optional',
+  'typing.Sequence',
+  'typing.Set',
+  'typing.Tuple',
+  'typing.Union',
+]);
+const DJANGO_TYPE_HINT_NAMES = new Set([
+  'AppConfig',
+  'BaseManager',
+  'Manager',
+  'ManyRelatedManager',
+  'Model',
+  'QuerySet',
+  'RelatedManager',
+  'django.apps.AppConfig',
+  'django.db.models.Manager',
+  'django.db.models.Model',
+  'django.db.models.QuerySet',
+  'models.Manager',
+  'models.Model',
+  'models.QuerySet',
 ]);
 
 interface LookupContext {
@@ -341,6 +399,9 @@ interface ImportBindings {
 type ImportReference =
   | { kind: 'symbol'; moduleName: string; symbol: string }
   | { kind: 'module'; moduleName: string };
+
+type SpecialClassKind = 'manager' | 'queryset' | 'related_manager';
+type ClassHoverCategory = 'django' | 'general';
 
 interface RelationDiagnosticContext {
   value: string;
@@ -438,6 +499,34 @@ interface FunctionDefinitionSource {
   beforeOffset: number;
 }
 
+interface ClassHoverTarget {
+  source: ClassDefinitionSource;
+  category: ClassHoverCategory;
+  specialKind?: SpecialClassKind;
+  referenceText: string;
+  fromDefinition: boolean;
+}
+
+type TypeHintHoverTarget =
+  | {
+      kind: 'class';
+      source: ClassDefinitionSource;
+      category: ClassHoverCategory;
+      referenceText: string;
+      specialKind?: SpecialClassKind;
+    }
+  | {
+      kind: 'type';
+      canonicalName: string;
+      category: 'builtin' | 'typing' | 'django';
+      referenceText: string;
+    };
+
+interface TypeAnnotationSegment {
+  start: number;
+  end: number;
+}
+
 type ParsedCallExpression =
   | { kind: 'function'; functionName: string }
   | { kind: 'member'; objectExpression: string; memberName: string };
@@ -481,6 +570,19 @@ export function registerPythonProviders(
     'djangoOrmIntellisense.orm'
   );
   const diagnosticTimers = new Map<string, NodeJS.Timeout>();
+  let fullDiagnosticsRefreshTimer: NodeJS.Timeout | undefined;
+
+  const clearScheduledDiagnostics = (): void => {
+    if (fullDiagnosticsRefreshTimer) {
+      clearTimeout(fullDiagnosticsRefreshTimer);
+      fullDiagnosticsRefreshTimer = undefined;
+    }
+
+    for (const timer of diagnosticTimers.values()) {
+      clearTimeout(timer);
+    }
+    diagnosticTimers.clear();
+  };
 
   const scheduleDiagnosticsRefresh = (
     document: vscode.TextDocument,
@@ -503,8 +605,33 @@ export function registerPythonProviders(
     diagnosticTimers.set(key, timer);
   };
 
-  const refreshAllDiagnostics = (): void => {
+  const collectDiagnosticRefreshDocuments = (): vscode.TextDocument[] => {
+    const documents = new Map<string, vscode.TextDocument>();
+
+    for (const editor of vscode.window.visibleTextEditors) {
+      documents.set(editor.document.uri.toString(), editor.document);
+    }
+
     for (const document of vscode.workspace.textDocuments) {
+      const key = document.uri.toString();
+      if (documents.has(key)) {
+        continue;
+      }
+
+      const existingDiagnostics = diagnosticCollection.get(document.uri);
+      if (
+        diagnosticTimers.has(key) ||
+        (existingDiagnostics !== undefined && existingDiagnostics.length > 0)
+      ) {
+        documents.set(key, document);
+      }
+    }
+
+    return [...documents.values()];
+  };
+
+  const refreshTrackedDiagnostics = (): void => {
+    for (const document of collectDiagnosticRefreshDocuments()) {
       if (!shouldAnalyzeDocument(document, daemon.getState().workspaceRoot)) {
         diagnosticCollection.delete(document.uri);
         continue;
@@ -512,6 +639,19 @@ export function registerPythonProviders(
 
       scheduleDiagnosticsRefresh(document, 0);
     }
+  };
+
+  const scheduleTrackedDiagnosticsRefresh = (
+    delayMs = INITIAL_DIAGNOSTIC_REFRESH_DELAY_MS
+  ): void => {
+    if (fullDiagnosticsRefreshTimer) {
+      clearTimeout(fullDiagnosticsRefreshTimer);
+    }
+
+    fullDiagnosticsRefreshTimer = setTimeout(() => {
+      fullDiagnosticsRefreshTimer = undefined;
+      refreshTrackedDiagnostics();
+    }, delayMs);
   };
 
   const refreshDiagnostics = async (
@@ -1368,15 +1508,51 @@ export function registerPythonProviders(
             document,
             position
           );
-          if (!importReference) {
-            return undefined;
+          if (importReference) {
+            const importHover = await buildImportHover(
+              daemon,
+              importReference
+            );
+            if (importHover) {
+              return importHover;
+            }
           }
-          const importHover = await buildImportHover(
+        } catch {
+          return undefined;
+        }
+
+        try {
+          await daemon.ensureStarted(document.uri);
+          const typeHintHoverTarget = await resolveTypeHintHoverTargetAtPosition(
             daemon,
-            importReference
+            document,
+            position
           );
-          if (importHover) {
-            return importHover;
+          if (typeHintHoverTarget) {
+            const typeHintHover = buildTypeHintHover(typeHintHoverTarget);
+            if (typeHintHover) {
+              return typeHintHover;
+            }
+          }
+        } catch {
+          return undefined;
+        }
+
+        try {
+          await daemon.ensureStarted(document.uri);
+          const classHoverTarget =
+            await resolveClassHoverTargetAtPosition(
+              daemon,
+              document,
+              position
+            );
+          if (classHoverTarget) {
+            const classHover = buildClassHover(
+              classHoverTarget
+            );
+            if (classHover) {
+              return classHover;
+            }
           }
         } catch {
           return undefined;
@@ -1612,7 +1788,7 @@ export function registerPythonProviders(
     }
   );
 
-  refreshAllDiagnostics();
+  scheduleTrackedDiagnosticsRefresh();
 
   return [
     completionProvider,
@@ -1625,6 +1801,9 @@ export function registerPythonProviders(
     vscode.workspace.onDidChangeTextDocument((event) => {
       scheduleDiagnosticsRefresh(event.document);
     }),
+    vscode.window.onDidChangeVisibleTextEditors(() => {
+      scheduleTrackedDiagnosticsRefresh(0);
+    }),
     vscode.workspace.onDidCloseTextDocument((document) => {
       diagnosticCollection.delete(document.uri);
       const key = document.uri.toString();
@@ -1634,14 +1813,21 @@ export function registerPythonProviders(
         diagnosticTimers.delete(key);
       }
     }),
-    daemon.onDidChangeState(() => {
-      refreshAllDiagnostics();
+    daemon.onDidChangeState((snapshot) => {
+      if (snapshot.phase === 'starting') {
+        return;
+      }
+
+      if (snapshot.phase === 'stopped' || snapshot.phase === 'error') {
+        clearScheduledDiagnostics();
+        diagnosticCollection.clear();
+        return;
+      }
+
+      scheduleTrackedDiagnosticsRefresh(0);
     }),
     new vscode.Disposable(() => {
-      for (const timer of diagnosticTimers.values()) {
-        clearTimeout(timer);
-      }
-      diagnosticTimers.clear();
+      clearScheduledDiagnostics();
     }),
   ];
 }
@@ -2771,12 +2957,6 @@ function relationHoverLiteral(
   position: vscode.Position
 ): { value: string } | undefined {
   const lineText = document.lineAt(position.line).text;
-  const wordRange = document.getWordRangeAtPosition(position, /[A-Za-z_][\w.]*/);
-  if (!wordRange) {
-    return undefined;
-  }
-
-  const word = document.getText(wordRange);
   for (const match of lineText.matchAll(RELATION_HOVER_PATTERN)) {
     const value = match[2];
     const prefix = match[0];
@@ -2784,11 +2964,7 @@ function relationHoverLiteral(
     const start = (match.index ?? 0) + localOffset;
     const end = start + value.length;
 
-    if (
-      position.character >= start &&
-      position.character <= end &&
-      value === word
-    ) {
+    if (position.character >= start && position.character < end) {
       return { value };
     }
   }
@@ -2974,6 +3150,108 @@ async function resolveImportReferenceAtPosition(
   };
 }
 
+async function resolveTypeHintHoverTargetAtPosition(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  position: vscode.Position
+): Promise<TypeHintHoverTarget | undefined> {
+  const annotationSegment = typeAnnotationSegmentAtPosition(document, position);
+  if (!annotationSegment) {
+    return undefined;
+  }
+
+  const referenceText = classReferenceExpressionAtPosition(document, position);
+  if (!referenceText) {
+    return undefined;
+  }
+
+  const beforeOffset = document.offsetAt(
+    new vscode.Position(position.line, annotationSegment.start)
+  );
+  const classSource = await resolveClassDefinitionSource(
+    daemon,
+    document,
+    referenceText,
+    beforeOffset
+  );
+  if (classSource) {
+    const category = await resolveClassHoverCategory(
+      daemon,
+      classSource,
+      new Set()
+    );
+    return {
+      kind: 'class',
+      source: classSource,
+      category,
+      referenceText,
+      specialKind: await resolveSpecialClassKind(
+        daemon,
+        classSource,
+        new Set()
+      ),
+    };
+  }
+
+  const canonicalName = await canonicalTypeAnnotationName(
+    daemon,
+    document,
+    referenceText,
+    beforeOffset
+  );
+  const category = typeHintCategory(canonicalName);
+  if (!category) {
+    return undefined;
+  }
+
+  return {
+    kind: 'type',
+    canonicalName,
+    category,
+    referenceText,
+  };
+}
+
+async function resolveClassHoverTargetAtPosition(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  position: vscode.Position
+): Promise<ClassHoverTarget | undefined> {
+  const classDefinition = classDefinitionAtPosition(document, position);
+  const referenceText = classDefinition
+    ? classDefinition.name
+    : classReferenceExpressionAtPosition(document, position);
+  if (!referenceText) {
+    return undefined;
+  }
+
+  const referenceName = referenceText.split('.').at(-1);
+  if (!referenceName || !/^[A-Z]/.test(referenceName)) {
+    return undefined;
+  }
+
+  const beforeOffset = classDefinition
+    ? document.offsetAt(new vscode.Position(classDefinition.line, 0))
+    : document.offsetAt(position);
+  const source = await resolveClassDefinitionSource(
+    daemon,
+    document,
+    referenceText,
+    beforeOffset
+  );
+  if (!source) {
+    return undefined;
+  }
+
+  return {
+    source,
+    category: await resolveClassHoverCategory(daemon, source, new Set()),
+    specialKind: await resolveSpecialClassKind(daemon, source, new Set()),
+    referenceText,
+    fromDefinition: Boolean(classDefinition),
+  };
+}
+
 async function resolveImportedModuleMemberReference(
   daemon: AnalysisDaemon,
   document: vscode.TextDocument,
@@ -3053,12 +3331,90 @@ async function buildImportHover(
     return buildModuleImportHover(target.moduleName, target.resolution);
   }
 
-  return buildSymbolImportHover(target.resolution);
+  return buildSymbolImportHover(daemon, target.resolution);
 }
 
-function buildSymbolImportHover(
-  resolution: ExportOriginResolution
+function buildTypeHintHover(
+  target: TypeHintHoverTarget
 ): vscode.Hover | undefined {
+  if (target.kind === 'class') {
+    return buildTypeHintClassHover(target);
+  }
+
+  const markdown = new vscode.MarkdownString(undefined, true);
+  markdown.appendMarkdown(`**Type Hint**\n\n`);
+  markdown.appendMarkdown(`Type: \`${target.canonicalName}\``);
+  markdown.appendMarkdown(`\n\nCategory: \`${target.category}\``);
+  markdown.appendMarkdown(
+    `\n\nResolved from type hint \`${target.referenceText}\`.`
+  );
+  return new vscode.Hover(markdown);
+}
+
+function buildTypeHintClassHover(
+  target: Extract<TypeHintHoverTarget, { kind: 'class' }>
+): vscode.Hover | undefined {
+  const markdown = new vscode.MarkdownString(undefined, true);
+  markdown.appendMarkdown(`**Type Hint Class**\n\n`);
+
+  const moduleName = moduleNameForDocument(target.source.document);
+  if (moduleName) {
+    markdown.appendMarkdown(`Defined in \`${moduleName}\`.`);
+  }
+
+  markdown.appendMarkdown(
+    `\n\nResolved symbol: \`${qualifiedClassSymbol(
+      target.source.document,
+      target.source.classDef.name
+    )}\``
+  );
+  appendImportFilePath(markdown, target.source.document.uri.fsPath);
+  markdown.appendMarkdown(`\n\nClass category: \`${target.category}\``);
+
+  if (target.specialKind) {
+    markdown.appendMarkdown(`\n\nClass kind: \`${target.specialKind}\``);
+  }
+
+  markdown.appendMarkdown(
+    `\n\nResolved from type hint \`${target.referenceText}\`.`
+  );
+  return new vscode.Hover(markdown);
+}
+
+function buildClassHover(
+  target: ClassHoverTarget
+): vscode.Hover | undefined {
+  const markdown = new vscode.MarkdownString(undefined, true);
+  markdown.appendMarkdown(`**${classHoverTitle(target)}**\n\n`);
+
+  const moduleName = moduleNameForDocument(target.source.document);
+  if (moduleName) {
+    markdown.appendMarkdown(`Defined in \`${moduleName}\`.`);
+  }
+
+  markdown.appendMarkdown(
+    `\n\nResolved symbol: \`${qualifiedClassSymbol(
+      target.source.document,
+      target.source.classDef.name
+    )}\``
+  );
+  appendImportFilePath(markdown, target.source.document.uri.fsPath);
+  markdown.appendMarkdown(`\n\nClass category: \`${target.category}\``);
+  if (target.specialKind) {
+    markdown.appendMarkdown(`\n\nClass kind: \`${target.specialKind}\``);
+  }
+  markdown.appendMarkdown(
+    `\n\nResolved from ${
+      target.fromDefinition ? 'class definition' : 'class reference'
+    } \`${target.referenceText}\`.`
+  );
+  return new vscode.Hover(markdown);
+}
+
+async function buildSymbolImportHover(
+  daemon: AnalysisDaemon,
+  resolution: ExportOriginResolution
+): Promise<vscode.Hover | undefined> {
   if (!resolution.resolved || !resolution.originModule) {
     return undefined;
   }
@@ -3081,6 +3437,23 @@ function buildSymbolImportHover(
   markdown.appendMarkdown(`\n\nResolved symbol: \`${qualifiedSymbol}\``);
   appendImportFilePath(markdown, resolution.originFilePath);
 
+  const importedClassHoverTarget = await resolveImportedClassHoverTarget(
+    daemon,
+    resolution
+  );
+  if (importedClassHoverTarget) {
+    markdown.appendMarkdown(`\n\nSymbol kind: \`class\``);
+    markdown.appendMarkdown(`\n\nDefined in \`${resolution.originModule}\`.`);
+    markdown.appendMarkdown(
+      `\n\nClass category: \`${importedClassHoverTarget.category}\``
+    );
+    if (importedClassHoverTarget.specialKind) {
+      markdown.appendMarkdown(
+        `\n\nClass kind: \`${importedClassHoverTarget.specialKind}\``
+      );
+    }
+  }
+
   if (resolution.viaModules.length > 1) {
     markdown.appendMarkdown(
       `\n\nResolution path: \`${resolution.viaModules.join(' -> ')}\``
@@ -3088,6 +3461,37 @@ function buildSymbolImportHover(
   }
 
   return new vscode.Hover(markdown);
+}
+
+async function resolveImportedClassHoverTarget(
+  daemon: AnalysisDaemon,
+  resolution: ExportOriginResolution
+): Promise<ClassHoverTarget | undefined> {
+  if (!resolution.originFilePath || !resolution.originSymbol) {
+    return undefined;
+  }
+
+  const document = await vscode.workspace.openTextDocument(
+    resolution.originFilePath
+  );
+  const classDef = findClassDefinition(document, resolution.originSymbol);
+  if (!classDef) {
+    return undefined;
+  }
+
+  const source = {
+    document,
+    classDef,
+    beforeOffset: document.offsetAt(new vscode.Position(classDef.line, 0)),
+  };
+
+  return {
+    source,
+    category: await resolveClassHoverCategory(daemon, source, new Set()),
+    specialKind: await resolveSpecialClassKind(daemon, source, new Set()),
+    referenceText: resolution.symbol,
+    fromDefinition: false,
+  };
 }
 
 function buildModuleImportHover(
@@ -3103,6 +3507,34 @@ function buildModuleImportHover(
   markdown.appendMarkdown(`Module: \`${moduleName}\``);
   appendImportFilePath(markdown, resolution.filePath);
   return new vscode.Hover(markdown);
+}
+
+function classHoverTitle(target: ClassHoverTarget): string {
+  if (target.specialKind) {
+    return specialClassHoverTitle(target.specialKind);
+  }
+
+  return target.category === 'django' ? 'Django Class' : 'Class';
+}
+
+function specialClassHoverTitle(kind: SpecialClassKind): string {
+  if (kind === 'queryset') {
+    return 'QuerySet Class';
+  }
+
+  if (kind === 'related_manager') {
+    return 'Related Manager Class';
+  }
+
+  return 'Manager Class';
+}
+
+function qualifiedClassSymbol(
+  document: vscode.TextDocument,
+  className: string
+): string {
+  const moduleName = moduleNameForDocument(document);
+  return moduleName ? `${moduleName}.${className}` : className;
 }
 
 function appendImportFilePath(
@@ -5427,20 +5859,20 @@ async function resolveOrmReceiverFromLoopTarget(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
-  const loopIterable = findNearestLoopIterableExpression(
+  const iterableBinding = findNearestIterableBindingExpression(
     document,
     variableName,
     beforeOffset
   );
-  if (!loopIterable) {
+  if (!iterableBinding) {
     return undefined;
   }
 
   const iterableReceiver = await resolveOrmReceiverAtOffset(
     daemon,
     document,
-    loopIterable.expression,
-    loopIterable.offset,
+    iterableBinding.expression,
+    iterableBinding.offset,
     visited
   );
   const resolvedLoopReceiver = receiverFromIterableReceiver(iterableReceiver);
@@ -5452,15 +5884,15 @@ async function resolveOrmReceiverFromLoopTarget(
     await resolveBulkCreateIterableElementReceiverAtOffset(
       daemon,
       document,
-      loopIterable.expression,
-      loopIterable.offset,
+      iterableBinding.expression,
+      iterableBinding.offset,
       visited
     );
   if (bulkCreateLoopReceiver) {
     return bulkCreateLoopReceiver;
   }
 
-  const iterableIdentifier = receiverRootIdentifier(loopIterable.expression);
+  const iterableIdentifier = receiverRootIdentifier(iterableBinding.expression);
   if (!iterableIdentifier) {
     return undefined;
   }
@@ -5468,7 +5900,7 @@ async function resolveOrmReceiverFromLoopTarget(
   const iterableTypeAnnotation = findTypeAnnotationForIdentifier(
     document,
     iterableIdentifier,
-    loopIterable.offset
+    iterableBinding.offset
   );
   if (!iterableTypeAnnotation) {
     return undefined;
@@ -6360,6 +6792,105 @@ async function resolveClassDefinitionSource(
   };
 }
 
+async function resolveSpecialClassKind(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  visited: Set<string>
+): Promise<SpecialClassKind | undefined> {
+  const visitKey = `${classSource.document.uri.toString()}:${classSource.classDef.name}`;
+  if (visited.has(visitKey)) {
+    return undefined;
+  }
+  visited.add(visitKey);
+
+  for (const baseExpression of classSource.classDef.baseExpressions) {
+    const baseReference = baseClassReferenceExpression(baseExpression);
+    if (!baseReference) {
+      continue;
+    }
+
+    const canonicalBase = await canonicalTypeAnnotationName(
+      daemon,
+      classSource.document,
+      baseReference,
+      classSource.beforeOffset
+    );
+    const directKind = specialClassKindFromCanonicalName(canonicalBase);
+    if (directKind) {
+      return directKind;
+    }
+
+    const baseClassSource = await resolveClassDefinitionSource(
+      daemon,
+      classSource.document,
+      baseReference,
+      classSource.beforeOffset
+    );
+    if (!baseClassSource) {
+      continue;
+    }
+
+    const inheritedKind = await resolveSpecialClassKind(
+      daemon,
+      baseClassSource,
+      visited
+    );
+    if (inheritedKind) {
+      return inheritedKind;
+    }
+  }
+
+  return undefined;
+}
+
+async function resolveClassHoverCategory(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  visited: Set<string>
+): Promise<ClassHoverCategory> {
+  const visitKey = `${classSource.document.uri.toString()}:${classSource.classDef.name}`;
+  if (visited.has(visitKey)) {
+    return 'general';
+  }
+  visited.add(visitKey);
+
+  for (const baseExpression of classSource.classDef.baseExpressions) {
+    const baseReference = baseClassReferenceExpression(baseExpression);
+    if (!baseReference) {
+      continue;
+    }
+
+    const canonicalBase = await canonicalTypeAnnotationName(
+      daemon,
+      classSource.document,
+      baseReference,
+      classSource.beforeOffset
+    );
+    if (isDjangoCanonicalClassName(canonicalBase)) {
+      return 'django';
+    }
+
+    const baseClassSource = await resolveClassDefinitionSource(
+      daemon,
+      classSource.document,
+      baseReference,
+      classSource.beforeOffset
+    );
+    if (!baseClassSource) {
+      continue;
+    }
+
+    if (
+      (await resolveClassHoverCategory(daemon, baseClassSource, visited)) ===
+      'django'
+    ) {
+      return 'django';
+    }
+  }
+
+  return 'general';
+}
+
 async function resolveFunctionDefinitionSource(
   daemon: AnalysisDaemon,
   document: vscode.TextDocument,
@@ -6481,6 +7012,34 @@ function findEnclosingClassDefinition(
   }
 
   return undefined;
+}
+
+function classDefinitionAtPosition(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): PythonClassDefinition | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const match = lineText.match(CLASS_DEFINITION_PATTERN);
+  if (!match) {
+    return undefined;
+  }
+
+  const classDef = buildClassDefinition(document, position.line, match);
+  const classPrefixMatch = lineText.match(/^(\s*class\s+)/);
+  const classNameStart = classPrefixMatch?.[0].length;
+  if (classNameStart === undefined) {
+    return undefined;
+  }
+
+  const classNameEnd = classNameStart + classDef.name.length;
+  if (
+    position.character < classNameStart ||
+    position.character > classNameEnd
+  ) {
+    return undefined;
+  }
+
+  return classDef;
 }
 
 function findEnclosingParentClassDefinition(
@@ -6632,6 +7191,103 @@ function buildFunctionDefinition(
     indent,
     endLine: findBlockEndLine(document, line, indent),
   };
+}
+
+function classReferenceExpressionAtPosition(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): string | undefined {
+  const wordRange = document.getWordRangeAtPosition(position, /[A-Za-z_][\w]*/);
+  if (!wordRange) {
+    return undefined;
+  }
+
+  const hoveredWord = document.getText(wordRange);
+  const lineText = document.lineAt(position.line).text;
+  if (
+    wordRange.start.character === 0 ||
+    lineText[wordRange.start.character - 1] !== '.'
+  ) {
+    return hoveredWord;
+  }
+
+  let objectEnd = wordRange.start.character - 1;
+  let objectStart = objectEnd;
+  while (objectStart > 0 && /[A-Za-z0-9_]/.test(lineText[objectStart - 1] ?? '')) {
+    objectStart -= 1;
+  }
+
+  const objectName = lineText.slice(objectStart, objectEnd);
+  if (!/^[A-Za-z_][\w]*$/.test(objectName)) {
+    return hoveredWord;
+  }
+
+  return `${objectName}.${hoveredWord}`;
+}
+
+function baseClassReferenceExpression(baseExpression: string): string | undefined {
+  const normalizedExpression = stripWrappingParentheses(baseExpression.trim());
+  if (!normalizedExpression) {
+    return undefined;
+  }
+
+  const parsedCall = parseCalledExpression(normalizedExpression);
+  if (!parsedCall) {
+    return normalizedExpression;
+  }
+
+  if (parsedCall.kind === 'function') {
+    return parsedCall.functionName;
+  }
+
+  if (parsedCall.memberName === 'from_queryset') {
+    return parsedCall.objectExpression;
+  }
+
+  return `${parsedCall.objectExpression}.${parsedCall.memberName}`;
+}
+
+function specialClassKindFromCanonicalName(
+  canonicalName: string
+): SpecialClassKind | undefined {
+  if (QUERYSET_TYPE_NAMES.has(canonicalName)) {
+    return 'queryset';
+  }
+
+  if (MANAGER_TYPE_NAMES.has(canonicalName)) {
+    return 'manager';
+  }
+
+  if (RELATED_MANAGER_TYPE_NAMES.has(canonicalName)) {
+    return 'related_manager';
+  }
+
+  return undefined;
+}
+
+function isDjangoCanonicalClassName(canonicalName: string): boolean {
+  return (
+    DJANGO_TYPE_HINT_NAMES.has(canonicalName) ||
+    canonicalName.startsWith('django.')
+  );
+}
+
+function typeHintCategory(
+  canonicalName: string
+): 'builtin' | 'typing' | 'django' | undefined {
+  if (BUILTIN_TYPE_HINT_NAMES.has(canonicalName)) {
+    return 'builtin';
+  }
+
+  if (TYPING_TYPE_HINT_NAMES.has(canonicalName)) {
+    return 'typing';
+  }
+
+  if (DJANGO_TYPE_HINT_NAMES.has(canonicalName)) {
+    return 'django';
+  }
+
+  return undefined;
 }
 
 function findBlockEndLine(
@@ -6865,6 +7521,55 @@ function splitTopLevelExpressions(value: string): string[] {
   return expressions;
 }
 
+function splitTopLevelExpressionsWithOffsets(
+  value: string
+): Array<{ value: string; start: number; end: number }> {
+  const expressions: Array<{ value: string; start: number; end: number }> = [];
+  let current = '';
+  let currentStart = 0;
+  let depth = 0;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (char === ',' && depth === 0) {
+      const trimmed = current.trim();
+      if (trimmed) {
+        const leadingWhitespace = current.search(/\S/);
+        const start = currentStart + Math.max(leadingWhitespace, 0);
+        expressions.push({
+          value: trimmed,
+          start,
+          end: currentStart + current.length,
+        });
+      }
+      current = '';
+      currentStart = index + 1;
+      continue;
+    }
+
+    if (char === '(' || char === '[' || char === '{') {
+      depth += 1;
+    } else if ((char === ')' || char === ']' || char === '}') && depth > 0) {
+      depth -= 1;
+    }
+
+    current += char;
+  }
+
+  const trailing = current.trim();
+  if (trailing) {
+    const leadingWhitespace = current.search(/\S/);
+    const start = currentStart + Math.max(leadingWhitespace, 0);
+    expressions.push({
+      value: trailing,
+      start,
+      end: currentStart + current.length,
+    });
+  }
+
+  return expressions;
+}
+
 function stripWrappingParentheses(value: string): string {
   let current = value.trim();
 
@@ -6880,19 +7585,33 @@ function stripWrappingParentheses(value: string): string {
 }
 
 function normalizeReceiverExpression(value: string): string {
-  let current = stripWrappingParentheses(value.trim());
+  let current = trimLeadingUnmatchedOpeningDelimiters(
+    stripWrappingParentheses(value.trim())
+  );
 
-  for (const prefix of ['return', 'await']) {
-    if (!current.startsWith(prefix) || current.length === prefix.length) {
-      continue;
+  while (true) {
+    let strippedPrefix = false;
+
+    for (const prefix of ['return', 'await']) {
+      if (!current.startsWith(prefix) || current.length === prefix.length) {
+        continue;
+      }
+
+      const candidate = current.slice(prefix.length).trimStart();
+      if (!candidate || !/[A-Za-z_(\[{]/.test(candidate[0])) {
+        continue;
+      }
+
+      current = trimLeadingUnmatchedOpeningDelimiters(
+        stripWrappingParentheses(candidate)
+      );
+      strippedPrefix = true;
+      break;
     }
 
-    const candidate = current.slice(prefix.length);
-    if (!candidate || !/[A-Za-z_(]/.test(candidate[0])) {
-      continue;
+    if (!strippedPrefix) {
+      break;
     }
-
-    current = stripWrappingParentheses(candidate);
   }
 
   return current;
@@ -7029,6 +7748,78 @@ function findNearestLoopIterableExpression(
   return undefined;
 }
 
+function findNearestIterableBindingExpression(
+  document: vscode.TextDocument,
+  variableName: string,
+  beforeOffset: number
+): { expression: string; offset: number } | undefined {
+  return (
+    findNearestLoopIterableExpression(document, variableName, beforeOffset) ??
+    findNearestComprehensionIterableExpression(
+      document,
+      variableName,
+      beforeOffset
+    )
+  );
+}
+
+function findNearestComprehensionIterableExpression(
+  document: vscode.TextDocument,
+  variableName: string,
+  beforeOffset: number
+): { expression: string; offset: number } | undefined {
+  const fullText = document.getText();
+
+  for (let index = beforeOffset - 1; index >= 0; index -= 1) {
+    const openingDelimiter = fullText[index];
+    const closingDelimiter =
+      openingDelimiter === '(' ? ')'
+      : openingDelimiter === '[' ? ']'
+      : openingDelimiter === '{' ? '}'
+      : undefined;
+    if (!closingDelimiter) {
+      continue;
+    }
+
+    const closingIndex = findMatchingClosingDelimiter(
+      fullText,
+      index,
+      openingDelimiter,
+      closingDelimiter
+    );
+    if (closingIndex === undefined || closingIndex < beforeOffset) {
+      continue;
+    }
+
+    const bodyStartOffset = index + 1;
+    const body = fullText.slice(bodyStartOffset, closingIndex);
+    const clauses = parseComprehensionClauses(body).filter((clause) =>
+      loopTargetContainsIdentifier(clause.target, variableName)
+    );
+    if (clauses.length === 0) {
+      continue;
+    }
+
+    const relativeOffset = beforeOffset - bodyStartOffset;
+    const inScopeClauses = clauses.filter(
+      (clause) => clause.clauseStart <= relativeOffset
+    );
+    const matchedClause =
+      inScopeClauses.at(-1) ??
+      clauses.at(-1);
+    if (!matchedClause) {
+      continue;
+    }
+
+    return {
+      expression: matchedClause.iterable,
+      offset: bodyStartOffset + matchedClause.iterableStart,
+    };
+  }
+
+  return undefined;
+}
+
 function findNearestAssignedExpression(
   document: vscode.TextDocument,
   variableName: string,
@@ -7110,6 +7901,158 @@ function findTypeAnnotationForIdentifier(
     findNearestAnnotatedAssignment(document, variableName, beforeOffset) ??
     findFunctionParameterTypeAnnotation(document, variableName, beforeOffset)
   );
+}
+
+function typeAnnotationSegmentAtPosition(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): TypeAnnotationSegment | undefined {
+  const lineText = document.lineAt(position.line).text;
+
+  for (const segment of typeAnnotationSegmentsForLine(lineText)) {
+    if (position.character >= segment.start && position.character < segment.end) {
+      return segment;
+    }
+  }
+
+  return undefined;
+}
+
+function typeAnnotationSegmentsForLine(lineText: string): TypeAnnotationSegment[] {
+  return [
+    ...functionTypeAnnotationSegments(lineText),
+    ...annotatedAssignmentTypeAnnotationSegments(lineText),
+  ];
+}
+
+function functionTypeAnnotationSegments(lineText: string): TypeAnnotationSegment[] {
+  if (!lineText.match(FUNCTION_DEFINITION_PATTERN)) {
+    return [];
+  }
+
+  const openParenIndex = lineText.indexOf('(');
+  if (openParenIndex < 0) {
+    return [];
+  }
+
+  const closeParenIndex = findMatchingClosingDelimiter(
+    lineText,
+    openParenIndex,
+    '(',
+    ')'
+  );
+  if (closeParenIndex === undefined) {
+    return [];
+  }
+
+  const segments: TypeAnnotationSegment[] = [];
+  const paramsText = lineText.slice(openParenIndex + 1, closeParenIndex);
+  for (const parameter of splitTopLevelExpressionsWithOffsets(paramsText)) {
+    const colonIndex = findTopLevelCharacter(parameter.value, ':');
+    if (colonIndex === undefined) {
+      continue;
+    }
+
+    const annotationSegment = annotationSegmentFromFragment(
+      parameter.value,
+      colonIndex + 1,
+      parameter.start + openParenIndex + 1
+    );
+    if (annotationSegment) {
+      segments.push(annotationSegment);
+    }
+  }
+
+  const returnArrowIndex = lineText.indexOf('->', closeParenIndex);
+  const definitionColonIndex = lineText.lastIndexOf(':');
+  if (
+    returnArrowIndex >= 0 &&
+    definitionColonIndex > returnArrowIndex + 2
+  ) {
+    const annotationSegment = annotationSegmentFromFragment(
+      lineText.slice(returnArrowIndex + 2, definitionColonIndex),
+      0,
+      returnArrowIndex + 2
+    );
+    if (annotationSegment) {
+      segments.push(annotationSegment);
+    }
+  }
+
+  return segments;
+}
+
+function annotatedAssignmentTypeAnnotationSegments(
+  lineText: string
+): TypeAnnotationSegment[] {
+  const trimmed = lineText.trimStart();
+  if (
+    trimmed.startsWith('def ') ||
+    trimmed.startsWith('async def ') ||
+    trimmed.startsWith('class ') ||
+    trimmed.startsWith('from ') ||
+    trimmed.startsWith('import ')
+  ) {
+    return [];
+  }
+
+  const colonIndex = findTopLevelCharacter(lineText, ':');
+  if (colonIndex === undefined) {
+    return [];
+  }
+
+  const target = lineText.slice(0, colonIndex).trim();
+  if (!/^[A-Za-z_][\w]*$/.test(target)) {
+    return [];
+  }
+
+  const assignmentIndex = findTopLevelEqualsIndex(lineText);
+  const commentIndex = lineText.indexOf('#');
+  let endIndex = lineText.length;
+  if (assignmentIndex >= 0) {
+    endIndex = assignmentIndex;
+  }
+  if (commentIndex >= 0) {
+    endIndex = Math.min(endIndex, commentIndex);
+  }
+  if (endIndex <= colonIndex + 1) {
+    return [];
+  }
+
+  const annotationSegment = annotationSegmentFromFragment(
+    lineText.slice(colonIndex + 1, endIndex),
+    0,
+    colonIndex + 1
+  );
+  return annotationSegment ? [annotationSegment] : [];
+}
+
+function annotationSegmentFromFragment(
+  fragment: string,
+  startOffset: number,
+  absoluteBase: number
+): TypeAnnotationSegment | undefined {
+  let start = startOffset;
+  while (start < fragment.length && /\s/.test(fragment[start])) {
+    start += 1;
+  }
+
+  const candidate = fragment.slice(start);
+  if (!candidate) {
+    return undefined;
+  }
+
+  const assignmentIndex = findTopLevelCharacter(candidate, '=');
+  const end =
+    assignmentIndex === undefined ? fragment.length : start + assignmentIndex;
+  if (end <= start) {
+    return undefined;
+  }
+
+  return {
+    start: absoluteBase + start,
+    end: absoluteBase + end,
+  };
 }
 
 function findNearestAnnotatedAssignment(
@@ -7241,7 +8184,14 @@ async function resolveSingleDirectReceiverType(
 
   const genericType = parseGenericTypeAnnotation(normalizedAnnotation);
   if (genericType) {
-    if (OPTIONAL_TYPE_NAMES.has(genericType.base) && genericType.args[0]) {
+    const canonicalBase = await canonicalTypeAnnotationName(
+      daemon,
+      document,
+      genericType.base,
+      beforeOffset
+    );
+
+    if (OPTIONAL_TYPE_NAMES.has(canonicalBase) && genericType.args[0]) {
       return resolveDirectReceiverFromTypeAnnotation(
         daemon,
         document,
@@ -7250,7 +8200,23 @@ async function resolveSingleDirectReceiverType(
       );
     }
 
-    if (QUERYSET_TYPE_NAMES.has(genericType.base) && genericType.args[0]) {
+    if (UNION_TYPE_NAMES.has(canonicalBase)) {
+      for (const arg of genericType.args) {
+        const resolvedReceiver = await resolveDirectReceiverFromTypeAnnotation(
+          daemon,
+          document,
+          arg,
+          beforeOffset
+        );
+        if (resolvedReceiver) {
+          return resolvedReceiver;
+        }
+      }
+
+      return undefined;
+    }
+
+    if (QUERYSET_TYPE_NAMES.has(canonicalBase) && genericType.args[0]) {
       const modelLabel = await resolveModelLabelFromTypeAnnotation(
         daemon,
         document,
@@ -7265,7 +8231,7 @@ async function resolveSingleDirectReceiverType(
       }
     }
 
-    if (MANAGER_TYPE_NAMES.has(genericType.base) && genericType.args[0]) {
+    if (MANAGER_TYPE_NAMES.has(canonicalBase) && genericType.args[0]) {
       const modelLabel = await resolveModelLabelFromTypeAnnotation(
         daemon,
         document,
@@ -7280,7 +8246,7 @@ async function resolveSingleDirectReceiverType(
       }
     }
 
-    if (RELATED_MANAGER_TYPE_NAMES.has(genericType.base) && genericType.args[0]) {
+    if (RELATED_MANAGER_TYPE_NAMES.has(canonicalBase) && genericType.args[0]) {
       const modelLabel = await resolveModelLabelFromTypeAnnotation(
         daemon,
         document,
@@ -7351,7 +8317,14 @@ async function resolveSingleIterableElementType(
     return undefined;
   }
 
-  if (OPTIONAL_TYPE_NAMES.has(genericType.base) && genericType.args[0]) {
+  const canonicalBase = await canonicalTypeAnnotationName(
+    daemon,
+    document,
+    genericType.base,
+    beforeOffset
+  );
+
+  if (OPTIONAL_TYPE_NAMES.has(canonicalBase) && genericType.args[0]) {
     return resolveIterableElementReceiverFromTypeAnnotation(
       daemon,
       document,
@@ -7360,7 +8333,23 @@ async function resolveSingleIterableElementType(
     );
   }
 
-  if (ITERABLE_TYPE_NAMES.has(genericType.base) && genericType.args[0]) {
+  if (UNION_TYPE_NAMES.has(canonicalBase)) {
+    for (const arg of genericType.args) {
+      const resolvedReceiver = await resolveIterableElementReceiverFromTypeAnnotation(
+        daemon,
+        document,
+        arg,
+        beforeOffset
+      );
+      if (resolvedReceiver) {
+        return resolvedReceiver;
+      }
+    }
+
+    return undefined;
+  }
+
+  if (ITERABLE_TYPE_NAMES.has(canonicalBase) && genericType.args[0]) {
     return resolveDirectReceiverFromTypeAnnotation(
       daemon,
       document,
@@ -7370,8 +8359,8 @@ async function resolveSingleIterableElementType(
   }
 
   if (
-    (QUERYSET_TYPE_NAMES.has(genericType.base) ||
-      RELATED_MANAGER_TYPE_NAMES.has(genericType.base)) &&
+    (QUERYSET_TYPE_NAMES.has(canonicalBase) ||
+      RELATED_MANAGER_TYPE_NAMES.has(canonicalBase)) &&
     genericType.args[0]
   ) {
     const modelLabel = await resolveModelLabelFromTypeAnnotation(
@@ -7402,6 +8391,31 @@ async function resolveModelLabelFromTypeAnnotation(
     return undefined;
   }
 
+  const genericType = parseGenericTypeAnnotation(normalizedAnnotation);
+  if (genericType) {
+    const canonicalBase = await canonicalTypeAnnotationName(
+      daemon,
+      document,
+      genericType.base,
+      beforeOffset
+    );
+
+    if (OPTIONAL_TYPE_NAMES.has(canonicalBase) || UNION_TYPE_NAMES.has(canonicalBase)) {
+      for (const arg of genericType.args) {
+        const resolvedLabel = await resolveModelLabelFromTypeAnnotation(
+          daemon,
+          document,
+          arg,
+          beforeOffset
+        );
+        if (resolvedLabel) {
+          return resolvedLabel;
+        }
+      }
+      return undefined;
+    }
+  }
+
   for (const candidate of splitTopLevelTypeAlternatives(normalizedAnnotation)) {
     const strippedCandidate = stripStringLiteralQuotes(candidate);
     if (!strippedCandidate) {
@@ -7420,6 +8434,38 @@ async function resolveModelLabelFromTypeAnnotation(
   }
 
   return undefined;
+}
+
+async function canonicalTypeAnnotationName(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  typeName: string,
+  beforeOffset: number
+): Promise<string> {
+  const normalizedTypeName = normalizeTypeAnnotation(typeName);
+  if (!normalizedTypeName) {
+    return typeName;
+  }
+
+  const bindings = collectImportBindings(document, beforeOffset);
+  const directBinding = bindings.symbols.get(normalizedTypeName);
+  if (directBinding) {
+    return `${directBinding.moduleName}.${directBinding.symbolName}`;
+  }
+
+  const parts = normalizedTypeName.split('.');
+  if (parts.length === 2) {
+    const moduleName = await resolveImportedModuleAlias(
+      daemon,
+      bindings,
+      parts[0]
+    );
+    if (moduleName) {
+      return `${moduleName}.${parts[1]}`;
+    }
+  }
+
+  return normalizedTypeName;
 }
 
 function parseForLoopHeader(
@@ -7452,6 +8498,66 @@ function parseForLoopHeader(
     target,
     iterable,
   };
+}
+
+function parseComprehensionClauses(
+  value: string
+): Array<{
+  clauseStart: number;
+  target: string;
+  iterable: string;
+  iterableStart: number;
+}> {
+  const clauses: Array<{
+    clauseStart: number;
+    target: string;
+    iterable: string;
+    iterableStart: number;
+  }> = [];
+  let searchStart = 0;
+
+  while (searchStart < value.length) {
+    const forIndex = findTopLevelKeywordFrom(value, ' for ', searchStart);
+    if (forIndex === undefined) {
+      break;
+    }
+
+    const targetStart = forIndex + ' for '.length;
+    const inIndex = findTopLevelKeywordFrom(value, ' in ', targetStart);
+    if (inIndex === undefined) {
+      break;
+    }
+
+    const nextIfIndex = findTopLevelKeywordFrom(
+      value,
+      ' if ',
+      inIndex + ' in '.length
+    );
+    const nextForIndex = findTopLevelKeywordFrom(
+      value,
+      ' for ',
+      inIndex + ' in '.length
+    );
+    const clauseEnd = [nextIfIndex, nextForIndex]
+      .filter((index): index is number => index !== undefined)
+      .reduce((smallest, index) => Math.min(smallest, index), value.length);
+    const target = value.slice(targetStart, inIndex).trim();
+    const iterableStart = inIndex + ' in '.length;
+    const iterable = value.slice(iterableStart, clauseEnd).trim();
+
+    if (target && iterable) {
+      clauses.push({
+        clauseStart: forIndex,
+        target,
+        iterable,
+        iterableStart,
+      });
+    }
+
+    searchStart = clauseEnd;
+  }
+
+  return clauses;
 }
 
 function loopTargetContainsIdentifier(
@@ -7543,10 +8649,42 @@ function stripStringLiteralQuotes(value: string): string {
 }
 
 function findTopLevelKeyword(value: string, keyword: string): number | undefined {
+  return findTopLevelKeywordFrom(value, keyword, 0);
+}
+
+function findTopLevelKeywordFrom(
+  value: string,
+  keyword: string,
+  startIndex: number
+): number | undefined {
   let depth = 0;
+  let activeQuote: '"' | "'" | undefined;
+  let escaped = false;
 
   for (let index = 0; index <= value.length - keyword.length; index += 1) {
     const char = value[index];
+    if (activeQuote) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+
+      if (char === activeQuote) {
+        activeQuote = undefined;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      activeQuote = char;
+      continue;
+    }
+
     if (char === '(' || char === '[' || char === '{') {
       depth += 1;
       continue;
@@ -7557,7 +8695,11 @@ function findTopLevelKeyword(value: string, keyword: string): number | undefined
       continue;
     }
 
-    if (depth === 0 && value.slice(index, index + keyword.length) === keyword) {
+    if (
+      index >= startIndex &&
+      depth === 0 &&
+      value.slice(index, index + keyword.length) === keyword
+    ) {
       return index;
     }
   }

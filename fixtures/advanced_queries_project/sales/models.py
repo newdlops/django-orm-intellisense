@@ -32,3 +32,16 @@ class LineItem(models.Model):
         on_delete=models.CASCADE,
     )
     quantity = models.PositiveIntegerField(default=1)
+
+
+class Fulfillment(models.Model):
+    reference = models.CharField(max_length=64)
+
+
+class FulfillmentDetail(models.Model):
+    detail_code = models.CharField(max_length=64)
+    fulfillment = models.ForeignKey(
+        Fulfillment,
+        related_name='details',
+        on_delete=models.CASCADE,
+    )

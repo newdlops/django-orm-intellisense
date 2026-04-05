@@ -42,6 +42,10 @@ class Tag(models.Model):
     label = models.CharField(max_length=64)
 
 
+class HiddenReverseTag(models.Model):
+    label = models.CharField(max_length=64)
+
+
 class Status(models.CharField):
     pass
 
@@ -67,6 +71,11 @@ class Post(models.Model):
     tags = models.ManyToManyField('blog.Tag', related_name='posts')
     title = models.CharField(max_length=255)
     published = models.BooleanField(default=False)
+
+
+class HiddenReversePost(models.Model):
+    tags = models.ManyToManyField('blog.HiddenReverseTag', related_name='+')
+    title = models.CharField(max_length=255)
 
 
 class Company(models.Model):

@@ -95,6 +95,12 @@ def _compute_detail(
             'and semantic graph summaries are available.'
         )
 
+    if runtime.bootstrap_status == 'warming_up':
+        return (
+            'Static indexing is ready. Runtime ORM inspection is still warming up '
+            'in the background.'
+        )
+
     if runtime.bootstrap_status == 'setup_failed':
         return (
             'Django imports successfully, but `django.setup()` failed for the selected '
