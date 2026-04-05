@@ -1,15 +1,20 @@
 from django.db import models
 from django.db.models import Case, QuerySet, Value, When
 
-from sales.models import Product
+from sales import expression_helpers as expr
+from sales.models import LineItem, Order, Product
 from sales.services import ProductLookupService
 
 
 def queryset_examples():
     active_products = Product.objects.active()
+    dynamic_lookup = "category__slug"
     active_products.values("category__ti")
     active_products.values("category__title")
     active_products.filter(category__sl='chairs')
+    active_products.filter(**{"category__sl": 'chairs'})
+    active_products.filter(**{"category__title": 'chairs'})
+    active_products.filter(**{f"{dynamic_lookup}__bogus": 'chairs'})
     active_products.filter(
         category__ti='chairs',
     )
@@ -49,6 +54,7 @@ def expression_examples():
     Product.objects.annotate(category_title_text=models.Cast("category__ti", output_field=models.CharField()))
     Product.objects.annotate(category_title_lower=models.Func("category__ti", function="LOWER"))
     Product.objects.annotate(category_title_or_name=models.Coalesce("category__ti", "na"))
+    Product.objects.filter(models.Q(**{"category__slug": 'chairs'}))
     Product.objects.alias(line_total=models.Count("li")).filter(line_to=1)
     Product.objects.alias(line_total=models.Count("li")).filter(line_total__g=1)
     Product.objects.alias(line_total=models.Count("lines")).filter(line_total__gt=1)
@@ -60,8 +66,18 @@ def expression_examples():
             default=Value('other'),
         )
     ).first().ca
+    Product.objects.annotate(
+        category_bucket=Case(
+            When(
+                condition=models.Q(category__sl='chairs'),
+                then=Value('chairs'),
+            ),
+            default=Value('other'),
+        )
+    ).first().ca
     Product.objects.annotate(category_bucket=Case(When(category__sl='chairs', then=Value('chairs')), default=Value('other'))).first().ca
     Product.objects.annotate(category_bucket=Case(When(category__slug='chairs', then=Value('chairs')), default=Value('other')))
+    Product.objects.annotate(category_bucket=Case(When(condition=models.Q(category__slug='chairs'), then=Value('chairs')), default=Value('other')))
     Product.objects.annotate(category_title_text=models.Cast("category__ti", output_field=models.CharField())).first().ca_t
     Product.objects.annotate(category_title_text=models.Cast("category__title", output_field=models.CharField()))
     Product.objects.annotate(category_title_lower=models.Func("category__ti", function="LOWER")).first().ca_t_l
@@ -73,6 +89,58 @@ def expression_examples():
     Product.objects.annotate(matching_name=models.Subquery(Product.objects.filter(pk=models.OuterRef("name")).values("category__sl")[:1])).first().ma
     Product.objects.annotate(matching_name=models.Subquery(Product.objects.filter(pk=models.OuterRef("bo")).values("category__sl")[:1]))
     Product.objects.annotate(has_active_category=models.Exists(Product.objects.filter(pk=models.OuterRef("pk"), category__sl='chairs')))
+    Product.objects.annotate(line_quantities=expr.ArrayAgg("li"))
+    Product.objects.annotate(line_quantities=expr.ArrayAgg("lines__quantity"))
+    Product.objects.annotate(line_quantities=expr.ArrayAgg("lines__quantitx"))
+    Product.objects.annotate(names=expr.JSONBAgg("na"))
+    Product.objects.annotate(sort_name=expr.Collate("na", "C"))
+    Product.objects.annotate(best_name=expr.Greatest(models.Value(""), "na"))
+    Product.objects.annotate(best_name=expr.Greatest(models.Value(""), "name"))
+    Product.objects.annotate(best_name=expr.Greatest(models.Value(""), "nax"))
+    Product.objects.annotate(short_name=expr.Least(models.Value("zzz"), "na"))
+    Product.objects.annotate(short_name=expr.Least(models.Value("zzz"), "name"))
+    Product.objects.annotate(short_name=expr.Least(models.Value("zzz"), "nax"))
+    Product.objects.annotate(initials=expr.Substr("na", 1, 2))
+    Product.objects.annotate(initials=expr.Substr("name", 1, 2))
+    Product.objects.annotate(initials=expr.Substr("nax", 1, 2))
+    Product.objects.annotate(normalized_name=models.functions.Replace("na", models.Value("-"), models.Value("")))
+    Product.objects.annotate(normalized_name=models.functions.Replace("name", models.Value("-"), models.Value("")))
+    Product.objects.annotate(normalized_name=models.functions.Replace("nax", models.Value("-"), models.Value("")))
+    Product.objects.annotate(payload=expr.JSONObject(name="na"))
+    Product.objects.annotate(payload=expr.JSONObject(name="name", category_title="category__ti"))
+    Product.objects.annotate(payload=expr.JSONObject(name="nax"))
+    Product.objects.annotate(
+        line_quantities=expr.ArraySubquery(
+            LineItem.objects.filter(product_id=models.OuterRef("pk")).values("qu")
+        )
+    )
+    Order.objects.annotate(
+        previous_customer_name=expr.Window(
+            expression=expr.Lag("customer_na"),
+            order_by=models.F("created_at").asc(),
+        )
+    )
+    Order.objects.annotate(
+        previous_customer_name=expr.Window(
+            expression=expr.Lag("customer_name"),
+            order_by=models.F("created_at").asc(),
+        )
+    )
+    Order.objects.annotate(
+        previous_customer_name=expr.Window(
+            expression=expr.Lag("customer_bo"),
+            order_by=models.F("created_at").asc(),
+        )
+    )
+    Order.objects.annotate(
+        customer_rank=expr.Window(
+            expression=models.Count("id"),
+            partition_by=[models.F("customer_na")],
+            order_by=[models.F("created_at").asc()],
+        )
+    )
+    Order.objects.annotate(created_year=expr.Extract("created_", "year"))
+    Order.objects.annotate(created_year_value=expr.ExtractYear("created_"))
     Product.objects.aggregate(line_total=models.Count("li"))
     Product.objects.aggregate(line_total=models.Count("lines"))
     Product.objects.aggregate(line_total=models.Count("bo"))

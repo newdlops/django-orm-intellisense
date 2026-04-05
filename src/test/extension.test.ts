@@ -6,7 +6,6 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { getActiveDaemonForTesting } from '../client/extension';
 import type { HealthSnapshot } from '../client/protocol';
-import { syncManagedPylanceStubPath } from '../client/pylance/stubPath';
 import {
   resolvePythonInterpreter,
   savePythonInterpreterSetting,
@@ -310,6 +309,23 @@ suite('Django ORM Intellisense UI', () => {
       'Expected prefetch_related() completion to include `profile`.'
     );
 
+    const prefetchWrapperCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Post.objects.prefetch_related(Prefetch("author__pro"))',
+      'author__pro'
+    );
+    const prefetchWrapperCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        prefetchWrapperCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(prefetchWrapperCompletionList?.items, 'profile'),
+      'Expected Prefetch() completion to include `profile`.'
+    );
+
     const onlyCompletionPosition = positionAfterTextInContainer(
       document,
       'Post.objects.only("author__na")',
@@ -399,6 +415,23 @@ suite('Django ORM Intellisense UI', () => {
       ),
       `Expected prefetch_related() diagnostics to flag non-relation paths. Received: ${stringifyDiagnostics(diagnostics)}`
     );
+
+    const prefetchWrapperHoverPosition = positionInsideText(
+      document,
+      'Post.objects.prefetch_related(Prefetch("author__profile"))',
+      'profile'
+    );
+    const prefetchWrapperHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      prefetchWrapperHoverPosition
+    );
+    const prefetchWrapperHoverText = stringifyHovers(prefetchWrapperHovers);
+
+    assert.ok(
+      prefetchWrapperHoverText.includes('Owner model: `blog.Author`'),
+      `Expected Prefetch() hover to mention blog.Author. Received: ${prefetchWrapperHoverText}`
+    );
   });
 
   test('supports relation-string field declarations', async function () {
@@ -429,6 +462,23 @@ suite('Django ORM Intellisense UI', () => {
       'Expected ForeignKey() relation completion to include `blog.Author`.'
     );
 
+    const foreignKeyToCompletionPosition = positionAfterTextInContainer(
+      document,
+      'models.ForeignKey(to="blog.Aut", on_delete=models.CASCADE)',
+      'blog.Aut'
+    );
+    const foreignKeyToCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        foreignKeyToCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(foreignKeyToCompletionList?.items, 'blog.Author'),
+      'Expected ForeignKey(to=...) completion to include `blog.Author`.'
+    );
+
     const manyToManyCompletionPosition = positionAfterTextInContainer(
       document,
       'models.ManyToManyField("blog.Ta")',
@@ -444,6 +494,23 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hasCompletionItemLabel(manyToManyCompletionList?.items, 'blog.Tag'),
       'Expected ManyToManyField() relation completion to include `blog.Tag`.'
+    );
+
+    const parentalKeyCompletionPosition = positionAfterTextInContainer(
+      document,
+      'ParentalKey(to="blog.Fa", on_delete=models.CASCADE)',
+      'blog.Fa'
+    );
+    const parentalKeyCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        parentalKeyCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(parentalKeyCompletionList?.items, 'blog.Faq'),
+      'Expected ParentalKey(to=...) completion to include `blog.Faq`.'
     );
 
     const hoverPosition = positionInsideText(
@@ -465,6 +532,56 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hoverText.includes('Module: `blog.models`'),
       `Expected relation-string hover to mention blog.models. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('Resolved symbol: `blog.models.Profile`'),
+      `Expected relation-string hover to mention the resolved symbol. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('Import hint: `from blog.models import Profile`'),
+      `Expected relation-string hover to include an import hint. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('File: `blog/models.py`'),
+      `Expected relation-string hover to mention the resolved file. Received: ${hoverText}`
+    );
+
+    const bareHoverPosition = positionInsideText(
+      document,
+      'models.ForeignKey("Profile", on_delete=models.CASCADE)',
+      'Profile'
+    );
+    const bareHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      bareHoverPosition
+    );
+    const bareHoverText = stringifyHovers(bareHovers);
+
+    assert.ok(
+      bareHoverText.includes('Import hint: `from blog.models import Profile`'),
+      `Expected bare relation-string hover to include an import hint. Received: ${bareHoverText}`
+    );
+    assert.ok(
+      bareHoverText.includes('Resolved from string reference `Profile`.'),
+      `Expected bare relation-string hover to mention the original string reference. Received: ${bareHoverText}`
+    );
+
+    const parentalKeyHoverPosition = positionInsideText(
+      document,
+      'ParentalKey(to="blog.Faq", on_delete=models.CASCADE)',
+      'blog.Faq'
+    );
+    const parentalKeyHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      parentalKeyHoverPosition
+    );
+    const parentalKeyHoverText = stringifyHovers(parentalKeyHovers);
+
+    assert.ok(
+      parentalKeyHoverText.includes('blog.Faq'),
+      `Expected ParentalKey() hover to mention blog.Faq. Received: ${parentalKeyHoverText}`
     );
 
     const definitions = await vscode.commands.executeCommand<
@@ -500,6 +617,222 @@ suite('Django ORM Intellisense UI', () => {
         item.message.includes('Unknown Django model reference `blog.UnknownModel`')
       ),
       `Expected relation-string diagnostics to flag unknown model references. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+  });
+
+  test('supports custom base models and ParentalKey reverse relations', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const titleCompletionPosition = positionAfterTextInContainer(
+      document,
+      "Faq.objects.filter(ti='faq')",
+      'ti'
+    );
+    const titleCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        titleCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(titleCompletionList?.items, 'title'),
+      'Expected custom-base model completion to include `title`.'
+    );
+
+    const titleHoverPosition = positionInsideText(
+      document,
+      "Faq.objects.filter(title='faq')",
+      'title'
+    );
+    const titleHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      titleHoverPosition
+    );
+    const titleHoverText = stringifyHovers(titleHovers);
+
+    assert.ok(
+      titleHoverText.includes('Owner model: `blog.Faq`'),
+      `Expected custom-base field hover to mention blog.Faq. Received: ${titleHoverText}`
+    );
+    assert.ok(
+      titleHoverText.includes('Field kind: `CharField`'),
+      `Expected custom-base field hover to mention CharField. Received: ${titleHoverText}`
+    );
+
+    const titleDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, titleHoverPosition);
+    const titleDefinitionTarget = firstDefinition(titleDefinitions);
+
+    assert.ok(
+      titleDefinitionTarget,
+      'Expected custom-base field definition to resolve to the model field.'
+    );
+    assert.ok(
+      titleDefinitionTarget!.uri.fsPath.endsWith(
+        path.join('fixtures', 'minimal_project', 'blog', 'models.py')
+      ),
+      `Expected custom-base field definition to target blog/models.py. Received: ${titleDefinitionTarget!.uri.fsPath}`
+    );
+
+    const reverseCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Faq.objects.prefetch_related("li")',
+      'li'
+    );
+    const reverseCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        reverseCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(reverseCompletionList?.items, 'link_set'),
+      'Expected ParentalKey reverse relation completion to include `link_set`.'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(reverseCompletionList?.items, 'link'),
+      'Expected prefetch_related() completion to keep `related_query_name` aliases out of relation-only paths.'
+    );
+
+    const reverseHoverPosition = positionInsideText(
+      document,
+      'Faq.objects.prefetch_related("link_set")',
+      'link_set'
+    );
+    const reverseHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      reverseHoverPosition
+    );
+    const reverseHoverText = stringifyHovers(reverseHovers);
+
+    assert.ok(
+      reverseHoverText.includes('Owner model: `blog.Faq`'),
+      `Expected ParentalKey reverse relation hover to mention blog.Faq. Received: ${reverseHoverText}`
+    );
+  });
+
+  test('supports reverse related_query_name lookups without leaking into relation-only paths', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const queryNameCompletionPosition = positionAfterTextInContainer(
+      document,
+      "Faq.objects.filter(li='faq')",
+      'li'
+    );
+    const queryNameCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        queryNameCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(queryNameCompletionList?.items, 'link'),
+      'Expected reverse related_query_name completion to include `link`.'
+    );
+
+    const queryNameHoverPosition = positionInsideText(
+      document,
+      "Faq.objects.filter(link__label='faq')",
+      'label'
+    );
+    const queryNameHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      queryNameHoverPosition
+    );
+    const queryNameHoverText = stringifyHovers(queryNameHovers);
+
+    assert.ok(
+      queryNameHoverText.includes('Owner model: `blog.FaqLink`'),
+      `Expected reverse related_query_name hover to mention blog.FaqLink. Received: ${queryNameHoverText}`
+    );
+    assert.ok(
+      queryNameHoverText.includes('Field kind: `CharField`'),
+      `Expected reverse related_query_name hover to mention CharField. Received: ${queryNameHoverText}`
+    );
+
+    const queryNameDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, queryNameHoverPosition);
+    const queryNameDefinitionTarget = firstDefinition(queryNameDefinitions);
+
+    assert.ok(
+      queryNameDefinitionTarget,
+      'Expected reverse related_query_name definition to resolve to the related model field.'
+    );
+    assert.ok(
+      queryNameDefinitionTarget!.uri.fsPath.endsWith(
+        path.join('fixtures', 'minimal_project', 'blog', 'models.py')
+      ),
+      `Expected reverse related_query_name definition to target blog/models.py. Received: ${queryNameDefinitionTarget!.uri.fsPath}`
+    );
+    assert.strictEqual(
+      queryNameDefinitionTarget!.range.start.line + 1,
+      116,
+      'Expected reverse related_query_name definition to target FaqLink.label.'
+    );
+
+    const prefetchQueryNamePosition = positionInsideText(
+      document,
+      'Faq.objects.prefetch_related("link")',
+      'link'
+    );
+    const prefetchQueryNameHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        prefetchQueryNamePosition
+      );
+
+    assert.strictEqual(
+      stringifyHovers(prefetchQueryNameHovers),
+      '',
+      'Expected prefetch_related("link") to stay unresolved because relation-only paths should use accessors, not related_query_name.'
+    );
+
+    const prefetchQueryNameDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >(
+      'vscode.executeDefinitionProvider',
+      document.uri,
+      prefetchQueryNamePosition
+    );
+
+    assert.ok(
+      !firstDefinition(prefetchQueryNameDefinitions),
+      'Expected prefetch_related("link") to avoid resolving a definition target.'
+    );
+
+    const diagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) => items.some((item) => item.message.includes('author__unknown'))
+    );
+
+    assert.ok(
+      diagnostics.every((item) => !item.message.includes('link__label')),
+      `Expected reverse related_query_name filter paths to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
     );
   });
 
@@ -1417,6 +1750,135 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
+  test('supports Meta constraint Q lookup paths', async function () {
+    this.timeout(60_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/schema_examples.py'
+    );
+
+    const conditionCompletionPosition = positionAfterTextInContainer(
+      document,
+      'condition=models.Q(pub=False)',
+      'pub'
+    );
+    const conditionCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        conditionCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(conditionCompletionList?.items, 'published'),
+      'Expected Meta constraint condition completion to include `published`.'
+    );
+
+    const nestedCompletionPosition = positionAfterTextInContainer(
+      document,
+      "check=Q(author__na__gt='')",
+      'author__na'
+    );
+    const nestedCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        nestedCompletionPosition
+      );
+    const nestedCompletionItem = findCompletionItemByLabel(
+      nestedCompletionList?.items,
+      'name'
+    );
+
+    assert.ok(
+      nestedCompletionItem,
+      'Expected Meta constraint Q completion to include the related field `name`.'
+    );
+    assert.strictEqual(
+      completionItemFilterValue(nestedCompletionItem!),
+      'author__name',
+      'Expected Meta constraint Q completion to preserve the full related path for editor filtering.'
+    );
+
+    const hoverPosition = positionInsideText(
+      document,
+      "check=Q(author__name__gt='')",
+      'name__gt'
+    );
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      hoverPosition
+    );
+    const hoverText = stringifyHovers(hovers);
+
+    assert.ok(
+      hoverText.includes('Owner model: `blog.Author`'),
+      `Expected Meta constraint Q hover to mention blog.Author. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('Field kind: `CharField`'),
+      `Expected Meta constraint Q hover to mention CharField. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('Lookup operator: `gt`'),
+      `Expected Meta constraint Q hover to mention the lookup operator. Received: ${hoverText}`
+    );
+
+    const definitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, hoverPosition);
+    const definitionTarget = firstDefinition(definitions);
+
+    assert.ok(
+      definitionTarget,
+      'Expected Meta constraint Q definition to resolve to the referenced model field.'
+    );
+    assert.ok(
+      definitionTarget!.uri.fsPath.endsWith(
+        path.join('fixtures', 'minimal_project', 'blog', 'models.py')
+      ),
+      `Expected Meta constraint Q definition to target blog/models.py. Received: ${definitionTarget!.uri.fsPath}`
+    );
+    assert.strictEqual(
+      definitionTarget!.range.start.line + 1,
+      22,
+      'Expected Meta constraint Q definition to target Author.name.'
+    );
+
+    const diagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) =>
+        items.some((item) =>
+          item.message.includes('Unknown Django lookup operator `na`')
+        ) &&
+        items.some((item) =>
+          item.message.includes('Unknown Django lookup operator `bogus`')
+        )
+    );
+
+    assert.ok(
+      diagnostics.some((item) =>
+        item.message.includes('Unknown Django lookup operator `na`')
+      ),
+      `Expected Meta constraint Q diagnostics to flag incomplete related paths. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+    assert.ok(
+      diagnostics.some((item) =>
+        item.message.includes('Unknown Django lookup operator `bogus`')
+      ),
+      `Expected Meta constraint Q diagnostics to flag invalid related paths. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+    assert.ok(
+      diagnostics.every((item) => !item.message.includes('author__name__gt')),
+      `Expected valid Meta constraint Q paths to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+  });
+
   test('propagates write-method results and bulk_update field lists', async function () {
     this.timeout(60_000);
 
@@ -2142,6 +2604,128 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
+  test('supports unpacked dict lookup keys in queryset and Q contexts', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const dictCompletionPosition = positionAfterTextInContainer(
+      document,
+      'active_products.filter(**{"category__sl": \'chairs\'})',
+      'category__sl'
+    );
+    const dictCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        dictCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(dictCompletionList?.items, 'slug'),
+      'Expected unpacked dict lookup completion to include `slug`.'
+    );
+
+    const dictHoverPosition = positionInsideText(
+      document,
+      'active_products.filter(**{"category__title": \'chairs\'})',
+      'title'
+    );
+    const dictHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      dictHoverPosition
+    );
+    const dictHoverText = stringifyHovers(dictHovers);
+
+    assert.ok(
+      dictHoverText.includes('Owner model: `catalog.Category`'),
+      `Expected unpacked dict hover to mention catalog.Category. Received: ${dictHoverText}`
+    );
+    assert.ok(
+      dictHoverText.includes('Field kind: `CharField`'),
+      `Expected unpacked dict hover to mention CharField. Received: ${dictHoverText}`
+    );
+
+    const dictDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, dictHoverPosition);
+    const dictDefinitionTarget = firstDefinition(dictDefinitions);
+
+    assert.ok(
+      dictDefinitionTarget,
+      'Expected unpacked dict definition to resolve to the model field.'
+    );
+    assert.ok(
+      dictDefinitionTarget!.uri.fsPath.endsWith(
+        path.join('fixtures', 'advanced_queries_project', 'catalog', 'models.py')
+      ),
+      `Expected unpacked dict definition to target catalog/models.py. Received: ${dictDefinitionTarget!.uri.fsPath}`
+    );
+
+    const qDictHoverPosition = positionInsideText(
+      document,
+      'Product.objects.filter(models.Q(**{"category__slug": \'chairs\'}))',
+      'slug'
+    );
+    const qDictHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      qDictHoverPosition
+    );
+    const qDictHoverText = stringifyHovers(qDictHovers);
+
+    assert.ok(
+      qDictHoverText.includes('Owner model: `catalog.Category`'),
+      `Expected Q(**{{...}}) hover to mention catalog.Category. Received: ${qDictHoverText}`
+    );
+  });
+
+  test('skips diagnostics for dynamic unpacked dict lookup keys', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const dynamicLookupPosition = positionInsideText(
+      document,
+      'active_products.filter(**{f"{dynamic_lookup}__bogus": \'chairs\'})',
+      'bogus'
+    );
+
+    const diagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) =>
+        items.some((item) => item.message.includes('line_count__bog')) &&
+        items.some((item) => item.message.includes('line_total__bog')) &&
+        items.some((item) => item.message.includes('`bo`'))
+    );
+
+    assert.ok(
+      diagnostics.every(
+        (item) => item.range.start.line !== dynamicLookupPosition.line
+      ),
+      `Expected dynamic unpacked dict lookup keys to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+  });
+
   test('isolates manager queryset and instance receiver handling in advanced fixture project', async function () {
     this.timeout(20_000);
 
@@ -2202,29 +2786,9 @@ suite('Django ORM Intellisense UI', () => {
         blankInstanceCompletionPosition
       );
 
-    const blankInstanceLabels = (blankInstanceCompletionList?.items ?? []).map((item) =>
-      completionItemLabel(item)
-    );
-    assert.deepStrictEqual(
-      blankInstanceLabels.slice(0, 3),
-      ['category', 'name', 'is_active'],
-      `Expected instance receiver completions to keep Django fields at the top. Received: ${blankInstanceLabels
-        .slice(0, 10)
-        .join(', ')}`
-    );
-    const nameCompletionItem = findCompletionItemByLabel(
-      blankInstanceCompletionList?.items,
-      'name'
-    );
-    assert.strictEqual(
-      completionItemDisplayLabel(nameCompletionItem!),
-      'name (CharField)',
-      'Expected instance receiver completions to expose the Django field kind inline.'
-    );
-    assert.strictEqual(
-      completionItemDescription(nameCompletionItem!),
-      'Django model',
-      'Expected instance receiver completions to be marked as Django model suggestions.'
+    assert.ok(
+      hasCompletionItemLabel(blankInstanceCompletionList?.items, 'category'),
+      'Expected blank instance receiver completions to include the relation field `category`.'
     );
   });
 
@@ -2334,43 +2898,6 @@ suite('Django ORM Intellisense UI', () => {
       hasCompletionItemLabel(blankInstanceCompletionList?.items, 'category'),
       'Expected blank model instance completion to include the relation field `category`.'
     );
-    const blankInstanceLabels = (blankInstanceCompletionList?.items ?? []).map((item) =>
-      completionItemLabel(item)
-    );
-    assert.ok(
-      blankInstanceLabels.slice(0, 5).includes('name'),
-      `Expected model fields to be prioritized when completing after \`instance.\`. Received: ${blankInstanceLabels
-        .slice(0, 10)
-        .join(', ')}`
-    );
-    assert.ok(
-      blankInstanceLabels.slice(0, 5).includes('category'),
-      `Expected relation fields to be prioritized when completing after \`instance.\`. Received: ${blankInstanceLabels
-        .slice(0, 10)
-        .join(', ')}`
-    );
-    assert.deepStrictEqual(
-      blankInstanceLabels.slice(0, 3),
-      ['category', 'name', 'is_active'],
-      `Expected Django model fields to occupy the first completion slots after \`instance.\`. Received: ${blankInstanceLabels
-        .slice(0, 10)
-        .join(', ')}`
-    );
-
-    const blankNameCompletionItem = findCompletionItemByLabel(
-      blankInstanceCompletionList?.items,
-      'name'
-    );
-    assert.strictEqual(
-      completionItemDisplayLabel(blankNameCompletionItem!),
-      'name (CharField)',
-      'Expected blank model instance suggestions to expose the Django field kind inline in the suggestion label.'
-    );
-    assert.strictEqual(
-      completionItemDescription(blankNameCompletionItem!),
-      'Django model',
-      'Expected blank model instance suggestions to be marked as Django model completions.'
-    );
 
     const instanceCompletionPosition = positionAfterTextInContainer(
       document,
@@ -2395,41 +2922,6 @@ suite('Django ORM Intellisense UI', () => {
       hasCompletionItemLabel(instanceCompletionList?.items, 'category'),
       'Expected model instance completion to include the relation field `category`.'
     );
-    const instanceCompletionLabels = (instanceCompletionList?.items ?? []).map((item) =>
-      completionItemLabel(item)
-    );
-    assert.ok(
-      instanceCompletionLabels.slice(0, 4).includes('name'),
-      `Expected model instance fields to appear near the top of completion results. Received: ${instanceCompletionLabels
-        .slice(0, 8)
-        .join(', ')}`
-    );
-    assert.ok(
-      instanceCompletionLabels.slice(0, 4).includes('category'),
-      `Expected relation fields to remain near the top of model instance completions. Received: ${instanceCompletionLabels
-        .slice(0, 8)
-        .join(', ')}`
-    );
-
-    const nameCompletionItem = findCompletionItemByLabel(
-      instanceCompletionList?.items,
-      'name'
-    );
-    assert.strictEqual(
-      completionItemDisplayLabel(nameCompletionItem!),
-      'name (CharField)',
-      'Expected model instance field completions to expose the Django field kind inline in the suggestion label.'
-    );
-    assert.strictEqual(
-      completionItemDescription(nameCompletionItem!),
-      'Django model',
-      'Expected model instance field completions to be labeled as Django model suggestions.'
-    );
-    assert.ok(
-      nameCompletionItem?.detail?.startsWith('Django model field · CharField'),
-      `Expected model instance field detail to describe a Django model field. Received: ${nameCompletionItem?.detail}`
-    );
-
     const relationCompletionPosition = positionAfterTextInContainer(
       document,
       'instance.category.ti',
@@ -2669,6 +3161,26 @@ suite('Django ORM Intellisense UI', () => {
       'Expected When() condition lookup completion to include `slug`.'
     );
 
+    const whenConditionCompletionPosition = positionAfterTextInContainer(
+      document,
+      `When(
+                condition=models.Q(category__sl='chairs'),
+                then=Value('chairs'),
+            )`,
+      'category__sl'
+    );
+    const whenConditionCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        whenConditionCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(whenConditionCompletionList?.items, 'slug'),
+      'Expected When(condition=Q(...)) completion to include `slug`.'
+    );
+
     const outerRefCompletionPosition = positionAfterTextInContainer(
       document,
       'Product.objects.filter(pk=models.OuterRef("na")).values("category__sl")[:1]',
@@ -2772,10 +3284,9 @@ suite('Django ORM Intellisense UI', () => {
       annotatedInstanceCompletionList?.items,
       'line_count'
     );
-    assert.strictEqual(
-      completionItemDisplayLabel(annotatedLineCountItem!),
-      'line_count (IntegerField)',
-      'Expected annotated Count() completions to expose the inferred field kind inline.'
+    assert.ok(
+      annotatedLineCountItem,
+      'Expected annotated instance completion to include a concrete `line_count` item.'
     );
 
     const customAnnotatedCompletionPosition = positionAfterTextInContainer(
@@ -2844,6 +3355,454 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       diagnostics.some((item) => item.message.includes('`bo`')),
       `Expected expression diagnostics to flag invalid aggregate or OuterRef paths. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+  });
+
+  test('supports captain-style aggregate and window expression field paths', async function () {
+    this.timeout(60_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const arrayAggCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Product.objects.annotate(line_quantities=expr.ArrayAgg("li"))',
+      'li'
+    );
+    const arrayAggCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        arrayAggCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(arrayAggCompletionList?.items, 'lines'),
+      'Expected ArrayAgg() expression completion to include the related field `lines`.'
+    );
+
+    const jsonbAggCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Product.objects.annotate(names=expr.JSONBAgg("na"))',
+      'na'
+    );
+    const jsonbAggCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        jsonbAggCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(jsonbAggCompletionList?.items, 'name'),
+      'Expected JSONBAgg() expression completion to include the `name` field.'
+    );
+
+    const arraySubqueryCompletionPosition = positionAfterTextInContainer(
+      document,
+      'LineItem.objects.filter(product_id=models.OuterRef("pk")).values("qu")',
+      'qu'
+    );
+    const arraySubqueryCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        arraySubqueryCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(arraySubqueryCompletionList?.items, 'quantity'),
+      'Expected ArraySubquery(...values()) to keep queryset string-path completion.'
+    );
+
+    const lagCompletionPosition = positionAfterTextInContainer(
+      document,
+      'expression=expr.Lag("customer_na")',
+      'customer_na'
+    );
+    const lagCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        lagCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(lagCompletionList?.items, 'customer_name'),
+      'Expected Lag() completion inside Window() to include `customer_name`.'
+    );
+
+    const windowPartitionCompletionPosition = positionAfterTextInContainer(
+      document,
+      'partition_by=[models.F("customer_na")]',
+      'customer_na'
+    );
+    const windowPartitionCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        windowPartitionCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(windowPartitionCompletionList?.items, 'customer_name'),
+      'Expected F() completion inside Window(partition_by=...) to include `customer_name`.'
+    );
+
+    const lagHoverPosition = positionInsideText(
+      document,
+      'expression=expr.Lag("customer_name")',
+      'customer_name'
+    );
+    const lagHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      lagHoverPosition
+    );
+    const lagHoverText = stringifyHovers(lagHovers);
+
+    assert.ok(
+      lagHoverText.includes('Owner model: `sales.Order`'),
+      `Expected Lag() hover to mention sales.Order. Received: ${lagHoverText}`
+    );
+    assert.ok(
+      lagHoverText.includes('Field kind: `CharField`'),
+      `Expected Lag() hover to mention CharField. Received: ${lagHoverText}`
+    );
+
+    const lagDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, lagHoverPosition);
+    const lagDefinitionTarget = firstDefinition(lagDefinitions);
+
+    assert.ok(
+      lagDefinitionTarget,
+      'Expected Lag() definitions to resolve to the referenced model field.'
+    );
+    assert.ok(
+      lagDefinitionTarget!.uri.fsPath.endsWith(
+        path.join('fixtures', 'advanced_queries_project', 'sales', 'models.py')
+      ),
+      `Expected Lag() definition to target sales/models.py. Received: ${lagDefinitionTarget!.uri.fsPath}`
+    );
+    assert.strictEqual(
+      lagDefinitionTarget!.range.start.line + 1,
+      19,
+      'Expected Lag() definition to target Order.customer_name.'
+    );
+
+    const diagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) =>
+        items.some((item) => item.message.includes('lines__quantitx')) &&
+        items.some((item) => item.message.includes('customer_bo'))
+    );
+
+    assert.ok(
+      diagnostics.some((item) => item.message.includes('lines__quantitx')),
+      `Expected ArrayAgg() diagnostics to flag invalid related field paths. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+    assert.ok(
+      diagnostics.some((item) => item.message.includes('customer_bo')),
+      `Expected Window(Lag()) diagnostics to flag invalid field paths. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+  });
+
+  test('supports captain-style keyword and later-argument expression field paths', async function () {
+    this.timeout(60_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const jsonObjectCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Product.objects.annotate(payload=expr.JSONObject(name="na"))',
+      'na'
+    );
+    const jsonObjectCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        jsonObjectCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(jsonObjectCompletionList?.items, 'name'),
+      'Expected JSONObject(keyword="...") completion to include the `name` field.'
+    );
+
+    const jsonObjectNestedCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Product.objects.annotate(payload=expr.JSONObject(name="name", category_title="category__ti"))',
+      'category__ti'
+    );
+    const jsonObjectNestedCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        jsonObjectNestedCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(jsonObjectNestedCompletionList?.items, 'title'),
+      'Expected JSONObject keyword values to keep nested related field completion.'
+    );
+
+    const greatestCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Product.objects.annotate(best_name=expr.Greatest(models.Value(""), "na"))',
+      'na'
+    );
+    const greatestCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        greatestCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(greatestCompletionList?.items, 'name'),
+      'Expected Greatest(..., "...") completion to include the `name` field.'
+    );
+
+    const collateCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Product.objects.annotate(sort_name=expr.Collate("na", "C"))',
+      'na'
+    );
+    const collateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        collateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(collateCompletionList?.items, 'name'),
+      'Expected Collate() completion to include the `name` field.'
+    );
+
+    const extractCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Order.objects.annotate(created_year=expr.Extract("created_", "year"))',
+      'created_'
+    );
+    const extractCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        extractCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(extractCompletionList?.items, 'created_at'),
+      'Expected Extract() completion to include the `created_at` field.'
+    );
+
+    const greatestHoverPosition = positionInsideText(
+      document,
+      'Product.objects.annotate(best_name=expr.Greatest(models.Value(""), "name"))',
+      'name'
+    );
+    const greatestHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      greatestHoverPosition
+    );
+    const greatestHoverText = stringifyHovers(greatestHovers);
+
+    assert.ok(
+      greatestHoverText.includes('Owner model: `sales.Product`'),
+      `Expected Greatest(..., "...") hover to mention sales.Product. Received: ${greatestHoverText}`
+    );
+    assert.ok(
+      greatestHoverText.includes('Field kind: `CharField`'),
+      `Expected Greatest(..., "...") hover to mention CharField. Received: ${greatestHoverText}`
+    );
+
+    const greatestDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, greatestHoverPosition);
+    const greatestDefinitionTarget = firstDefinition(greatestDefinitions);
+
+    assert.ok(
+      greatestDefinitionTarget,
+      'Expected Greatest(..., "...") definitions to resolve to the referenced model field.'
+    );
+    assert.ok(
+      greatestDefinitionTarget!.uri.fsPath.endsWith(
+        path.join('fixtures', 'advanced_queries_project', 'sales', 'models.py')
+      ),
+      `Expected Greatest(..., "...") definition to target sales/models.py. Received: ${greatestDefinitionTarget!.uri.fsPath}`
+    );
+    assert.strictEqual(
+      greatestDefinitionTarget!.range.start.line + 1,
+      12,
+      'Expected Greatest(..., "...") definition to target Product.name.'
+    );
+
+    const diagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) =>
+        items.some((item) => item.message.includes('best_name=expr.Greatest') || item.message.includes('`nax`')) &&
+        items.some((item) => item.message.includes('payload=expr.JSONObject') || item.message.includes('`nax`'))
+    );
+
+    assert.ok(
+      diagnostics.some((item) => item.message.includes('`nax` in `nax`') || item.message.includes('`nax`')),
+      `Expected expression diagnostics to flag invalid JSONObject()/Greatest() field paths. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+  });
+
+  test('supports dotted and variant captain expression field paths', async function () {
+    this.timeout(60_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const replaceCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Product.objects.annotate(normalized_name=models.functions.Replace("na", models.Value("-"), models.Value("")))',
+      'na'
+    );
+    const replaceCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        replaceCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(replaceCompletionList?.items, 'name'),
+      'Expected models.functions.Replace() completion to include the `name` field.'
+    );
+
+    const substrCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Product.objects.annotate(initials=expr.Substr("na", 1, 2))',
+      'na'
+    );
+    const substrCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        substrCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(substrCompletionList?.items, 'name'),
+      'Expected Substr() completion to include the `name` field.'
+    );
+
+    const leastCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Product.objects.annotate(short_name=expr.Least(models.Value("zzz"), "na"))',
+      'na'
+    );
+    const leastCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        leastCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(leastCompletionList?.items, 'name'),
+      'Expected Least(..., "...") completion to include the `name` field.'
+    );
+
+    const extractYearCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Order.objects.annotate(created_year_value=expr.ExtractYear("created_"))',
+      'created_'
+    );
+    const extractYearCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        extractYearCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(extractYearCompletionList?.items, 'created_at'),
+      'Expected ExtractYear() completion to include the `created_at` field.'
+    );
+
+    const replaceHoverPosition = positionInsideText(
+      document,
+      'Product.objects.annotate(normalized_name=models.functions.Replace("name", models.Value("-"), models.Value("")))',
+      'name'
+    );
+    const replaceHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      replaceHoverPosition
+    );
+    const replaceHoverText = stringifyHovers(replaceHovers);
+
+    assert.ok(
+      replaceHoverText.includes('Owner model: `sales.Product`'),
+      `Expected Replace() hover to mention sales.Product. Received: ${replaceHoverText}`
+    );
+    assert.ok(
+      replaceHoverText.includes('Field kind: `CharField`'),
+      `Expected Replace() hover to mention CharField. Received: ${replaceHoverText}`
+    );
+
+    const replaceDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, replaceHoverPosition);
+    const replaceDefinitionTarget = firstDefinition(replaceDefinitions);
+
+    assert.ok(
+      replaceDefinitionTarget,
+      'Expected Replace() definitions to resolve to the referenced model field.'
+    );
+    assert.ok(
+      replaceDefinitionTarget!.uri.fsPath.endsWith(
+        path.join('fixtures', 'advanced_queries_project', 'sales', 'models.py')
+      ),
+      `Expected Replace() definition to target sales/models.py. Received: ${replaceDefinitionTarget!.uri.fsPath}`
+    );
+    assert.strictEqual(
+      replaceDefinitionTarget!.range.start.line + 1,
+      12,
+      'Expected Replace() definition to target Product.name.'
+    );
+
+    const diagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) =>
+        items.filter((item) => item.message.includes('`nax`')).length >= 4
+    );
+
+    assert.ok(
+      diagnostics.some((item) => item.message.includes('`nax`')),
+      `Expected dotted/variant expression diagnostics to flag invalid Replace()/Substr()/Least() field paths. Received: ${stringifyDiagnostics(diagnostics)}`
     );
   });
 
@@ -3237,6 +4196,55 @@ suite('Django ORM Intellisense UI', () => {
       whenDefinitionTarget!.range.start.line + 1,
       5,
       'Expected When() definition to target Category.slug.'
+    );
+
+    const whenConditionHoverPosition = positionInsideText(
+      document,
+      "Product.objects.annotate(category_bucket=Case(When(condition=models.Q(category__slug='chairs'), then=Value('chairs')), default=Value('other')))",
+      'category__slug'
+    );
+    const whenConditionHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        whenConditionHoverPosition
+      );
+    const whenConditionHoverText = stringifyHovers(whenConditionHovers);
+
+    assert.ok(
+      whenConditionHoverText.includes('Owner model: `catalog.Category`'),
+      `Expected When(condition=Q(...)) hover to mention catalog.Category. Received: ${whenConditionHoverText}`
+    );
+    assert.ok(
+      whenConditionHoverText.includes('Field kind: `SlugField`'),
+      `Expected When(condition=Q(...)) hover to mention SlugField. Received: ${whenConditionHoverText}`
+    );
+
+    const whenConditionDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >(
+      'vscode.executeDefinitionProvider',
+      document.uri,
+      whenConditionHoverPosition
+    );
+    const whenConditionDefinitionTarget = firstDefinition(
+      whenConditionDefinitions
+    );
+
+    assert.ok(
+      whenConditionDefinitionTarget,
+      'Expected When(condition=Q(...)) definitions to resolve to the referenced model field.'
+    );
+    assert.ok(
+      whenConditionDefinitionTarget!.uri.fsPath.endsWith(
+        path.join('fixtures', 'advanced_queries_project', 'catalog', 'models.py')
+      ),
+      `Expected When(condition=Q(...)) definition to target catalog/models.py. Received: ${whenConditionDefinitionTarget!.uri.fsPath}`
+    );
+    assert.strictEqual(
+      whenConditionDefinitionTarget!.range.start.line + 1,
+      5,
+      'Expected When(condition=Q(...)) definition to target Category.slug.'
     );
 
     const castHoverPosition = positionInsideText(
@@ -3937,148 +4945,6 @@ suite('Django ORM Intellisense UI', () => {
 
     assert.strictEqual(interpreter.source, 'fallback');
     assert.ok(interpreter.path.length > 0);
-  });
-
-  test('configures managed Pylance stubPath and extraPaths when stubs are available', async function () {
-    this.timeout(20_000);
-
-    const tempRoot = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'django-orm-intellisense-managed-stubs-')
-    );
-    const tempWorkspace = path.join(tempRoot, 'workspace');
-    const stubRoot = path.join(tempWorkspace, '.django_orm_intellisense', 'stubs');
-    fs.mkdirSync(stubRoot, { recursive: true });
-
-    await removeWorkspaceFoldersFrom(0);
-    await addWorkspaceFolder(tempWorkspace);
-
-    try {
-      writeWorkspaceSettings(tempWorkspace, {
-        'python.analysis.extraPaths': ['src'],
-      });
-
-      const snapshot: HealthSnapshot = {
-        phase: 'ready',
-        detail: 'stub sync test',
-        capabilities: ['pylance.stubs'],
-        workspaceRoot: tempWorkspace,
-        pylanceStubs: {
-          rootPath: stubRoot,
-          relativeRoot: '.django_orm_intellisense/stubs',
-          fileCount: 2,
-          moduleCount: 1,
-          packageCount: 1,
-          generatedAt: new Date().toISOString(),
-        },
-      };
-      const output = vscode.window.createOutputChannel(
-        'Django ORM Intellisense Test'
-      );
-
-      try {
-        await syncManagedPylanceStubPath(snapshot, output);
-      } finally {
-        output.dispose();
-      }
-
-      const settings = readWorkspaceSettings(tempWorkspace);
-      assert.strictEqual(
-        settings['python.analysis.stubPath'],
-        '.django_orm_intellisense/stubs'
-      );
-      assert.deepStrictEqual(settings['python.analysis.extraPaths'], [
-        '.django_orm_intellisense/stubs',
-        'src',
-      ]);
-    } finally {
-      await removeWorkspaceFoldersFrom(0);
-      fs.rmSync(tempRoot, { recursive: true, force: true });
-    }
-  });
-
-  test('removes legacy managed Pylance stubPath and stub files when stub generation is disabled', async function () {
-    this.timeout(20_000);
-
-    const tempRoot = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'django-orm-intellisense-stub-workspace-')
-    );
-    const tempWorkspace = path.join(tempRoot, 'workspace');
-    fs.mkdirSync(tempWorkspace, { recursive: true });
-    const legacyStubRoot = path.join(
-      tempWorkspace,
-      '.django_orm_intellisense',
-      'stubs'
-    );
-    fs.mkdirSync(path.join(legacyStubRoot, 'blog'), { recursive: true });
-    fs.writeFileSync(path.join(legacyStubRoot, '.stub-version'), '2\n', 'utf8');
-    fs.writeFileSync(
-      path.join(legacyStubRoot, '_django_orm_intellisense_support.pyi'),
-      'class DjangoQuerySet: ...\n',
-      'utf8'
-    );
-    fs.writeFileSync(
-      path.join(legacyStubRoot, 'blog', 'models.pyi'),
-      'class Post: ...\n',
-      'utf8'
-    );
-
-    await removeWorkspaceFoldersFrom(0);
-    await addWorkspaceFolder(tempWorkspace);
-
-    try {
-      writeWorkspaceSettings(tempWorkspace, {
-        'python.analysis.stubPath': '.django_orm_intellisense/stubs',
-        'python.analysis.extraPaths': [
-          '.django_orm_intellisense/stubs',
-          'src',
-        ],
-      });
-
-      const snapshot: HealthSnapshot = {
-        phase: 'ready',
-        detail: 'stub sync test',
-        capabilities: [],
-        workspaceRoot: tempWorkspace,
-      };
-      const output = vscode.window.createOutputChannel(
-        'Django ORM Intellisense Test'
-      );
-
-      try {
-        await syncManagedPylanceStubPath(snapshot, output);
-      } finally {
-        output.dispose();
-      }
-
-      const managedStubPath = readWorkspaceSettings(tempWorkspace)[
-        'python.analysis.stubPath'
-      ];
-      const managedExtraPaths = readWorkspaceSettings(tempWorkspace)[
-        'python.analysis.extraPaths'
-      ];
-
-      assert.strictEqual(
-        managedStubPath,
-        undefined,
-        'Expected the legacy managed python.analysis.stubPath to be removed.'
-      );
-      assert.deepStrictEqual(
-        managedExtraPaths,
-        ['src'],
-        'Expected only the managed extraPaths entry to be removed.'
-      );
-      assert.ok(
-        !fs.existsSync(legacyStubRoot),
-        'Expected the legacy managed stub files to be removed.'
-      );
-      assert.ok(
-        !fs.existsSync(path.join(tempWorkspace, '.django_orm_intellisense')),
-        'Expected the empty legacy managed stub directory to be removed.'
-      );
-    } finally {
-      await removeWorkspaceFoldersFrom(0);
-      fs.rmSync(tempRoot, { recursive: true, force: true });
-    }
   });
 
   test('configures and restores managed Pylance diagnostic overrides', async function () {

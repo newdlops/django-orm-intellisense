@@ -4,7 +4,6 @@ import * as path from 'path';
 import * as readline from 'readline';
 import * as vscode from 'vscode';
 import { getExtensionSettings } from '../config/settings';
-import { syncManagedPylanceStubPath } from '../pylance/stubPath';
 import {
   resolvePythonInterpreter,
   validatePythonInterpreterPath,
@@ -171,7 +170,6 @@ export class AnalysisDaemon implements vscode.Disposable {
     const snapshot = this.decorateSnapshot(
       await this.request<HealthSnapshot>('health', {})
     );
-    await this.applyWorkspaceIntegrations(snapshot);
     this.updateState(snapshot);
     return snapshot;
   }
@@ -515,7 +513,6 @@ export class AnalysisDaemon implements vscode.Disposable {
         INITIALIZE_REQUEST_TIMEOUT_MS
       );
       const snapshot = this.decorateSnapshot(initializeResult.health);
-      await this.applyWorkspaceIntegrations(snapshot);
       this.updateState(snapshot);
       return snapshot;
     } catch (error) {
@@ -712,19 +709,6 @@ export class AnalysisDaemon implements vscode.Disposable {
       semanticGraph: this.currentState.semanticGraph,
       startedAt: this.currentState.startedAt,
     });
-  }
-
-  private async applyWorkspaceIntegrations(
-    snapshot: HealthSnapshot
-  ): Promise<void> {
-    try {
-      await syncManagedPylanceStubPath(snapshot, this.output);
-    } catch (error) {
-      this.log(
-        'info',
-        `[extension] Failed to sync managed Pylance stubPath: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
   }
 
   private async checkForInterpreterChange(): Promise<void> {

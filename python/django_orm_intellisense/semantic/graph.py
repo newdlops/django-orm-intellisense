@@ -119,9 +119,11 @@ def build_model_graph(
                     related_model_label=runtime_field.related_model_label,
                     declared_model_label=existing.declared_model_label if existing is not None else model_label,
                     related_name=existing.related_name if existing is not None else None,
+                    related_query_name=existing.related_query_name if existing is not None else None,
                     source='runtime',
                 )
 
+        _add_related_query_alias_fields(fields_by_name=fields_by_name)
         _add_relation_attname_alias_fields(
             runtime=runtime,
             model_label=model_label,
@@ -182,7 +184,37 @@ def _add_relation_attname_alias_fields(
             related_model_label=None,
             declared_model_label=field.declared_model_label,
             related_name=field.related_name,
+            related_query_name=field.related_query_name,
             source='runtime' if runtime_attname_field is not None else field.source,
+        )
+
+
+def _add_related_query_alias_fields(
+    *,
+    fields_by_name: dict[str, FieldCandidate],
+) -> None:
+    for field in list(fields_by_name.values()):
+        if field.relation_direction != 'reverse':
+            continue
+
+        query_name = field.related_query_name
+        if not query_name or query_name == field.name or query_name in fields_by_name:
+            continue
+
+        fields_by_name[query_name] = FieldCandidate(
+            model_label=field.model_label,
+            name=query_name,
+            file_path=field.file_path,
+            line=field.line,
+            column=field.column,
+            field_kind=field.field_kind,
+            is_relation=field.is_relation,
+            relation_direction=field.relation_direction,
+            related_model_label=field.related_model_label,
+            declared_model_label=field.declared_model_label,
+            related_name=field.related_name,
+            related_query_name=field.related_query_name,
+            source='related_query_alias',
         )
 
 
@@ -190,7 +222,7 @@ def _supports_relation_attname_alias(field: FieldCandidate) -> bool:
     return (
         field.is_relation
         and field.relation_direction == 'forward'
-        and field.field_kind in {'ForeignKey', 'OneToOneField'}
+        and field.field_kind in {'ForeignKey', 'OneToOneField', 'ParentalKey'}
     )
 
 

@@ -166,12 +166,6 @@ function buildStatusReport(
     plainTextLines.push(`Semantic graph: ${semanticGraphSummary}`);
   }
 
-  if (snapshot.pylanceStubs) {
-    const pylanceStubSummary = `${snapshot.pylanceStubs.fileCount} files in ${snapshot.pylanceStubs.relativeRoot}`;
-    markdownLines.push(`- Pylance stubs: ${pylanceStubSummary}`);
-    plainTextLines.push(`Pylance stubs: ${pylanceStubSummary}`);
-  }
-
   const recommendations = buildRecommendations(snapshot, configuredInterpreter);
   if (recommendations.length > 0) {
     markdownLines.push('', '## Next Steps', '');

@@ -1,4 +1,5 @@
 from django.db import models
+from django.db.models import Q
 
 from blog.models import Author
 
@@ -17,4 +18,21 @@ class SchemaExample(models.Model):
         constraints = [
             models.UniqueConstraint(fields=['code', 'author'], name='schema_example_code_author_uniq'),
             models.UniqueConstraint(fields=['bog'], name='schema_example_bog_uniq'),
+            models.UniqueConstraint(
+                fields=['author'],
+                name='schema_example_author_if_unpublished',
+                condition=models.Q(pub=False),
+            ),
+            models.CheckConstraint(
+                check=Q(author__na__gt=''),
+                name='schema_example_author_name_partial',
+            ),
+            models.CheckConstraint(
+                check=Q(author__name__gt=''),
+                name='schema_example_author_name_not_empty',
+            ),
+            models.CheckConstraint(
+                check=models.Q(author__profile__bogus__isnull=True),
+                name='schema_example_author_profile_bogus',
+            ),
         ]

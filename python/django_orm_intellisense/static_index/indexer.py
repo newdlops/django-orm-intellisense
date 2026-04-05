@@ -6,6 +6,14 @@ from pathlib import Path
 
 from ..discovery.workspace import iter_python_files
 
+RELATION_FIELD_KINDS = {
+    'ForeignKey',
+    'OneToOneField',
+    'ManyToManyField',
+    'ParentalKey',
+    'ParentalManyToManyField',
+}
+
 
 @dataclass(frozen=True)
 class DefinitionLocation:
@@ -88,6 +96,7 @@ class PendingFieldCandidate:
     related_model_ref_kind: str | None
     related_model_ref_value: str | None
     related_name: str | None
+    related_query_name: str | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -103,6 +112,7 @@ class PendingFieldCandidate:
             'relatedModelRefKind': self.related_model_ref_kind,
             'relatedModelRefValue': self.related_model_ref_value,
             'relatedName': self.related_name,
+            'relatedQueryName': self.related_query_name,
         }
 
     @classmethod
@@ -120,6 +130,7 @@ class PendingFieldCandidate:
             related_model_ref_kind=_string_or_none(payload.get('relatedModelRefKind')),
             related_model_ref_value=_string_or_none(payload.get('relatedModelRefValue')),
             related_name=_string_or_none(payload.get('relatedName')),
+            related_query_name=_string_or_none(payload.get('relatedQueryName')),
         )
 
 
@@ -136,6 +147,7 @@ class FieldCandidate:
     related_model_label: str | None
     declared_model_label: str | None = None
     related_name: str | None = None
+    related_query_name: str | None = None
     source: str = 'static'
 
     def to_dict(self) -> dict[str, str | int | bool | None]:
@@ -588,6 +600,7 @@ class StaticIndex:
                         related_model_label=related_model_label,
                         declared_model_label=pending.model_label,
                         related_name=pending.related_name,
+                        related_query_name=pending.related_query_name,
                     )
                 )
 
@@ -646,6 +659,13 @@ class StaticIndex:
                     field.field_kind,
                     candidate.label,
                 )
+                if reverse_name == '+':
+                    continue
+
+                reverse_query_name = _reverse_query_name(
+                    field=field,
+                    source_model_label=candidate.label,
+                )
                 reverse_key = (
                     field.related_model_label,
                     reverse_name,
@@ -667,6 +687,8 @@ class StaticIndex:
                         relation_direction='reverse',
                         related_model_label=candidate.label,
                         declared_model_label=field.declared_model_label,
+                        related_name=field.related_name,
+                        related_query_name=reverse_query_name,
                     )
                 )
 
@@ -1082,17 +1104,19 @@ def _extract_pending_fields_from_model_class(
         if field_kind is None:
             continue
 
-        is_relation = field_kind in {'ForeignKey', 'OneToOneField', 'ManyToManyField'}
+        is_relation = field_kind in RELATION_FIELD_KINDS
         related_model_ref_kind: str | None = None
         related_model_ref_value: str | None = None
 
-        if is_relation and value_node.args:
+        related_model_node = _extract_related_model_reference_node(value_node)
+        if is_relation and related_model_node is not None:
             related_model_ref_kind, related_model_ref_value = _extract_related_model_reference(
-                value_node.args[0],
+                related_model_node,
                 app_label=app_label,
             )
 
         related_name = _extract_keyword_string(value_node, 'related_name')
+        related_query_name = _extract_keyword_string(value_node, 'related_query_name')
         fields.append(
             PendingFieldCandidate(
                 model_label=model_label,
@@ -1107,6 +1131,7 @@ def _extract_pending_fields_from_model_class(
                 related_model_ref_kind=related_model_ref_kind,
                 related_model_ref_value=related_model_ref_value,
                 related_name=related_name,
+                related_query_name=related_query_name,
             )
         )
 
@@ -1119,8 +1144,21 @@ def _field_kind_name(function_node: ast.expr) -> str | None:
         return None
 
     field_name = name.split('.')[-1]
-    if field_name.endswith('Field') or field_name == 'ForeignKey':
+    if field_name.endswith('Field') or field_name in {'ForeignKey', 'ParentalKey'}:
         return field_name
+
+    return None
+
+
+def _extract_related_model_reference_node(
+    call_node: ast.Call,
+) -> ast.expr | None:
+    if call_node.args:
+        return call_node.args[0]
+
+    for keyword in call_node.keywords:
+        if keyword.arg == 'to':
+            return keyword.value
 
     return None
 
@@ -1219,8 +1257,10 @@ def _is_builtin_model_base_name(dotted_name: str) -> bool:
 def _is_model_base_name(dotted_name: str) -> bool:
     return (
         _is_builtin_model_base_name(dotted_name)
+        or dotted_name.endswith('Model')
         or dotted_name.endswith('BaseModel')
         or dotted_name.endswith('JobModel')
+        or dotted_name.endswith('Orderable')
     )
 
 
@@ -1292,6 +1332,28 @@ def _default_reverse_name(field_kind: str, source_model_label: str) -> str:
     return f'{source_model_name_lower}_set'
 
 
+def _default_reverse_query_name(source_model_label: str) -> str:
+    source_model_name = source_model_label.split('.', 1)[1]
+    return source_model_name.lower()
+
+
+def _reverse_query_name(
+    *,
+    field: FieldCandidate,
+    source_model_label: str,
+) -> str | None:
+    if field.related_name == '+' or field.related_query_name == '+':
+        return None
+
+    if field.related_query_name:
+        return field.related_query_name
+
+    if field.related_name:
+        return field.related_name
+
+    return _default_reverse_query_name(source_model_label)
+
+
 def _string_or_none(value: object) -> str | None:
     if value is None:
         return None
@@ -1312,6 +1374,7 @@ def _clone_field_for_model(field: FieldCandidate, model_label: str) -> FieldCand
         related_model_label=field.related_model_label,
         declared_model_label=field.declared_model_label,
         related_name=field.related_name,
+        related_query_name=field.related_query_name,
         source=field.source,
     )
 

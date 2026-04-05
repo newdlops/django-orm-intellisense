@@ -18,10 +18,22 @@ const PYTHON_SELECTOR: vscode.DocumentSelector = [
   { language: 'python', scheme: 'file' },
 ];
 
-const RELATION_COMPLETION_PATTERN =
-  /(?:[A-Za-z_][\w.]*\.)?(?:ForeignKey|OneToOneField|ManyToManyField)\(\s*(['"])([\w.]*)$/;
-const RELATION_HOVER_PATTERN =
-  /(?:[A-Za-z_][\w.]*\.)?(?:ForeignKey|OneToOneField|ManyToManyField)\(\s*(['"])([\w.]+)\1/g;
+const RELATION_FIELD_CALL_PATTERN = String.raw`(?:[A-Za-z_][\w.]*\.)?(?:ForeignKey|OneToOneField|ManyToManyField|ParentalKey|ParentalManyToManyField)`;
+const RELATION_TARGET_ARGUMENT_PATTERN = String.raw`${RELATION_FIELD_CALL_PATTERN}\(\s*(?:to\s*=\s*)?`;
+const RELATION_COMPLETION_PATTERN = new RegExp(
+  String.raw`${RELATION_TARGET_ARGUMENT_PATTERN}(['"])([\w.]*)$`
+);
+const RELATION_HOVER_PATTERN = new RegExp(
+  String.raw`${RELATION_TARGET_ARGUMENT_PATTERN}(['"])([\w.]+)\1`,
+  'g'
+);
+const PREFETCH_LOOKUP_COMPLETION_PATTERN = /(?:[A-Za-z_][\w.]*\.)?Prefetch\(\s*(['"])([-\w.]*)$/;
+const PREFETCH_LOOKUP_HOVER_PATTERN =
+  /(?:[A-Za-z_][\w.]*\.)?Prefetch\(\s*(['"])([-\w.]+)\1/g;
+const LOOKUP_DICT_KEY_COMPLETION_PATTERN =
+  /(?:\*\*\{\s*|,\s*)(?:[rRuUbBfF]{0,2})(['"])([^'"]*)$/;
+const LOOKUP_DICT_KEY_HOVER_PATTERN =
+  /(?:\*\*\{\s*|,\s*)(?:[rRuUbBfF]{0,2})(['"])([^'"]+)\1\s*:/g;
 const IMPORT_FROM_PATTERN = /^\s*from\s+([.A-Za-z_][\w.]*)\s+import\s+(.+)$/;
 const IMPORT_SPEC_PATTERN = /([A-Za-z_][\w]*)(?:\s+as\s+([A-Za-z_][\w]*))?/g;
 const IMPORT_MODULE_PATTERN = /^\s*import\s+(.+)$/;
@@ -125,7 +137,7 @@ const F_EXPRESSION_HOVER_PATTERN = new RegExp(
   String.raw`(?:^|[^\w.])(?:[A-Za-z_][\w.]*\.)?F\(\s*(['"])([-\w.]+)\1`,
   'g'
 );
-const EXPRESSION_FIELD_FUNCTION_NAMES = new Set([
+const EXPRESSION_FIELD_FUNCTION_NAMES = [
   'OuterRef',
   'Count',
   'Sum',
@@ -135,20 +147,69 @@ const EXPRESSION_FIELD_FUNCTION_NAMES = new Set([
   'Cast',
   'Coalesce',
   'Func',
-]);
+  'ArrayAgg',
+  'JSONBAgg',
+  'StringAgg',
+  'Concat',
+  'Greatest',
+  'Least',
+  'Length',
+  'Replace',
+  'Collate',
+  'Substr',
+  'Extract',
+  'ExtractYear',
+  'ExtractDay',
+  'ExtractMonth',
+  'ExtractWeek',
+  'ExtractWeekDay',
+  'ExtractQuarter',
+  'ExtractHour',
+  'ExtractMinute',
+  'ExtractSecond',
+  'Lag',
+  'Lead',
+  'FirstValue',
+  'LastValue',
+  'NthValue',
+  'TruncDate',
+] as const;
+const EXPRESSION_FIELD_FUNCTION_NAME_SET = new Set<string>(
+  EXPRESSION_FIELD_FUNCTION_NAMES
+);
+const EXPRESSION_FIELD_FUNCTION_PATTERN =
+  EXPRESSION_FIELD_FUNCTION_NAMES.join('|');
 const EXPRESSION_WRAPPER_FUNCTION_NAMES = new Set([
   'ExpressionWrapper',
   'Value',
   'Subquery',
   'Exists',
+  'ArraySubquery',
+  'Window',
+  'JSONObject',
 ]);
 const EXPRESSION_PATH_COMPLETION_PATTERN = new RegExp(
-  String.raw`(?:^|[^\w.])((?:[A-Za-z_][\w.]*\.)?(?:OuterRef|Count|Sum|Avg|Min|Max|Cast|Coalesce|Func))\(\s*(['"])([-\w.]*)$`
+  String.raw`(?:^|[^\w.])((?:[A-Za-z_][\w.]*\.)?(?:${EXPRESSION_FIELD_FUNCTION_PATTERN}))\(\s*(['"])([-\w.]*)$`
 );
 const EXPRESSION_PATH_HOVER_PATTERN = new RegExp(
-  String.raw`(?:^|[^\w.])((?:[A-Za-z_][\w.]*\.)?(?:OuterRef|Count|Sum|Avg|Min|Max|Cast|Coalesce|Func))\(\s*(['"])([-\w.]+)\2`,
+  String.raw`(?:^|[^\w.])((?:[A-Za-z_][\w.]*\.)?(?:${EXPRESSION_FIELD_FUNCTION_PATTERN}))\(\s*(['"])([-\w.]+)\2`,
   'g'
 );
+const EXPRESSION_STRING_COMPLETION_PATTERN = /(['"])([-\w.]*)$/;
+const EXPRESSION_STRING_HOVER_PATTERN = /(['"])([-\w.]+)\1/g;
+const ANY_POSITION_EXPRESSION_FIELD_FUNCTIONS = new Set<string>([
+  'Coalesce',
+  'Concat',
+  'Greatest',
+  'Least',
+  'Func',
+]);
+const FIRST_ARGUMENT_EXPRESSION_FIELD_FUNCTIONS = new Set<string>([
+  ...EXPRESSION_FIELD_FUNCTION_NAMES.filter(
+    (name) => !ANY_POSITION_EXPRESSION_FIELD_FUNCTIONS.has(name)
+  ),
+]);
+const KEYWORD_VALUE_EXPRESSION_FIELD_FUNCTIONS = new Set<string>(['JSONObject']);
 const DJANGO_FIELD_PRIORITY_METHODS = new Set(['filter', 'exclude', 'get']);
 const LOOKUP_OPERATOR_METHODS = new Set([
   'filter',
@@ -317,6 +378,20 @@ interface SchemaFieldLiteral {
 }
 
 interface SchemaFieldDiagnosticContext extends SchemaFieldLiteral {
+  range: vscode.Range;
+}
+
+interface MetaConstraintLookupContext {
+  prefix: string;
+  range: vscode.Range;
+}
+
+interface MetaConstraintLookupLiteral {
+  value: string;
+}
+
+interface MetaConstraintLookupDiagnosticContext
+  extends MetaConstraintLookupLiteral {
   range: vscode.Range;
 }
 
@@ -612,6 +687,47 @@ export function registerPythonProviders(
       }
     }
 
+    for (const context of findMetaConstraintLookupDiagnosticContexts(document)) {
+      try {
+        const baseModelLabel = await resolveMetaOwnerModelLabel(
+          daemon,
+          document,
+          context.range.end
+        );
+        if (!baseModelLabel) {
+          continue;
+        }
+
+        const resolution = await daemon.resolveLookupPath(
+          baseModelLabel,
+          context.value,
+          'filter'
+        );
+        const diagnostic = buildLookupDiagnostic(
+          {
+            receiverExpression: '',
+            method: 'filter',
+            value: context.value,
+            range: context.range,
+          },
+          baseModelLabel,
+          resolution
+        );
+        if (!diagnostic) {
+          continue;
+        }
+
+        const key = diagnostic.range.start.toString() + diagnostic.message;
+        if (seenRanges.has(key)) {
+          continue;
+        }
+        seenRanges.add(key);
+        diagnostics.push(diagnostic);
+      } catch {
+        continue;
+      }
+    }
+
     for (const context of findBulkUpdateFieldDiagnosticContexts(document)) {
       try {
         const baseModelLabel = await resolveBaseModelLabelForReceiver(
@@ -680,10 +796,16 @@ export function registerPythonProviders(
 
         const lookupContext =
           lookupCompletionContext(document, position) ??
+          prefetchLookupCompletionContext(document, position) ??
+          lookupDictKeyCompletionContext(document, position) ??
           expressionPathCompletionContext(document, position) ??
           fExpressionCompletionContext(document, position) ??
           keywordLookupCompletionContext(document, position);
         const directFieldContext = directFieldKeywordCompletionContext(
+          document,
+          position
+        );
+        const metaConstraintLookupContext = metaConstraintLookupCompletionContext(
           document,
           position
         );
@@ -801,6 +923,58 @@ export function registerPythonProviders(
                 'filter',
                 baseModelLabel
               );
+              return completion;
+            });
+          }
+
+          if (metaConstraintLookupContext) {
+            const baseModelLabel = await resolveMetaOwnerModelLabel(
+              daemon,
+              document,
+              position
+            );
+            if (!baseModelLabel) {
+              return undefined;
+            }
+
+            const result = await daemon.listLookupPathCompletions(
+              baseModelLabel,
+              metaConstraintLookupContext.prefix,
+              'filter'
+            );
+            const sortedItems = prioritizeLookupCompletionItems(
+              result.items,
+              'filter'
+            );
+
+            return sortedItems.map((item, index) => {
+              const completion = new vscode.CompletionItem(
+                lookupCompletionLabel(item),
+                lookupCompletionKind(item)
+              );
+              completion.detail = lookupCompletionDetail(item);
+              completion.insertText = lookupCompletionInsertText('filter', item);
+              completion.filterText = lookupFilterText(
+                metaConstraintLookupContext.prefix,
+                item
+              );
+              completion.range = metaConstraintLookupContext.range;
+              completion.sortText = lookupCompletionSortText(
+                'filter',
+                item,
+                index
+              );
+              completion.preselect = shouldPreselectLookupCompletion(
+                'filter',
+                item,
+                index
+              );
+              completion.documentation = buildLookupItemMarkdown(
+                item,
+                'filter',
+                baseModelLabel
+              );
+              completion.command = lookupCompletionCommand('filter', item);
               return completion;
             });
           }
@@ -977,10 +1151,16 @@ export function registerPythonProviders(
 
         const lookupLiteral =
           lookupHoverLiteral(document, position) ??
+          prefetchLookupLiteral(document, position) ??
+          lookupDictKeyHoverLiteral(document, position) ??
           expressionPathHoverLiteral(document, position) ??
           fExpressionHoverLiteral(document, position) ??
           keywordLookupLiteral(document, position);
         const directFieldLiteral = directFieldKeywordLiteral(document, position);
+        const metaConstraintLookupLiteralAtPosition = metaConstraintLookupLiteral(
+          document,
+          position
+        );
         const schemaFieldLiteral = schemaFieldHoverLiteral(document, position);
         const bulkUpdateFieldLiteral = bulkUpdateFieldListHoverLiteral(
           document,
@@ -1046,6 +1226,34 @@ export function registerPythonProviders(
             return buildLookupHover(
               directFieldLiteral.value,
               directFieldLiteral.method,
+              baseModelLabel,
+              resolution
+            );
+          } catch {
+            return undefined;
+          }
+        }
+
+        if (metaConstraintLookupLiteralAtPosition) {
+          try {
+            await daemon.ensureStarted(document.uri);
+            const baseModelLabel = await resolveMetaOwnerModelLabel(
+              daemon,
+              document,
+              position
+            );
+            if (!baseModelLabel) {
+              return undefined;
+            }
+
+            const resolution = await daemon.resolveLookupPath(
+              baseModelLabel,
+              metaConstraintLookupLiteralAtPosition.value,
+              'filter'
+            );
+            return buildLookupHover(
+              metaConstraintLookupLiteralAtPosition.value,
+              'filter',
               baseModelLabel,
               resolution
             );
@@ -1199,10 +1407,16 @@ export function registerPythonProviders(
 
         const lookupLiteral =
           lookupHoverLiteral(document, position) ??
+          prefetchLookupLiteral(document, position) ??
+          lookupDictKeyHoverLiteral(document, position) ??
           expressionPathHoverLiteral(document, position) ??
           fExpressionHoverLiteral(document, position) ??
           keywordLookupLiteral(document, position);
         const directFieldLiteral = directFieldKeywordLiteral(document, position);
+        const metaConstraintLookupLiteralAtPosition = metaConstraintLookupLiteral(
+          document,
+          position
+        );
         const schemaFieldLiteral = schemaFieldHoverLiteral(document, position);
         const bulkUpdateFieldLiteral = bulkUpdateFieldListHoverLiteral(
           document,
@@ -1258,6 +1472,29 @@ export function registerPythonProviders(
             const resolution = await daemon.resolveLookupPath(
               baseModelLabel,
               directFieldLiteral.value,
+              'filter'
+            );
+            return definitionLocationFromLookupResolution(resolution);
+          } catch {
+            return undefined;
+          }
+        }
+
+        if (metaConstraintLookupLiteralAtPosition) {
+          try {
+            await daemon.ensureStarted(document.uri);
+            const baseModelLabel = await resolveMetaOwnerModelLabel(
+              daemon,
+              document,
+              position
+            );
+            if (!baseModelLabel) {
+              return undefined;
+            }
+
+            const resolution = await daemon.resolveLookupPath(
+              baseModelLabel,
+              metaConstraintLookupLiteralAtPosition.value,
               'filter'
             );
             return definitionLocationFromLookupResolution(resolution);
@@ -1627,11 +1864,14 @@ function ormMemberCompletionLabel(
   item: OrmMemberItem,
   receiver: OrmReceiverInfo
 ): string | vscode.CompletionItemLabel {
-  if (
-    receiver.kind === 'instance' &&
+  const shouldInlineFieldKind =
     (item.memberKind === 'field' ||
       item.memberKind === 'relation' ||
-      item.memberKind === 'reverse_relation')
+      item.memberKind === 'reverse_relation') ||
+    item.source === ANNOTATED_MEMBER_SOURCE;
+  if (
+    shouldInlineFieldKind &&
+    (item.fieldKind !== undefined || item.detail.length > 0)
   ) {
     return {
       label: `${item.name} (${item.fieldKind ?? item.detail})`,
@@ -1689,7 +1929,7 @@ function ormMemberCompletionSortText(
   receiver: OrmReceiverInfo,
   index: number
 ): string {
-  return `${ormMemberCompletionPriority(item, receiver)
+  return `\u0000django-${ormMemberCompletionPriority(item, receiver)
     .toString()
     .padStart(4, '0')}-${index
     .toString()
@@ -1772,6 +2012,93 @@ function lookupCompletionContext(
   };
 }
 
+function prefetchLookupCompletionContext(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): LookupContext | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const prefixText = lineText.slice(0, position.character);
+  const match = prefixText.match(PREFETCH_LOOKUP_COMPLETION_PATTERN);
+  if (!match) {
+    return undefined;
+  }
+
+  const currentValue = match[2] ?? '';
+  const callContext = prefetchLookupCallContext(
+    document.getText(),
+    document.offsetAt(position)
+  );
+  if (!callContext) {
+    return undefined;
+  }
+
+  const replacementLength = lookupReplacementLength(currentValue);
+  return {
+    receiverExpression: callContext.receiverExpression,
+    method: callContext.method,
+    prefix: currentValue,
+    range: new vscode.Range(
+      position.line,
+      position.character - replacementLength,
+      position.line,
+      position.character
+    ),
+  };
+}
+
+function lookupDictKeyCompletionMatch(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): { currentValue: string; startCharacter: number } | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const prefixText = lineText.slice(0, position.character);
+  const match = prefixText.match(LOOKUP_DICT_KEY_COMPLETION_PATTERN);
+  if (!match) {
+    return undefined;
+  }
+
+  const currentValue = match[2] ?? '';
+  return {
+    currentValue,
+    startCharacter: position.character - currentValue.length,
+  };
+}
+
+function lookupDictKeyCompletionContext(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): LookupContext | undefined {
+  const match = lookupDictKeyCompletionMatch(document, position);
+  if (!match || isDynamicLookupDictKey(match.currentValue)) {
+    return undefined;
+  }
+
+  const startOffset = document.offsetAt(
+    new vscode.Position(position.line, match.startCharacter)
+  );
+  const callContext = unpackedLookupDictCallContext(
+    document.getText(),
+    startOffset,
+    document.offsetAt(position)
+  );
+  if (!callContext) {
+    return undefined;
+  }
+
+  const replacementLength = lookupReplacementLength(match.currentValue);
+  return {
+    receiverExpression: callContext.receiverExpression,
+    method: callContext.method,
+    prefix: match.currentValue,
+    range: new vscode.Range(
+      position.line,
+      position.character - replacementLength,
+      position.line,
+      position.character
+    ),
+  };
+}
+
 function fExpressionCompletionContext(
   document: vscode.TextDocument,
   position: vscode.Position
@@ -1814,14 +2141,16 @@ function expressionPathCompletionContext(
 ): LookupContext | undefined {
   const lineText = document.lineAt(position.line).text;
   const prefixText = lineText.slice(0, position.character);
-  const match = prefixText.match(EXPRESSION_PATH_COMPLETION_PATTERN);
+  const match = prefixText.match(EXPRESSION_STRING_COMPLETION_PATTERN);
   if (!match) {
     return undefined;
   }
 
-  const currentValue = match[3] ?? '';
-  const callContext = expressionPathCallContext(
+  const currentValue = match[2] ?? '';
+  const tokenStartOffset = document.offsetAt(position) - currentValue.length;
+  const callContext = expressionStringArgumentCallContext(
     document.getText(),
+    tokenStartOffset,
     document.offsetAt(position)
   );
   if (!callContext) {
@@ -1848,6 +2177,10 @@ function keywordLookupCompletionContext(
   document: vscode.TextDocument,
   position: vscode.Position
 ): LookupContext | undefined {
+  if (lookupDictKeyCompletionMatch(document, position)) {
+    return undefined;
+  }
+
   const fullText = document.getText();
   const cursorOffset = document.offsetAt(position);
   const prefixText = fullText.slice(0, cursorOffset);
@@ -1929,6 +2262,40 @@ function schemaFieldCompletionContext(
   };
 }
 
+function metaConstraintLookupCompletionContext(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): MetaConstraintLookupContext | undefined {
+  if (lookupDictKeyCompletionMatch(document, position)) {
+    return undefined;
+  }
+
+  const fullText = document.getText();
+  const cursorOffset = document.offsetAt(position);
+  const prefixText = fullText.slice(0, cursorOffset);
+  const tokenStartOffset = scanKeywordTokenStart(prefixText);
+  const currentValue = prefixText.slice(tokenStartOffset);
+  if (!isLookupKeywordCandidate(currentValue)) {
+    return undefined;
+  }
+
+  const callContext = qExpressionKeywordCallContext(
+    fullText,
+    tokenStartOffset,
+    cursorOffset
+  );
+  if (!callContext) {
+    return undefined;
+  }
+
+  const replacementLength = lookupReplacementLength(currentValue);
+  const rangeStart = document.positionAt(cursorOffset - replacementLength);
+  return {
+    prefix: currentValue,
+    range: new vscode.Range(rangeStart, position),
+  };
+}
+
 function bulkUpdateFieldListCompletionContext(
   document: vscode.TextDocument,
   position: vscode.Position
@@ -1995,6 +2362,100 @@ function lookupHoverLiteral(
   return undefined;
 }
 
+function prefetchLookupLiteral(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): LookupLiteral | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const lineStartOffset = document.offsetAt(new vscode.Position(position.line, 0));
+
+  for (const match of lineText.matchAll(PREFETCH_LOOKUP_HOVER_PATTERN)) {
+    const value = match[2];
+    const prefix = match[0];
+    const localOffset = prefix.lastIndexOf(value);
+    const start = (match.index ?? 0) + localOffset;
+    const end = start + value.length;
+
+    if (position.character < start || position.character > end) {
+      continue;
+    }
+
+    const callContext = prefetchLookupCallContext(
+      document.getText(),
+      lineStartOffset + start
+    );
+    if (!callContext) {
+      return undefined;
+    }
+
+    return {
+      receiverExpression: callContext.receiverExpression,
+      method: callContext.method,
+      value,
+    };
+  }
+
+  return undefined;
+}
+
+function lookupDictKeyHoverMatchAtPosition(
+  document: vscode.TextDocument,
+  position: vscode.Position
+):
+  | {
+      value: string;
+      start: number;
+      end: number;
+    }
+  | undefined {
+  const lineText = document.lineAt(position.line).text;
+  for (const match of lineText.matchAll(LOOKUP_DICT_KEY_HOVER_PATTERN)) {
+    const value = match[2];
+    const prefix = match[0];
+    const localOffset = prefix.lastIndexOf(value);
+    const start = (match.index ?? 0) + localOffset;
+    const end = start + value.length;
+    if (position.character >= start && position.character <= end) {
+      return {
+        value,
+        start,
+        end,
+      };
+    }
+  }
+
+  return undefined;
+}
+
+function lookupDictKeyHoverLiteral(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): LookupLiteral | undefined {
+  const match = lookupDictKeyHoverMatchAtPosition(document, position);
+  if (!match || isDynamicLookupDictKey(match.value)) {
+    return undefined;
+  }
+
+  const startOffset = document.offsetAt(
+    new vscode.Position(position.line, match.start)
+  );
+  const endOffset = document.offsetAt(new vscode.Position(position.line, match.end));
+  const callContext = unpackedLookupDictCallContext(
+    document.getText(),
+    startOffset,
+    endOffset
+  );
+  if (!callContext) {
+    return undefined;
+  }
+
+  return {
+    receiverExpression: callContext.receiverExpression,
+    method: callContext.method,
+    value: match.value,
+  };
+}
+
 function fExpressionHoverLiteral(
   document: vscode.TextDocument,
   position: vscode.Position
@@ -2038,20 +2499,19 @@ function expressionPathHoverLiteral(
   const lineText = document.lineAt(position.line).text;
   const lineStartOffset = document.offsetAt(new vscode.Position(position.line, 0));
 
-  for (const match of lineText.matchAll(EXPRESSION_PATH_HOVER_PATTERN)) {
-    const value = match[3];
-    const prefix = match[0];
-    const localOffset = prefix.lastIndexOf(value);
-    const start = (match.index ?? 0) + localOffset;
+  for (const match of lineText.matchAll(EXPRESSION_STRING_HOVER_PATTERN)) {
+    const value = match[2];
+    const start = (match.index ?? 0) + 1;
     const end = start + value.length;
 
     if (position.character < start || position.character > end) {
       continue;
     }
 
-    const callContext = expressionPathCallContext(
+    const callContext = expressionStringArgumentCallContext(
       document.getText(),
-      lineStartOffset + start
+      lineStartOffset + start,
+      lineStartOffset + end + 1
     );
     if (!callContext) {
       return undefined;
@@ -2071,6 +2531,10 @@ function keywordLookupLiteral(
   document: vscode.TextDocument,
   position: vscode.Position
 ): LookupLiteral | undefined {
+  if (lookupDictKeyHoverMatchAtPosition(document, position)) {
+    return undefined;
+  }
+
   const fullText = document.getText();
   const wordRange = document.getWordRangeAtPosition(
     position,
@@ -2207,6 +2671,64 @@ function schemaFieldHoverLiteral(
   }
 
   return { value: word };
+}
+
+function metaConstraintLookupLiteral(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): MetaConstraintLookupLiteral | undefined {
+  if (lookupDictKeyHoverMatchAtPosition(document, position)) {
+    return undefined;
+  }
+
+  const fullText = document.getText();
+  const wordRange = document.getWordRangeAtPosition(
+    position,
+    /[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/
+  );
+  if (!wordRange) {
+    return undefined;
+  }
+
+  const value = document.getText(wordRange);
+  if (!isLookupKeywordCandidate(value)) {
+    return undefined;
+  }
+
+  const startOffset = document.offsetAt(wordRange.start);
+  const endOffset = document.offsetAt(wordRange.end);
+  const callContext = qExpressionKeywordCallContext(
+    fullText,
+    startOffset,
+    endOffset
+  );
+  if (!callContext) {
+    return undefined;
+  }
+
+  const argumentText = fullText.slice(
+    callContext.argumentStartOffset,
+    callContext.argumentEndOffset
+  );
+  const equalsIndex = findTopLevelEqualsIndex(argumentText);
+  if (equalsIndex < 0) {
+    return undefined;
+  }
+
+  const rawKey = argumentText.slice(0, equalsIndex);
+  const trimmedKey = rawKey.trim();
+  const rawKeyOffset = rawKey.indexOf(trimmedKey);
+  if (!trimmedKey || rawKeyOffset < 0 || value !== trimmedKey) {
+    return undefined;
+  }
+
+  const keyStartOffset = callContext.argumentStartOffset + rawKeyOffset;
+  const keyEndOffset = keyStartOffset + trimmedKey.length;
+  if (startOffset < keyStartOffset || endOffset > keyEndOffset) {
+    return undefined;
+  }
+
+  return { value: trimmedKey };
 }
 
 function bulkUpdateFieldListHoverLiteral(
@@ -2654,7 +3176,12 @@ function buildRelationTargetMarkdown(
   const markdown = new vscode.MarkdownString(undefined, true);
   markdown.appendMarkdown(`**${item.label}**\n\n`);
   markdown.appendMarkdown(`Module: \`${item.module}\`\n\n`);
+  markdown.appendMarkdown(
+    `Resolved symbol: \`${relationTargetQualifiedSymbol(item)}\`\n\n`
+  );
+  markdown.appendMarkdown(`Import hint: \`${relationTargetImportHint(item)}\`\n\n`);
   markdown.appendMarkdown(`Source: \`${item.source}\``);
+  appendImportFilePath(markdown, item.filePath);
 
   if (item.fieldNames.length > 0) {
     markdown.appendMarkdown(
@@ -2675,6 +3202,14 @@ function buildRelationTargetMarkdown(
   }
 
   return markdown;
+}
+
+function relationTargetQualifiedSymbol(item: RelationTargetItem): string {
+  return `${item.module}.${item.objectName}`;
+}
+
+function relationTargetImportHint(item: RelationTargetItem): string {
+  return `from ${item.module} import ${item.objectName}`;
 }
 
 function buildLookupItemMarkdown(
@@ -3227,6 +3762,7 @@ function findLookupDiagnosticContexts(
   for (let line = 0; line < document.lineCount; line += 1) {
     const lineText = document.lineAt(line).text;
     const lineStartOffset = document.offsetAt(new vscode.Position(line, 0));
+    const excludedWordRanges: Array<{ start: number; end: number }> = [];
 
     for (const match of lineText.matchAll(LOOKUP_HOVER_PATTERN)) {
       const [, method, , value] = match;
@@ -3249,6 +3785,68 @@ function findLookupDiagnosticContexts(
       contexts.push({
         receiverExpression: callContext.receiverExpression,
         method,
+        value,
+        range,
+      });
+    }
+
+    for (const match of lineText.matchAll(PREFETCH_LOOKUP_HOVER_PATTERN)) {
+      const value = match[2];
+      const prefix = match[0];
+      const localOffset = prefix.lastIndexOf(value);
+      const start = (match.index ?? 0) + localOffset;
+      const absoluteStart = lineStartOffset + start;
+      const callContext = prefetchLookupCallContext(document.getText(), absoluteStart);
+      if (!callContext) {
+        continue;
+      }
+
+      const range = new vscode.Range(line, start, line, start + value.length);
+      const key = `${range.start.line}:${range.start.character}:${value}:${callContext.method}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+
+      contexts.push({
+        receiverExpression: callContext.receiverExpression,
+        method: callContext.method,
+        value,
+        range,
+      });
+    }
+
+    for (const match of lineText.matchAll(LOOKUP_DICT_KEY_HOVER_PATTERN)) {
+      const value = match[2];
+      const prefix = match[0];
+      const localOffset = prefix.lastIndexOf(value);
+      const start = (match.index ?? 0) + localOffset;
+      const end = start + value.length;
+      excludedWordRanges.push({ start, end });
+
+      if (isDynamicLookupDictKey(value)) {
+        continue;
+      }
+
+      const callContext = unpackedLookupDictCallContext(
+        document.getText(),
+        lineStartOffset + start,
+        lineStartOffset + end
+      );
+      if (!callContext) {
+        continue;
+      }
+
+      const range = new vscode.Range(line, start, line, end);
+      const key = `${range.start.line}:${range.start.character}:${value}:${callContext.method}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+
+      contexts.push({
+        receiverExpression: callContext.receiverExpression,
+        method: callContext.method,
         value,
         range,
       });
@@ -3280,13 +3878,16 @@ function findLookupDiagnosticContexts(
       });
     }
 
-    for (const match of lineText.matchAll(EXPRESSION_PATH_HOVER_PATTERN)) {
-      const value = match[3];
-      const prefix = match[0];
-      const localOffset = prefix.lastIndexOf(value);
-      const start = (match.index ?? 0) + localOffset;
+    for (const match of lineText.matchAll(EXPRESSION_STRING_HOVER_PATTERN)) {
+      const value = match[2];
+      const start = (match.index ?? 0) + 1;
       const absoluteStart = lineStartOffset + start;
-      const callContext = expressionPathCallContext(document.getText(), absoluteStart);
+      const absoluteEnd = absoluteStart + value.length + 1;
+      const callContext = expressionStringArgumentCallContext(
+        document.getText(),
+        absoluteStart,
+        absoluteEnd
+      );
       if (!callContext) {
         continue;
       }
@@ -3310,6 +3911,13 @@ function findLookupDiagnosticContexts(
     for (const match of lineText.matchAll(/[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/g)) {
       const start = match.index ?? 0;
       const value = match[0];
+      if (
+        excludedWordRanges.some(
+          (range) => start >= range.start && start < range.end
+        )
+      ) {
+        continue;
+      }
       const position = new vscode.Position(
         line,
         start + Math.floor(value.length / 2)
@@ -3385,6 +3993,40 @@ function findSchemaFieldDiagnosticContexts(
       const value = match[0];
       const start = match.index ?? 0;
       const context = schemaFieldHoverLiteral(
+        document,
+        new vscode.Position(line, start + Math.floor(value.length / 2))
+      );
+      if (!context) {
+        continue;
+      }
+
+      const key = `${line}:${start}:${context.value}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      contexts.push({
+        value: context.value,
+        range: new vscode.Range(line, start, line, start + context.value.length),
+      });
+    }
+  }
+
+  return contexts;
+}
+
+function findMetaConstraintLookupDiagnosticContexts(
+  document: vscode.TextDocument
+): MetaConstraintLookupDiagnosticContext[] {
+  const contexts: MetaConstraintLookupDiagnosticContext[] = [];
+  const seen = new Set<string>();
+
+  for (let line = 0; line < document.lineCount; line += 1) {
+    const lineText = document.lineAt(line).text;
+    for (const match of lineText.matchAll(/[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/g)) {
+      const value = match[0];
+      const start = match.index ?? 0;
+      const context = metaConstraintLookupLiteral(
         document,
         new vscode.Position(line, start + Math.floor(value.length / 2))
       );
@@ -7200,6 +7842,10 @@ function scanKeywordTokenStart(textBefore: string): number {
   return index;
 }
 
+function isDynamicLookupDictKey(value: string): boolean {
+  return value.includes('{') || value.includes('}');
+}
+
 function isLookupKeywordCandidate(value: string): boolean {
   return (
     value.length === 0 ||
@@ -7257,6 +7903,85 @@ function querysetKeywordCallContext(
   return {
     receiverExpression,
     method,
+    argumentStartOffset,
+    argumentEndOffset,
+  };
+}
+
+function qExpressionKeywordCallContext(
+  text: string,
+  tokenStartOffset: number,
+  tokenEndOffset: number
+):
+  | {
+      argumentStartOffset: number;
+      argumentEndOffset: number;
+    }
+  | undefined {
+  const openParenOffset = findEnclosingCallOpenParenOffset(text, tokenStartOffset);
+  if (openParenOffset === undefined || !isQExpressionCall(text, openParenOffset)) {
+    return undefined;
+  }
+
+  const argumentStartOffset = findCurrentArgumentStartOffset(
+    text,
+    openParenOffset,
+    tokenStartOffset
+  );
+  const argumentEndOffset = findCurrentArgumentEndOffset(text, tokenEndOffset);
+  const argumentPrefix = text.slice(argumentStartOffset, tokenStartOffset);
+  if (hasTopLevelEquals(argumentPrefix)) {
+    return undefined;
+  }
+
+  return {
+    argumentStartOffset,
+    argumentEndOffset,
+  };
+}
+
+function unpackedLookupDictCallContext(
+  text: string,
+  tokenStartOffset: number,
+  tokenEndOffset: number
+):
+  | {
+      receiverExpression: string;
+      method: string;
+      argumentStartOffset: number;
+      argumentEndOffset: number;
+    }
+  | undefined {
+  const openParenOffset = findEnclosingCallOpenParenOffset(text, tokenStartOffset);
+  if (openParenOffset === undefined) {
+    return undefined;
+  }
+
+  const argumentStartOffset = findCurrentArgumentStartOffset(
+    text,
+    openParenOffset,
+    tokenStartOffset
+  );
+  const argumentEndOffset = findCurrentArgumentEndOffset(text, tokenEndOffset);
+  const argumentPrefix = text.slice(argumentStartOffset, tokenStartOffset).trimStart();
+  if (!argumentPrefix.startsWith('**{')) {
+    return undefined;
+  }
+
+  const directCalleeMatch = parseQuerysetCallee(
+    text,
+    openParenOffset,
+    KEYWORD_LOOKUP_METHODS
+  );
+  const calleeMatch =
+    directCalleeMatch ?? resolveKeywordEnclosingQuerysetCallContext(text, openParenOffset);
+  if (!calleeMatch) {
+    return undefined;
+  }
+
+  return {
+    receiverExpression: calleeMatch.receiverExpression,
+    method: calleeMatch.method,
     argumentStartOffset,
     argumentEndOffset,
   };
@@ -7349,6 +8074,34 @@ function resolveKeywordEnclosingQuerysetCallContext(
   };
 }
 
+function prefetchLookupCallContext(
+  text: string,
+  beforeOffset: number
+): { receiverExpression: string; method: string } | undefined {
+  const openParenOffset = findEnclosingCallOpenParenOffset(text, beforeOffset);
+  if (
+    openParenOffset === undefined ||
+    normalizedEnclosingCallName(text, openParenOffset) !== 'Prefetch'
+  ) {
+    return undefined;
+  }
+
+  const callContext = resolveEnclosingQuerysetCallContext(
+    text,
+    openParenOffset,
+    new Set(['prefetch_related']),
+    () => false
+  );
+  if (!callContext) {
+    return undefined;
+  }
+
+  return {
+    receiverExpression: callContext.receiverExpression,
+    method: 'prefetch_related',
+  };
+}
+
 function fExpressionCallContext(
   text: string,
   beforeOffset: number
@@ -7380,6 +8133,42 @@ function expressionPathCallContext(
 
   const expressionName = normalizedEnclosingCallName(text, openParenOffset);
   if (!expressionName) {
+    return undefined;
+  }
+
+  const callContext = resolveExpressionQuerysetCallContext(text, openParenOffset);
+  if (!callContext) {
+    return undefined;
+  }
+
+  return {
+    receiverExpression: callContext.receiverExpression,
+    expressionName,
+  };
+}
+
+function expressionStringArgumentCallContext(
+  text: string,
+  tokenStartOffset: number,
+  tokenEndOffset: number
+): { receiverExpression: string; expressionName: string } | undefined {
+  const openParenOffset = findEnclosingCallOpenParenOffset(text, tokenStartOffset);
+  if (openParenOffset === undefined) {
+    return undefined;
+  }
+
+  const expressionName = normalizedEnclosingCallName(text, openParenOffset);
+  if (!expressionName) {
+    return undefined;
+  }
+
+  const argument = describeEnclosingCallArgument(
+    text,
+    openParenOffset,
+    tokenStartOffset,
+    tokenEndOffset
+  );
+  if (!expressionArgumentAllowsFieldPath(expressionName, argument)) {
     return undefined;
   }
 
@@ -7436,7 +8225,9 @@ function parseQuerysetCallee(
   }
 
   return {
-    receiverExpression: memberAccess.objectExpression,
+    receiverExpression: trailingNestedReceiverExpression(
+      memberAccess.objectExpression
+    ),
     method: memberAccess.memberName,
   };
 }
@@ -7445,6 +8236,71 @@ function trailingTopLevelExpression(text: string): string {
   const starts = [...topLevelStatementStarts(text, text.length)];
   const start = starts.length > 0 ? Math.max(...starts) : 0;
   return text.slice(start).trim();
+}
+
+function trailingNestedReceiverExpression(text: string): string {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+
+  for (let index = text.length - 1; index >= 0; index -= 1) {
+    const char = text[index];
+    if (char === ')') {
+      parenDepth += 1;
+      continue;
+    }
+
+    if (char === ']') {
+      bracketDepth += 1;
+      continue;
+    }
+
+    if (char === '}') {
+      braceDepth += 1;
+      continue;
+    }
+
+    if (char === '(') {
+      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+        return text.slice(index + 1).trim();
+      }
+      if (parenDepth > 0) {
+        parenDepth -= 1;
+      }
+      continue;
+    }
+
+    if (char === '[') {
+      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+        return text.slice(index + 1).trim();
+      }
+      if (bracketDepth > 0) {
+        bracketDepth -= 1;
+      }
+      continue;
+    }
+
+    if (char === '{') {
+      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+        return text.slice(index + 1).trim();
+      }
+      if (braceDepth > 0) {
+        braceDepth -= 1;
+      }
+      continue;
+    }
+
+    if (
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0 &&
+      ',=:\n;'.includes(char)
+    ) {
+      return text.slice(index + 1).trim();
+    }
+  }
+
+  return text.trim();
 }
 
 function topLevelStatementStarts(
@@ -7613,7 +8469,7 @@ function isCaseExpressionCall(text: string, openParenOffset: number): boolean {
 
 function isExpressionPathCall(text: string, openParenOffset: number): boolean {
   const callName = normalizedEnclosingCallName(text, openParenOffset);
-  return callName ? EXPRESSION_FIELD_FUNCTION_NAMES.has(callName) : false;
+  return callName ? EXPRESSION_FIELD_FUNCTION_NAME_SET.has(callName) : false;
 }
 
 function isExpressionWrapperCall(
@@ -7678,23 +8534,82 @@ function findCurrentArgumentStartOffset(
   openParenOffset: number,
   tokenStartOffset: number
 ): number {
-  let depth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let activeQuote: '"' | "'" | undefined;
+  let escaped = false;
 
   for (let index = tokenStartOffset - 1; index > openParenOffset; index -= 1) {
     const char = text[index];
-    if (char === ')') {
-      depth += 1;
+    if (!char) {
       continue;
     }
 
-    if (char === '(') {
-      if (depth > 0) {
-        depth -= 1;
+    if (activeQuote) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+
+      if (char === activeQuote) {
+        activeQuote = undefined;
       }
       continue;
     }
 
-    if (char === ',' && depth === 0) {
+    if (char === "'" || char === '"') {
+      activeQuote = char;
+      continue;
+    }
+
+    if (char === ')') {
+      parenDepth += 1;
+      continue;
+    }
+
+    if (char === ']') {
+      bracketDepth += 1;
+      continue;
+    }
+
+    if (char === '}') {
+      braceDepth += 1;
+      continue;
+    }
+
+    if (char === '(') {
+      if (parenDepth > 0) {
+        parenDepth -= 1;
+      }
+      continue;
+    }
+
+    if (char === '[') {
+      if (bracketDepth > 0) {
+        bracketDepth -= 1;
+      }
+      continue;
+    }
+
+    if (char === '{') {
+      if (braceDepth > 0) {
+        braceDepth -= 1;
+      }
+      continue;
+    }
+
+    if (
+      char === ',' &&
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0
+    ) {
       return index + 1;
     }
   }
@@ -7703,24 +8618,85 @@ function findCurrentArgumentStartOffset(
 }
 
 function findCurrentArgumentEndOffset(text: string, tokenEndOffset: number): number {
-  let depth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let activeQuote: '"' | "'" | undefined;
+  let escaped = false;
 
   for (let index = tokenEndOffset; index < text.length; index += 1) {
     const char = text[index];
+    if (!char) {
+      continue;
+    }
+
+    if (activeQuote) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+
+      if (char === activeQuote) {
+        activeQuote = undefined;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      activeQuote = char;
+      continue;
+    }
+
     if (char === '(') {
-      depth += 1;
+      parenDepth += 1;
+      continue;
+    }
+
+    if (char === '[') {
+      bracketDepth += 1;
+      continue;
+    }
+
+    if (char === '{') {
+      braceDepth += 1;
       continue;
     }
 
     if (char === ')') {
-      if (depth === 0) {
+      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
         return index;
       }
-      depth -= 1;
+      if (parenDepth > 0) {
+        parenDepth -= 1;
+      }
       continue;
     }
 
-    if (char === ',' && depth === 0) {
+    if (char === ']') {
+      if (bracketDepth > 0) {
+        bracketDepth -= 1;
+      }
+      continue;
+    }
+
+    if (char === '}') {
+      if (braceDepth > 0) {
+        braceDepth -= 1;
+      }
+      continue;
+    }
+
+    if (
+      char === ',' &&
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0
+    ) {
       return index;
     }
   }
@@ -7728,26 +8704,215 @@ function findCurrentArgumentEndOffset(text: string, tokenEndOffset: number): num
   return text.length;
 }
 
+function describeEnclosingCallArgument(
+  text: string,
+  openParenOffset: number,
+  tokenStartOffset: number,
+  tokenEndOffset: number
+): { argumentIndex: number; keywordName: string | undefined } {
+  const argumentStartOffset = findCurrentArgumentStartOffset(
+    text,
+    openParenOffset,
+    tokenStartOffset
+  );
+  const argumentEndOffset = findCurrentArgumentEndOffset(text, tokenEndOffset);
+  const argumentText = text.slice(argumentStartOffset, argumentEndOffset).trim();
+  const equalsIndex = findTopLevelEqualsIndex(argumentText);
+
+  return {
+    argumentIndex: countTopLevelArgumentsBeforeOffset(
+      text,
+      openParenOffset,
+      argumentStartOffset
+    ),
+    keywordName:
+      equalsIndex >= 0
+        ? argumentText.slice(0, equalsIndex).trim() || undefined
+        : undefined,
+  };
+}
+
+function expressionArgumentAllowsFieldPath(
+  expressionName: string,
+  argument: { argumentIndex: number; keywordName: string | undefined }
+): boolean {
+  if (KEYWORD_VALUE_EXPRESSION_FIELD_FUNCTIONS.has(expressionName)) {
+    return Boolean(argument.keywordName);
+  }
+
+  if (argument.keywordName) {
+    return false;
+  }
+
+  if (ANY_POSITION_EXPRESSION_FIELD_FUNCTIONS.has(expressionName)) {
+    return true;
+  }
+
+  if (FIRST_ARGUMENT_EXPRESSION_FIELD_FUNCTIONS.has(expressionName)) {
+    return argument.argumentIndex === 0;
+  }
+
+  return false;
+}
+
+function countTopLevelArgumentsBeforeOffset(
+  text: string,
+  openParenOffset: number,
+  argumentStartOffset: number
+): number {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let activeQuote: '"' | "'" | undefined;
+  let escaped = false;
+  let count = 0;
+
+  for (let index = openParenOffset + 1; index < argumentStartOffset; index += 1) {
+    const char = text[index];
+    if (!char) {
+      continue;
+    }
+
+    if (activeQuote) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+
+      if (char === activeQuote) {
+        activeQuote = undefined;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      activeQuote = char;
+      continue;
+    }
+
+    if (char === '(') {
+      parenDepth += 1;
+      continue;
+    }
+
+    if (char === '[') {
+      bracketDepth += 1;
+      continue;
+    }
+
+    if (char === '{') {
+      braceDepth += 1;
+      continue;
+    }
+
+    if (char === ')' && parenDepth > 0) {
+      parenDepth -= 1;
+      continue;
+    }
+
+    if (char === ']' && bracketDepth > 0) {
+      bracketDepth -= 1;
+      continue;
+    }
+
+    if (char === '}' && braceDepth > 0) {
+      braceDepth -= 1;
+      continue;
+    }
+
+    if (
+      char === ',' &&
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0
+    ) {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
 function hasTopLevelEquals(text: string): boolean {
   return findTopLevelEqualsIndex(text) >= 0;
 }
 
 function findTopLevelEqualsIndex(text: string): number {
-  let depth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let activeQuote: '"' | "'" | undefined;
+  let escaped = false;
 
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
+    if (!char) {
+      continue;
+    }
+
+    if (activeQuote) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+
+      if (char === activeQuote) {
+        activeQuote = undefined;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      activeQuote = char;
+      continue;
+    }
+
     if (char === '(') {
-      depth += 1;
+      parenDepth += 1;
       continue;
     }
 
-    if (char === ')' && depth > 0) {
-      depth -= 1;
+    if (char === '[') {
+      bracketDepth += 1;
       continue;
     }
 
-    if (char === '=' && depth === 0) {
+    if (char === '{') {
+      braceDepth += 1;
+      continue;
+    }
+
+    if (char === ')' && parenDepth > 0) {
+      parenDepth -= 1;
+      continue;
+    }
+
+    if (char === ']' && bracketDepth > 0) {
+      bracketDepth -= 1;
+      continue;
+    }
+
+    if (char === '}' && braceDepth > 0) {
+      braceDepth -= 1;
+      continue;
+    }
+
+    if (
+      char === '=' &&
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0
+    ) {
       return index;
     }
   }

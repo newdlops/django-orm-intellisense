@@ -36,7 +36,6 @@ from ..features.relation_targets import (
     list_relation_targets,
     resolve_relation_target,
 )
-from ..pylance import PylanceStubGenerationSummary, generate_pylance_stubs
 from ..runtime.inspector import RuntimeInspection, inspect_runtime
 from ..semantic.graph import SemanticGraphSummary, build_semantic_graph
 from ..static_index.indexer import StaticIndex, build_static_index
@@ -51,7 +50,6 @@ class DaemonServer:
         self.static_index: StaticIndex | None = None
         self.runtime_inspection: RuntimeInspection | None = None
         self.semantic_graph: SemanticGraphSummary | None = None
-        self.pylance_stubs: PylanceStubGenerationSummary | None = None
 
     def run_stdio(self) -> None:
         for raw_line in sys.stdin:
@@ -201,28 +199,15 @@ class DaemonServer:
             f'coverage={semantic_graph.coverage_mode} '
             f'elapsed={time.perf_counter() - started_at:.2f}s'
         )
-        pylance_stubs = generate_pylance_stubs(
-            workspace_root=workspace_root,
-            static_index=static_index,
-            runtime=runtime,
-        )
-        _log_initialize_step(
-            'generate_pylance_stubs '
-            f'root={pylance_stubs.relative_root} '
-            f'files={pylance_stubs.file_count} '
-            f'elapsed={time.perf_counter() - started_at:.2f}s'
-        )
         self.workspace_profile = workspace_profile
         self.static_index = static_index
         self.runtime_inspection = runtime
         self.semantic_graph = semantic_graph
-        self.pylance_stubs = pylance_stubs
         self.health_snapshot = build_health_snapshot(
             workspace=workspace_profile,
             static_index=static_index,
             runtime=runtime,
             semantic_graph=semantic_graph,
-            pylance_stubs=pylance_stubs,
             initialized_at=self.initialized_at,
         )
         _log_initialize_step(

@@ -5,6 +5,7 @@ from ..semantic.graph import ModelGraph, build_model_graph
 from ..static_index.indexer import FieldCandidate, StaticIndex
 
 RELATION_ONLY_METHODS = {'select_related', 'prefetch_related'}
+ATTRIBUTE_PATH_METHODS = {'select_related', 'prefetch_related', 'only', 'defer'}
 FILTER_LOOKUP_METHODS = {'filter', 'exclude', 'get', 'get_or_create', 'update_or_create'}
 MAX_CHAINED_FIELD_COMPLETION_DEPTH = 3
 DEFAULT_LOOKUP_OPERATORS = (
@@ -75,7 +76,11 @@ def list_lookup_path_completions(
         relation_only = method in RELATION_ONLY_METHODS
         matching_fields = [
             field
-            for field in model_graph.fields_for_model(current_model_label)
+            for field in _lookup_fields_for_method(
+                model_graph=model_graph,
+                model_label=current_model_label,
+                method=method,
+            )
             if (field.is_relation or not relation_only)
             and field.name.startswith(current_partial)
         ]
@@ -96,6 +101,7 @@ def list_lookup_path_completions(
                 model_label=current_model_label,
                 current_partial=current_partial,
                 relation_only=relation_only,
+                method=method,
             )
         )
     elif traversal['completionMode'] == 'field_and_lookup':
@@ -103,7 +109,11 @@ def list_lookup_path_completions(
         relation_only = method in RELATION_ONLY_METHODS
         matching_fields = [
             field
-            for field in model_graph.fields_for_model(current_model_label)
+            for field in _lookup_fields_for_method(
+                model_graph=model_graph,
+                model_label=current_model_label,
+                method=method,
+            )
             if (field.is_relation or not relation_only)
             and field.name.startswith(current_partial)
         ]
@@ -124,6 +134,7 @@ def list_lookup_path_completions(
                 model_label=current_model_label,
                 current_partial=current_partial,
                 relation_only=relation_only,
+                method=method,
             )
         )
         items.extend(
@@ -179,7 +190,12 @@ def resolve_lookup_path(
     lookup_operator: str | None = None
 
     for index, segment in enumerate(segments):
-        field = model_graph.find_field(current_model_label, segment)
+        field = _lookup_field_for_method(
+            model_graph=model_graph,
+            model_label=current_model_label,
+            field_name=segment,
+            method=method,
+        )
         if field is None:
             if (
                 method in FILTER_LOOKUP_METHODS
@@ -215,7 +231,12 @@ def resolve_lookup_path(
 
         next_segment = segments[index + 1]
         if field.is_relation and field.related_model_label:
-            next_field = model_graph.find_field(field.related_model_label, next_segment)
+            next_field = _lookup_field_for_method(
+                model_graph=model_graph,
+                model_label=field.related_model_label,
+                field_name=next_segment,
+                method=method,
+            )
             if next_field is not None:
                 current_model_label = field.related_model_label
                 continue
@@ -303,7 +324,12 @@ def _analyze_lookup_completion_context(
 
     while index < len(segments):
         segment = segments[index]
-        field = model_graph.find_field(current_model_label, segment)
+        field = _lookup_field_for_method(
+            model_graph=model_graph,
+            model_label=current_model_label,
+            field_name=segment,
+            method=method,
+        )
         if field is None:
             return {
                 'resolved': False,
@@ -348,7 +374,12 @@ def _analyze_lookup_completion_context(
             }
 
         if field.is_relation and field.related_model_label:
-            next_field = model_graph.find_field(field.related_model_label, next_segment)
+            next_field = _lookup_field_for_method(
+                model_graph=model_graph,
+                model_label=field.related_model_label,
+                field_name=next_segment,
+                method=method,
+            )
             if next_field is not None:
                 current_model_label = field.related_model_label
                 index += 1
@@ -459,6 +490,7 @@ def _lookup_descendant_completion_items(
     model_label: str,
     current_partial: str,
     relation_only: bool,
+    method: str,
 ) -> list[dict[str, object]]:
     items_by_name: dict[str, dict[str, object]] = {}
 
@@ -470,7 +502,11 @@ def _lookup_descendant_completion_items(
         if depth >= MAX_CHAINED_FIELD_COMPLETION_DEPTH:
             return
 
-        for field in model_graph.fields_for_model(current_model_label):
+        for field in _lookup_fields_for_method(
+            model_graph=model_graph,
+            model_label=current_model_label,
+            method=method,
+        ):
             path_parts = [*prefix_parts, field.name]
             path_name = '__'.join(path_parts)
             if (
@@ -488,6 +524,40 @@ def _lookup_descendant_completion_items(
 
     walk(model_label, [], 0)
     return list(items_by_name.values())
+
+
+def _lookup_fields_for_method(
+    *,
+    model_graph: ModelGraph,
+    model_label: str,
+    method: str,
+) -> list[FieldCandidate]:
+    fields = model_graph.fields_for_model(model_label)
+    if _allows_related_query_aliases(method):
+        return fields
+
+    return [field for field in fields if field.source != 'related_query_alias']
+
+
+def _lookup_field_for_method(
+    *,
+    model_graph: ModelGraph,
+    model_label: str,
+    field_name: str,
+    method: str,
+) -> FieldCandidate | None:
+    field = model_graph.find_field(model_label, field_name)
+    if field is None:
+        return None
+
+    if not _allows_related_query_aliases(method) and field.source == 'related_query_alias':
+        return None
+
+    return field
+
+
+def _allows_related_query_aliases(method: str) -> bool:
+    return method not in ATTRIBUTE_PATH_METHODS
 
 
 def _prefixed_lookup_chain_completion_items(

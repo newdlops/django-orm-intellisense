@@ -1,7 +1,8 @@
 from django.db import models as db_models
-from django.db.models import F, Q
+from django.db.models import F, Prefetch, Q
 
 from blog import AuditLog, Company, MultiInheritedLog, Post
+from blog.models import Faq
 
 
 def lookup_examples():
@@ -14,6 +15,9 @@ def lookup_examples():
     Post.objects.prefetch_related("author__pro")
     Post.objects.prefetch_related("author__profile")
     Post.objects.prefetch_related("author__profile__timezone")
+    Post.objects.prefetch_related(Prefetch("author__pro"))
+    Post.objects.prefetch_related(Prefetch("author__profile"))
+    Post.objects.prefetch_related(Prefetch("author__profile__timezone"))
     Post.objects.only("author__na")
     Post.objects.defer("author__na")
     Post.objects.order_by("author__name")
@@ -48,6 +52,14 @@ def lookup_examples():
     AuditLog.objects.filter(na='entry')
     AuditLog.objects.exclude(Q(na='entry'))
     MultiInheritedLog.objects.filter(sl='entry')
+    Faq.objects.filter(ti='faq')
+    Faq.objects.filter(title='faq')
+    Faq.objects.filter(li='faq')
+    Faq.objects.filter(link__la='faq')
+    Faq.objects.filter(link__label='faq')
+    Faq.objects.prefetch_related("li")
+    Faq.objects.prefetch_related("link")
+    Faq.objects.prefetch_related("link_set")
     Company.objects.exclude(db_models.Q(st='READY'))
     Company.objects.get(name=db_models.F("st"))
     Post.objects.values("author__unknown")

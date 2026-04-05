@@ -90,3 +90,27 @@ class AuditLog(TimeStampedBaseModel):
 
 class MultiInheritedLog(TimeStampedBaseModel, SluggedBaseModel):
     title = models.CharField(max_length=255)
+
+
+ParentalKey = models.ForeignKey
+
+
+class TimestampedModel(models.Model):
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        abstract = True
+
+
+class Faq(TimestampedModel):
+    title = models.CharField(max_length=255)
+
+
+class FaqLink(TimestampedModel):
+    faq = ParentalKey(
+        to=Faq,
+        related_name='link_set',
+        related_query_name='link',
+        on_delete=models.CASCADE,
+    )
+    label = models.CharField(max_length=255)
