@@ -279,7 +279,7 @@ const LOOKUP_OPERATOR_PRIORITY = new Map(
 const CLASS_DEFINITION_PATTERN =
   /^(\s*)class\s+([A-Za-z_][\w]*)\s*(?:\((.*)\))?\s*:/;
 const FUNCTION_DEFINITION_PATTERN =
-  /^(\s*)(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)\s*(?:->\s*[^:]+)?\s*:/;
+  /^(\s*)(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)\s*(?:->\s*([^:]+))?\s*:/;
 const ITERABLE_TYPE_NAMES = new Set([
   'Collection',
   'Iterable',
@@ -485,6 +485,7 @@ interface PythonFunctionDefinition {
   line: number;
   indent: number;
   endLine: number;
+  returnAnnotation?: string;
 }
 
 interface ClassDefinitionSource {
@@ -497,6 +498,28 @@ interface FunctionDefinitionSource {
   document: vscode.TextDocument;
   functionDef: PythonFunctionDefinition;
   beforeOffset: number;
+}
+
+interface TypeAnnotationSource {
+  document: vscode.TextDocument;
+  annotation: string;
+  offset: number;
+}
+
+interface ClassMemberItem {
+  name: string;
+  kind: 'method' | 'attribute' | 'property';
+  detail: string;
+  filePath: string;
+  line: number;
+  column: number;
+}
+
+interface ClassInstanceCompletionContext {
+  receiverExpression: string;
+  prefix: string;
+  range: vscode.Range;
+  classSource: ClassDefinitionSource;
 }
 
 interface ClassHoverTarget {
@@ -1211,51 +1234,78 @@ export function registerPythonProviders(
             document,
             position
           );
-          if (!memberContext) {
+          if (memberContext) {
+            const result = await daemon.listOrmMemberCompletions(
+              memberContext.receiver.modelLabel,
+              memberContext.receiver.kind,
+              memberContext.prefix,
+              memberContext.receiver.managerName
+            );
+            const mergedItems = mergeVirtualOrmMemberItems(
+              result.items,
+              memberContext.receiver
+            );
+            const sortedItems = prioritizeOrmMemberCompletionItems(
+              mergedItems,
+              memberContext.receiver
+            );
+
+            return sortedItems.map((item, index) => {
+              const completion = new vscode.CompletionItem(
+                ormMemberCompletionLabel(item, memberContext.receiver),
+                ormMemberCompletionKind(item, memberContext.receiver)
+              );
+              completion.detail = ormMemberCompletionDetail(
+                item,
+                memberContext.receiver
+              );
+              completion.insertText = item.name;
+              completion.filterText = item.name;
+              completion.range = memberContext.range;
+              completion.sortText = ormMemberCompletionSortText(
+                item,
+                memberContext.receiver,
+                index
+              );
+              completion.preselect = shouldPreselectOrmMemberCompletion(
+                item,
+                memberContext.receiver,
+                index
+              );
+              completion.documentation = buildOrmMemberMarkdown(
+                item,
+                memberContext.receiver
+              );
+              return completion;
+            });
+          }
+
+          const classInstanceContext = await resolveClassInstanceCompletionContext(
+            daemon,
+            document,
+            position
+          );
+          if (!classInstanceContext) {
             return undefined;
           }
 
-          const result = await daemon.listOrmMemberCompletions(
-            memberContext.receiver.modelLabel,
-            memberContext.receiver.kind,
-            memberContext.prefix,
-            memberContext.receiver.managerName
+          const classItems = await listClassInstanceMemberItems(
+            daemon,
+            classInstanceContext.classSource
           );
-          const mergedItems = mergeVirtualOrmMemberItems(
-            result.items,
-            memberContext.receiver
-          );
-          const sortedItems = prioritizeOrmMemberCompletionItems(
-            mergedItems,
-            memberContext.receiver
+          const filteredItems = classItems.filter((item) =>
+            item.name.startsWith(classInstanceContext.prefix)
           );
 
-          return sortedItems.map((item, index) => {
+          return filteredItems.map((item) => {
             const completion = new vscode.CompletionItem(
-              ormMemberCompletionLabel(item, memberContext.receiver),
-              ormMemberCompletionKind(item, memberContext.receiver)
+              item.name,
+              classMemberCompletionKind(item)
             );
-            completion.detail = ormMemberCompletionDetail(
-              item,
-              memberContext.receiver
-            );
+            completion.detail = item.detail;
             completion.insertText = item.name;
             completion.filterText = item.name;
-            completion.range = memberContext.range;
-            completion.sortText = ormMemberCompletionSortText(
-              item,
-              memberContext.receiver,
-              index
-            );
-            completion.preselect = shouldPreselectOrmMemberCompletion(
-              item,
-              memberContext.receiver,
-              index
-            );
-            completion.documentation = buildOrmMemberMarkdown(
-              item,
-              memberContext.receiver
-            );
+            completion.range = classInstanceContext.range;
             return completion;
           });
         } catch {
@@ -2134,6 +2184,20 @@ function shouldPreselectOrmMemberCompletion(
   );
 }
 
+function classMemberCompletionKind(
+  item: ClassMemberItem
+): vscode.CompletionItemKind {
+  if (item.kind === 'method') {
+    return vscode.CompletionItemKind.Method;
+  }
+
+  if (item.kind === 'property') {
+    return vscode.CompletionItemKind.Property;
+  }
+
+  return vscode.CompletionItemKind.Field;
+}
+
 function relationCompletionContext(
   document: vscode.TextDocument,
   position: vscode.Position
@@ -2333,11 +2397,16 @@ function expressionPathCompletionContext(
   }
 
   const currentValue = match[2] ?? '';
-  const tokenStartOffset = document.offsetAt(position) - currentValue.length;
+  const cursorOffset = document.offsetAt(position);
+  const tokenStartOffset = cursorOffset - currentValue.length;
+  const tokenEndOffset = expressionStringTokenEndOffset(
+    document.getText(),
+    cursorOffset
+  );
   const callContext = expressionStringArgumentCallContext(
     document.getText(),
     tokenStartOffset,
-    document.offsetAt(position)
+    tokenEndOffset
   );
   if (!callContext) {
     return undefined;
@@ -4669,11 +4738,12 @@ async function resolveOrmMemberCompletionContext(
   }
 
   const endOffset = document.offsetAt(position);
-  for (const candidate of ormMemberExpressionCandidates(
+  const candidates = ormMemberExpressionCandidates(
     document,
     prefixContext.startOffset,
     endOffset
-  )) {
+  );
+  for (const [index, candidate] of candidates.entries()) {
     const parsedAccess = parseTrailingMemberAccessCandidate(
       candidate,
       prefixContext.prefix
@@ -4698,6 +4768,9 @@ async function resolveOrmMemberCompletionContext(
     );
     const receiver = preferMemberReceiver(staticReceiver, dynamicReceiver);
     if (!receiver) {
+      if (index === 0) {
+        return undefined;
+      }
       continue;
     }
 
@@ -4706,6 +4779,56 @@ async function resolveOrmMemberCompletionContext(
       prefix: prefixContext.prefix,
       range: prefixContext.range,
       receiver,
+    };
+  }
+
+  return undefined;
+}
+
+async function resolveClassInstanceCompletionContext(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  position: vscode.Position
+): Promise<ClassInstanceCompletionContext | undefined> {
+  const prefixContext = ormMemberPrefixContext(document, position);
+  if (!prefixContext) {
+    return undefined;
+  }
+
+  const endOffset = document.offsetAt(position);
+  const candidates = ormMemberExpressionCandidates(
+    document,
+    prefixContext.startOffset,
+    endOffset
+  );
+  for (const [index, candidate] of candidates.entries()) {
+    const parsedAccess = parseTrailingMemberAccessCandidate(
+      candidate,
+      prefixContext.prefix
+    );
+    if (!parsedAccess) {
+      continue;
+    }
+
+    const classSource = await resolveClassDefinitionForExpression(
+      daemon,
+      document,
+      parsedAccess.receiverExpression,
+      endOffset,
+      new Set()
+    );
+    if (!classSource) {
+      if (index === 0) {
+        return undefined;
+      }
+      continue;
+    }
+
+    return {
+      receiverExpression: parsedAccess.receiverExpression,
+      prefix: prefixContext.prefix,
+      range: prefixContext.range,
+      classSource,
     };
   }
 
@@ -4733,11 +4856,12 @@ async function resolveOrmMemberAccessContext(
 
   const startOffset = document.offsetAt(wordRange.start);
   const endOffset = document.offsetAt(wordRange.end);
-  for (const candidate of ormMemberExpressionCandidates(
+  const candidates = ormMemberExpressionCandidates(
     document,
     startOffset,
     endOffset
-  )) {
+  );
+  for (const [index, candidate] of candidates.entries()) {
     const parsedAccess = parseTrailingMemberAccessCandidate(candidate, memberName);
     if (!parsedAccess) {
       continue;
@@ -4759,6 +4883,9 @@ async function resolveOrmMemberAccessContext(
     );
     const receiver = preferMemberReceiver(staticReceiver, dynamicReceiver);
     if (!receiver) {
+      if (index === 0) {
+        return undefined;
+      }
       continue;
     }
 
@@ -4805,6 +4932,12 @@ function ormMemberExpressionCandidates(
   tokenStartOffset: number,
   endOffset: number
 ): string[] {
+  const endPosition = document.positionAt(endOffset);
+  const sameLineCandidate = compactPythonExpression(
+    stripTrailingComment(
+      document.lineAt(endPosition.line).text.slice(0, endPosition.character)
+    ).trim()
+  );
   const windowStartOffset = Math.max(0, endOffset - 4_000);
   const rawWindow = document.getText(
     new vscode.Range(
@@ -4819,7 +4952,7 @@ function ormMemberExpressionCandidates(
     localTokenStart
   );
 
-  return [...candidateStarts]
+  const windowCandidates = [...candidateStarts]
     .sort((left, right) => right - left)
     .map((start) =>
       compactPythonExpression(
@@ -4830,8 +4963,12 @@ function ormMemberExpressionCandidates(
           .join('\n')
           .trim()
       )
-    )
-    .filter((candidate, index, values) => candidate.length > 0 && values.indexOf(candidate) === index);
+    );
+
+  return [sameLineCandidate, ...windowCandidates].filter(
+    (candidate, index, values) =>
+      candidate.length > 0 && values.indexOf(candidate) === index
+  );
 }
 
 function topLevelExpressionCandidateStarts(
@@ -4839,6 +4976,9 @@ function topLevelExpressionCandidateStarts(
   beforeOffset: number
 ): Set<number> {
   const starts = new Set<number>([0]);
+  const parenStack: number[] = [];
+  const bracketStack: number[] = [];
+  const braceStack: number[] = [];
   let parenDepth = 0;
   let bracketDepth = 0;
   let braceDepth = 0;
@@ -4874,41 +5014,38 @@ function topLevelExpressionCandidateStarts(
     }
 
     if (char === '(') {
-      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
-        starts.add(index + 1);
-      }
+      parenStack.push(index);
       parenDepth += 1;
       continue;
     }
 
     if (char === '[') {
-      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
-        starts.add(index + 1);
-      }
+      bracketStack.push(index);
       bracketDepth += 1;
       continue;
     }
 
     if (char === '{') {
-      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
-        starts.add(index + 1);
-      }
+      braceStack.push(index);
       braceDepth += 1;
       continue;
     }
 
     if (char === ')' && parenDepth > 0) {
       parenDepth -= 1;
+      parenStack.pop();
       continue;
     }
 
     if (char === ']' && bracketDepth > 0) {
       bracketDepth -= 1;
+      bracketStack.pop();
       continue;
     }
 
     if (char === '}' && braceDepth > 0) {
       braceDepth -= 1;
+      braceStack.pop();
       continue;
     }
 
@@ -4920,6 +5057,10 @@ function topLevelExpressionCandidateStarts(
     ) {
       starts.add(index + 1);
     }
+  }
+
+  for (const index of [...parenStack, ...bracketStack, ...braceStack]) {
+    starts.add(index + 1);
   }
 
   return starts;
@@ -4936,7 +5077,9 @@ function parseTrailingMemberAccessCandidate(
 
     const receiverExpression = candidate.slice(0, -1);
     return receiverExpression
-      ? { receiverExpression, memberName }
+      ? isPlausibleMemberReceiverExpression(receiverExpression)
+        ? { receiverExpression, memberName }
+        : undefined
       : undefined;
   }
 
@@ -4945,10 +5088,19 @@ function parseTrailingMemberAccessCandidate(
     return undefined;
   }
 
+  if (!isPlausibleMemberReceiverExpression(memberAccess.objectExpression)) {
+    return undefined;
+  }
+
   return {
     receiverExpression: memberAccess.objectExpression,
     memberName: memberAccess.memberName,
   };
+}
+
+function isPlausibleMemberReceiverExpression(value: string): boolean {
+  const normalized = normalizeReceiverExpression(value);
+  return Boolean(normalized) && /^[A-Za-z_]/.test(normalized);
 }
 
 async function resolveOrmReceiverAtOffset(
@@ -5019,6 +5171,18 @@ async function resolveOrmReceiverAtOffset(
       if (resolvedReceiver) {
         return resolvedReceiver;
       }
+    }
+
+    const annotatedMemberReceiver = await resolveAnnotatedReceiverForMemberAccess(
+      daemon,
+      document,
+      memberAccess.objectExpression,
+      memberAccess.memberName,
+      beforeOffset,
+      new Set()
+    );
+    if (annotatedMemberReceiver) {
+      return annotatedMemberReceiver;
     }
   }
 
@@ -5116,6 +5280,15 @@ function preferMemberReceiver(
     staticReceiver.kind !== 'instance' &&
     staticReceiver.kind !== 'unknown' &&
     staticReceiver.kind !== 'scalar'
+  ) {
+    return staticReceiver;
+  }
+
+  if (
+    staticReceiver &&
+    dynamicReceiver &&
+    staticReceiver.kind === dynamicReceiver.kind &&
+    staticReceiver.modelLabel !== dynamicReceiver.modelLabel
   ) {
     return staticReceiver;
   }
@@ -5352,10 +5525,6 @@ async function resolveOrmReceiverFromFunctionSource(
     functionSource.document,
     functionSource.functionDef
   );
-  if (returnExpressions.length === 0) {
-    return undefined;
-  }
-
   const resolvedReceivers = new Map<string, OrmReceiverInfo>();
   for (const returnExpression of returnExpressions) {
     const resolvedReceiver = await resolveOrmReceiverAtOffset(
@@ -5371,9 +5540,11 @@ async function resolveOrmReceiverFromFunctionSource(
     resolvedReceivers.set(receiverInfoKey(resolvedReceiver), resolvedReceiver);
   }
 
-  return resolvedReceivers.size === 1
-    ? [...resolvedReceivers.values()][0]
-    : undefined;
+  if (resolvedReceivers.size === 1) {
+    return [...resolvedReceivers.values()][0];
+  }
+
+  return resolveReceiverFromFunctionReturnAnnotation(daemon, functionSource);
 }
 
 async function resolveOrmReceiverFromClassMethodSource(
@@ -6141,6 +6312,20 @@ async function resolveLookupReceiverAtOffset(
         return resolvedReceiver;
       }
     }
+
+    const annotatedMemberReceiver = asLookupReceiver(
+      await resolveAnnotatedReceiverForMemberAccess(
+        daemon,
+        document,
+        memberAccess.objectExpression,
+        memberAccess.memberName,
+        beforeOffset,
+        new Set()
+      )
+    );
+    if (annotatedMemberReceiver) {
+      return annotatedMemberReceiver;
+    }
   }
 
   if (/^[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?$/.test(normalizedExpression)) {
@@ -6545,10 +6730,6 @@ async function resolveModelLabelFromFunctionSource(
     functionSource.document,
     functionSource.functionDef
   );
-  if (returnExpressions.length === 0) {
-    return undefined;
-  }
-
   const resolvedLabels = new Set<string>();
   for (const returnExpression of returnExpressions) {
     const resolvedLabel = await resolveBaseModelLabelForReceiverAtOffset(
@@ -6563,7 +6744,11 @@ async function resolveModelLabelFromFunctionSource(
     }
   }
 
-  return resolvedLabels.size === 1 ? [...resolvedLabels][0] : undefined;
+  if (resolvedLabels.size === 1) {
+    return [...resolvedLabels.values()][0];
+  }
+
+  return resolveModelLabelFromFunctionReturnAnnotation(daemon, functionSource);
 }
 
 async function resolveModelLabelFromClassMethodSource(
@@ -6697,25 +6882,146 @@ async function resolveClassDefinitionForExpression(
   }
 
   if (/^[A-Za-z_][\w]*$/.test(normalizedExpression)) {
-    return resolveClassDefinitionSource(
+    const directClassSource = await resolveClassDefinitionSource(
       daemon,
       document,
       normalizedExpression,
       beforeOffset
     );
+    if (directClassSource) {
+      return directClassSource;
+    }
+
+    const typeAnnotation = findTypeAnnotationForIdentifier(
+      document,
+      normalizedExpression,
+      beforeOffset
+    );
+    if (typeAnnotation) {
+      const annotatedClassSource = await resolveClassDefinitionFromTypeAnnotation(
+        daemon,
+        document,
+        typeAnnotation.annotation,
+        typeAnnotation.offset
+      );
+      if (annotatedClassSource) {
+        return annotatedClassSource;
+      }
+    }
+  }
+
+  const memberAccess = splitTopLevelMemberAccess(normalizedExpression);
+  if (memberAccess) {
+    const typeAnnotation = await resolveTypeAnnotationForMemberAccess(
+      daemon,
+      document,
+      memberAccess.objectExpression,
+      memberAccess.memberName,
+      beforeOffset,
+      visited
+    );
+    if (typeAnnotation) {
+      const resolvedClassSource = await resolveClassDefinitionFromTypeAnnotation(
+        daemon,
+        typeAnnotation.document,
+        typeAnnotation.annotation,
+        typeAnnotation.offset
+      );
+      if (resolvedClassSource) {
+        return resolvedClassSource;
+      }
+    }
   }
 
   const parsedCall = parseCalledExpression(normalizedExpression);
-  if (
-    parsedCall &&
-    parsedCall.kind === 'function' &&
-    /^[A-Za-z_][\w]*$/.test(parsedCall.functionName)
-  ) {
-    return resolveClassDefinitionSource(
+  if (parsedCall) {
+    if (
+      parsedCall.kind === 'function' &&
+      /^[A-Za-z_][\w]*$/.test(parsedCall.functionName)
+    ) {
+      const directClassSource = await resolveClassDefinitionSource(
+        daemon,
+        document,
+        parsedCall.functionName,
+        beforeOffset
+      );
+      if (directClassSource) {
+        return directClassSource;
+      }
+
+      const functionSource = await resolveFunctionDefinitionSource(
+        daemon,
+        document,
+        parsedCall.functionName,
+        beforeOffset
+      );
+      if (!functionSource) {
+        return undefined;
+      }
+
+      return resolveClassDefinitionFromFunctionReturnAnnotation(
+        daemon,
+        functionSource
+      );
+    }
+
+    if (parsedCall.kind !== 'member') {
+      return undefined;
+    }
+
+    if (
+      parsedCall.objectExpression === 'self' ||
+      parsedCall.objectExpression === 'cls'
+    ) {
+      const classDef = findEnclosingClassDefinition(document, beforeOffset);
+      if (!classDef) {
+        return undefined;
+      }
+
+      return resolveClassDefinitionFromClassMethodSource(
+        daemon,
+        {
+          document,
+          classDef,
+          beforeOffset: document.offsetAt(new vscode.Position(classDef.line, 0)),
+        },
+        parsedCall.memberName
+      );
+    }
+
+    if (parsedCall.objectExpression === 'super()') {
+      const classDef = findEnclosingClassDefinition(document, beforeOffset);
+      if (!classDef) {
+        return undefined;
+      }
+
+      return resolveClassDefinitionFromBaseClasses(
+        daemon,
+        {
+          document,
+          classDef,
+          beforeOffset: document.offsetAt(new vscode.Position(classDef.line, 0)),
+        },
+        parsedCall.memberName,
+        new Set()
+      );
+    }
+
+    const objectClassSource = await resolveClassDefinitionForExpression(
       daemon,
       document,
-      parsedCall.functionName,
-      beforeOffset
+      parsedCall.objectExpression,
+      beforeOffset,
+      visited
+    );
+    if (!objectClassSource) {
+      return undefined;
+    }
+
+    return resolveClassDefinitionFromClassMethodSource(
+      daemon,
+      objectClassSource,
+      parsedCall.memberName
     );
   }
 
@@ -6843,6 +7149,223 @@ async function resolveSpecialClassKind(
   return undefined;
 }
 
+async function resolveClassDefinitionFromClassMethodSource(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  methodName: string
+): Promise<ClassDefinitionSource | undefined> {
+  const methodSource = await resolveMethodDefinitionInClassHierarchy(
+    daemon,
+    classSource,
+    methodName,
+    new Set()
+  );
+  if (!methodSource) {
+    return undefined;
+  }
+
+  return resolveClassDefinitionFromFunctionReturnAnnotation(daemon, methodSource);
+}
+
+async function resolveClassDefinitionFromBaseClasses(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  methodName: string,
+  visitedClasses: Set<string>
+): Promise<ClassDefinitionSource | undefined> {
+  const methodSource = await resolveMethodDefinitionFromBaseClasses(
+    daemon,
+    classSource,
+    methodName,
+    visitedClasses
+  );
+  if (!methodSource) {
+    return undefined;
+  }
+
+  return resolveClassDefinitionFromFunctionReturnAnnotation(daemon, methodSource);
+}
+
+async function listClassInstanceMemberItems(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource
+): Promise<ClassMemberItem[]> {
+  const items = new Map<string, ClassMemberItem>();
+  await collectClassInstanceMemberItems(
+    daemon,
+    classSource,
+    items,
+    new Set()
+  );
+  return [...items.values()];
+}
+
+async function collectClassInstanceMemberItems(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  items: Map<string, ClassMemberItem>,
+  visitedClasses: Set<string>
+): Promise<void> {
+  const visitKey = `${classSource.document.uri.toString()}:${classSource.classDef.name}`;
+  if (visitedClasses.has(visitKey)) {
+    return;
+  }
+  visitedClasses.add(visitKey);
+
+  for (const item of directClassInstanceMemberItems(classSource)) {
+    if (!items.has(item.name)) {
+      items.set(item.name, item);
+    }
+  }
+
+  for (const baseExpression of classSource.classDef.baseExpressions) {
+    const baseReference = baseClassReferenceExpression(baseExpression);
+    if (!baseReference) {
+      continue;
+    }
+
+    const baseClassSource = await resolveClassDefinitionSource(
+      daemon,
+      classSource.document,
+      baseReference,
+      classSource.beforeOffset
+    );
+    if (!baseClassSource) {
+      continue;
+    }
+
+    await collectClassInstanceMemberItems(
+      daemon,
+      baseClassSource,
+      items,
+      visitedClasses
+    );
+  }
+}
+
+function directClassInstanceMemberItems(
+  classSource: ClassDefinitionSource
+): ClassMemberItem[] {
+  const items = new Map<string, ClassMemberItem>();
+  const { document, classDef } = classSource;
+  const qualifiedClassName = qualifiedClassSymbol(document, classDef.name);
+
+  for (let line = classDef.line + 1; line <= classDef.endLine; line += 1) {
+    const lineText = document.lineAt(line).text;
+    const trimmed = stripTrailingComment(lineText).trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const lineOffset = document.offsetAt(new vscode.Position(line, lineText.length));
+    const enclosingClass = findEnclosingClassDefinition(document, lineOffset);
+    if (
+      !enclosingClass ||
+      enclosingClass.line !== classDef.line ||
+      enclosingClass.name !== classDef.name
+    ) {
+      continue;
+    }
+
+    const enclosingFunction = findEnclosingFunctionDefinition(document, lineOffset);
+    const functionMatch = lineText.match(FUNCTION_DEFINITION_PATTERN);
+    if (functionMatch && !enclosingFunction) {
+      const functionDef = buildFunctionDefinition(document, line, functionMatch);
+      const decorators = collectFunctionDecorators(document, line);
+      const kind = hasPropertyDecorator(decorators) ? 'property' : 'method';
+      items.set(functionDef.name, {
+        name: functionDef.name,
+        kind,
+        detail: `${kind} · ${qualifiedClassName}`,
+        filePath: document.uri.fsPath,
+        line: line + 1,
+        column: memberColumn(lineText, functionDef.name),
+      });
+      continue;
+    }
+
+    if (!enclosingFunction) {
+      const classAttributeMatch = trimmed.match(
+        /^([A-Za-z_][\w]*)\s*(?::\s*[^=]+)?=\s*.+$/
+      );
+      const annotatedAttributeMatch = trimmed.match(
+        /^([A-Za-z_][\w]*)\s*:\s*.+$/
+      );
+      const attributeName =
+        classAttributeMatch?.[1] ?? annotatedAttributeMatch?.[1];
+      if (attributeName) {
+        items.set(attributeName, {
+          name: attributeName,
+          kind: 'attribute',
+          detail: `attribute · ${qualifiedClassName}`,
+          filePath: document.uri.fsPath,
+          line: line + 1,
+          column: memberColumn(lineText, attributeName),
+        });
+      }
+      continue;
+    }
+
+    const selfAttributeMatch = trimmed.match(
+      /^self\.([A-Za-z_][\w]*)\s*(?::\s*[^=]+)?=\s*.+$/
+    );
+    if (selfAttributeMatch) {
+      const attributeName = selfAttributeMatch[1];
+      if (!items.has(attributeName)) {
+        items.set(attributeName, {
+          name: attributeName,
+          kind: 'attribute',
+          detail: `instance attribute · ${qualifiedClassName}`,
+          filePath: document.uri.fsPath,
+          line: line + 1,
+          column: memberColumn(lineText, attributeName),
+        });
+      }
+    }
+  }
+
+  return [...items.values()];
+}
+
+function collectFunctionDecorators(
+  document: vscode.TextDocument,
+  functionLine: number
+): string[] {
+  const decorators: string[] = [];
+
+  for (let line = functionLine - 1; line >= 0; line -= 1) {
+    const text = stripTrailingComment(document.lineAt(line).text).trim();
+    if (!text) {
+      break;
+    }
+
+    if (!text.startsWith('@')) {
+      break;
+    }
+
+    decorators.unshift(text);
+  }
+
+  return decorators;
+}
+
+function hasPropertyDecorator(decorators: string[]): boolean {
+  return decorators.some((decorator) => {
+    const normalizedDecorator = decorator.replace(/\s+/g, '');
+    return (
+      normalizedDecorator === '@property' ||
+      normalizedDecorator === '@cached_property' ||
+      normalizedDecorator.endsWith('.setter') ||
+      normalizedDecorator.endsWith('.deleter')
+    );
+  });
+}
+
+function memberColumn(lineText: string, memberName: string): number {
+  const index = lineText.indexOf(memberName);
+  return index >= 0 ? index + 1 : 1;
+}
+
 async function resolveClassHoverCategory(
   daemon: AnalysisDaemon,
   classSource: ClassDefinitionSource,
@@ -6933,6 +7456,57 @@ async function resolveFunctionDefinitionSource(
       new vscode.Position(importedFunction.line, 0)
     ),
   };
+}
+
+async function resolveReceiverFromFunctionReturnAnnotation(
+  daemon: AnalysisDaemon,
+  functionSource: FunctionDefinitionSource
+): Promise<OrmReceiverInfo | undefined> {
+  const annotation = functionSource.functionDef.returnAnnotation;
+  if (!annotation) {
+    return undefined;
+  }
+
+  return resolveDirectReceiverFromTypeAnnotation(
+    daemon,
+    functionSource.document,
+    annotation,
+    functionSource.beforeOffset
+  );
+}
+
+async function resolveModelLabelFromFunctionReturnAnnotation(
+  daemon: AnalysisDaemon,
+  functionSource: FunctionDefinitionSource
+): Promise<string | undefined> {
+  const annotation = functionSource.functionDef.returnAnnotation;
+  if (!annotation) {
+    return undefined;
+  }
+
+  return resolveModelLabelFromTypeAnnotation(
+    daemon,
+    functionSource.document,
+    annotation,
+    functionSource.beforeOffset
+  );
+}
+
+async function resolveClassDefinitionFromFunctionReturnAnnotation(
+  daemon: AnalysisDaemon,
+  functionSource: FunctionDefinitionSource
+): Promise<ClassDefinitionSource | undefined> {
+  const annotation = functionSource.functionDef.returnAnnotation;
+  if (!annotation) {
+    return undefined;
+  }
+
+  return resolveClassDefinitionFromTypeAnnotation(
+    daemon,
+    functionSource.document,
+    annotation,
+    functionSource.beforeOffset
+  );
 }
 
 async function resolveImportedDefinitionDocument(
@@ -7185,11 +7759,13 @@ function buildFunctionDefinition(
   match: RegExpMatchArray
 ): PythonFunctionDefinition {
   const indent = match[1].length;
+  const returnAnnotation = stripTypeDefaultValue((match[4] ?? '').trim());
   return {
     name: match[2],
     line,
     indent,
     endLine: findBlockEndLine(document, line, indent),
+    returnAnnotation: returnAnnotation || undefined,
   };
 }
 
@@ -7377,9 +7953,39 @@ function collectMultilineExpression(
   }
 
   return {
-    expression: stripWrappingParentheses(parts.join(' ').trim()),
+    expression: stripWrappingParentheses(
+      joinCollectedExpressionParts(parts).trim()
+    ),
     endLine: currentLine,
   };
+}
+
+function joinCollectedExpressionParts(parts: string[]): string {
+  let expression = '';
+
+  for (const part of parts) {
+    if (!part) {
+      continue;
+    }
+
+    if (
+      !expression ||
+      part.startsWith('.') ||
+      part.startsWith(')') ||
+      part.startsWith(']') ||
+      part.startsWith('}') ||
+      expression.endsWith('(') ||
+      expression.endsWith('[') ||
+      expression.endsWith('{')
+    ) {
+      expression += part;
+      continue;
+    }
+
+    expression += ` ${part}`;
+  }
+
+  return expression;
 }
 
 function parseCalledExpression(expression: string): ParsedCallExpression | undefined {
@@ -7842,9 +8448,19 @@ function findNearestAssignedExpression(
       continue;
     }
 
+    const collected = collectMultilineExpression(
+      document,
+      line,
+      beforePosition.line,
+      rawExpression
+    );
+    if (!collected.expression) {
+      continue;
+    }
+
     const expressionOffset = document.offsetAt(new vscode.Position(line, 0));
     return {
-      expression: rawExpression,
+      expression: collected.expression,
       offset: expressionOffset,
     };
   }
@@ -7901,6 +8517,60 @@ function findTypeAnnotationForIdentifier(
     findNearestAnnotatedAssignment(document, variableName, beforeOffset) ??
     findFunctionParameterTypeAnnotation(document, variableName, beforeOffset)
   );
+}
+
+function findClassAttributeTypeAnnotation(
+  document: vscode.TextDocument,
+  classDef: PythonClassDefinition,
+  attributeName: string
+): { annotation: string; offset: number } | undefined {
+  const annotationPattern = new RegExp(
+    String.raw`^\s*${escapeRegExp(attributeName)}\s*:\s*(.+)$`
+  );
+
+  for (let line = classDef.line + 1; line <= classDef.endLine; line += 1) {
+    const lineOffset = document.offsetAt(new vscode.Position(line, 0));
+    const enclosingClass = findEnclosingClassDefinition(document, lineOffset);
+    if (
+      !enclosingClass ||
+      enclosingClass.line !== classDef.line ||
+      enclosingClass.name !== classDef.name
+    ) {
+      continue;
+    }
+
+    const enclosingFunction = findEnclosingFunctionDefinition(
+      document,
+      lineOffset
+    );
+    if (
+      enclosingFunction &&
+      line > enclosingFunction.line &&
+      line <= enclosingFunction.endLine &&
+      enclosingFunction.indent > classDef.indent
+    ) {
+      continue;
+    }
+
+    const match = document.lineAt(line).text.match(annotationPattern);
+    if (!match) {
+      continue;
+    }
+
+    const annotation = stripTypeDefaultValue(
+      stripTrailingComment(match[1]).trim()
+    );
+    if (!annotation) {
+      continue;
+    }
+
+    return {
+      annotation,
+      offset: lineOffset,
+    };
+  }
+
+  return undefined;
 }
 
 function typeAnnotationSegmentAtPosition(
@@ -8148,6 +8818,110 @@ async function resolveAnnotatedReceiverForIdentifier(
     typeAnnotation.annotation,
     typeAnnotation.offset
   );
+}
+
+async function resolveAnnotatedReceiverForMemberAccess(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  objectExpression: string,
+  memberName: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  const typeAnnotation = await resolveTypeAnnotationForMemberAccess(
+    daemon,
+    document,
+    objectExpression,
+    memberName,
+    beforeOffset,
+    visited
+  );
+  if (!typeAnnotation) {
+    return undefined;
+  }
+
+  return resolveDirectReceiverFromTypeAnnotation(
+    daemon,
+    typeAnnotation.document,
+    typeAnnotation.annotation,
+    typeAnnotation.offset
+  );
+}
+
+async function resolveTypeAnnotationForMemberAccess(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  objectExpression: string,
+  memberName: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<TypeAnnotationSource | undefined> {
+  const classSource = await resolveClassDefinitionForExpression(
+    daemon,
+    document,
+    objectExpression,
+    beforeOffset,
+    visited
+  );
+  if (!classSource) {
+    return undefined;
+  }
+
+  return resolveClassAttributeTypeAnnotationSource(
+    daemon,
+    classSource,
+    memberName,
+    new Set()
+  );
+}
+
+async function resolveClassAttributeTypeAnnotationSource(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  attributeName: string,
+  visitedClasses: Set<string>
+): Promise<TypeAnnotationSource | undefined> {
+  const visitKey = `${classSource.document.uri.toString()}:${classSource.classDef.name}:${attributeName}`;
+  if (visitedClasses.has(visitKey)) {
+    return undefined;
+  }
+  visitedClasses.add(visitKey);
+
+  const directAnnotation = findClassAttributeTypeAnnotation(
+    classSource.document,
+    classSource.classDef,
+    attributeName
+  );
+  if (directAnnotation) {
+    return {
+      document: classSource.document,
+      ...directAnnotation,
+    };
+  }
+
+  for (const baseExpression of classSource.classDef.baseExpressions) {
+    const baseClassSource = await resolveClassDefinitionSource(
+      daemon,
+      classSource.document,
+      baseExpression,
+      classSource.beforeOffset
+    );
+    if (!baseClassSource) {
+      continue;
+    }
+
+    const resolvedAnnotation = await resolveClassAttributeTypeAnnotationSource(
+      daemon,
+      baseClassSource,
+      attributeName,
+      visitedClasses
+    );
+    if (resolvedAnnotation) {
+      return resolvedAnnotation;
+    }
+  }
+
+  return undefined;
 }
 
 async function resolveDirectReceiverFromTypeAnnotation(
@@ -8430,6 +9204,63 @@ async function resolveModelLabelFromTypeAnnotation(
     );
     if (resolvedLabel) {
       return resolvedLabel;
+    }
+  }
+
+  return undefined;
+}
+
+async function resolveClassDefinitionFromTypeAnnotation(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  annotation: string,
+  beforeOffset: number
+): Promise<ClassDefinitionSource | undefined> {
+  const normalizedAnnotation = normalizeTypeAnnotation(annotation);
+  if (!normalizedAnnotation) {
+    return undefined;
+  }
+
+  const genericType = parseGenericTypeAnnotation(normalizedAnnotation);
+  if (genericType) {
+    const canonicalBase = await canonicalTypeAnnotationName(
+      daemon,
+      document,
+      genericType.base,
+      beforeOffset
+    );
+
+    if (OPTIONAL_TYPE_NAMES.has(canonicalBase) || UNION_TYPE_NAMES.has(canonicalBase)) {
+      for (const arg of genericType.args) {
+        const resolvedClassSource = await resolveClassDefinitionFromTypeAnnotation(
+          daemon,
+          document,
+          arg,
+          beforeOffset
+        );
+        if (resolvedClassSource) {
+          return resolvedClassSource;
+        }
+      }
+
+      return undefined;
+    }
+  }
+
+  for (const candidate of splitTopLevelTypeAlternatives(normalizedAnnotation)) {
+    const strippedCandidate = stripStringLiteralQuotes(candidate);
+    if (!strippedCandidate) {
+      continue;
+    }
+
+    const classSource = await resolveClassDefinitionSource(
+      daemon,
+      document,
+      strippedCandidate,
+      beforeOffset
+    );
+    if (classSource) {
+      return classSource;
     }
   }
 
@@ -9278,7 +10109,10 @@ function expressionPathCallContext(
     return undefined;
   }
 
-  const callContext = resolveExpressionQuerysetCallContext(text, openParenOffset);
+  const callContext =
+    expressionName === 'OuterRef'
+      ? resolveOuterRefQuerysetCallContext(text, openParenOffset)
+      : resolveExpressionQuerysetCallContext(text, openParenOffset);
   if (!callContext) {
     return undefined;
   }
@@ -9314,7 +10148,10 @@ function expressionStringArgumentCallContext(
     return undefined;
   }
 
-  const callContext = resolveExpressionQuerysetCallContext(text, openParenOffset);
+  const callContext =
+    expressionName === 'OuterRef'
+      ? resolveOuterRefQuerysetCallContext(text, openParenOffset)
+      : resolveExpressionQuerysetCallContext(text, openParenOffset);
   if (!callContext) {
     return undefined;
   }
@@ -9551,6 +10388,37 @@ function resolveEnclosingQuerysetCallContext(
     openParenOffset: number
   ) => boolean
 ): { receiverExpression: string; method: string } | undefined {
+  const callContext = resolveEnclosingQuerysetCallContextWithOffset(
+    text,
+    searchBeforeOffset,
+    allowedMethods,
+    isWrapperCall
+  );
+  if (!callContext) {
+    return undefined;
+  }
+
+  return {
+    receiverExpression: callContext.receiverExpression,
+    method: callContext.method,
+  };
+}
+
+function resolveEnclosingQuerysetCallContextWithOffset(
+  text: string,
+  searchBeforeOffset: number,
+  allowedMethods: ReadonlySet<string>,
+  isWrapperCall: (
+    text: string,
+    openParenOffset: number
+  ) => boolean
+):
+  | {
+      receiverExpression: string;
+      method: string;
+      openParenOffset: number;
+    }
+  | undefined {
   let currentBeforeOffset = searchBeforeOffset;
 
   while (true) {
@@ -9564,7 +10432,10 @@ function resolveEnclosingQuerysetCallContext(
 
     const calleeMatch = parseQuerysetCallee(text, openParenOffset, allowedMethods);
     if (calleeMatch) {
-      return calleeMatch;
+      return {
+        ...calleeMatch,
+        openParenOffset,
+      };
     }
 
     if (!isWrapperCall(text, openParenOffset)) {
@@ -9591,6 +10462,46 @@ function resolveExpressionQuerysetCallContext(
       isExpressionWrapperCall(candidateText, candidateOpenParenOffset) ||
       isExpressionPathCall(candidateText, candidateOpenParenOffset)
   );
+}
+
+function resolveOuterRefQuerysetCallContext(
+  text: string,
+  outerRefOpenParenOffset: number
+): { receiverExpression: string; method: string } | undefined {
+  const innerQueryContext = resolveEnclosingQuerysetCallContextWithOffset(
+    text,
+    outerRefOpenParenOffset,
+    EXPRESSION_QUERYSET_METHODS,
+    (candidateText, candidateOpenParenOffset) =>
+      isQExpressionCall(candidateText, candidateOpenParenOffset) ||
+      isFExpressionCall(candidateText, candidateOpenParenOffset) ||
+      isWhenExpressionCall(candidateText, candidateOpenParenOffset) ||
+      isCaseExpressionCall(candidateText, candidateOpenParenOffset) ||
+      isExpressionWrapperCall(candidateText, candidateOpenParenOffset) ||
+      isExpressionPathCall(candidateText, candidateOpenParenOffset)
+  );
+  if (!innerQueryContext) {
+    return undefined;
+  }
+
+  const outerQueryContext = resolveEnclosingQuerysetCallContextWithOffset(
+    text,
+    innerQueryContext.openParenOffset,
+    EXPRESSION_QUERYSET_METHODS,
+    (candidateText, candidateOpenParenOffset) =>
+      isExpressionQuerysetContextWrapperCall(
+        candidateText,
+        candidateOpenParenOffset
+      )
+  );
+  if (!outerQueryContext) {
+    return undefined;
+  }
+
+  return {
+    receiverExpression: outerQueryContext.receiverExpression,
+    method: outerQueryContext.method,
+  };
 }
 
 function isQExpressionCall(text: string, openParenOffset: number): boolean {
@@ -9620,6 +10531,30 @@ function isExpressionWrapperCall(
 ): boolean {
   const callName = normalizedEnclosingCallName(text, openParenOffset);
   return callName ? EXPRESSION_WRAPPER_FUNCTION_NAMES.has(callName) : false;
+}
+
+function isExpressionQuerysetContextWrapperCall(
+  text: string,
+  openParenOffset: number
+): boolean {
+  return (
+    isQExpressionCall(text, openParenOffset) ||
+    isFExpressionCall(text, openParenOffset) ||
+    isWhenExpressionCall(text, openParenOffset) ||
+    isCaseExpressionCall(text, openParenOffset) ||
+    isExpressionWrapperCall(text, openParenOffset) ||
+    isExpressionPathCall(text, openParenOffset) ||
+    isQuerysetMethodCall(text, openParenOffset, EXPRESSION_QUERYSET_METHODS)
+  );
+}
+
+function isQuerysetMethodCall(
+  text: string,
+  openParenOffset: number,
+  allowedMethods: ReadonlySet<string>
+): boolean {
+  const callName = normalizedEnclosingCallName(text, openParenOffset);
+  return callName ? allowedMethods.has(callName) : false;
 }
 
 function expressionPathMethodName(expressionName: string): string {
@@ -9895,6 +10830,23 @@ function expressionArgumentAllowsFieldPath(
   }
 
   return false;
+}
+
+function expressionStringTokenEndOffset(
+  text: string,
+  cursorOffset: number
+): number {
+  let offset = cursorOffset;
+  while (offset < text.length && /[-\w.]/.test(text[offset] ?? '')) {
+    offset += 1;
+  }
+
+  const trailingCharacter = text[offset];
+  if (trailingCharacter === "'" || trailingCharacter === '"') {
+    offset += 1;
+  }
+
+  return offset;
 }
 
 function countTopLevelArgumentsBeforeOffset(

@@ -1,6 +1,6 @@
 from django.db import models
 
-from .managers import ProductManager
+from .managers import FulfillmentDetailManager, ProductManager
 
 
 class Product(models.Model):
@@ -45,3 +45,5 @@ class FulfillmentDetail(models.Model):
         related_name='details',
         on_delete=models.CASCADE,
     )
+
+    objects = FulfillmentDetailManager()

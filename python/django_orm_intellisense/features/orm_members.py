@@ -35,6 +35,7 @@ BUILTIN_QUERYSET_METHODS: dict[str, tuple[str, str]] = {
 BUILTIN_MANAGER_METHODS: dict[str, tuple[str, str]] = {
     **BUILTIN_QUERYSET_METHODS,
     'bulk_create': ('Django manager method', 'scalar'),
+    'get_queryset': ('Django manager method', 'queryset'),
     'get_or_create': ('Django manager method', 'unknown'),
     'update_or_create': ('Django manager method', 'unknown'),
 }

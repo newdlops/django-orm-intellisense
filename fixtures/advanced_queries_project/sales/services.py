@@ -6,6 +6,13 @@ class BaseProductService:
         return ProductQueryFactory().call()
 
 
+class QuestionThreadMessage:
+    content: str
+
+    def render_preview(self) -> str:
+        raise NotImplementedError
+
+
 class ProductLookupService(BaseProductService):
     @classmethod
     def available_products(cls):

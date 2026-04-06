@@ -125,6 +125,11 @@ def build_model_graph(
 
         _add_related_query_alias_fields(fields_by_name=fields_by_name)
         if runtime.bootstrap_status == 'ready':
+            _add_primary_key_alias_field(
+                runtime=runtime,
+                model_label=model_label,
+                fields_by_name=fields_by_name,
+            )
             _add_relation_attname_alias_fields(
                 runtime=runtime,
                 model_label=model_label,
@@ -146,6 +151,48 @@ def _runtime_model_summary(
             return model
 
     return None
+
+
+def _add_primary_key_alias_field(
+    *,
+    runtime: RuntimeInspection,
+    model_label: str,
+    fields_by_name: dict[str, FieldCandidate],
+) -> None:
+    if 'pk' in fields_by_name:
+        return
+
+    runtime_pk_field = get_runtime_field(
+        runtime.settings_module,
+        model_label=model_label,
+        field_name='pk',
+    )
+    if runtime_pk_field is None:
+        return
+
+    runtime_pk_field_name = getattr(runtime_pk_field, 'name', None)
+    if not runtime_pk_field_name:
+        return
+
+    source_field = fields_by_name.get(str(runtime_pk_field_name))
+    if source_field is None:
+        return
+
+    fields_by_name['pk'] = FieldCandidate(
+        model_label=source_field.model_label,
+        name='pk',
+        file_path=source_field.file_path,
+        line=source_field.line,
+        column=source_field.column,
+        field_kind=source_field.field_kind,
+        is_relation=source_field.is_relation,
+        relation_direction=source_field.relation_direction,
+        related_model_label=source_field.related_model_label,
+        declared_model_label=source_field.declared_model_label,
+        related_name=source_field.related_name,
+        related_query_name=source_field.related_query_name,
+        source='runtime',
+    )
 
 
 def _add_relation_attname_alias_fields(

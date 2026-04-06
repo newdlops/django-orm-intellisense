@@ -6,7 +6,7 @@ from django.db.models import Case, QuerySet, Value, When
 
 from sales import expression_helpers as expr
 from sales.models import Fulfillment, FulfillmentDetail, LineItem, Order, Product
-from sales.services import ProductLookupService
+from sales.services import ProductLookupService, QuestionThreadMessage
 
 
 def queryset_examples():
@@ -36,6 +36,18 @@ def build_products():
 
 def build_product_instance():
     return Product.objects.get(id=1)
+
+
+def build_fulfillment_from_string_annotation() -> "Fulfillment":
+    raise NotImplementedError
+
+
+def build_product_queryset_from_string_annotation() -> "QuerySet[Product]":
+    raise NotImplementedError
+
+
+def build_question_thread_message() -> "QuestionThreadMessage":
+    raise NotImplementedError
 
 
 def helper_examples():
@@ -91,6 +103,8 @@ def expression_examples():
     Product.objects.annotate(matching_name=models.Subquery(Product.objects.filter(pk=models.OuterRef("name")).values("category__sl")[:1]))
     Product.objects.annotate(matching_name=models.Subquery(Product.objects.filter(pk=models.OuterRef("name")).values("category__sl")[:1])).first().ma
     Product.objects.annotate(matching_name=models.Subquery(Product.objects.filter(pk=models.OuterRef("bo")).values("category__sl")[:1]))
+    FulfillmentDetail.objects.annotate(detail_reference=models.Subquery(Fulfillment.objects.filter(pk=models.OuterRef("ful")).values("re")[:1]))
+    FulfillmentDetail.objects.annotate(detail_reference=models.Subquery(Fulfillment.objects.filter(pk=models.OuterRef("fulfillment")).values("re")[:1]))
     Product.objects.annotate(has_active_category=models.Exists(Product.objects.filter(pk=models.OuterRef("pk"), category__sl='chairs')))
     Product.objects.annotate(line_quantities=expr.ArrayAgg("li"))
     Product.objects.annotate(line_quantities=expr.ArrayAgg("lines__quantity"))
@@ -161,6 +175,50 @@ class ReceiverExamples(ProductLookupService):
         super().base_queryset().filter(category__sl='chairs')
 
 
+class FulfillmentReceiverExamples:
+    fulfillment: Fulfillment
+
+    def method_examples(self):
+        self.fulfillment.details.get_q
+        self.fulfillment.details.exclude_d
+        self.fulfillment.details.get_queryset().exclude_d
+
+
+class StringReturnAnnotationExamples:
+    def current_fulfillment(self) -> "Fulfillment":
+        raise NotImplementedError
+
+    def current_products(self) -> "QuerySet[Product]":
+        raise NotImplementedError
+
+    def method_examples(self):
+        self.current_fulfillment().details.get_q
+        self.current_products().with_li
+
+
+class QuestionThreadMessageExamples:
+    def append_message_to_company_question_thread(
+        self, *, company_question_thread_id: int, content: str
+    ) -> "QuestionThreadMessage":
+        raise NotImplementedError
+
+    def method_examples(self):
+        message = self.append_message_to_company_question_thread(
+            company_question_thread_id=1,
+            content="hello",
+        )
+        message.con
+        message.render_p
+        self.append_message_to_company_question_thread(
+            company_question_thread_id=1,
+            content="hello",
+        ).con
+        self.append_message_to_company_question_thread(
+            company_question_thread_id=1,
+            content="hello",
+        ).render_p
+
+
 def member_examples():
     manager = Product.objects
     manager.ac
@@ -178,6 +236,29 @@ def member_examples():
     dynamic_instance = build_product_instance()
     dynamic_instance.
     dynamic_instance.category.ti
+
+    build_fulfillment_from_string_annotation().de
+    build_fulfillment_from_string_annotation().details.get_q
+    build_product_queryset_from_string_annotation().with_li
+    build_question_thread_message().con
+    build_question_thread_message().render_p
+
+    fulfillment = Fulfillment.objects.get(id=1)
+    fulfillment.details.get_q
+    fulfillment.details.exclude_d
+    fulfillment.details.cre
+    fulfillment.details.get_queryset().exclude_d
+    fulfillment.details.get_queryset().exclude_deleted().get(id=1).ful
+
+    detail = (
+        fulfillment.details.get_queryset()
+        .exclude_deleted()
+        .get(id=1)
+    )
+    detail.ful
+
+    created_detail = fulfillment.details.create(detail_code='active')
+    created_detail.ful
 
     Product.objects.first().ca
     Product.objects.active().first().na

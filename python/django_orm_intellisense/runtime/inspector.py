@@ -552,10 +552,21 @@ def _register_runtime_field(
     if field_name:
         registry[(model_label, str(field_name))] = field
 
+    primary_key_field = _primary_key_alias_field(field)
+    if primary_key_field is not None and (model_label, 'pk') not in registry:
+        registry[(model_label, 'pk')] = primary_key_field
+
     attname = _relation_attname(field)
     attname_field = _relation_attname_field(field)
     if attname and attname_field is not None and (model_label, attname) not in registry:
         registry[(model_label, attname)] = attname_field
+
+
+def _primary_key_alias_field(field: object) -> object | None:
+    if not getattr(field, 'primary_key', False):
+        return None
+
+    return field
 
 
 def _relation_attname(field: object) -> str | None:

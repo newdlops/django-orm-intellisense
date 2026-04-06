@@ -154,6 +154,78 @@ suite('Django ORM Intellisense UI', () => {
       'Expected lookup operator completion to include `in` after a completed field path.'
     );
 
+    const directPkCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Post.objects.filter(p=1)',
+      'p'
+    );
+    const directPkCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        directPkCompletionPosition
+      );
+    const directPkCompletionItem = (directPkCompletionList?.items ?? []).find(
+      (item) =>
+        completionItemLabel(item) === 'pk' &&
+        item.detail === 'BigAutoField · blog.Post'
+    );
+
+    assert.ok(
+      directPkCompletionItem,
+      `Expected filter() completion to include the pk alias. Received: ${(directPkCompletionList?.items ?? [])
+        .slice(0, 20)
+        .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
+        .join(', ')}`
+    );
+    assert.strictEqual(
+      directPkCompletionItem!.insertText,
+      'pk__',
+      'Expected pk lookup completion to continue the operator chain.'
+    );
+
+    const relatedPkCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Post.objects.filter(author__p=1)',
+      'author__p'
+    );
+    const relatedPkCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relatedPkCompletionPosition
+      );
+    const relatedPkCompletionItem = (relatedPkCompletionList?.items ?? []).find(
+      (item) =>
+        completionItemLabel(item) === 'pk' &&
+        item.detail === 'BigAutoField · blog.Author'
+    );
+
+    assert.ok(
+      relatedPkCompletionItem,
+      `Expected related lookup completion to include the related model pk alias. Received: ${(relatedPkCompletionList?.items ?? [])
+        .slice(0, 20)
+        .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
+        .join(', ')}`
+    );
+
+    const pkOperatorCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Post.objects.filter(pk__i=[1, 2])',
+      'pk__i'
+    );
+    const pkOperatorCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        pkOperatorCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(pkOperatorCompletionList?.items, 'in'),
+      'Expected pk lookup operator completion to include `in`.'
+    );
+
     const hiddenReverseCompletionPosition = positionAfterTextInContainer(
       document,
       "HiddenReverseTag.objects.filter(_b='hidden')",
@@ -208,6 +280,48 @@ suite('Django ORM Intellisense UI', () => {
       `Expected lookup hover to mention the field kind. Received: ${hoverText}`
     );
 
+    const directPkHoverPosition = positionInsideText(
+      document,
+      'Post.objects.filter(pk=1)',
+      'pk'
+    );
+    const directPkHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      directPkHoverPosition
+    );
+    const directPkHoverText = stringifyHovers(directPkHovers);
+
+    assert.ok(
+      directPkHoverText.includes('Owner model: `blog.Post`'),
+      `Expected pk hover to mention blog.Post. Received: ${directPkHoverText}`
+    );
+    assert.ok(
+      directPkHoverText.includes('Field kind: `BigAutoField`'),
+      `Expected pk hover to mention the primary-key field kind. Received: ${directPkHoverText}`
+    );
+
+    const relatedPkHoverPosition = positionInsideText(
+      document,
+      'Post.objects.filter(author__pk=1)',
+      'pk'
+    );
+    const relatedPkHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      relatedPkHoverPosition
+    );
+    const relatedPkHoverText = stringifyHovers(relatedPkHovers);
+
+    assert.ok(
+      relatedPkHoverText.includes('Owner model: `blog.Author`'),
+      `Expected related pk hover to mention blog.Author. Received: ${relatedPkHoverText}`
+    );
+    assert.ok(
+      relatedPkHoverText.includes('Field kind: `BigAutoField`'),
+      `Expected related pk hover to mention the primary-key field kind. Received: ${relatedPkHoverText}`
+    );
+
     const definitions = await vscode.commands.executeCommand<
       Array<vscode.Location | vscode.LocationLink>
     >('vscode.executeDefinitionProvider', document.uri, hoverPosition);
@@ -222,6 +336,22 @@ suite('Django ORM Intellisense UI', () => {
       `Expected lookup definition to target blog/models.py. Received: ${lookupDefinition.uri.fsPath}`
     );
     assert.strictEqual(lookupDefinition.range.start.line + 1, 38);
+
+    const directPkDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, directPkHoverPosition);
+    const directPkDefinitionTarget = firstDefinition(directPkDefinitions);
+
+    assert.ok(
+      directPkDefinitionTarget,
+      'Expected pk lookup to resolve to a definition target.'
+    );
+    assert.ok(
+      directPkDefinitionTarget!.uri.fsPath.endsWith(
+        path.join('fixtures', 'minimal_project', 'blog', 'models.py')
+      ),
+      `Expected pk definition to target blog/models.py. Received: ${directPkDefinitionTarget!.uri.fsPath}`
+    );
   });
 
   test('resolves runtime-backed reverse lookup paths with non-literal related_name', async function () {
@@ -3079,6 +3209,378 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
+  test('completes related managers and querysets from instance receivers', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const relatedManagerCompletionPosition = positionAfterTextInContainer(
+      document,
+      'fulfillment.details.get_q',
+      'fulfillment.details.get_q'
+    );
+    const relatedManagerCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relatedManagerCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(relatedManagerCompletionList?.items, 'get_queryset'),
+      `Expected reverse related manager completion to include \`get_queryset\`. Received: ${(relatedManagerCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const relatedManagerCustomCompletionPosition = positionAfterTextInContainer(
+      document,
+      'fulfillment.details.exclude_d',
+      'fulfillment.details.exclude_d'
+    );
+    const relatedManagerCustomCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relatedManagerCustomCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(relatedManagerCustomCompletionList?.items, 'exclude_deleted'),
+      'Expected reverse related manager completion to include custom queryset-backed methods.'
+    );
+
+    const relatedQuerysetCustomCompletionPosition = positionAfterTextInContainer(
+      document,
+      'fulfillment.details.get_queryset().exclude_d',
+      'exclude_d'
+    );
+    const relatedQuerysetCustomCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relatedQuerysetCustomCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(relatedQuerysetCustomCompletionList?.items, 'exclude_deleted'),
+      'Expected queryset completions from reverse related managers to keep custom queryset methods.'
+    );
+
+    const relatedManagerCreateCompletionPosition = positionAfterTextInContainer(
+      document,
+      'fulfillment.details.cre',
+      'fulfillment.details.cre'
+    );
+    const relatedManagerCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relatedManagerCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(relatedManagerCreateCompletionList?.items, 'create'),
+      'Expected reverse related manager completion to include built-in manager methods like `create`.'
+    );
+
+    const directGetResultCompletionPosition = positionAfterTextInContainer(
+      document,
+      'fulfillment.details.get_queryset().exclude_deleted().get(id=1).ful',
+      '.ful'
+    );
+    const directGetResultCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        directGetResultCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(directGetResultCompletionList?.items, 'fulfillment'),
+      `Expected reverse related queryset get() chains to propagate the related model instance. Received: ${(directGetResultCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const multilineAssignedInstanceCompletionPosition = positionAfterTextInContainer(
+      document,
+      'detail.ful',
+      'detail.ful'
+    );
+    const multilineAssignedInstanceCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        multilineAssignedInstanceCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(multilineAssignedInstanceCompletionList?.items, 'fulfillment'),
+      `Expected multiline queryset assignments to propagate instance receivers. Received: ${(multilineAssignedInstanceCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const createdInstanceCompletionPosition = positionAfterTextInContainer(
+      document,
+      'created_detail.ful',
+      'created_detail.ful'
+    );
+    const createdInstanceCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        createdInstanceCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(createdInstanceCompletionList?.items, 'fulfillment'),
+      `Expected reverse related manager create() calls to propagate the created model instance. Received: ${(createdInstanceCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const selfRelatedManagerCompletionPosition = positionAfterTextInContainer(
+      document,
+      'self.fulfillment.details.get_q',
+      'self.fulfillment.details.get_q'
+    );
+    const selfRelatedManagerCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        selfRelatedManagerCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(selfRelatedManagerCompletionList?.items, 'get_queryset'),
+      'Expected annotated self-attribute receivers to resolve reverse related managers.'
+    );
+
+    const selfRelatedQuerysetCompletionPosition = positionAfterTextInContainer(
+      document,
+      'self.fulfillment.details.get_queryset().exclude_d',
+      'exclude_d'
+    );
+    const selfRelatedQuerysetCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        selfRelatedQuerysetCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(selfRelatedQuerysetCompletionList?.items, 'exclude_deleted'),
+      'Expected annotated self-attribute receivers to keep reverse queryset completions after get_queryset().'
+    );
+  });
+
+  test('supports string forward-reference return annotations for receiver inference', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const functionModelCompletionPosition = positionAfterTextInContainer(
+      document,
+      'build_fulfillment_from_string_annotation().de',
+      '.de'
+    );
+    const functionModelCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        functionModelCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(functionModelCompletionList?.items, 'details'),
+      `Expected string model return annotations to propagate instance receivers. Received: ${(functionModelCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const functionRelationCompletionPosition = positionAfterTextInContainer(
+      document,
+      'build_fulfillment_from_string_annotation().details.get_q',
+      'get_q'
+    );
+    const functionRelationCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        functionRelationCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(functionRelationCompletionList?.items, 'get_queryset'),
+      'Expected string model return annotations to support downstream reverse manager completions.'
+    );
+
+    const functionQuerysetCompletionPosition = positionAfterTextInContainer(
+      document,
+      'build_product_queryset_from_string_annotation().with_li',
+      'with_li'
+    );
+    const functionQuerysetCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        functionQuerysetCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(functionQuerysetCompletionList?.items, 'with_line_count'),
+      'Expected string queryset return annotations to propagate queryset receivers.'
+    );
+
+    const methodRelationCompletionPosition = positionAfterTextInContainer(
+      document,
+      'self.current_fulfillment().details.get_q',
+      'get_q'
+    );
+    const methodRelationCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        methodRelationCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(methodRelationCompletionList?.items, 'get_queryset'),
+      'Expected string method return annotations to propagate model receivers.'
+    );
+
+    const methodQuerysetCompletionPosition = positionAfterTextInContainer(
+      document,
+      'self.current_products().with_li',
+      'with_li'
+    );
+    const methodQuerysetCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        methodQuerysetCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(methodQuerysetCompletionList?.items, 'with_line_count'),
+      'Expected string method return annotations to propagate queryset receivers.'
+    );
+  });
+
+  test('supports string forward-reference return annotations for general class instances', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const functionAttributeCompletionPosition = positionAfterTextInContainer(
+      document,
+      'build_question_thread_message().con',
+      '.con'
+    );
+    const functionAttributeCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        functionAttributeCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(functionAttributeCompletionList?.items, 'content'),
+      `Expected string general-class return annotations to propagate annotated attributes. Received: ${(functionAttributeCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const functionMethodCompletionPosition = positionAfterTextInContainer(
+      document,
+      'build_question_thread_message().render_p',
+      '.render_p'
+    );
+    const functionMethodCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        functionMethodCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(functionMethodCompletionList?.items, 'render_preview'),
+      'Expected string general-class return annotations to propagate instance methods.'
+    );
+
+    const methodAttributeCompletionPosition = positionAfterTextInContainer(
+      document,
+      'message.con',
+      '.con'
+    );
+    const methodAttributeCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        methodAttributeCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(methodAttributeCompletionList?.items, 'content'),
+      `Expected self method string return annotations to propagate general-class attributes. Received: ${(methodAttributeCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const methodMethodCompletionPosition = positionAfterTextInContainer(
+      document,
+      'message.render_p',
+      '.render_p'
+    );
+    const methodMethodCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        methodMethodCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(methodMethodCompletionList?.items, 'render_preview'),
+      'Expected self method string return annotations to propagate general-class methods.'
+    );
+  });
+
   test('supports annotate expressions and annotated instance members in advanced fixture project', async function () {
     this.timeout(60_000);
 
@@ -3281,9 +3783,17 @@ suite('Django ORM Intellisense UI', () => {
         outerRefCompletionPosition
       );
 
+    const outerRefCompletionItem = (outerRefCompletionList?.items ?? []).find(
+      (item) =>
+        completionItemLabel(item) === 'name' &&
+        item.detail === 'CharField · sales.Product'
+    );
     assert.ok(
-      hasCompletionItemLabel(outerRefCompletionList?.items, 'name'),
-      'Expected OuterRef() completion to include the outer queryset field `name`.'
+      outerRefCompletionItem,
+      `Expected OuterRef() completion to include the outer queryset field \`name\`. Received: ${(outerRefCompletionList?.items ?? [])
+        .slice(0, 20)
+        .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
+        .join(', ')}`
     );
 
     const outerRefHoverPosition = positionInsideText(
@@ -3443,6 +3953,119 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       diagnostics.some((item) => item.message.includes('`bo`')),
       `Expected expression diagnostics to flag invalid aggregate or OuterRef paths. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+  });
+
+  test('supports relation-valued OuterRef field paths in subqueries', async function () {
+    this.timeout(60_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/advanced_queries_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'sales/query_examples.py'
+    );
+
+    const relationOuterRefCompletionPosition = positionAfterTextInContainer(
+      document,
+      'FulfillmentDetail.objects.annotate(detail_reference=models.Subquery(Fulfillment.objects.filter(pk=models.OuterRef("ful")).values("re")[:1]))',
+      'ful'
+    );
+    const relationOuterRefCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relationOuterRefCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(relationOuterRefCompletionList?.items, 'fulfillment'),
+      'Expected OuterRef() completion to include relation-valued outer queryset fields.'
+    );
+    const relationOuterRefCompletionItem = (
+      relationOuterRefCompletionList?.items ?? []
+    ).find(
+      (item) =>
+        completionItemLabel(item) === 'fulfillment' &&
+        item.detail ===
+          'ForeignKey · sales.FulfillmentDetail -> sales.Fulfillment'
+    );
+    assert.ok(
+      relationOuterRefCompletionItem,
+      `Expected a concrete OuterRef() completion item for the outer relation field. Received: ${(relationOuterRefCompletionList?.items ?? [])
+        .slice(0, 20)
+        .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
+        .join(', ')}`
+    );
+
+    const relationOuterRefHoverPosition = positionInsideText(
+      document,
+      'FulfillmentDetail.objects.annotate(detail_reference=models.Subquery(Fulfillment.objects.filter(pk=models.OuterRef("fulfillment")).values("re")[:1]))',
+      'fulfillment'
+    );
+    const relationOuterRefHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        relationOuterRefHoverPosition
+      );
+    const relationOuterRefHoverText = stringifyHovers(relationOuterRefHovers);
+
+    assert.ok(
+      relationOuterRefHoverText.includes('Owner model: `sales.FulfillmentDetail`'),
+      `Expected relation OuterRef() hover to mention the outer queryset model. Received: ${relationOuterRefHoverText}`
+    );
+    assert.ok(
+      relationOuterRefHoverText.includes('Base model: `sales.FulfillmentDetail`'),
+      `Expected relation OuterRef() hover to resolve against the outer queryset base model. Received: ${relationOuterRefHoverText}`
+    );
+    assert.ok(
+      relationOuterRefHoverText.includes('Field kind: `ForeignKey`'),
+      `Expected relation OuterRef() hover to mention the foreign-key field kind. Received: ${relationOuterRefHoverText}`
+    );
+    assert.ok(
+      relationOuterRefHoverText.includes('Related model: `sales.Fulfillment`'),
+      `Expected relation OuterRef() hover to mention the related model. Received: ${relationOuterRefHoverText}`
+    );
+
+    const relationOuterRefDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >(
+      'vscode.executeDefinitionProvider',
+      document.uri,
+      relationOuterRefHoverPosition
+    );
+    const relationOuterRefDefinitionTarget = firstDefinition(
+      relationOuterRefDefinitions
+    );
+
+    assert.ok(
+      relationOuterRefDefinitionTarget,
+      'Expected relation OuterRef() definition to resolve to the referenced outer model field.'
+    );
+    assert.strictEqual(
+      path.basename(relationOuterRefDefinitionTarget!.uri.fsPath),
+      'models.py',
+      'Expected relation OuterRef() definition to land in sales/models.py.'
+    );
+    assert.strictEqual(
+      relationOuterRefDefinitionTarget!.range.start.line + 1,
+      43,
+      'Expected relation OuterRef() definition to target FulfillmentDetail.fulfillment.'
+    );
+
+    const diagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) => items.some((item) => item.message.includes('`bo`'))
+    );
+
+    assert.ok(
+      diagnostics.every((item) => !item.message.includes('`fulfillment`')),
+      `Expected relation-valued OuterRef() paths to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
     );
   });
 
@@ -5342,6 +5965,10 @@ suite('Django ORM Intellisense UI', () => {
         item.message.includes('`select_related` only accepts relation paths')
       ),
       `Expected diagnostics to flag invalid relation-only lookup paths. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+    assert.ok(
+      diagnostics.every((item) => !item.message.includes('`pk`')),
+      `Expected pk lookup aliases to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
     );
   });
 
