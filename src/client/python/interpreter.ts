@@ -119,7 +119,7 @@ export async function normalizePythonInterpreterSettings(
     resource
   );
   const configuredInterpreter = configuration.get<string>('pythonInterpreter')?.trim();
-  const legacyInterpreter = configuration.get<string>('pythonPath')?.trim();
+  const legacyInterpreter = getLegacyPythonInterpreterSetting(resource);
 
   if (!legacyInterpreter) {
     return 'noop';
@@ -129,14 +129,14 @@ export async function normalizePythonInterpreterSettings(
     await configuration.update(
       'pythonInterpreter',
       legacyInterpreter,
-      resolveLegacySettingTarget(configuration) ??
+      resolveLegacySettingTarget(configuration, resource) ??
         resolveInterpreterConfigurationTarget(resource)
     );
-    await clearLegacyPythonPathSetting(configuration);
+    await clearLegacyPythonPathSetting(configuration, resource);
     return 'migrated';
   }
 
-  await clearLegacyPythonPathSetting(configuration);
+  await clearLegacyPythonPathSetting(configuration, resource);
   return 'cleared';
 }
 
@@ -661,7 +661,8 @@ function remapKnownMacOsPythonStub(candidate: string): string {
 }
 
 function resolveLegacySettingTarget(
-  configuration: vscode.WorkspaceConfiguration
+  configuration: vscode.WorkspaceConfiguration,
+  resource?: vscode.Uri
 ): vscode.ConfigurationTarget | undefined {
   const inspected = configuration.inspect<string>('pythonPath');
   if (inspected?.workspaceFolderValue !== undefined) {
@@ -676,18 +677,28 @@ function resolveLegacySettingTarget(
     return vscode.ConfigurationTarget.Global;
   }
 
+  if (legacyPythonPathExistsInWorkspaceSettings(resource)) {
+    return resolveInterpreterConfigurationTarget(resource);
+  }
+
   return undefined;
 }
 
 function getLegacyPythonInterpreterSetting(resource?: vscode.Uri): string | undefined {
-  return vscode.workspace
+  const configured = vscode.workspace
     .getConfiguration(CONFIGURATION_SECTION, resource)
     .get<string>('pythonPath')
     ?.trim();
+  if (configured) {
+    return configured;
+  }
+
+  return readLegacyPythonPathFromWorkspaceSettings(resource);
 }
 
 async function clearLegacyPythonPathSetting(
-  configuration: vscode.WorkspaceConfiguration
+  configuration: vscode.WorkspaceConfiguration,
+  resource?: vscode.Uri
 ): Promise<void> {
   const inspected = configuration.inspect<string>('pythonPath');
   const updates: Thenable<void>[] = [];
@@ -723,6 +734,7 @@ async function clearLegacyPythonPathSetting(
   }
 
   await Promise.all(updates);
+  clearLegacyPythonPathFromWorkspaceSettings(resource);
 }
 
 function resolveInterpreterConfigurationTarget(
@@ -763,4 +775,56 @@ function replaceToken(
   }
 
   return value.split(token).join(replacement);
+}
+
+function readLegacyPythonPathFromWorkspaceSettings(
+  resource?: vscode.Uri
+): string | undefined {
+  const settings = readWorkspaceSettingsFile(resource);
+  const rawValue = settings?.[`${CONFIGURATION_SECTION}.pythonPath`];
+  return typeof rawValue === 'string' ? rawValue.trim() || undefined : undefined;
+}
+
+function legacyPythonPathExistsInWorkspaceSettings(resource?: vscode.Uri): boolean {
+  const settings = readWorkspaceSettingsFile(resource);
+  return Boolean(settings && `${CONFIGURATION_SECTION}.pythonPath` in settings);
+}
+
+function clearLegacyPythonPathFromWorkspaceSettings(resource?: vscode.Uri): void {
+  const settingsPath = workspaceSettingsFilePath(resource);
+  const settings = readWorkspaceSettingsFile(resource);
+  if (!settingsPath || !settings || !(`${CONFIGURATION_SECTION}.pythonPath` in settings)) {
+    return;
+  }
+
+  delete settings[`${CONFIGURATION_SECTION}.pythonPath`];
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+}
+
+function readWorkspaceSettingsFile(
+  resource?: vscode.Uri
+): Record<string, unknown> | undefined {
+  const settingsPath = workspaceSettingsFilePath(resource);
+  if (!settingsPath || !fs.existsSync(settingsPath)) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    return isPlainObject(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function workspaceSettingsFilePath(resource?: vscode.Uri): string | undefined {
+  const workspaceFolderPath = getWorkspaceFolderPath(resource);
+  return workspaceFolderPath
+    ? path.join(workspaceFolderPath, '.vscode', 'settings.json')
+    : undefined;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

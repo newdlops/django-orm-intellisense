@@ -5,5 +5,8 @@ dist/
 *.vsix
 .DS_Store
 __pycache__/
+*pycache*
 *.pyc
 .django_orm_intellisense/
+.e2e*
+.vscode

@@ -5,6 +5,7 @@ from django.db import models
 from django.db.models import Case, QuerySet, Value, When
 
 from sales import expression_helpers as expr
+from sales.managers import CatalogManager, ProductManager, ProductQuerySet
 from sales.models import Fulfillment, FulfillmentDetail, LineItem, Order, Product
 from sales.services import ProductLookupService, QuestionThreadMessage
 
@@ -43,6 +44,22 @@ def build_fulfillment_from_string_annotation() -> "Fulfillment":
 
 
 def build_product_queryset_from_string_annotation() -> "QuerySet[Product]":
+    raise NotImplementedError
+
+
+def build_product_manager_from_string_annotation() -> "ProductManager":
+    raise NotImplementedError
+
+
+def build_catalog_manager_from_string_annotation() -> "CatalogManager":
+    raise NotImplementedError
+
+
+def build_generic_catalog_manager_from_string_annotation() -> "CatalogManager[Product]":
+    raise NotImplementedError
+
+
+def build_product_queryset_from_custom_annotation() -> "ProductQuerySet":
     raise NotImplementedError
 
 
@@ -223,6 +240,9 @@ def member_examples():
     manager = Product.objects
     manager.ac
     manager.with_li
+    Product.objects.create(na='draft')
+    Product.objects.active().create(na='draft')
+    Product.catalog.create(na='draft')
 
     queryset = Product.objects.active()
     queryset.fi
@@ -232,6 +252,7 @@ def member_examples():
     instance.
     instance.na
     instance.category.ti
+    instance.typed_catalog_manager.create(na='draft')
 
     dynamic_instance = build_product_instance()
     dynamic_instance.
@@ -240,10 +261,16 @@ def member_examples():
     build_fulfillment_from_string_annotation().de
     build_fulfillment_from_string_annotation().details.get_q
     build_product_queryset_from_string_annotation().with_li
+    build_product_manager_from_string_annotation().create(na='draft')
+    build_catalog_manager_from_string_annotation().create(na='draft')
+    build_generic_catalog_manager_from_string_annotation().create(na='draft')
+    build_product_queryset_from_custom_annotation().create(na='draft')
     build_question_thread_message().con
     build_question_thread_message().render_p
 
     fulfillment = Fulfillment.objects.get(id=1)
+    fulfillment.primary_d
+    fulfillment.primary_detail.de
     fulfillment.details.get_q
     fulfillment.details.exclude_d
     fulfillment.details.cre
@@ -281,6 +308,23 @@ def loop_examples(products: list[Product], queryset_groups: list[QuerySet[Produc
     for typed_queryset in queryset_groups:
         typed_queryset.with_li
         typed_queryset.values("category__ti")
+
+
+typed_product_manager: ProductManager = Product.objects
+typed_catalog_manager: CatalogManager = Product.catalog
+typed_generic_catalog_manager: CatalogManager[Product] = Product.catalog
+typed_custom_queryset: ProductQuerySet = Product.objects.active()
+typed_product_instance: Product = Product.objects.get(id=1)
+
+
+def typed_manager_examples():
+    typed_product_manager.create(na='draft')
+    typed_catalog_manager.create(na='draft')
+    typed_generic_catalog_manager.create(na='draft')
+    typed_custom_queryset.create(na='draft')
+    typed_product_instance.typed_catalog_manager.create(na='draft')
+    typed_product_instance.typed_catalog_manager.filter(na='draft')
+    typed_product_instance.typed_catalog_manager.exclude(na='draft')
 
 
 def comprehension_examples(fulfillment_details: list[Product]):

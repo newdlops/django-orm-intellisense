@@ -463,6 +463,26 @@ class StaticIndex:
     def find_model_candidate(self, label: str) -> ModelCandidate | None:
         return self._model_candidates_by_label.get(label)
 
+    def find_model_candidate_by_module_and_name(
+        self,
+        module_name: str,
+        object_name: str,
+    ) -> ModelCandidate | None:
+        return self._model_candidates_by_module_and_name.get((module_name, object_name))
+
+    def resolve_model_label_reference(
+        self,
+        *,
+        module_name: str,
+        app_label: str,
+        reference: str,
+    ) -> str | None:
+        return self._resolve_model_base_label(
+            module_name=module_name,
+            app_label=app_label,
+            base_ref=reference,
+        )
+
     def fields_for_model(self, model_label: str) -> list[FieldCandidate]:
         return list(self._fields_by_model_label.get(model_label, []))
 
@@ -903,6 +923,10 @@ def _build_module_index(
             )
 
             if _looks_like_model_candidate(node):
+                model_app_label = _model_app_label(
+                    module_name=module_name,
+                    node=node,
+                )
                 model_candidates.append(
                     _model_candidate_from_class(
                         python_file=python_file,
@@ -914,7 +938,7 @@ def _build_module_index(
                     _extract_pending_fields_from_model_class(
                         python_file=python_file,
                         module_name=module_name,
-                        app_label=module_name.split('.', 1)[0],
+                        app_label=model_app_label,
                         model_name=node.name,
                         class_node=node,
                     )
@@ -1042,7 +1066,7 @@ def _model_candidate_from_class(
     module_name: str,
     node: ast.ClassDef,
 ) -> ModelCandidate:
-    app_label = module_name.split('.', 1)[0]
+    app_label = _model_app_label(module_name=module_name, node=node)
     return ModelCandidate(
         app_label=app_label,
         object_name=node.name,
@@ -1219,26 +1243,51 @@ def _looks_like_model_candidate(node: ast.ClassDef) -> bool:
     return any(_is_model_base(base) for base in node.bases)
 
 
+def _model_app_label(
+    *,
+    module_name: str,
+    node: ast.ClassDef,
+) -> str:
+    return _extract_model_meta_string(node, 'app_label') or module_name.split('.', 1)[0]
+
+
 def _is_abstract_model_class(node: ast.ClassDef) -> bool:
+    value = _extract_model_meta_value(node, 'abstract')
+    return isinstance(value, ast.Constant) and value.value is True
+
+
+def _extract_model_meta_string(
+    node: ast.ClassDef,
+    attribute_name: str,
+) -> str | None:
+    value = _extract_model_meta_value(node, attribute_name)
+    if (
+        isinstance(value, ast.Constant)
+        and isinstance(value.value, str)
+        and value.value
+    ):
+        return value.value
+    return None
+
+
+def _extract_model_meta_value(
+    node: ast.ClassDef,
+    attribute_name: str,
+) -> ast.expr | None:
     for child in node.body:
         if not isinstance(child, ast.ClassDef) or child.name != 'Meta':
             continue
 
         for meta_node in child.body:
-            value: ast.expr | None = None
             if isinstance(meta_node, ast.Assign):
                 for target in meta_node.targets:
-                    if isinstance(target, ast.Name) and target.id == 'abstract':
-                        value = meta_node.value
-                        break
+                    if isinstance(target, ast.Name) and target.id == attribute_name:
+                        return meta_node.value
             elif isinstance(meta_node, ast.AnnAssign) and isinstance(meta_node.target, ast.Name):
-                if meta_node.target.id == 'abstract':
-                    value = meta_node.value
+                if meta_node.target.id == attribute_name:
+                    return meta_node.value
 
-            if isinstance(value, ast.Constant) and value.value is True:
-                return True
-
-    return False
+    return None
 
 
 def _is_model_base(expression: ast.expr) -> bool:

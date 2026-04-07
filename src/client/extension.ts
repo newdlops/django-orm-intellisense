@@ -9,6 +9,7 @@ import { AnalysisDaemon } from './daemon/analysisDaemon';
 import { HealthDiagnostics } from './diagnostics/healthDiagnostics';
 import { registerPythonProviders } from './providers/pythonProviders';
 import { normalizePythonInterpreterSettings } from './python/interpreter';
+import { isPylanceAvailable } from './python/pylance';
 import { HealthStatusView } from './status/healthStatus';
 
 let activeDaemon: AnalysisDaemon | undefined;
@@ -25,6 +26,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const autoRestartsEnabled = process.env.DJLS_DISABLE_AUTO_RESTARTS !== '1';
 
   activeDaemon = daemon;
+
+  if (!isPylanceAvailable()) {
+    output.appendLine(
+      '[extension] Pylance not detected. ORM diagnostics are disabled to reduce noisy errors and startup cost.'
+    );
+  }
 
   daemon.onDidChangeState((snapshot) => {
     statusView.update(snapshot);

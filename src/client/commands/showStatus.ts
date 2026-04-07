@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { getExtensionSettings } from '../config/settings';
 import { AnalysisDaemon } from '../daemon/analysisDaemon';
+import { isPylanceAvailable } from '../python/pylance';
 import type { HealthSnapshot } from '../protocol';
 
 const STATUS_REPORT_SCHEME = 'django-orm-intellisense-status';
@@ -98,6 +99,8 @@ function buildStatusReport(
   plainTextLines.push(
     `djangoOrmIntellisense.pythonInterpreter: ${configuredInterpreter ?? 'Not set'}`
   );
+  markdownLines.push(`- Pylance: \`${isPylanceAvailable() ? 'detected' : 'not installed'}\``);
+  plainTextLines.push(`Pylance: ${isPylanceAvailable() ? 'detected' : 'not installed'}`);
 
   if (snapshot.pythonSourceDetail) {
     markdownLines.push(
@@ -197,10 +200,17 @@ function buildRecommendations(
 ): string[] {
   const recommendations: string[] = [];
   const runtime = snapshot.runtime;
+  const pylanceAvailable = isPylanceAvailable();
 
   if (!configuredInterpreter) {
     recommendations.push(
       'Run "Django ORM Intellisense: Select Python Interpreter" and set `djangoOrmIntellisense.pythonInterpreter` for this workspace.'
+    );
+  }
+
+  if (!pylanceAvailable) {
+    recommendations.push(
+      'Pylance is not installed, so Django ORM Intellisense disables its ORM diagnostics to avoid noisy false positives and extra background scans.'
     );
   }
 
@@ -298,14 +308,19 @@ export function registerShowStatusCommand(
           : snapshot.phase === 'degraded'
             ? vscode.window.showWarningMessage
             : vscode.window.showInformationMessage;
-
-      const choice = await prompt(
-        'Opened the Django ORM Intellisense status report.',
+      const actions = [
         'Select Interpreter',
         'Select Settings',
         'Open Output',
         'Restart Daemon',
-        'Configure Pylance'
+      ];
+      if (isPylanceAvailable()) {
+        actions.push('Configure Pylance');
+      }
+
+      const choice = await prompt(
+        'Opened the Django ORM Intellisense status report.',
+        ...actions
       );
 
       if (choice === 'Select Interpreter') {

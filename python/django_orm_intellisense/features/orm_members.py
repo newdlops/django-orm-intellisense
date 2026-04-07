@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, get_args, get_origin, get_type_hints
@@ -611,6 +612,7 @@ def _static_class_method_items(
         if child.name.startswith('_'):
             continue
 
+        member_kind = _static_member_kind(child)
         detail = _static_method_detail(child)
         return_kind, return_model_label = _static_return_semantics(
             static_index=static_index,
@@ -621,7 +623,7 @@ def _static_class_method_items(
         items.append(
             OrmMemberItem(
                 name=child.name,
-                member_kind='method',
+                member_kind=member_kind,
                 model_label=model_label,
                 receiver_kind=receiver_kind,
                 detail=detail,
@@ -640,6 +642,16 @@ def _static_class_method_items(
         )
 
     return sorted(items, key=lambda item: item.name)
+
+
+def _static_member_kind(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> str:
+    decorator_names = {
+        _expression_text(decorator).split('.')[-1]
+        for decorator in node.decorator_list
+    }
+    return 'property' if 'property' in decorator_names else 'method'
 
 
 def _static_method_detail(
@@ -666,15 +678,18 @@ def _static_return_semantics(
     default_return_kind: str,
 ) -> tuple[str, str | None]:
     normalized = annotation.replace(' ', '')
+    annotation_model_label = _static_annotation_model_label(
+        static_index=static_index,
+        annotation=annotation,
+        current_model_label=current_model_label,
+    )
     if normalized:
         if 'QuerySet' in normalized:
-            return 'queryset', current_model_label
+            return 'queryset', annotation_model_label or current_model_label
         if normalized.endswith('Manager') or 'Manager[' in normalized:
-            return 'manager', current_model_label
-
-        candidate = static_index.find_model_candidate(current_model_label)
-        if candidate is not None and candidate.object_name in normalized:
-            return 'instance', current_model_label
+            return 'manager', annotation_model_label or current_model_label
+        if annotation_model_label is not None:
+            return 'instance', annotation_model_label
 
     if default_return_kind == 'unknown':
         return 'unknown', None
@@ -724,7 +739,9 @@ def _runtime_callable_member_items(
                 if name.startswith('_') or name in seen_names:
                     continue
 
-                callable_member, member_detail = _callable_member_target(raw_member)
+                callable_member, member_kind, member_detail = _callable_member_target(
+                    raw_member
+                )
                 if callable_member is None:
                     continue
 
@@ -748,7 +765,7 @@ def _runtime_callable_member_items(
                 items.append(
                     OrmMemberItem(
                         name=name,
-                        member_kind='method',
+                        member_kind=member_kind,
                         model_label=model_label,
                         receiver_kind=receiver_kind,
                         detail=member_detail,
@@ -766,22 +783,22 @@ def _runtime_callable_member_items(
     return sorted(items, key=lambda item: item.name)
 
 
-def _callable_member_target(raw_member: object) -> tuple[object | None, str]:
+def _callable_member_target(raw_member: object) -> tuple[object | None, str, str]:
     if isinstance(raw_member, property):
         if raw_member.fget is None:
-            return None, ''
-        return raw_member.fget, 'Django model property'
+            return None, '', ''
+        return raw_member.fget, 'property', 'Django model property'
 
     if isinstance(raw_member, staticmethod):
-        return raw_member.__func__, 'Django static method'
+        return raw_member.__func__, 'method', 'Django static method'
 
     if isinstance(raw_member, classmethod):
-        return raw_member.__func__, 'Django class method'
+        return raw_member.__func__, 'method', 'Django class method'
 
     if inspect.isfunction(raw_member):
-        return raw_member, 'Django method'
+        return raw_member, 'method', 'Django method'
 
-    return None, ''
+    return None, '', ''
 
 
 def _runtime_return_semantics(
@@ -865,16 +882,110 @@ def _return_semantics_from_annotation_string(
     current_model_label: str,
 ) -> tuple[str, str | None] | None:
     normalized = annotation.replace(' ', '')
+    annotation_model_label = _runtime_annotation_model_label(
+        annotation,
+        current_model_label=current_model_label,
+    )
     if 'QuerySet' in normalized:
-        return 'queryset', current_model_label
+        return 'queryset', annotation_model_label or current_model_label
     if normalized.endswith('Manager') or 'Manager[' in normalized:
-        return 'manager', current_model_label
-
-    model_class = _runtime_model_class(current_model_label)
-    if model_class is not None and model_class.__name__ in normalized:
-        return 'instance', current_model_label
+        return 'manager', annotation_model_label or current_model_label
+    if annotation_model_label is not None:
+        return 'instance', annotation_model_label
 
     return None
+
+
+def _static_annotation_model_label(
+    *,
+    static_index: StaticIndex,
+    annotation: str,
+    current_model_label: str,
+) -> str | None:
+    candidate = static_index.find_model_candidate(current_model_label)
+    if candidate is None:
+        return None
+
+    for reference in _annotation_reference_candidates(annotation):
+        resolved_label = static_index.resolve_model_label_reference(
+            module_name=candidate.module,
+            app_label=candidate.app_label,
+            reference=reference,
+        )
+        if resolved_label is not None:
+            return resolved_label
+
+    return None
+
+
+def _runtime_annotation_model_label(
+    annotation: str,
+    *,
+    current_model_label: str,
+) -> str | None:
+    try:
+        from django.apps import apps  # type: ignore
+    except Exception:
+        return None
+
+    current_model_class = _runtime_model_class(current_model_label)
+    current_app_label = (
+        getattr(current_model_class._meta, 'app_label', None)
+        if current_model_class is not None
+        else None
+    )
+    all_models = list(apps.get_models())
+
+    for reference in _annotation_reference_candidates(annotation):
+        if '.' in reference:
+            app_label, _, object_name = reference.rpartition('.')
+            if app_label and object_name:
+                try:
+                    model_class = apps.get_model(app_label, object_name)
+                except Exception:
+                    model_class = None
+                if model_class is not None:
+                    return _model_label_for_runtime_model(model_class)
+
+            module_name, _, class_name = reference.rpartition('.')
+            if module_name and class_name:
+                for model_class in all_models:
+                    if model_class.__module__ == module_name and model_class.__name__ == class_name:
+                        return _model_label_for_runtime_model(model_class)
+
+        if isinstance(current_app_label, str):
+            same_app_matches = [
+                model_class
+                for model_class in all_models
+                if (
+                    getattr(model_class._meta, 'app_label', None) == current_app_label
+                    and model_class.__name__ == reference
+                )
+            ]
+            if len(same_app_matches) == 1:
+                return _model_label_for_runtime_model(same_app_matches[0])
+
+        global_matches = [
+            model_class
+            for model_class in all_models
+            if model_class.__name__ == reference
+        ]
+        if len(global_matches) == 1:
+            return _model_label_for_runtime_model(global_matches[0])
+
+    return None
+
+
+def _annotation_reference_candidates(annotation: str) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r'[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)*', annotation):
+        candidate = match.group(0)
+        if candidate in seen or candidate in {'None', 'NoneType'}:
+            continue
+        seen.add(candidate)
+        candidates.append(candidate)
+    return candidates
 
 
 def _manager_binding_for_model(

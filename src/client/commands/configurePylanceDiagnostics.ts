@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { isPylanceAvailable } from '../python/pylance';
 import {
   readWorkspaceSettingValue,
   writeWorkspaceSettingValue,
@@ -52,6 +53,17 @@ export function registerConfigurePylanceDiagnosticsCommand(
   return vscode.commands.registerCommand(
     'djangoOrmIntellisense.configurePylanceDiagnostics',
     async (requestedProfile?: PylanceDiagnosticProfile) => {
+      if (!isPylanceAvailable()) {
+        if (requestedProfile !== undefined) {
+          return;
+        }
+
+        await vscode.window.showWarningMessage(
+          'Pylance is not installed. Install the Pylance extension to configure its diagnostics.'
+        );
+        return;
+      }
+
       const interactive = requestedProfile === undefined;
       const profile = requestedProfile ?? (await pickProfile());
       if (!profile) {

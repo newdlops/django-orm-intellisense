@@ -2,7 +2,7 @@ from django.db import models as db_models
 from django.db.models import F, Prefetch, Q
 
 from blog import AuditLog, Company, MultiInheritedLog, Post
-from blog.models import Faq, HiddenReverseTag
+from blog.models import AppLabelCompany, Faq, HiddenReverseTag
 
 
 def lookup_examples():
@@ -80,6 +80,8 @@ def lookup_examples():
     Post.objects.select_related("author__profile__timezone")
     Company.objects.values("corporate_registration__registration_code")
     Company.objects.filter(corporate_registration__registration_code='ABC123')
+    AppLabelCompany.objects.values("corporate_registration__registration_code")
+    AppLabelCompany.objects.filter(corporate_registration__registration_code='ABC123')
     Company.objects.filter(st='READY')
     Company.objects.filter(state__rea='READY')
     Company.objects.filter(state__in=['READY'])
@@ -113,3 +115,26 @@ def write_result_examples(post: Post):
     Post.objects.bulk_update([post], ["tit"])
     Post.objects.bulk_update([post], ["title"])
     Post.objects.bulk_update([post], ["bog"])
+
+
+def create_receiver_examples():
+    Post.objects.filter(published=True).create(ti='draft', author_i=1)
+    Post.objects.filter(published=True).create(title='draft', bog='x')
+    Post.objects.filter(published=True).get_or_create(ti='draft')
+    Post.objects.filter(published=True).update_or_create(ti='draft')
+
+    author = Post.objects.get(id=1).author
+    author.posts.create(ti='draft')
+    author.posts.create(title='draft', bog='x')
+    author.posts.get_or_create(ti='draft')
+    author.posts.update_or_create(ti='draft')
+
+    company = Company.objects.get(id=1)
+    company.question_thread_set.create(ti='draft')
+    company.question_thread_set.filter(ti='draft')
+    company.question_thread_set.exclude(ti='draft')
+
+    typed_company: Company = Company.objects.get(id=1)
+    typed_company.question_thread_set.create(ti='draft')
+    typed_company.question_thread_set.filter(ti='draft')
+    typed_company.question_thread_set.exclude(ti='draft')

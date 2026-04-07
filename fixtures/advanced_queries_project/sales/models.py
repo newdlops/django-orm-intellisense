@@ -1,9 +1,16 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from django.db import models
 
-from .managers import FulfillmentDetailManager, ProductManager
+from .managers import CatalogManager, FulfillmentDetailManager, ProductManager
 
 
 class Product(models.Model):
+    if TYPE_CHECKING:
+        typed_catalog_manager: CatalogManager[Product]
+
     category = models.ForeignKey(
         'catalog.Category',
         related_name='products',
@@ -13,6 +20,7 @@ class Product(models.Model):
     is_active = models.BooleanField(default=True)
 
     objects = ProductManager()
+    catalog = CatalogManager()
 
 
 class Order(models.Model):
@@ -36,6 +44,10 @@ class LineItem(models.Model):
 
 class Fulfillment(models.Model):
     reference = models.CharField(max_length=64)
+
+    @property
+    def primary_detail(self) -> FulfillmentDetail | None:
+        return self.details.order_by('id').first()
 
 
 class FulfillmentDetail(models.Model):

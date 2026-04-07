@@ -335,7 +335,7 @@ suite('Django ORM Intellisense UI', () => {
       ),
       `Expected lookup definition to target blog/models.py. Received: ${lookupDefinition.uri.fsPath}`
     );
-    assert.strictEqual(lookupDefinition.range.start.line + 1, 38);
+    assert.strictEqual(lookupDefinition.range.start.line + 1, 40);
 
     const directPkDefinitions = await vscode.commands.executeCommand<
       Array<vscode.Location | vscode.LocationLink>
@@ -414,7 +414,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      92,
+      118,
       'Expected reverse lookup definition to target the CorporateRegistration.registration_code field.'
     );
 
@@ -428,6 +428,83 @@ suite('Django ORM Intellisense UI', () => {
         (item) => !item.message.includes('corporate_registration__registration_code')
       ),
       `Expected runtime-backed reverse lookup path to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+  });
+
+  test('resolves reverse lookup paths when Meta.app_label overrides the module root', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const completionPosition = positionAfterTextInContainer(
+      document,
+      'AppLabelCompany.objects.values("corporate_registration__registration_code")',
+      'corporate_registration__reg'
+    );
+    const completionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        completionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(completionList?.items, 'registration_code'),
+      'Expected app-label-overridden reverse lookup completion to include `registration_code`.'
+    );
+
+    const hoverPosition = positionInsideText(
+      document,
+      'AppLabelCompany.objects.values("corporate_registration__registration_code")',
+      'registration_code'
+    );
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      hoverPosition
+    );
+    const hoverText = stringifyHovers(hovers);
+
+    assert.ok(
+      hoverText.includes('Owner model: `db.AppLabelCorporateRegistration`'),
+      `Expected app-label-overridden reverse lookup hover to mention db.AppLabelCorporateRegistration. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('Field kind: `CharField`'),
+      `Expected app-label-overridden reverse lookup hover to mention the field kind. Received: ${hoverText}`
+    );
+
+    const definitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, hoverPosition);
+    const definitionTarget = firstDefinition(definitions);
+
+    assert.ok(
+      definitionTarget,
+      'Expected a definition target for the app-label-overridden reverse lookup path.'
+    );
+    assert.strictEqual(
+      definitionTarget!.range.start.line + 1,
+      177,
+      'Expected app-label-overridden reverse lookup definition to target AppLabelCorporateRegistration.registration_code.'
+    );
+
+    const diagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) =>
+        items.some((item) => item.message.includes('author__unknown'))
+    );
+    assert.ok(
+      diagnostics.every(
+        (item) => !item.message.includes('corporate_registration__registration_code')
+      ),
+      `Expected app-label-overridden reverse lookup path to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
     );
   });
 
@@ -565,7 +642,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      38,
+      40,
       'Expected values_list() definition to target the Profile.timezone field.'
     );
 
@@ -792,7 +869,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      32,
+      34,
       'Expected relation-string definition to target the Profile model.'
     );
 
@@ -819,7 +896,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       foreignKeyTailDefinitionTarget!.range.start.line + 1,
-      32,
+      34,
       'Expected dotted ForeignKey relation-string tail symbol definition to target the Profile model.'
     );
 
@@ -1008,7 +1085,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       queryNameDefinitionTarget!.range.start.line + 1,
-      125,
+      151,
       'Expected reverse related_query_name definition to target FaqLink.label.'
     );
 
@@ -1229,7 +1306,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      66,
+      68,
       'Expected foreign-key attname definition to target the Post.author field.'
     );
 
@@ -1719,7 +1796,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      38,
+      40,
       'Expected F expression definition to target the Profile.timezone field.'
     );
 
@@ -1873,6 +1950,217 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
+  test('supports create-like field contexts through queryset and instance-related receivers', async function () {
+    this.timeout(60_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const querysetCreateCompletionPosition = positionAfterTextInContainer(
+      document,
+      "Post.objects.filter(published=True).create(ti='draft', author_i=1)",
+      'ti'
+    );
+    const querysetCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        querysetCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(querysetCreateCompletionList?.items, 'title'),
+      'Expected queryset-scoped create() field completion to include `title`.'
+    );
+
+    const querysetGetOrCreateCompletionPosition = positionAfterTextInContainer(
+      document,
+      "Post.objects.filter(published=True).get_or_create(ti='draft')",
+      'ti'
+    );
+    const querysetGetOrCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        querysetGetOrCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(querysetGetOrCreateCompletionList?.items, 'title'),
+      'Expected queryset-scoped get_or_create() field completion to include `title`.'
+    );
+
+    const querysetUpdateOrCreateCompletionPosition = positionAfterTextInContainer(
+      document,
+      "Post.objects.filter(published=True).update_or_create(ti='draft')",
+      'ti'
+    );
+    const querysetUpdateOrCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        querysetUpdateOrCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(querysetUpdateOrCreateCompletionList?.items, 'title'),
+      'Expected queryset-scoped update_or_create() field completion to include `title`.'
+    );
+
+    const relatedManagerCreateCompletionPosition = positionAfterTextInContainer(
+      document,
+      "author.posts.create(ti='draft')",
+      'ti'
+    );
+    const relatedManagerCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relatedManagerCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(relatedManagerCreateCompletionList?.items, 'title'),
+      'Expected instance-related-manager create() field completion to include `title`.'
+    );
+
+    const relatedManagerGetOrCreateCompletionPosition = positionAfterTextInContainer(
+      document,
+      "author.posts.get_or_create(ti='draft')",
+      'ti'
+    );
+    const relatedManagerGetOrCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relatedManagerGetOrCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(relatedManagerGetOrCreateCompletionList?.items, 'title'),
+      'Expected instance-related-manager get_or_create() field completion to include `title`.'
+    );
+
+    const relatedManagerUpdateOrCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "author.posts.update_or_create(ti='draft')",
+        'ti'
+      );
+    const relatedManagerUpdateOrCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relatedManagerUpdateOrCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        relatedManagerUpdateOrCreateCompletionList?.items,
+        'title'
+      ),
+      'Expected instance-related-manager update_or_create() field completion to include `title`.'
+    );
+
+    const relatedManagerCreateHoverPosition = positionInsideText(
+      document,
+      "author.posts.create(title='draft', bog='x')",
+      'title'
+    );
+    const relatedManagerCreateHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        relatedManagerCreateHoverPosition
+      );
+    const relatedManagerCreateHoverText = stringifyHovers(
+      relatedManagerCreateHovers
+    );
+
+    assert.ok(
+      relatedManagerCreateHoverText.includes('Owner model: `blog.Post`'),
+      `Expected related-manager create() field hover to mention blog.Post. Received: ${relatedManagerCreateHoverText}`
+    );
+    assert.ok(
+      relatedManagerCreateHoverText.includes('Field kind: `CharField`'),
+      `Expected related-manager create() field hover to mention CharField. Received: ${relatedManagerCreateHoverText}`
+    );
+
+    const relatedManagerCreateDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, relatedManagerCreateHoverPosition);
+    const relatedManagerCreateDefinitionTarget = firstDefinition(
+      relatedManagerCreateDefinitions
+    );
+
+    assert.ok(
+      relatedManagerCreateDefinitionTarget,
+      'Expected related-manager create() field definition to resolve to the Post.title declaration.'
+    );
+    assert.ok(
+      relatedManagerCreateDefinitionTarget!.uri.fsPath.endsWith(
+        path.join('fixtures', 'minimal_project', 'blog', 'models.py')
+      ),
+      `Expected related-manager create() definition to target blog/models.py. Received: ${relatedManagerCreateDefinitionTarget!.uri.fsPath}`
+    );
+
+    const customRelatedManagerCreateCompletionPosition = positionAfterTextInContainer(
+      document,
+      "typed_company.question_thread_set.create(ti='draft')",
+      'ti'
+    );
+    const customRelatedManagerCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        customRelatedManagerCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(customRelatedManagerCreateCompletionList?.items, 'title'),
+      'Expected typed custom related-manager create() field completion to include `title`.'
+    );
+
+    const customRelatedManagerFilterCompletionPosition = positionAfterTextInContainer(
+      document,
+      "typed_company.question_thread_set.filter(ti='draft')",
+      'ti'
+    );
+    const customRelatedManagerFilterCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        customRelatedManagerFilterCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(customRelatedManagerFilterCompletionList?.items, 'title'),
+      'Expected typed custom related-manager filter() field completion to include `title`.'
+    );
+
+    const customRelatedManagerExcludeCompletionPosition = positionAfterTextInContainer(
+      document,
+      "typed_company.question_thread_set.exclude(ti='draft')",
+      'ti'
+    );
+    const customRelatedManagerExcludeCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        customRelatedManagerExcludeCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(customRelatedManagerExcludeCompletionList?.items, 'title'),
+      'Expected typed custom related-manager exclude() field completion to include `title`.'
+    );
+  });
+
   test('supports Meta index and constraint field contexts', async function () {
     this.timeout(60_000);
 
@@ -1886,7 +2174,7 @@ suite('Django ORM Intellisense UI', () => {
 
     const indexCompletionPosition = positionAfterTextInContainer(
       document,
-      "models.Index(fields=['co'], name='schema_example_code_idx')",
+      "fields=['co']",
       'co'
     );
     const indexCompletionList =
@@ -1903,7 +2191,7 @@ suite('Django ORM Intellisense UI', () => {
 
     const constraintCompletionPosition = positionAfterTextInContainer(
       document,
-      "models.Index(fields=['author', 'pub'], name='schema_example_author_published_idx')",
+      "fields=['author', 'pub']",
       'pub'
     );
     const constraintCompletionList =
@@ -2064,7 +2352,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      22,
+      24,
       'Expected Meta constraint Q definition to target Author.name.'
     );
 
@@ -2498,7 +2786,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      38,
+      40,
       'Expected keyword lookup definition to target the Profile.timezone field.'
     );
   });
@@ -3056,6 +3344,370 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hasCompletionItemLabel(managerCustomCompletionList?.items, 'with_line_count'),
       'Expected manager completion to include the custom queryset-backed `with_line_count` method.'
+    );
+
+    const managerCreateFieldCompletionPosition = positionAfterTextInContainer(
+      document,
+      "Product.objects.create(na='draft')",
+      'na'
+    );
+    const managerCreateFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        managerCreateFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(managerCreateFieldCompletionList?.items, 'name'),
+      `Expected custom manager create() field completion to include \`name\`. Received: ${(managerCreateFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const customQuerysetCreateFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "Product.objects.active().create(na='draft')",
+        'na'
+      );
+    const customQuerysetCreateFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        customQuerysetCreateFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(customQuerysetCreateFieldCompletionList?.items, 'name'),
+      `Expected custom queryset create() field completion to include \`name\`. Received: ${(customQuerysetCreateFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const alternateManagerCreateFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "Product.catalog.create(na='draft')",
+        'na'
+      );
+    const alternateManagerCreateFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        alternateManagerCreateFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(alternateManagerCreateFieldCompletionList?.items, 'name'),
+      `Expected alternate custom manager create() field completion to include \`name\`. Received: ${(alternateManagerCreateFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const annotatedManagerCreateFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "typed_product_manager.create(na='draft')",
+        'na'
+      );
+    const annotatedManagerCreateFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        annotatedManagerCreateFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(annotatedManagerCreateFieldCompletionList?.items, 'name'),
+      `Expected annotated custom manager create() field completion to include \`name\`. Received: ${(annotatedManagerCreateFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const annotatedAlternateManagerCreateFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "typed_catalog_manager.create(na='draft')",
+        'na'
+      );
+    const annotatedAlternateManagerCreateFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        annotatedAlternateManagerCreateFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        annotatedAlternateManagerCreateFieldCompletionList?.items,
+        'name'
+      ),
+      `Expected annotated alternate custom manager create() field completion to include \`name\`. Received: ${(annotatedAlternateManagerCreateFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const annotatedGenericManagerCreateFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "typed_generic_catalog_manager.create(na='draft')",
+        'na'
+      );
+    const annotatedGenericManagerCreateFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        annotatedGenericManagerCreateFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        annotatedGenericManagerCreateFieldCompletionList?.items,
+        'name'
+      ),
+      `Expected annotated generic custom manager create() field completion to include \`name\`. Received: ${(annotatedGenericManagerCreateFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const annotatedQuerysetCreateFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "typed_custom_queryset.create(na='draft')",
+        'na'
+      );
+    const annotatedQuerysetCreateFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        annotatedQuerysetCreateFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(annotatedQuerysetCreateFieldCompletionList?.items, 'name'),
+      `Expected annotated custom queryset create() field completion to include \`name\`. Received: ${(annotatedQuerysetCreateFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const functionAnnotatedManagerCreateFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "build_product_manager_from_string_annotation().create(na='draft')",
+        'na'
+      );
+    const functionAnnotatedManagerCreateFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        functionAnnotatedManagerCreateFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        functionAnnotatedManagerCreateFieldCompletionList?.items,
+        'name'
+      ),
+      `Expected string-annotated custom manager create() field completion to include \`name\`. Received: ${(functionAnnotatedManagerCreateFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const functionAnnotatedAlternateManagerCreateFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "build_catalog_manager_from_string_annotation().create(na='draft')",
+        'na'
+      );
+    const functionAnnotatedAlternateManagerCreateFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        functionAnnotatedAlternateManagerCreateFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        functionAnnotatedAlternateManagerCreateFieldCompletionList?.items,
+        'name'
+      ),
+      `Expected string-annotated alternate custom manager create() field completion to include \`name\`. Received: ${(functionAnnotatedAlternateManagerCreateFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const functionAnnotatedGenericManagerCreateFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "build_generic_catalog_manager_from_string_annotation().create(na='draft')",
+        'na'
+      );
+    const functionAnnotatedGenericManagerCreateFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        functionAnnotatedGenericManagerCreateFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        functionAnnotatedGenericManagerCreateFieldCompletionList?.items,
+        'name'
+      ),
+      `Expected string-annotated generic custom manager create() field completion to include \`name\`. Received: ${(functionAnnotatedGenericManagerCreateFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const functionAnnotatedQuerysetCreateFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "build_product_queryset_from_custom_annotation().create(na='draft')",
+        'na'
+      );
+    const functionAnnotatedQuerysetCreateFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        functionAnnotatedQuerysetCreateFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        functionAnnotatedQuerysetCreateFieldCompletionList?.items,
+        'name'
+      ),
+      `Expected string-annotated custom queryset create() field completion to include \`name\`. Received: ${(functionAnnotatedQuerysetCreateFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const memberAnnotatedGenericManagerCreateFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "instance.typed_catalog_manager.create(na='draft')",
+        'na'
+      );
+    const memberAnnotatedGenericManagerCreateFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        memberAnnotatedGenericManagerCreateFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        memberAnnotatedGenericManagerCreateFieldCompletionList?.items,
+        'name'
+      ),
+      `Expected member-annotated generic custom manager create() field completion to include \`name\`. Received: ${(memberAnnotatedGenericManagerCreateFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const memberAnnotatedGenericManagerFilterFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "typed_product_instance.typed_catalog_manager.filter(na='draft')",
+        'na'
+      );
+    const memberAnnotatedGenericManagerFilterFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        memberAnnotatedGenericManagerFilterFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        memberAnnotatedGenericManagerFilterFieldCompletionList?.items,
+        'name'
+      ),
+      `Expected member-annotated generic custom manager filter() field completion to include \`name\`. Received: ${(memberAnnotatedGenericManagerFilterFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const memberAnnotatedGenericManagerExcludeFieldCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "typed_product_instance.typed_catalog_manager.exclude(na='draft')",
+        'na'
+      );
+    const memberAnnotatedGenericManagerExcludeFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        memberAnnotatedGenericManagerExcludeFieldCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        memberAnnotatedGenericManagerExcludeFieldCompletionList?.items,
+        'name'
+      ),
+      `Expected member-annotated generic custom manager exclude() field completion to include \`name\`. Received: ${(memberAnnotatedGenericManagerExcludeFieldCompletionList?.items ?? [])
+        .map((item) => completionItemLabel(item))
+        .slice(0, 20)
+        .join(', ')}`
+    );
+
+    const propertyCompletionPosition = positionAfterTextInContainer(
+      document,
+      'fulfillment.primary_d',
+      'primary_d'
+    );
+    const propertyCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        propertyCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(propertyCompletionList?.items, 'primary_detail'),
+      'Expected instance completion to include the `@property` member `primary_detail`.'
+    );
+
+    const propertyCompletionItem = findCompletionItemByLabel(
+      propertyCompletionList?.items,
+      'primary_detail'
+    );
+    assert.strictEqual(
+      propertyCompletionItem?.kind,
+      vscode.CompletionItemKind.Property,
+      'Expected `@property` model members to use the property completion kind.'
+    );
+
+    const propertyNestedCompletionPosition = positionAfterTextInContainer(
+      document,
+      'fulfillment.primary_detail.de',
+      '.de'
+    );
+    const propertyNestedCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        propertyNestedCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(propertyNestedCompletionList?.items, 'detail_code'),
+      'Expected property return annotations to propagate related model member completion.'
     );
 
     const querysetCompletionPosition = positionAfterTextInContainer(
@@ -4054,7 +4706,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       relationOuterRefDefinitionTarget!.range.start.line + 1,
-      43,
+      55,
       'Expected relation OuterRef() definition to target FulfillmentDetail.fulfillment.'
     );
 
@@ -4206,7 +4858,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       lagDefinitionTarget!.range.start.line + 1,
-      19,
+      27,
       'Expected Lag() definition to target Order.customer_name.'
     );
 
@@ -4364,7 +5016,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       greatestDefinitionTarget!.range.start.line + 1,
-      12,
+      19,
       'Expected Greatest(..., "...") definition to target Product.name.'
     );
 
@@ -4501,7 +5153,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       replaceDefinitionTarget!.range.start.line + 1,
-      12,
+      19,
       'Expected Replace() definition to target Product.name.'
     );
 
@@ -4646,7 +5298,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       aggregateDefinitionTarget!.range.start.line + 1,
-      29,
+      37,
       'Expected aggregate() definition to target the LineItem.product field that defines the reverse `lines` relation.'
     );
   });
@@ -6110,6 +6762,54 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
+  test('shows hover and definition for multiline relative symbol imports', async function () {
+    this.timeout(60_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/reexport_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'library/import_examples.py'
+    );
+
+    const hoverPosition = positionInsideText(
+      document,
+      'Book as MultiLineBook',
+      'MultiLineBook'
+    );
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      hoverPosition
+    );
+    const hoverText = stringifyHovers(hovers);
+
+    assert.ok(
+      hoverText.includes('Resolved symbol: `library.models.Book`'),
+      `Expected multiline relative import hover to describe the resolved symbol. Received: ${hoverText}`
+    );
+    assert.ok(
+      hoverText.includes('File: `library/models.py`'),
+      `Expected multiline relative import hover to describe the resolved file. Received: ${hoverText}`
+    );
+
+    const definitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >('vscode.executeDefinitionProvider', document.uri, hoverPosition);
+    const definitionTarget = firstDefinition(definitions);
+
+    assert.ok(
+      definitionTarget,
+      'Expected a definition target for the multiline relative imported symbol.'
+    );
+    assert.strictEqual(
+      definitionTarget!.range.start.line + 1,
+      4,
+      'Expected multiline relative import definition to target the Book model.'
+    );
+  });
+
   test('shows hover and definition for module imports', async function () {
     this.timeout(20_000);
 
@@ -6184,6 +6884,35 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hasCompletionItemLabel(completionList?.items, 'title'),
       'Expected re-exported model keyword lookup completion to include `title`.'
+    );
+  });
+
+  test('infers base models from multiline relative imports', async function () {
+    this.timeout(60_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/reexport_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'library/import_examples.py'
+    );
+
+    const completionPosition = positionAfterTextInContainer(
+      document,
+      "MultiLineBook.objects.filter(ti='x')",
+      'ti'
+    );
+    const completionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        completionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(completionList?.items, 'title'),
+      'Expected multiline imported model keyword lookup completion to include `title`.'
     );
   });
 
@@ -6649,6 +7378,27 @@ async function ensureFixtureE2EEnvironment(
   );
 
   const baseInterpreter = await findDjango5BaseInterpreter();
+  if (await isVirtualEnvironmentInterpreter(baseInterpreter)) {
+    const djangoVersion = await readDjangoVersion(baseInterpreter);
+    assert.ok(
+      djangoVersion,
+      `Expected ${baseInterpreter} to import Django for E2E bootstrap.`
+    );
+    assert.strictEqual(
+      djangoMajorVersion(djangoVersion),
+      DJANGO_E2E_MAJOR_VERSION,
+      `Expected ${baseInterpreter} to provide Django ${DJANGO_E2E_MAJOR_VERSION}.x, received ${djangoVersion}.`
+    );
+
+    const environment: FixtureE2EEnvironment = {
+      ...projectConfig,
+      interpreterPath: baseInterpreter,
+      djangoVersion,
+    };
+    fixtureE2EEnvironmentCache.set(rootPath, environment);
+    return environment;
+  }
+
   const environmentRoot = path.join(
     os.tmpdir(),
     'django-orm-intellisense-e2e',
@@ -6792,6 +7542,8 @@ function django5BaseInterpreterCandidates(): string[] {
     candidates.add(envOverride);
   }
 
+  addAsdfPythonInterpreterCandidates(candidates);
+
   const homeDirectory = os.homedir();
   const pyenvVersionsRoot = path.join(homeDirectory, '.pyenv', 'versions');
   if (fs.existsSync(pyenvVersionsRoot)) {
@@ -6816,6 +7568,33 @@ function django5BaseInterpreterCandidates(): string[] {
   return [...candidates].filter((candidate) => fs.existsSync(candidate));
 }
 
+function addAsdfPythonInterpreterCandidates(candidates: Set<string>): void {
+  const homeDirectory = os.homedir();
+  const asdfInstallsRoot = path.join(homeDirectory, '.asdf', 'installs', 'python');
+  if (!fs.existsSync(asdfInstallsRoot)) {
+    return;
+  }
+
+  const configuredVersion = readAsdfPythonVersionFromToolVersions();
+  if (configuredVersion) {
+    for (const binaryName of ['python', 'python3', `python${configuredVersion}`]) {
+      candidates.add(path.join(asdfInstallsRoot, configuredVersion, 'bin', binaryName));
+    }
+  }
+
+  for (const versionName of fs.readdirSync(asdfInstallsRoot)) {
+    candidates.add(path.join(asdfInstallsRoot, versionName, 'bin', 'python'));
+    candidates.add(path.join(asdfInstallsRoot, versionName, 'bin', 'python3'));
+  }
+}
+
+function readAsdfPythonVersionFromToolVersions(): string | undefined {
+  const toolVersionsPath = path.resolve(__dirname, '../../.tool-versions');
+  const toolVersions = readFileIfExists(toolVersionsPath);
+  const match = toolVersions?.match(/^python\s+([^\s]+)$/m);
+  return match?.[1];
+}
+
 async function readDjangoVersion(
   interpreterPath: string
 ): Promise<string | undefined> {
@@ -6834,6 +7613,24 @@ async function readDjangoVersion(
     return output || undefined;
   } catch {
     return undefined;
+  }
+}
+
+async function isVirtualEnvironmentInterpreter(
+  interpreterPath: string
+): Promise<boolean> {
+  if (!fs.existsSync(interpreterPath)) {
+    return false;
+  }
+
+  try {
+    const output = await execFileAsync(interpreterPath, [
+      '-c',
+      "import sys; print('1' if getattr(sys, 'real_prefix', None) or sys.prefix != getattr(sys, 'base_prefix', sys.prefix) else '0')",
+    ]);
+    return output === '1';
+  } catch {
+    return false;
   }
 }
 

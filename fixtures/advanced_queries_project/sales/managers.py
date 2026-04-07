@@ -13,6 +13,14 @@ class ProductManager(models.Manager.from_queryset(ProductQuerySet)):
     pass
 
 
+class CatalogQuerySet(models.QuerySet["Product"]):
+    pass
+
+
+class CatalogManager(models.Manager.from_queryset(CatalogQuerySet)):
+    pass
+
+
 class FulfillmentDetailQuerySet(models.QuerySet):
     def exclude_deleted(self) -> 'FulfillmentDetailQuerySet':
         return self.exclude(detail_code='deleted')

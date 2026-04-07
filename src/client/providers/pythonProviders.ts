@@ -2,6 +2,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { getExtensionSettings } from '../config/settings';
 import { AnalysisDaemon } from '../daemon/analysisDaemon';
+import { isPylanceAvailable } from '../python/pylance';
 import type {
   ExportOriginResolution,
   LookupPathItem,
@@ -400,6 +401,46 @@ type ImportReference =
   | { kind: 'symbol'; moduleName: string; symbol: string }
   | { kind: 'module'; moduleName: string };
 
+interface RawImportStatement {
+  startOffset: number;
+  endOffset: number;
+  text: string;
+}
+
+interface ParsedImportSymbolSpec {
+  importedName: string;
+  aliasName?: string;
+  importedStartOffset: number;
+  importedEndOffset: number;
+  aliasStartOffset?: number;
+  aliasEndOffset?: number;
+}
+
+interface ParsedImportModuleSpec {
+  importedModule: string;
+  aliasName?: string;
+  importedStartOffset: number;
+  importedEndOffset: number;
+  aliasStartOffset?: number;
+  aliasEndOffset?: number;
+}
+
+type ParsedImportStatement =
+  | {
+      kind: 'from';
+      startOffset: number;
+      endOffset: number;
+      rawModuleName: string;
+      moduleName?: string;
+      symbolSpecs: ParsedImportSymbolSpec[];
+    }
+  | {
+      kind: 'import';
+      startOffset: number;
+      endOffset: number;
+      moduleSpecs: ParsedImportModuleSpec[];
+    };
+
 type SpecialClassKind = 'manager' | 'queryset' | 'related_manager';
 type ClassHoverCategory = 'django' | 'general';
 
@@ -500,6 +541,17 @@ interface FunctionDefinitionSource {
   beforeOffset: number;
 }
 
+interface CachedParsedImportStatements {
+  version: number;
+  statements: ParsedImportStatement[];
+}
+
+interface CachedDocumentDefinitions {
+  version: number;
+  classesByName: Map<string, PythonClassDefinition>;
+  topLevelFunctionsByName: Map<string, PythonFunctionDefinition>;
+}
+
 interface TypeAnnotationSource {
   document: vscode.TextDocument;
   annotation: string;
@@ -521,6 +573,20 @@ interface ClassInstanceCompletionContext {
   range: vscode.Range;
   classSource: ClassDefinitionSource;
 }
+
+type OrmMemberExpressionCandidate = {
+  text: string;
+  source: 'same_line' | 'structural' | 'top_level';
+};
+
+const parsedImportStatementCache = new WeakMap<
+  vscode.TextDocument,
+  CachedParsedImportStatements
+>();
+const documentDefinitionsCache = new WeakMap<
+  vscode.TextDocument,
+  CachedDocumentDefinitions
+>();
 
 interface ClassHoverTarget {
   source: ClassDefinitionSource;
@@ -592,6 +658,7 @@ export function registerPythonProviders(
   const diagnosticCollection = vscode.languages.createDiagnosticCollection(
     'djangoOrmIntellisense.orm'
   );
+  const diagnosticsEnabled = isPylanceAvailable();
   const diagnosticTimers = new Map<string, NodeJS.Timeout>();
   let fullDiagnosticsRefreshTimer: NodeJS.Timeout | undefined;
 
@@ -1325,10 +1392,11 @@ export function registerPythonProviders(
     PYTHON_SELECTOR,
     {
       async provideHover(document, position) {
+        const ensureStarted = createEnsureStartedOnce(daemon, document.uri);
         const relationLiteral = relationHoverLiteral(document, position);
         if (relationLiteral) {
           try {
-            await daemon.ensureStarted(document.uri);
+            await ensureStarted();
             const resolution = await daemon.resolveRelationTarget(relationLiteral.value);
             const relationHover = buildRelationHover(relationLiteral.value, resolution);
             if (relationHover) {
@@ -1358,7 +1426,7 @@ export function registerPythonProviders(
         );
         if (lookupLiteral) {
           try {
-            await daemon.ensureStarted(document.uri);
+            await ensureStarted();
             const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
               daemon,
               document,
@@ -1397,7 +1465,7 @@ export function registerPythonProviders(
 
         if (directFieldLiteral) {
           try {
-            await daemon.ensureStarted(document.uri);
+            await ensureStarted();
             const baseModelLabel = await resolveBaseModelLabelForReceiver(
               daemon,
               document,
@@ -1426,7 +1494,7 @@ export function registerPythonProviders(
 
         if (metaConstraintLookupLiteralAtPosition) {
           try {
-            await daemon.ensureStarted(document.uri);
+            await ensureStarted();
             const baseModelLabel = await resolveMetaOwnerModelLabel(
               daemon,
               document,
@@ -1454,7 +1522,7 @@ export function registerPythonProviders(
 
         if (schemaFieldLiteral) {
           try {
-            await daemon.ensureStarted(document.uri);
+            await ensureStarted();
             const baseModelLabel = await resolveMetaOwnerModelLabel(
               daemon,
               document,
@@ -1482,7 +1550,7 @@ export function registerPythonProviders(
 
         if (bulkUpdateFieldLiteral) {
           try {
-            await daemon.ensureStarted(document.uri);
+            await ensureStarted();
             const baseModelLabel = await resolveBaseModelLabelForReceiver(
               daemon,
               document,
@@ -1510,7 +1578,7 @@ export function registerPythonProviders(
         }
 
         try {
-          await daemon.ensureStarted(document.uri);
+          await ensureStarted();
           const memberContext = await resolveOrmMemberAccessContext(
             daemon,
             document,
@@ -1552,7 +1620,7 @@ export function registerPythonProviders(
         }
 
         try {
-          await daemon.ensureStarted(document.uri);
+          await ensureStarted();
           const importReference = await resolveImportReferenceAtPosition(
             daemon,
             document,
@@ -1572,7 +1640,7 @@ export function registerPythonProviders(
         }
 
         try {
-          await daemon.ensureStarted(document.uri);
+          await ensureStarted();
           const typeHintHoverTarget = await resolveTypeHintHoverTargetAtPosition(
             daemon,
             document,
@@ -1589,7 +1657,7 @@ export function registerPythonProviders(
         }
 
         try {
-          await daemon.ensureStarted(document.uri);
+          await ensureStarted();
           const classHoverTarget =
             await resolveClassHoverTargetAtPosition(
               daemon,
@@ -1617,10 +1685,11 @@ export function registerPythonProviders(
     PYTHON_SELECTOR,
     {
       async provideDefinition(document, position) {
+        const ensureStarted = createEnsureStartedOnce(daemon, document.uri);
         const relationLiteral = relationHoverLiteral(document, position);
         if (relationLiteral) {
           try {
-            await daemon.ensureStarted(document.uri);
+            await ensureStarted();
             const resolution = await daemon.resolveRelationTarget(relationLiteral.value);
             const location = definitionLocationFromRelationResolution(resolution);
             if (location) {
@@ -1650,7 +1719,7 @@ export function registerPythonProviders(
         );
         if (lookupLiteral) {
           try {
-            await daemon.ensureStarted(document.uri);
+            await ensureStarted();
             const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
               daemon,
               document,
@@ -1684,7 +1753,7 @@ export function registerPythonProviders(
 
         if (directFieldLiteral) {
           try {
-            await daemon.ensureStarted(document.uri);
+            await ensureStarted();
             const baseModelLabel = await resolveBaseModelLabelForReceiver(
               daemon,
               document,
@@ -1708,7 +1777,7 @@ export function registerPythonProviders(
 
         if (metaConstraintLookupLiteralAtPosition) {
           try {
-            await daemon.ensureStarted(document.uri);
+            await ensureStarted();
             const baseModelLabel = await resolveMetaOwnerModelLabel(
               daemon,
               document,
@@ -1731,7 +1800,7 @@ export function registerPythonProviders(
 
         if (schemaFieldLiteral) {
           try {
-            await daemon.ensureStarted(document.uri);
+            await ensureStarted();
             const baseModelLabel = await resolveMetaOwnerModelLabel(
               daemon,
               document,
@@ -1754,7 +1823,7 @@ export function registerPythonProviders(
 
         if (bulkUpdateFieldLiteral) {
           try {
-            await daemon.ensureStarted(document.uri);
+            await ensureStarted();
             const baseModelLabel = await resolveBaseModelLabelForReceiver(
               daemon,
               document,
@@ -1777,7 +1846,7 @@ export function registerPythonProviders(
         }
 
         try {
-          await daemon.ensureStarted(document.uri);
+          await ensureStarted();
           const memberContext = await resolveOrmMemberAccessContext(
             daemon,
             document,
@@ -1813,7 +1882,7 @@ export function registerPythonProviders(
         }
 
         try {
-          await daemon.ensureStarted(document.uri);
+          await ensureStarted();
           const importReference = await resolveImportReferenceAtPosition(
             daemon,
             document,
@@ -1838,7 +1907,9 @@ export function registerPythonProviders(
     }
   );
 
-  scheduleTrackedDiagnosticsRefresh();
+  if (diagnosticsEnabled) {
+    scheduleTrackedDiagnosticsRefresh();
+  }
 
   return [
     completionProvider,
@@ -1846,12 +1917,21 @@ export function registerPythonProviders(
     definitionProvider,
     diagnosticCollection,
     vscode.workspace.onDidOpenTextDocument((document) => {
+      if (!diagnosticsEnabled) {
+        return;
+      }
       scheduleDiagnosticsRefresh(document);
     }),
     vscode.workspace.onDidChangeTextDocument((event) => {
+      if (!diagnosticsEnabled) {
+        return;
+      }
       scheduleDiagnosticsRefresh(event.document);
     }),
     vscode.window.onDidChangeVisibleTextEditors(() => {
+      if (!diagnosticsEnabled) {
+        return;
+      }
       scheduleTrackedDiagnosticsRefresh(0);
     }),
     vscode.workspace.onDidCloseTextDocument((document) => {
@@ -1864,6 +1944,11 @@ export function registerPythonProviders(
       }
     }),
     daemon.onDidChangeState((snapshot) => {
+      if (!diagnosticsEnabled) {
+        diagnosticCollection.clear();
+        return;
+      }
+
       if (snapshot.phase === 'starting') {
         return;
       }
@@ -2124,6 +2209,9 @@ function ormMemberCompletionKind(
 ): vscode.CompletionItemKind {
   if (item.memberKind === 'method') {
     return vscode.CompletionItemKind.Method;
+  }
+  if (item.memberKind === 'property') {
+    return vscode.CompletionItemKind.Property;
   }
   if (item.memberKind === 'manager') {
     return vscode.CompletionItemKind.Property;
@@ -3045,76 +3133,12 @@ function importReferenceAtPosition(
   document: vscode.TextDocument,
   position: vscode.Position
 ): ImportReference | undefined {
-  const lineText = document.lineAt(position.line).text;
-  const lineMatch = lineText.match(IMPORT_FROM_PATTERN);
-  if (lineMatch) {
-    const [, rawModuleName, clauseText] = lineMatch;
-    const moduleName = resolveImportedModuleName(document, rawModuleName);
-    if (!moduleName) {
-      return undefined;
-    }
-
-    const clauseStart = lineText.lastIndexOf(clauseText);
-    if (clauseStart === -1) {
-      return undefined;
-    }
-
-    const wordRange = document.getWordRangeAtPosition(position, /[A-Za-z_][\w]*/);
-    if (!wordRange) {
-      return undefined;
-    }
-
-    const hoveredWord = document.getText(wordRange);
-
-    for (const match of clauseText.matchAll(IMPORT_SPEC_PATTERN)) {
-      const importedName = match[1];
-      const aliasName = match[2];
-      const relativeStart = match.index ?? 0;
-      const importedStart = clauseStart + relativeStart;
-      const importedEnd = importedStart + importedName.length;
-
-      if (
-        hoveredWord === importedName &&
-        position.character >= importedStart &&
-        position.character <= importedEnd
-      ) {
-        return {
-          kind: 'symbol',
-          moduleName,
-          symbol: importedName,
-        };
-      }
-
-      if (aliasName) {
-        const aliasOffset = match[0].lastIndexOf(aliasName);
-        const aliasStart = clauseStart + relativeStart + aliasOffset;
-        const aliasEnd = aliasStart + aliasName.length;
-
-        if (
-          hoveredWord === aliasName &&
-          position.character >= aliasStart &&
-          position.character <= aliasEnd
-        ) {
-          return {
-            kind: 'symbol',
-            moduleName,
-            symbol: importedName,
-          };
-        }
-      }
-    }
-
-    return undefined;
-  }
-
-  const importMatch = lineText.match(IMPORT_MODULE_PATTERN);
-  if (!importMatch) {
-    return undefined;
-  }
-
-  const clauseText = importMatch[1];
-  const clauseStart = lineText.lastIndexOf(clauseText);
-  if (clauseStart === -1) {
+  const positionOffset = document.offsetAt(position);
+  const statement = collectParsedImportStatements(document).find(
+    (candidate) =>
+      candidate.startOffset <= positionOffset && positionOffset < candidate.endOffset
+  );
+  if (!statement) {
     return undefined;
   }
 
@@ -3125,39 +3149,66 @@ function importReferenceAtPosition(
 
   const hoveredWord = document.getText(wordRange);
 
-  for (const match of clauseText.matchAll(IMPORT_MODULE_SPEC_PATTERN)) {
-    const importedModule = match[1];
-    const aliasName = match[2];
-    const relativeStart = match.index ?? 0;
-    const importedStart = clauseStart + relativeStart;
-    const importedEnd = importedStart + importedModule.length;
+  if (statement.kind === 'from') {
+    if (!statement.moduleName) {
+      return undefined;
+    }
 
+    for (const spec of statement.symbolSpecs) {
+      if (
+        hoveredWord === spec.importedName &&
+        positionOffset >= spec.importedStartOffset &&
+        positionOffset < spec.importedEndOffset
+      ) {
+        return {
+          kind: 'symbol',
+          moduleName: statement.moduleName,
+          symbol: spec.importedName,
+        };
+      }
+
+      if (
+        spec.aliasName &&
+        hoveredWord === spec.aliasName &&
+        spec.aliasStartOffset !== undefined &&
+        spec.aliasEndOffset !== undefined &&
+        positionOffset >= spec.aliasStartOffset &&
+        positionOffset < spec.aliasEndOffset
+      ) {
+        return {
+          kind: 'symbol',
+          moduleName: statement.moduleName,
+          symbol: spec.importedName,
+        };
+      }
+    }
+
+    return undefined;
+  }
+
+  for (const spec of statement.moduleSpecs) {
     if (
-      position.character >= importedStart &&
-      position.character <= importedEnd &&
-      importedModule.split('.').includes(hoveredWord)
+      positionOffset >= spec.importedStartOffset &&
+      positionOffset < spec.importedEndOffset &&
+      spec.importedModule.split('.').includes(hoveredWord)
     ) {
       return {
         kind: 'module',
-        moduleName: importedModule,
+        moduleName: spec.importedModule,
       };
     }
 
-    if (!aliasName) {
-      continue;
-    }
-
-    const aliasOffset = match[0].lastIndexOf(aliasName);
-    const aliasStart = clauseStart + relativeStart + aliasOffset;
-    const aliasEnd = aliasStart + aliasName.length;
     if (
-      hoveredWord === aliasName &&
-      position.character >= aliasStart &&
-      position.character <= aliasEnd
+      spec.aliasName &&
+      hoveredWord === spec.aliasName &&
+      spec.aliasStartOffset !== undefined &&
+      spec.aliasEndOffset !== undefined &&
+      positionOffset >= spec.aliasStartOffset &&
+      positionOffset < spec.aliasEndOffset
     ) {
       return {
         kind: 'module',
-        moduleName: importedModule,
+        moduleName: spec.importedModule,
       };
     }
   }
@@ -4069,6 +4120,24 @@ function virtualFieldToLookupPathItem(
   };
 }
 
+function createEnsureStartedOnce(
+  daemon: AnalysisDaemon,
+  scope: vscode.ConfigurationScope
+): () => Promise<void> {
+  let pending: Promise<void> | undefined;
+
+  return async () => {
+    if (!pending) {
+      pending = daemon.ensureStarted(scope).catch((error) => {
+        pending = undefined;
+        throw error;
+      });
+    }
+
+    await pending;
+  };
+}
+
 function definitionLocationFromRelationResolution(
   resolution: RelationTargetResolution
 ): vscode.Location | undefined {
@@ -4743,13 +4812,17 @@ async function resolveOrmMemberCompletionContext(
     prefixContext.startOffset,
     endOffset
   );
-  for (const [index, candidate] of candidates.entries()) {
+  let sawScopedCandidate = false;
+  for (const candidate of candidates) {
     const parsedAccess = parseTrailingMemberAccessCandidate(
-      candidate,
+      candidate.text,
       prefixContext.prefix
     );
     if (!parsedAccess) {
       continue;
+    }
+    if (candidate.source === 'top_level' && sawScopedCandidate) {
+      return undefined;
     }
 
     const dynamicReceiver = await resolveDynamicInstanceReceiverAtOffset(
@@ -4768,8 +4841,8 @@ async function resolveOrmMemberCompletionContext(
     );
     const receiver = preferMemberReceiver(staticReceiver, dynamicReceiver);
     if (!receiver) {
-      if (index === 0) {
-        return undefined;
+      if (candidate.source !== 'top_level') {
+        sawScopedCandidate = true;
       }
       continue;
     }
@@ -4801,13 +4874,17 @@ async function resolveClassInstanceCompletionContext(
     prefixContext.startOffset,
     endOffset
   );
-  for (const [index, candidate] of candidates.entries()) {
+  let sawScopedCandidate = false;
+  for (const candidate of candidates) {
     const parsedAccess = parseTrailingMemberAccessCandidate(
-      candidate,
+      candidate.text,
       prefixContext.prefix
     );
     if (!parsedAccess) {
       continue;
+    }
+    if (candidate.source === 'top_level' && sawScopedCandidate) {
+      return undefined;
     }
 
     const classSource = await resolveClassDefinitionForExpression(
@@ -4818,8 +4895,8 @@ async function resolveClassInstanceCompletionContext(
       new Set()
     );
     if (!classSource) {
-      if (index === 0) {
-        return undefined;
+      if (candidate.source !== 'top_level') {
+        sawScopedCandidate = true;
       }
       continue;
     }
@@ -4861,10 +4938,17 @@ async function resolveOrmMemberAccessContext(
     startOffset,
     endOffset
   );
-  for (const [index, candidate] of candidates.entries()) {
-    const parsedAccess = parseTrailingMemberAccessCandidate(candidate, memberName);
+  let sawScopedCandidate = false;
+  for (const candidate of candidates) {
+    const parsedAccess = parseTrailingMemberAccessCandidate(
+      candidate.text,
+      memberName
+    );
     if (!parsedAccess) {
       continue;
+    }
+    if (candidate.source === 'top_level' && sawScopedCandidate) {
+      return undefined;
     }
 
     const dynamicReceiver = await resolveDynamicInstanceReceiverAtOffset(
@@ -4883,8 +4967,8 @@ async function resolveOrmMemberAccessContext(
     );
     const receiver = preferMemberReceiver(staticReceiver, dynamicReceiver);
     if (!receiver) {
-      if (index === 0) {
-        return undefined;
+      if (candidate.source !== 'top_level') {
+        sawScopedCandidate = true;
       }
       continue;
     }
@@ -4931,7 +5015,7 @@ function ormMemberExpressionCandidates(
   document: vscode.TextDocument,
   tokenStartOffset: number,
   endOffset: number
-): string[] {
+): OrmMemberExpressionCandidate[] {
   const endPosition = document.positionAt(endOffset);
   const sameLineCandidate = compactPythonExpression(
     stripTrailingComment(
@@ -4947,35 +5031,81 @@ function ormMemberExpressionCandidates(
   );
   const localTokenStart = tokenStartOffset - windowStartOffset;
   const localEndOffset = endOffset - windowStartOffset;
-  const candidateStarts = topLevelExpressionCandidateStarts(
+  const candidateStarts = expressionCandidateStartGroups(
     rawWindow,
     localTokenStart
   );
 
-  const windowCandidates = [...candidateStarts]
+  const structuralCandidates = [...candidateStarts.structural]
     .sort((left, right) => right - left)
     .map((start) =>
-      compactPythonExpression(
-        rawWindow
-          .slice(start, localEndOffset)
-          .split('\n')
-          .map((line) => stripTrailingComment(line))
-          .join('\n')
-          .trim()
+      buildOrmMemberExpressionCandidate(
+        rawWindow,
+        start,
+        localEndOffset,
+        'structural'
+      )
+    );
+  const topLevelCandidates = [...candidateStarts.topLevel]
+    .sort((left, right) => right - left)
+    .map((start) =>
+      buildOrmMemberExpressionCandidate(
+        rawWindow,
+        start,
+        localEndOffset,
+        'top_level'
       )
     );
 
-  return [sameLineCandidate, ...windowCandidates].filter(
-    (candidate, index, values) =>
-      candidate.length > 0 && values.indexOf(candidate) === index
-  );
+  const candidates: OrmMemberExpressionCandidate[] = [];
+  const seen = new Set<string>();
+  const pushCandidate = (candidate: OrmMemberExpressionCandidate): void => {
+    if (!candidate.text || seen.has(candidate.text)) {
+      return;
+    }
+    seen.add(candidate.text);
+    candidates.push(candidate);
+  };
+
+  pushCandidate({
+    text: sameLineCandidate,
+    source: 'same_line',
+  });
+  for (const candidate of structuralCandidates) {
+    pushCandidate(candidate);
+  }
+  for (const candidate of topLevelCandidates) {
+    pushCandidate(candidate);
+  }
+
+  return candidates;
 }
 
-function topLevelExpressionCandidateStarts(
+function buildOrmMemberExpressionCandidate(
+  rawWindow: string,
+  start: number,
+  end: number,
+  source: OrmMemberExpressionCandidate['source']
+): OrmMemberExpressionCandidate {
+  return {
+    text: compactPythonExpression(
+      rawWindow
+        .slice(start, end)
+        .split('\n')
+        .map((line) => stripTrailingComment(line))
+        .join('\n')
+        .trim()
+    ),
+    source,
+  };
+}
+
+function expressionCandidateStartGroups(
   text: string,
   beforeOffset: number
-): Set<number> {
-  const starts = new Set<number>([0]);
+): { structural: Set<number>; topLevel: Set<number> } {
+  const structural = new Set<number>();
+  const topLevel = new Set<number>([0]);
   const parenStack: number[] = [];
   const bracketStack: number[] = [];
   const braceStack: number[] = [];
@@ -5011,6 +5141,11 @@ function topLevelExpressionCandidateStarts(
     if (char === "'" || char === '"') {
       activeQuote = char;
       continue;
+    }
+
+    const keywordStart = keywordExpressionCandidateStart(text, index);
+    if (keywordStart !== undefined && keywordStart < beforeOffset) {
+      structural.add(keywordStart);
     }
 
     if (char === '(') {
@@ -5055,15 +5190,55 @@ function topLevelExpressionCandidateStarts(
       braceDepth === 0 &&
       '\n;=,:'.includes(char)
     ) {
-      starts.add(index + 1);
+      topLevel.add(index + 1);
     }
   }
 
   for (const index of [...parenStack, ...bracketStack, ...braceStack]) {
-    starts.add(index + 1);
+    structural.add(index + 1);
   }
 
-  return starts;
+  return {
+    structural,
+    topLevel,
+  };
+}
+
+function keywordExpressionCandidateStart(
+  text: string,
+  index: number
+): number | undefined {
+  for (const keyword of ['return', 'await', 'if']) {
+    if (!text.startsWith(keyword, index)) {
+      continue;
+    }
+
+    const previousChar = index > 0 ? text[index - 1] : undefined;
+    if (previousChar && /[A-Za-z0-9_]/.test(previousChar)) {
+      continue;
+    }
+
+    const whitespaceIndex = index + keyword.length;
+    if (whitespaceIndex >= text.length || !/\s/.test(text[whitespaceIndex])) {
+      continue;
+    }
+
+    let candidateStart = whitespaceIndex;
+    while (candidateStart < text.length && /\s/.test(text[candidateStart])) {
+      candidateStart += 1;
+    }
+
+    if (
+      candidateStart >= text.length ||
+      !/[A-Za-z_(\[{]/.test(text[candidateStart])
+    ) {
+      continue;
+    }
+
+    return candidateStart;
+  }
+
+  return undefined;
 }
 
 function parseTrailingMemberAccessCandidate(
@@ -5141,6 +5316,14 @@ async function resolveOrmReceiverAtOffset(
       staticObjectReceiver,
       dynamicObjectReceiver
     );
+    const annotatedMemberReceiver = await resolveAnnotatedReceiverForMemberAccess(
+      daemon,
+      document,
+      memberAccess.objectExpression,
+      memberAccess.memberName,
+      beforeOffset,
+      new Set()
+    );
     if (objectReceiver) {
       const virtualResolution = resolveVirtualOrmMember(
         objectReceiver,
@@ -5169,18 +5352,13 @@ async function resolveOrmReceiverAtOffset(
         memberAccess.memberName
       );
       if (resolvedReceiver) {
-        return resolvedReceiver;
+        return preferAnnotatedMemberReceiver(
+          resolvedReceiver,
+          annotatedMemberReceiver,
+          objectReceiver
+        );
       }
     }
-
-    const annotatedMemberReceiver = await resolveAnnotatedReceiverForMemberAccess(
-      daemon,
-      document,
-      memberAccess.objectExpression,
-      memberAccess.memberName,
-      beforeOffset,
-      new Set()
-    );
     if (annotatedMemberReceiver) {
       return annotatedMemberReceiver;
     }
@@ -5294,6 +5472,29 @@ function preferMemberReceiver(
   }
 
   return dynamicReceiver ?? staticReceiver;
+}
+
+function preferAnnotatedMemberReceiver(
+  resolvedReceiver: OrmReceiverInfo | undefined,
+  annotatedReceiver: OrmReceiverInfo | undefined,
+  objectReceiver: OrmReceiverInfo
+): OrmReceiverInfo | undefined {
+  if (!annotatedReceiver) {
+    return resolvedReceiver;
+  }
+
+  if (!resolvedReceiver) {
+    return annotatedReceiver;
+  }
+
+  if (
+    resolvedReceiver.modelLabel === objectReceiver.modelLabel &&
+    annotatedReceiver.modelLabel !== objectReceiver.modelLabel
+  ) {
+    return annotatedReceiver;
+  }
+
+  return resolvedReceiver;
 }
 
 async function resolveDynamicInstanceReceiverAtOffset(
@@ -5854,12 +6055,12 @@ function findFunctionDefinitionAtLine(
     return undefined;
   }
 
-  const match = document.lineAt(line).text.match(FUNCTION_DEFINITION_PATTERN);
-  if (!match || match[2] !== functionName) {
+  const functionDef = parseFunctionDefinitionAtLine(document, line);
+  if (!functionDef || functionDef.name !== functionName) {
     return undefined;
   }
 
-  return buildFunctionDefinition(document, line, match);
+  return functionDef;
 }
 
 function findNearestNamedFunctionDefinition(
@@ -5990,13 +6191,22 @@ async function resolveBulkCreateIterableElementReceiverAtOffset(
       beforeOffset,
       visited
     );
-    if (!sourceReceiver) {
+    const sourceModelLabel =
+      sourceReceiver?.modelLabel ??
+      (await resolveBaseModelLabelForReceiverAtOffset(
+        daemon,
+        document,
+        parsedCall.objectExpression,
+        beforeOffset,
+        new Set()
+      ));
+    if (!sourceModelLabel) {
       return undefined;
     }
 
     return {
       kind: 'instance',
-      modelLabel: sourceReceiver.modelLabel,
+      modelLabel: sourceModelLabel,
     };
   }
 
@@ -6204,6 +6414,32 @@ async function resolveBaseModelLabelForReceiverAtOffset(
   }
   visited.add(visitKey);
 
+  const memberAccess = splitTopLevelMemberAccess(normalizedExpression);
+  if (memberAccess) {
+    const objectReceiver = await resolveOrmReceiverAtOffset(
+      daemon,
+      document,
+      memberAccess.objectExpression,
+      beforeOffset,
+      new Set()
+    );
+    const annotatedMemberReceiver = await resolveAnnotatedReceiverForMemberAccess(
+      daemon,
+      document,
+      memberAccess.objectExpression,
+      memberAccess.memberName,
+      beforeOffset,
+      new Set()
+    );
+    if (
+      annotatedMemberReceiver &&
+      (!objectReceiver ||
+        annotatedMemberReceiver.modelLabel !== objectReceiver.modelLabel)
+    ) {
+      return annotatedMemberReceiver.modelLabel;
+    }
+  }
+
   const resolvedReceiver = await resolveLookupReceiverAtOffset(
     daemon,
     document,
@@ -6298,6 +6534,16 @@ async function resolveLookupReceiverAtOffset(
       beforeOffset,
       visited
     );
+    const annotatedMemberReceiver = asLookupReceiver(
+      await resolveAnnotatedReceiverForMemberAccess(
+        daemon,
+        document,
+        memberAccess.objectExpression,
+        memberAccess.memberName,
+        beforeOffset,
+        new Set()
+      )
+    );
     if (objectReceiver) {
       const resolution = await daemon.resolveOrmMember(
         objectReceiver.modelLabel,
@@ -6309,20 +6555,13 @@ async function resolveLookupReceiverAtOffset(
         receiverFromOrmMemberResolution(resolution)
       );
       if (resolvedReceiver) {
-        return resolvedReceiver;
+        return preferAnnotatedMemberReceiver(
+          resolvedReceiver,
+          annotatedMemberReceiver,
+          objectReceiver
+        );
       }
     }
-
-    const annotatedMemberReceiver = asLookupReceiver(
-      await resolveAnnotatedReceiverForMemberAccess(
-        daemon,
-        document,
-        memberAccess.objectExpression,
-        memberAccess.memberName,
-        beforeOffset,
-        new Set()
-      )
-    );
     if (annotatedMemberReceiver) {
       return annotatedMemberReceiver;
     }
@@ -7268,9 +7507,8 @@ function directClassInstanceMemberItems(
     }
 
     const enclosingFunction = findEnclosingFunctionDefinition(document, lineOffset);
-    const functionMatch = lineText.match(FUNCTION_DEFINITION_PATTERN);
-    if (functionMatch && !enclosingFunction) {
-      const functionDef = buildFunctionDefinition(document, line, functionMatch);
+    const functionDef = parseFunctionDefinitionAtLine(document, line);
+    if (functionDef && !enclosingFunction) {
       const decorators = collectFunctionDecorators(document, line);
       const kind = hasPropertyDecorator(decorators) ? 'property' : 'method';
       items.set(functionDef.name, {
@@ -7542,6 +7780,15 @@ async function resolveImportedDefinitionDocument(
         ),
       };
     }
+
+    const importedModelDefinition = await resolveImportedModelDefinitionDocument(
+      daemon,
+      directBinding.moduleName,
+      directBinding.symbolName
+    );
+    if (importedModelDefinition) {
+      return importedModelDefinition;
+    }
   }
 
   const parts = symbol.split('.');
@@ -7565,6 +7812,102 @@ async function resolveImportedDefinitionDocument(
   }
 
   return undefined;
+}
+
+async function resolveImportedModelDefinitionDocument(
+  daemon: AnalysisDaemon,
+  moduleName: string,
+  symbolName: string
+): Promise<{ document: vscode.TextDocument; symbolName: string } | undefined> {
+  const targets = await daemon.listRelationTargets('');
+  const sameNameTargets = targets.items.filter(
+    (item) => item.objectName === symbolName
+  );
+  if (sameNameTargets.length === 0) {
+    return undefined;
+  }
+
+  const preferredTarget =
+    preferredImportedModelDefinitionTarget(sameNameTargets, moduleName) ??
+    (sameNameTargets.length === 1 ? sameNameTargets[0] : undefined);
+  if (!preferredTarget?.filePath) {
+    return undefined;
+  }
+
+  return {
+    document: await vscode.workspace.openTextDocument(
+      preferredTarget.filePath
+    ),
+    symbolName: preferredTarget.objectName,
+  };
+}
+
+function preferredImportedModelDefinitionTarget(
+  targets: RelationTargetItem[],
+  moduleName: string
+): RelationTargetItem | undefined {
+  const exactModuleTarget = targets.filter((item) => item.module === moduleName);
+  if (exactModuleTarget.length === 1) {
+    return exactModuleTarget[0];
+  }
+
+  const packageModuleTargets = targets.filter((item) =>
+    item.module.startsWith(`${moduleName}.`)
+  );
+  if (packageModuleTargets.length === 1) {
+    return packageModuleTargets[0];
+  }
+
+  const moduleRoot = moduleName.split('.', 1)[0];
+  const sameRootTargets = targets.filter(
+    (item) =>
+      item.appLabel === moduleName ||
+      item.appLabel === moduleRoot ||
+      item.module === moduleRoot ||
+      item.module.startsWith(`${moduleRoot}.`)
+  );
+  if (sameRootTargets.length === 1) {
+    return sameRootTargets[0];
+  }
+
+  return undefined;
+}
+
+function cachedDocumentDefinitions(
+  document: vscode.TextDocument
+): CachedDocumentDefinitions {
+  const cached = documentDefinitionsCache.get(document);
+  if (cached && cached.version === document.version) {
+    return cached;
+  }
+
+  const classesByName = new Map<string, PythonClassDefinition>();
+  const topLevelFunctionsByName = new Map<string, PythonFunctionDefinition>();
+
+  for (let line = 0; line < document.lineCount; line += 1) {
+    const lineText = document.lineAt(line).text;
+    const classMatch = lineText.match(CLASS_DEFINITION_PATTERN);
+    if (classMatch && !classesByName.has(classMatch[2])) {
+      classesByName.set(classMatch[2], buildClassDefinition(document, line, classMatch));
+    }
+
+    const functionDef = parseFunctionDefinitionAtLine(document, line);
+    if (
+      functionDef &&
+      functionDef.indent === 0 &&
+      !topLevelFunctionsByName.has(functionDef.name)
+    ) {
+      topLevelFunctionsByName.set(functionDef.name, functionDef);
+    }
+  }
+
+  const nextCache = {
+    version: document.version,
+    classesByName,
+    topLevelFunctionsByName,
+  };
+  documentDefinitionsCache.set(document, nextCache);
+  return nextCache;
 }
 
 function findEnclosingClassDefinition(
@@ -7669,12 +8012,10 @@ function findEnclosingFunctionDefinition(
   const targetLine = document.positionAt(beforeOffset).line;
 
   for (let line = targetLine; line >= 0; line -= 1) {
-    const match = document.lineAt(line).text.match(FUNCTION_DEFINITION_PATTERN);
-    if (!match) {
+    const functionDef = parseFunctionDefinitionAtLine(document, line);
+    if (!functionDef) {
       continue;
     }
-
-    const functionDef = buildFunctionDefinition(document, line, match);
     if (targetLine > functionDef.line && targetLine <= functionDef.endLine) {
       return functionDef;
     }
@@ -7687,16 +8028,7 @@ function findClassDefinition(
   document: vscode.TextDocument,
   className: string
 ): PythonClassDefinition | undefined {
-  for (let line = 0; line < document.lineCount; line += 1) {
-    const match = document.lineAt(line).text.match(CLASS_DEFINITION_PATTERN);
-    if (!match || match[2] !== className) {
-      continue;
-    }
-
-    return buildClassDefinition(document, line, match);
-  }
-
-  return undefined;
+  return cachedDocumentDefinitions(document).classesByName.get(className);
 }
 
 function buildClassDefinition(
@@ -7720,18 +8052,16 @@ function findMethodDefinition(
   methodName: string
 ): PythonFunctionDefinition | undefined {
   for (let line = classDef.line + 1; line <= classDef.endLine; line += 1) {
-    const text = document.lineAt(line).text;
-    const match = text.match(FUNCTION_DEFINITION_PATTERN);
-    if (!match || match[2] !== methodName) {
+    const functionDef = parseFunctionDefinitionAtLine(document, line);
+    if (!functionDef || functionDef.name !== methodName) {
       continue;
     }
 
-    const indent = match[1].length;
-    if (indent <= classDef.indent) {
+    if (functionDef.indent <= classDef.indent) {
       continue;
     }
 
-    return buildFunctionDefinition(document, line, match);
+    return functionDef;
   }
 
   return undefined;
@@ -7741,16 +8071,9 @@ function findTopLevelFunctionDefinition(
   document: vscode.TextDocument,
   functionName: string
 ): PythonFunctionDefinition | undefined {
-  for (let line = 0; line < document.lineCount; line += 1) {
-    const match = document.lineAt(line).text.match(FUNCTION_DEFINITION_PATTERN);
-    if (!match || match[2] !== functionName || match[1].length !== 0) {
-      continue;
-    }
-
-    return buildFunctionDefinition(document, line, match);
-  }
-
-  return undefined;
+  return cachedDocumentDefinitions(document).topLevelFunctionsByName.get(
+    functionName
+  );
 }
 
 function buildFunctionDefinition(
@@ -7766,6 +8089,70 @@ function buildFunctionDefinition(
     indent,
     endLine: findBlockEndLine(document, line, indent),
     returnAnnotation: returnAnnotation || undefined,
+  };
+}
+
+function parseFunctionDefinitionAtLine(
+  document: vscode.TextDocument,
+  line: number
+): PythonFunctionDefinition | undefined {
+  const header = collectFunctionDefinitionHeader(document, line);
+  if (!header) {
+    return undefined;
+  }
+
+  const match = header.text.match(
+    /^(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\(([\s\S]*?)\)\s*(?:->\s*([^:]+))?\s*:$/
+  );
+  if (!match) {
+    return undefined;
+  }
+
+  const returnAnnotation = stripTypeDefaultValue((match[3] ?? '').trim());
+  return {
+    name: match[1],
+    line,
+    indent: header.indent,
+    endLine: findBlockEndLine(document, line, header.indent),
+    returnAnnotation: returnAnnotation || undefined,
+  };
+}
+
+function collectFunctionDefinitionHeader(
+  document: vscode.TextDocument,
+  line: number
+): { text: string; indent: number } | undefined {
+  if (line < 0 || line >= document.lineCount) {
+    return undefined;
+  }
+
+  const firstLineText = stripTrailingComment(document.lineAt(line).text);
+  if (!firstLineText.match(/^\s*(?:async\s+)?def\b/)) {
+    return undefined;
+  }
+
+  const indent = indentationWidth(firstLineText);
+  const parts: string[] = [firstLineText.trim()];
+  let currentLine = line;
+  let depth = bracketBalance(firstLineText);
+
+  while (currentLine < document.lineCount - 1) {
+    const currentText = stripTrailingComment(document.lineAt(currentLine).text).trimEnd();
+    if (depth <= 0 && currentText.trim().endsWith(':')) {
+      break;
+    }
+
+    currentLine += 1;
+    const nextLineText = stripTrailingComment(document.lineAt(currentLine).text);
+    if (nextLineText.trim()) {
+      parts.push(nextLineText.trim());
+    }
+    depth += bracketBalance(nextLineText);
+  }
+
+  return {
+    text: joinCollectedExpressionParts(parts),
+    indent,
   };
 }
 
@@ -8768,14 +9155,19 @@ function findFunctionParameterTypeAnnotation(
     return undefined;
   }
 
-  const match = document
-    .lineAt(functionDef.line)
-    .text.match(FUNCTION_DEFINITION_PATTERN);
+  const header = collectFunctionDefinitionHeader(document, functionDef.line);
+  if (!header) {
+    return undefined;
+  }
+
+  const match = header.text.match(
+    /^(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\(([\s\S]*?)\)\s*(?:->\s*([^:]+))?\s*:$/
+  );
   if (!match) {
     return undefined;
   }
 
-  for (const parameter of splitTopLevelExpressions(match[3] ?? '')) {
+  for (const parameter of splitTopLevelExpressions(match[2] ?? '')) {
     const parameterMatch = parameter.match(
       /^\s*\*{0,2}([A-Za-z_][\w]*)\s*:\s*(.+)$/
     );
@@ -9035,7 +9427,28 @@ async function resolveSingleDirectReceiverType(
       }
     }
 
+    const specialGenericReceiver = await resolveReceiverFromSpecialClassGenericType(
+      daemon,
+      document,
+      genericType.base,
+      genericType.args[0],
+      beforeOffset
+    );
+    if (specialGenericReceiver) {
+      return specialGenericReceiver;
+    }
+
     return undefined;
+  }
+
+  const specialReceiver = await resolveReceiverFromSpecialClassTypeAnnotation(
+    daemon,
+    document,
+    normalizedAnnotation,
+    beforeOffset
+  );
+  if (specialReceiver) {
+    return specialReceiver;
   }
 
   const modelLabel = await resolveModelLabelFromTypeAnnotation(
@@ -9151,6 +9564,24 @@ async function resolveSingleIterableElementType(
     }
   }
 
+  const specialGenericReceiver = await resolveReceiverFromSpecialClassGenericType(
+    daemon,
+    document,
+    genericType.base,
+    genericType.args[0],
+    beforeOffset
+  );
+  if (
+    specialGenericReceiver &&
+    (specialGenericReceiver.kind === 'queryset' ||
+      specialGenericReceiver.kind === 'related_manager')
+  ) {
+    return {
+      kind: 'instance',
+      modelLabel: specialGenericReceiver.modelLabel,
+    };
+  }
+
   return undefined;
 }
 
@@ -9188,6 +9619,27 @@ async function resolveModelLabelFromTypeAnnotation(
       }
       return undefined;
     }
+
+    const specialGenericLabel = await resolveModelLabelFromSpecialClassGenericType(
+      daemon,
+      document,
+      genericType.base,
+      genericType.args[0],
+      beforeOffset
+    );
+    if (specialGenericLabel) {
+      return specialGenericLabel;
+    }
+  }
+
+  const specialClassLabel = await resolveModelLabelFromSpecialClassTypeAnnotation(
+    daemon,
+    document,
+    normalizedAnnotation,
+    beforeOffset
+  );
+  if (specialClassLabel) {
+    return specialClassLabel;
   }
 
   for (const candidate of splitTopLevelTypeAlternatives(normalizedAnnotation)) {
@@ -9205,6 +9657,392 @@ async function resolveModelLabelFromTypeAnnotation(
     if (resolvedLabel) {
       return resolvedLabel;
     }
+  }
+
+  return undefined;
+}
+
+async function resolveReceiverFromSpecialClassTypeAnnotation(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  annotation: string,
+  beforeOffset: number
+): Promise<OrmReceiverInfo | undefined> {
+  const classSource = await resolveClassDefinitionFromTypeAnnotation(
+    daemon,
+    document,
+    annotation,
+    beforeOffset
+  );
+  if (!classSource) {
+    return undefined;
+  }
+
+  const specialKind = await resolveSpecialClassKind(daemon, classSource, new Set());
+  if (
+    specialKind !== 'manager' &&
+    specialKind !== 'queryset' &&
+    specialKind !== 'related_manager'
+  ) {
+    return undefined;
+  }
+
+  const modelLabel = await resolveModelLabelFromSpecialClassSource(
+    daemon,
+    classSource,
+    specialKind
+  );
+  if (!modelLabel) {
+    return undefined;
+  }
+
+  return {
+    kind: specialKind,
+    modelLabel,
+  };
+}
+
+async function resolveReceiverFromSpecialClassGenericType(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  baseAnnotation: string,
+  modelAnnotation: string | undefined,
+  beforeOffset: number
+): Promise<OrmReceiverInfo | undefined> {
+  const classSource = await resolveClassDefinitionFromTypeAnnotation(
+    daemon,
+    document,
+    baseAnnotation,
+    beforeOffset
+  );
+  if (!classSource) {
+    return undefined;
+  }
+
+  const specialKind = await resolveSpecialClassKind(daemon, classSource, new Set());
+  if (
+    specialKind !== 'manager' &&
+    specialKind !== 'queryset' &&
+    specialKind !== 'related_manager'
+  ) {
+    return undefined;
+  }
+
+  const modelLabel =
+    (modelAnnotation ?
+      await resolveModelLabelFromTypeAnnotation(
+        daemon,
+        document,
+        modelAnnotation,
+        beforeOffset
+      )
+    : undefined) ??
+    (await resolveModelLabelFromSpecialClassSource(
+      daemon,
+      classSource,
+      specialKind
+    ));
+  if (!modelLabel) {
+    return undefined;
+  }
+
+  return {
+    kind: specialKind,
+    modelLabel,
+  };
+}
+
+async function resolveModelLabelFromSpecialClassTypeAnnotation(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  annotation: string,
+  beforeOffset: number
+): Promise<string | undefined> {
+  const classSource = await resolveClassDefinitionFromTypeAnnotation(
+    daemon,
+    document,
+    annotation,
+    beforeOffset
+  );
+  if (!classSource) {
+    return undefined;
+  }
+
+  const specialKind = await resolveSpecialClassKind(daemon, classSource, new Set());
+  if (
+    specialKind !== 'manager' &&
+    specialKind !== 'queryset' &&
+    specialKind !== 'related_manager'
+  ) {
+    return undefined;
+  }
+
+  return resolveModelLabelFromSpecialClassSource(daemon, classSource, specialKind);
+}
+
+async function resolveModelLabelFromSpecialClassGenericType(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  baseAnnotation: string,
+  modelAnnotation: string | undefined,
+  beforeOffset: number
+): Promise<string | undefined> {
+  const specialReceiver = await resolveReceiverFromSpecialClassGenericType(
+    daemon,
+    document,
+    baseAnnotation,
+    modelAnnotation,
+    beforeOffset
+  );
+  return specialReceiver?.modelLabel;
+}
+
+async function resolveModelLabelFromSpecialClassSource(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  specialKind: SpecialClassKind
+): Promise<string | undefined> {
+  const explicitBaseLabel = await resolveModelLabelFromSpecialClassBaseExpressions(
+    daemon,
+    classSource,
+    specialKind,
+    new Set()
+  );
+  if (explicitBaseLabel) {
+    return explicitBaseLabel;
+  }
+
+  const candidateModelNames = specialClassModelNameCandidates(
+    classSource,
+    specialKind
+  );
+  if (candidateModelNames.length === 0) {
+    return undefined;
+  }
+
+  const relationTargets = await daemon.listRelationTargets('');
+  const currentModule = moduleNameForDocument(classSource.document);
+  const currentModuleRoot = currentModule?.split('.', 1)[0];
+
+  for (const candidateName of candidateModelNames) {
+    const exactMatches = relationTargets.items.filter(
+      (item) => item.objectName === candidateName
+    );
+    if (exactMatches.length === 0) {
+      continue;
+    }
+
+    const sameModuleRootMatches =
+      currentModuleRoot ?
+        exactMatches.filter(
+          (item) =>
+            item.appLabel === currentModuleRoot ||
+            item.module === currentModuleRoot ||
+            item.module.startsWith(`${currentModuleRoot}.`)
+        )
+      : [];
+    if (sameModuleRootMatches.length === 1) {
+      return sameModuleRootMatches[0].label;
+    }
+
+    if (exactMatches.length === 1) {
+      return exactMatches[0].label;
+    }
+  }
+
+  return undefined;
+}
+
+async function resolveModelLabelFromSpecialClassBaseExpressions(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  specialKind: SpecialClassKind,
+  visited: Set<string>
+): Promise<string | undefined> {
+  const visitKey = `${classSource.document.uri.toString()}:${classSource.classDef.name}:${specialKind}`;
+  if (visited.has(visitKey)) {
+    return undefined;
+  }
+  visited.add(visitKey);
+
+  for (const baseExpression of classSource.classDef.baseExpressions) {
+    const genericBaseLabel =
+      await resolveModelLabelFromSpecialClassGenericBaseExpression(
+        daemon,
+        classSource,
+        baseExpression,
+        specialKind
+      );
+    if (genericBaseLabel) {
+      return genericBaseLabel;
+    }
+
+    const fromQuerysetLabel = await resolveModelLabelFromFromQuerysetArgument(
+      daemon,
+      classSource,
+      baseExpression,
+      visited
+    );
+    if (fromQuerysetLabel) {
+      return fromQuerysetLabel;
+    }
+
+    const baseReference = baseClassReferenceExpression(baseExpression);
+    if (!baseReference) {
+      continue;
+    }
+
+    const baseClassSource = await resolveClassDefinitionSource(
+      daemon,
+      classSource.document,
+      baseReference,
+      classSource.beforeOffset
+    );
+    if (!baseClassSource) {
+      continue;
+    }
+
+    const inheritedLabel = await resolveModelLabelFromSpecialClassBaseExpressions(
+      daemon,
+      baseClassSource,
+      specialKind,
+      visited
+    );
+    if (inheritedLabel) {
+      return inheritedLabel;
+    }
+  }
+
+  return undefined;
+}
+
+async function resolveModelLabelFromSpecialClassGenericBaseExpression(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  baseExpression: string,
+  specialKind: SpecialClassKind
+): Promise<string | undefined> {
+  const normalizedExpression = stripWrappingParentheses(baseExpression.trim());
+  if (!normalizedExpression) {
+    return undefined;
+  }
+
+  const genericBase = parseGenericTypeAnnotation(normalizedExpression);
+  if (!genericBase || !genericBase.args[0]) {
+    return undefined;
+  }
+
+  const canonicalBase = await canonicalTypeAnnotationName(
+    daemon,
+    classSource.document,
+    genericBase.base,
+    classSource.beforeOffset
+  );
+  if (specialClassKindFromCanonicalName(canonicalBase) !== specialKind) {
+    return undefined;
+  }
+
+  return resolveModelLabelFromTypeAnnotation(
+    daemon,
+    classSource.document,
+    genericBase.args[0],
+    classSource.beforeOffset
+  );
+}
+
+async function resolveModelLabelFromFromQuerysetArgument(
+  daemon: AnalysisDaemon,
+  classSource: ClassDefinitionSource,
+  baseExpression: string,
+  visited: Set<string>
+): Promise<string | undefined> {
+  const details = parseCallExpressionDetails(baseExpression);
+  if (
+    !details ||
+    details.parsedCall.kind !== 'member' ||
+    details.parsedCall.memberName !== 'from_queryset'
+  ) {
+    return undefined;
+  }
+
+  const firstArgument = splitTopLevelExpressions(details.argsText)[0];
+  if (!firstArgument) {
+    return undefined;
+  }
+
+  const querysetClassSource = await resolveClassDefinitionSource(
+    daemon,
+    classSource.document,
+    firstArgument,
+    classSource.beforeOffset
+  );
+  if (!querysetClassSource) {
+    return undefined;
+  }
+
+  return resolveModelLabelFromSpecialClassBaseExpressions(
+    daemon,
+    querysetClassSource,
+    'queryset',
+    visited
+  );
+}
+
+function specialClassModelNameCandidates(
+  classSource: ClassDefinitionSource,
+  specialKind: SpecialClassKind
+): string[] {
+  const candidates: string[] = [];
+  const pushCandidate = (value: string | undefined): void => {
+    const candidate = specialClassModelNameCandidate(value, specialKind);
+    if (!candidate || candidates.includes(candidate)) {
+      return;
+    }
+    candidates.push(candidate);
+  };
+
+  pushCandidate(classSource.classDef.name);
+
+  for (const baseExpression of classSource.classDef.baseExpressions) {
+    const details = parseCallExpressionDetails(baseExpression);
+    if (
+      !details ||
+      details.parsedCall.kind !== 'member' ||
+      details.parsedCall.memberName !== 'from_queryset'
+    ) {
+      continue;
+    }
+
+    const firstArgument = splitTopLevelExpressions(details.argsText)[0];
+    pushCandidate(firstArgument);
+  }
+
+  return candidates;
+}
+
+function specialClassModelNameCandidate(
+  value: string | undefined,
+  specialKind: SpecialClassKind
+): string | undefined {
+  const normalizedValue = value?.trim();
+  if (!normalizedValue) {
+    return undefined;
+  }
+
+  const name = normalizedValue.split('.').at(-1);
+  if (!name) {
+    return undefined;
+  }
+
+  if (specialKind === 'manager' && name.endsWith('Manager')) {
+    return name.slice(0, -'Manager'.length) || undefined;
+  }
+
+  if (
+    (specialKind === 'queryset' || specialKind === 'related_manager') &&
+    name.endsWith('QuerySet')
+  ) {
+    return name.slice(0, -'QuerySet'.length) || undefined;
   }
 
   return undefined;
@@ -9244,6 +10082,16 @@ async function resolveClassDefinitionFromTypeAnnotation(
       }
 
       return undefined;
+    }
+
+    const genericBaseClassSource = await resolveClassDefinitionSource(
+      daemon,
+      document,
+      genericType.base,
+      beforeOffset
+    );
+    if (genericBaseClassSource) {
+      return genericBaseClassSource;
     }
   }
 
@@ -9594,50 +10442,232 @@ async function resolveImportedModuleAlias(
   return moduleResolution.resolved ? importedModuleName : undefined;
 }
 
+function collectParsedImportStatements(
+  document: vscode.TextDocument
+): ParsedImportStatement[] {
+  const cached = parsedImportStatementCache.get(document);
+  if (cached && cached.version === document.version) {
+    return cached.statements;
+  }
+
+  const statements = buildParsedImportStatements(document);
+  parsedImportStatementCache.set(document, {
+    version: document.version,
+    statements,
+  });
+  return statements;
+}
+
+function buildParsedImportStatements(
+  document: vscode.TextDocument
+): ParsedImportStatement[] {
+  const statements: ParsedImportStatement[] = [];
+
+  for (const rawStatement of collectRawImportStatements(document)) {
+    const parsedStatement = parseImportStatement(document, rawStatement);
+    if (parsedStatement) {
+      statements.push(parsedStatement);
+    }
+  }
+
+  return statements;
+}
+
+function collectRawImportStatements(
+  document: vscode.TextDocument
+): RawImportStatement[] {
+  const statements: RawImportStatement[] = [];
+
+  for (let line = 0; line < document.lineCount; line += 1) {
+    const lineText = document.lineAt(line).text;
+    const trimmed = lineText.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+
+    if (!trimmed.startsWith('from ') && !trimmed.startsWith('import ')) {
+      continue;
+    }
+
+    let endLine = line;
+    let delimiterDepth = 0;
+    while (true) {
+      const statementLine = stripTrailingComment(document.lineAt(endLine).text);
+      delimiterDepth = Math.max(
+        0,
+        delimiterDepth + importStatementDelimiterDelta(statementLine)
+      );
+      const continues =
+        delimiterDepth > 0 || statementLine.trimEnd().endsWith('\\');
+      if (!continues || endLine >= document.lineCount - 1) {
+        break;
+      }
+
+      endLine += 1;
+    }
+
+    const start = new vscode.Position(line, 0);
+    const end = document.lineAt(endLine).range.end;
+    statements.push({
+      startOffset: document.offsetAt(start),
+      endOffset: document.offsetAt(end),
+      text: document.getText(new vscode.Range(start, end)),
+    });
+    line = endLine;
+  }
+
+  return statements;
+}
+
+function importStatementDelimiterDelta(text: string): number {
+  let delta = 0;
+
+  for (const char of text) {
+    if (char === '(' || char === '[' || char === '{') {
+      delta += 1;
+      continue;
+    }
+
+    if (char === ')' || char === ']' || char === '}') {
+      delta -= 1;
+    }
+  }
+
+  return delta;
+}
+
+function parseImportStatement(
+  document: vscode.TextDocument,
+  statement: RawImportStatement
+): ParsedImportStatement | undefined {
+  const fromMatch = statement.text.match(/^\s*from\s+([.A-Za-z_][\w.]*)\s+import\b/);
+  if (fromMatch) {
+    const rawModuleName = fromMatch[1];
+    const moduleName = resolveImportedModuleName(document, rawModuleName);
+    const clauseStartOffset = statement.startOffset + fromMatch[0].length;
+    const clauseText = statement.text.slice(fromMatch[0].length);
+
+    return {
+      kind: 'from',
+      startOffset: statement.startOffset,
+      endOffset: statement.endOffset,
+      rawModuleName,
+      moduleName,
+      symbolSpecs: parseImportSymbolSpecs(clauseText, clauseStartOffset),
+    };
+  }
+
+  const importMatch = statement.text.match(/^\s*import\b/);
+  if (!importMatch) {
+    return undefined;
+  }
+
+  const clauseStartOffset = statement.startOffset + importMatch[0].length;
+  const clauseText = statement.text.slice(importMatch[0].length);
+
+  return {
+    kind: 'import',
+    startOffset: statement.startOffset,
+    endOffset: statement.endOffset,
+    moduleSpecs: parseImportModuleSpecs(clauseText, clauseStartOffset),
+  };
+}
+
+function parseImportSymbolSpecs(
+  clauseText: string,
+  clauseStartOffset: number
+): ParsedImportSymbolSpec[] {
+  const specs: ParsedImportSymbolSpec[] = [];
+
+  for (const match of clauseText.matchAll(IMPORT_SPEC_PATTERN)) {
+    const importedName = match[1];
+    const aliasName = match[2];
+    const relativeStart = match.index ?? 0;
+    const importedStartOffset = clauseStartOffset + relativeStart;
+    const spec: ParsedImportSymbolSpec = {
+      importedName,
+      aliasName,
+      importedStartOffset,
+      importedEndOffset: importedStartOffset + importedName.length,
+    };
+
+    if (aliasName) {
+      const aliasOffset = match[0].lastIndexOf(aliasName);
+      spec.aliasStartOffset = clauseStartOffset + relativeStart + aliasOffset;
+      spec.aliasEndOffset = spec.aliasStartOffset + aliasName.length;
+    }
+
+    specs.push(spec);
+  }
+
+  return specs;
+}
+
+function parseImportModuleSpecs(
+  clauseText: string,
+  clauseStartOffset: number
+): ParsedImportModuleSpec[] {
+  const specs: ParsedImportModuleSpec[] = [];
+
+  for (const match of clauseText.matchAll(IMPORT_MODULE_SPEC_PATTERN)) {
+    const importedModule = match[1];
+    const aliasName = match[2];
+    const relativeStart = match.index ?? 0;
+    const importedStartOffset = clauseStartOffset + relativeStart;
+    const spec: ParsedImportModuleSpec = {
+      importedModule,
+      aliasName,
+      importedStartOffset,
+      importedEndOffset: importedStartOffset + importedModule.length,
+    };
+
+    if (aliasName) {
+      const aliasOffset = match[0].lastIndexOf(aliasName);
+      spec.aliasStartOffset = clauseStartOffset + relativeStart + aliasOffset;
+      spec.aliasEndOffset = spec.aliasStartOffset + aliasName.length;
+    }
+
+    specs.push(spec);
+  }
+
+  return specs;
+}
+
 function collectImportBindings(
   document: vscode.TextDocument,
   beforeOffset: number
 ): ImportBindings {
   const symbols = new Map<string, { moduleName: string; symbolName: string }>();
   const modules = new Map<string, string>();
-  const beforePosition = document.positionAt(beforeOffset);
+  const importStatements = collectParsedImportStatements(document);
 
-  for (let line = 0; line <= beforePosition.line; line += 1) {
-    const lineText = document.lineAt(line).text.trim();
-    if (!lineText || lineText.startsWith('#')) {
+  for (const statement of importStatements) {
+    if (statement.endOffset > beforeOffset) {
       continue;
     }
 
-    const fromMatch = lineText.match(IMPORT_FROM_PATTERN);
-    if (fromMatch) {
-      const [, rawModuleName, clauseText] = fromMatch;
-      const moduleName = resolveImportedModuleName(document, rawModuleName);
-      if (!moduleName) {
+    if (statement.kind === 'from') {
+      if (!statement.moduleName) {
         continue;
       }
-      for (const match of clauseText.matchAll(IMPORT_SPEC_PATTERN)) {
-        const importedName = match[1];
-        const aliasName = match[2] ?? importedName;
+
+      for (const spec of statement.symbolSpecs) {
+        const aliasName = spec.aliasName ?? spec.importedName;
         symbols.set(aliasName, {
-          moduleName,
-          symbolName: importedName,
+          moduleName: statement.moduleName,
+          symbolName: spec.importedName,
         });
       }
       continue;
     }
 
-    const importMatch = lineText.match(IMPORT_MODULE_PATTERN);
-    if (!importMatch) {
-      continue;
-    }
-
-    for (const match of importMatch[1].matchAll(IMPORT_MODULE_SPEC_PATTERN)) {
-      const importedModule = match[1];
-      const aliasName = match[2] ?? importedModule.split('.').at(-1);
+    for (const spec of statement.moduleSpecs) {
+      const aliasName =
+        spec.aliasName ?? spec.importedModule.split('.').at(-1);
       if (!aliasName) {
         continue;
       }
-      modules.set(aliasName, importedModule);
+      modules.set(aliasName, spec.importedModule);
     }
   }
 
