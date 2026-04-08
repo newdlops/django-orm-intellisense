@@ -914,6 +914,7 @@ def _build_module_index(
     pending_fields: list[PendingFieldCandidate] = []
     is_package_init = python_file.name == '__init__.py'
 
+    class_nodes: list[ast.ClassDef] = []
     for node in _iter_indexable_module_nodes(parsed_module.body):
         if isinstance(node, ast.ClassDef):
             defined_symbols.add(node.name)
@@ -921,6 +922,7 @@ def _build_module_index(
                 node.name,
                 _definition_location(str(python_file), node.lineno, node.col_offset),
             )
+            class_nodes.append(node)
 
             if _looks_like_model_candidate(node):
                 model_app_label = _model_app_label(
@@ -1019,6 +1021,44 @@ def _build_module_index(
                         is_star=alias.name == '*',
                     )
                 )
+
+    # 2차 패스: 같은 모듈 내 model candidate를 상속하는 클래스도 model candidate로 등록
+    registered_names = {c.object_name for c in model_candidates}
+    changed = True
+    while changed:
+        changed = False
+        for node in class_nodes:
+            if node.name in registered_names:
+                continue
+            base_names = [_dotted_name(base) for base in node.bases]
+            if any(
+                base_name in registered_names
+                or base_name.rsplit('.', 1)[-1] in registered_names
+                for base_name in base_names
+                if base_name
+            ):
+                model_app_label = _model_app_label(
+                    module_name=module_name,
+                    node=node,
+                )
+                model_candidates.append(
+                    _model_candidate_from_class(
+                        python_file=python_file,
+                        module_name=module_name,
+                        node=node,
+                    )
+                )
+                pending_fields.extend(
+                    _extract_pending_fields_from_model_class(
+                        python_file=python_file,
+                        module_name=module_name,
+                        app_label=model_app_label,
+                        model_name=node.name,
+                        class_node=node,
+                    )
+                )
+                registered_names.add(node.name)
+                changed = True
 
     return ModuleIndex(
         module_name=module_name,
@@ -1434,6 +1474,132 @@ def _clone_field_for_model(field: FieldCandidate, model_label: str) -> FieldCand
     )
 
 
+def _expand_model_candidates_via_imports(
+    *,
+    modules: dict[str, ModuleIndex],
+    initial_candidates: list[ModelCandidate],
+) -> list[ModelCandidate]:
+    """등록된 model candidate를 import해서 상속하는 클래스를 추가 등록."""
+    registered: set[tuple[str, str]] = {
+        (c.module, c.object_name) for c in initial_candidates
+    }
+    all_candidates = list(initial_candidates)
+
+    # model candidate가 정의된 모듈별 이름 set
+    names_by_module: dict[str, set[str]] = {}
+    for c in initial_candidates:
+        names_by_module.setdefault(c.module, set()).add(c.object_name)
+
+    # model candidate를 import하는 모듈 → {local_alias: symbol}
+    importers: dict[str, dict[str, str]] = {}
+    for module_name, module_index in modules.items():
+        aliases: dict[str, str] = {}
+        for binding in module_index.import_bindings:
+            if binding.symbol is None or binding.is_star:
+                continue
+            source = names_by_module.get(binding.module, set())
+            if binding.symbol in source:
+                aliases[binding.alias] = binding.symbol
+        if aliases:
+            importers[module_name] = aliases
+
+    # import alias가 있는 모듈만 재파싱 (대상 모듈 수가 제한적)
+    class_cache: dict[str, list[ast.ClassDef]] = {}
+    changed = True
+    while changed:
+        changed = False
+        for module_name in list(importers.keys()):
+            module_index = modules[module_name]
+            local_names = names_by_module.get(module_name, set())
+            known = local_names | set(importers.get(module_name, {}).keys())
+            if not known:
+                continue
+
+            if module_name not in class_cache:
+                class_cache[module_name] = _parse_class_nodes(
+                    module_index.file_path
+                )
+
+            for node in class_cache[module_name]:
+                if (module_name, node.name) in registered:
+                    continue
+                bases = [_dotted_name(b) for b in node.bases]
+                if not any(
+                    b in known or b.rsplit('.', 1)[-1] in known
+                    for b in bases if b
+                ):
+                    continue
+
+                app_label = (
+                    _extract_model_meta_string(node, 'app_label')
+                    or module_name.split('.', 1)[0]
+                )
+                candidate = _build_expanded_candidate(
+                    module_index, module_name, app_label, node,
+                )
+                all_candidates.append(candidate)
+                module_index.model_candidates.append(candidate)
+                module_index.pending_fields.extend(
+                    _extract_pending_fields_from_model_class(
+                        python_file=Path(module_index.file_path),
+                        module_name=module_name,
+                        app_label=app_label,
+                        model_name=node.name,
+                        class_node=node,
+                    )
+                )
+                registered.add((module_name, node.name))
+                names_by_module.setdefault(module_name, set()).add(
+                    node.name
+                )
+                # 새 candidate를 import하는 다른 모듈도 대상에 추가
+                for other_name, other_mod in modules.items():
+                    for binding in other_mod.import_bindings:
+                        if (
+                            binding.symbol == node.name
+                            and binding.module == module_name
+                        ):
+                            importers.setdefault(other_name, {})[
+                                binding.alias
+                            ] = node.name
+                changed = True
+
+    return all_candidates
+
+
+def _parse_class_nodes(file_path: str) -> list[ast.ClassDef]:
+    try:
+        text = Path(file_path).read_text(encoding='utf-8')
+        parsed = ast.parse(text)
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return []
+    return [
+        n for n in _iter_indexable_module_nodes(parsed.body)
+        if isinstance(n, ast.ClassDef)
+    ]
+
+
+def _build_expanded_candidate(
+    module_index: ModuleIndex,
+    module_name: str,
+    app_label: str,
+    node: ast.ClassDef,
+) -> ModelCandidate:
+    return ModelCandidate(
+        app_label=app_label,
+        object_name=node.name,
+        label=f'{app_label}.{node.name}',
+        module=module_name,
+        file_path=module_index.file_path,
+        line=node.lineno,
+        column=node.col_offset + 1,
+        is_abstract=_is_abstract_model_class(node),
+        base_class_refs=tuple(
+            b for b in (_dotted_name(base) for base in node.bases) if b
+        ),
+    )
+
+
 def _static_index_from_modules(
     *,
     python_file_count: int,
@@ -1467,6 +1633,12 @@ def _static_index_from_modules(
 
         star_import_count += module_star_imports
         model_candidates.extend(module_index.model_candidates)
+
+    # Cross-module 상속: 이미 등록된 model candidate를 import해서 상속하는 클래스도 등록
+    model_candidates = _expand_model_candidates_via_imports(
+        modules=modules,
+        initial_candidates=model_candidates,
+    )
 
     return StaticIndex(
         python_file_count=python_file_count,

@@ -414,7 +414,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      118,
+      127,
       'Expected reverse lookup definition to target the CorporateRegistration.registration_code field.'
     );
 
@@ -491,7 +491,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      177,
+      186,
       'Expected app-label-overridden reverse lookup definition to target AppLabelCorporateRegistration.registration_code.'
     );
 
@@ -1085,7 +1085,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       queryNameDefinitionTarget!.range.start.line + 1,
-      151,
+      160,
       'Expected reverse related_query_name definition to target FaqLink.label.'
     );
 
@@ -2126,6 +2126,34 @@ suite('Django ORM Intellisense UI', () => {
       'Expected typed custom related-manager create() field completion to include `title`.'
     );
 
+    const customRelatedManagerEmptyCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        'typed_company.question_thread_set.create()',
+        'create('
+      );
+    const customRelatedManagerEmptyCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        customRelatedManagerEmptyCreateCompletionPosition
+      );
+    const customRelatedManagerEmptyCreateTitleItem = findCompletionItemByLabel(
+      customRelatedManagerEmptyCreateCompletionList?.items,
+      'title'
+    );
+
+    assert.ok(
+      customRelatedManagerEmptyCreateTitleItem,
+      'Expected empty create() completion to include `title` before typing a keyword prefix.'
+    );
+    assert.ok(
+      (customRelatedManagerEmptyCreateTitleItem?.sortText ?? '').startsWith(
+        '\u0000django-'
+      ),
+      `Expected empty create() field completion to carry high-priority Django sortText. Received: ${customRelatedManagerEmptyCreateTitleItem?.sortText}`
+    );
+
     const customRelatedManagerFilterCompletionPosition = positionAfterTextInContainer(
       document,
       "typed_company.question_thread_set.filter(ti='draft')",
@@ -2158,6 +2186,388 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hasCompletionItemLabel(customRelatedManagerExcludeCompletionList?.items, 'title'),
       'Expected typed custom related-manager exclude() field completion to include `title`.'
+    );
+
+    const defaultRelatedManagerCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "company_question_thread.message_set.create(co='draft')",
+        'co'
+      );
+    const defaultRelatedManagerCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        defaultRelatedManagerCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(defaultRelatedManagerCreateCompletionList?.items, 'content'),
+      'Expected default reverse related-manager create() field completion to include `content`.'
+    );
+
+    const defaultRelatedManagerFilterCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "company_question_thread.message_set.filter(co='draft')",
+        'co'
+      );
+    const defaultRelatedManagerFilterCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        defaultRelatedManagerFilterCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(defaultRelatedManagerFilterCompletionList?.items, 'content'),
+      'Expected default reverse related-manager filter() field completion to include `content`.'
+    );
+
+    const defaultRelatedManagerExcludeCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "company_question_thread.message_set.exclude(co='draft')",
+        'co'
+      );
+    const defaultRelatedManagerExcludeCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        defaultRelatedManagerExcludeCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        defaultRelatedManagerExcludeCompletionList?.items,
+        'content'
+      ),
+      'Expected default reverse related-manager exclude() field completion to include `content`.'
+    );
+
+    const typedDefaultRelatedManagerCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "typed_question_thread.message_set.create(co='draft')",
+        'co'
+      );
+    const typedDefaultRelatedManagerCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typedDefaultRelatedManagerCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        typedDefaultRelatedManagerCreateCompletionList?.items,
+        'content'
+      ),
+      'Expected typed default reverse related-manager create() field completion to include `content`.'
+    );
+
+    const typedDefaultRelatedManagerFilterCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "typed_question_thread.message_set.filter(co='draft')",
+        'co'
+      );
+    const typedDefaultRelatedManagerFilterCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typedDefaultRelatedManagerFilterCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        typedDefaultRelatedManagerFilterCompletionList?.items,
+        'content'
+      ),
+      'Expected typed default reverse related-manager filter() field completion to include `content`.'
+    );
+
+    const typedDefaultRelatedManagerExcludeCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "typed_question_thread.message_set.exclude(co='draft')",
+        'co'
+      );
+    const typedDefaultRelatedManagerExcludeCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        typedDefaultRelatedManagerExcludeCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        typedDefaultRelatedManagerExcludeCompletionList?.items,
+        'content'
+      ),
+      'Expected typed default reverse related-manager exclude() field completion to include `content`.'
+    );
+
+    const selfAnnotatedRelatedManagerCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.question_thread_set.create(ti='draft')",
+        'ti'
+      );
+    const selfAnnotatedRelatedManagerCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        selfAnnotatedRelatedManagerCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        selfAnnotatedRelatedManagerCreateCompletionList?.items,
+        'title'
+      ),
+      'Expected self-annotated reverse related-manager create() field completion to include `title`.'
+    );
+
+    const selfAnnotatedRelatedManagerFilterCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.question_thread_set.filter(ti='draft')",
+        'ti'
+      );
+    const selfAnnotatedRelatedManagerFilterCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        selfAnnotatedRelatedManagerFilterCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        selfAnnotatedRelatedManagerFilterCompletionList?.items,
+        'title'
+      ),
+      'Expected self-annotated reverse related-manager filter() field completion to include `title`.'
+    );
+
+    const selfAnnotatedRelatedManagerExcludeCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.question_thread_set.exclude(ti='draft')",
+        'ti'
+      );
+    const selfAnnotatedRelatedManagerExcludeCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        selfAnnotatedRelatedManagerExcludeCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        selfAnnotatedRelatedManagerExcludeCompletionList?.items,
+        'title'
+      ),
+      'Expected self-annotated reverse related-manager exclude() field completion to include `title`.'
+    );
+
+    const captainSelfRelatedManagerCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.question_thread_set.create(he='captain')",
+        'he'
+      );
+    const captainSelfRelatedManagerCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainSelfRelatedManagerCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        captainSelfRelatedManagerCreateCompletionList?.items,
+        'help_type'
+      ),
+      'Expected Captain-style self.company reverse related-manager create() field completion to include `help_type`.'
+    );
+
+    const captainSelfRelatedManagerEmptyCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        'self.company.question_thread_set.create()',
+        'create('
+      );
+    const captainSelfRelatedManagerEmptyCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainSelfRelatedManagerEmptyCreateCompletionPosition
+      );
+    const captainSelfRelatedManagerEmptyCreateHelpTypeItem = findCompletionItemByLabel(
+      captainSelfRelatedManagerEmptyCreateCompletionList?.items,
+      'help_type'
+    );
+
+    assert.ok(
+      captainSelfRelatedManagerEmptyCreateHelpTypeItem,
+      'Expected Captain-style empty create() completion to include `help_type` before typing a keyword prefix.'
+    );
+    assert.ok(
+      (captainSelfRelatedManagerEmptyCreateHelpTypeItem?.sortText ?? '').startsWith(
+        '\u0000django-'
+      ),
+      `Expected Captain-style empty create() field completion to carry high-priority Django sortText. Received: ${captainSelfRelatedManagerEmptyCreateHelpTypeItem?.sortText}`
+    );
+
+    const captainSelfRelatedManagerFilterCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.question_thread_set.filter(he='captain')",
+        'he'
+      );
+    const captainSelfRelatedManagerFilterCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainSelfRelatedManagerFilterCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        captainSelfRelatedManagerFilterCompletionList?.items,
+        'help_type'
+      ),
+      'Expected Captain-style self.company reverse related-manager filter() field completion to include `help_type`.'
+    );
+
+    const captainSelfRelatedManagerExcludeCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.question_thread_set.exclude(he='captain')",
+        'he'
+      );
+    const captainSelfRelatedManagerExcludeCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainSelfRelatedManagerExcludeCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        captainSelfRelatedManagerExcludeCompletionList?.items,
+        'help_type'
+      ),
+      'Expected Captain-style self.company reverse related-manager exclude() field completion to include `help_type`.'
+    );
+
+    const captainMessageCreateCompletionPosition = positionAfterTextInContainer(
+      document,
+      `self.get_company_question_thread(
+            company_question_thread_id=1
+        ).message_set.create(co='captain')`,
+      'co'
+    );
+    const captainMessageCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainMessageCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(captainMessageCreateCompletionList?.items, 'content'),
+      'Expected Captain-style returned thread message_set create() field completion to include `content`.'
+    );
+
+    const captainMessageFilterCompletionPosition = positionAfterTextInContainer(
+      document,
+      `self.get_company_question_thread(
+            company_question_thread_id=1
+        ).message_set.filter(co='captain')`,
+      'co'
+    );
+    const captainMessageFilterCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainMessageFilterCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(captainMessageFilterCompletionList?.items, 'content'),
+      'Expected Captain-style returned thread message_set filter() field completion to include `content`.'
+    );
+
+    const captainMessageExcludeCompletionPosition = positionAfterTextInContainer(
+      document,
+      `self.get_company_question_thread(
+            company_question_thread_id=1
+        ).message_set.exclude(co='captain')`,
+      'co'
+    );
+    const captainMessageExcludeCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainMessageExcludeCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(captainMessageExcludeCompletionList?.items, 'content'),
+      'Expected Captain-style returned thread message_set exclude() field completion to include `content`.'
+    );
+
+    const multilineInitSelfCreatePosition = positionAfterTextInContainer(
+      document,
+      "self.company.question_thread_set.create(ti='multiline_init')",
+      'ti'
+    );
+    const multilineInitSelfCreateList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        multilineInitSelfCreatePosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(multilineInitSelfCreateList?.items, 'title'),
+      'Expected multi-line __init__ self-annotated reverse related-manager create() field completion to include `title`.'
+    );
+
+    const multilineCreateAssignCreatePosition = positionAfterTextInContainer(
+      document,
+      "company_question_thread.message_set.create(con='multiline')",
+      'con'
+    );
+    const multilineCreateAssignCreateList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        multilineCreateAssignCreatePosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(multilineCreateAssignCreateList?.items, 'content'),
+      'Expected multi-line create() assigned variable message_set create() field completion to include `content`.'
+    );
+
+    const multilineCreateAssignFilterPosition = positionAfterTextInContainer(
+      document,
+      "company_question_thread.message_set.filter(con='multiline')",
+      'con'
+    );
+    const multilineCreateAssignFilterList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        multilineCreateAssignFilterPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(multilineCreateAssignFilterList?.items, 'content'),
+      'Expected multi-line create() assigned variable message_set filter() field completion to include `content`.'
     );
   });
 
@@ -3945,6 +4355,23 @@ suite('Django ORM Intellisense UI', () => {
       hasCompletionItemLabel(relatedManagerCreateCompletionList?.items, 'create'),
       'Expected reverse related manager completion to include built-in manager methods like `create`.'
     );
+    const relatedManagerCreateCompletionItem = findCompletionItemByLabel(
+      relatedManagerCreateCompletionList?.items,
+      'create'
+    );
+
+    assert.ok(
+      (relatedManagerCreateCompletionItem?.sortText ?? '').startsWith(
+        '\u0000django-'
+      ),
+      `Expected reverse related manager create() completion to carry high-priority Django sortText. Received: ${relatedManagerCreateCompletionItem?.sortText}`
+    );
+    assert.strictEqual(
+      completionItemDescription(relatedManagerCreateCompletionItem!),
+      'Django',
+      `Expected reverse related manager create() completion to expose a Django description and avoid duplicate-label merging. Received: ${completionItemDescription(relatedManagerCreateCompletionItem!)}`
+    );
+
 
     const directGetResultCompletionPosition = positionAfterTextInContainer(
       document,

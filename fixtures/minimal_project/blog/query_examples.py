@@ -2,7 +2,14 @@ from django.db import models as db_models
 from django.db.models import F, Prefetch, Q
 
 from blog import AuditLog, Company, MultiInheritedLog, Post
-from blog.models import AppLabelCompany, Faq, HiddenReverseTag
+from blog.models import (
+    AppLabelCompany,
+    CaptainCompany,
+    CaptainQuestionThread,
+    Faq,
+    HiddenReverseTag,
+    QuestionThread,
+)
 
 
 def lookup_examples():
@@ -133,8 +140,77 @@ def create_receiver_examples():
     company.question_thread_set.create(ti='draft')
     company.question_thread_set.filter(ti='draft')
     company.question_thread_set.exclude(ti='draft')
+    company_question_thread = company.question_thread_set.get(id=1)
+    company_question_thread.message_set.create(co='draft')
+    company_question_thread.message_set.filter(co='draft')
+    company_question_thread.message_set.exclude(co='draft')
 
     typed_company: Company = Company.objects.get(id=1)
+    typed_company.question_thread_set.create()
     typed_company.question_thread_set.create(ti='draft')
     typed_company.question_thread_set.filter(ti='draft')
     typed_company.question_thread_set.exclude(ti='draft')
+
+    typed_question_thread: QuestionThread = QuestionThread.objects.get(id=1)
+    typed_question_thread.message_set.create(co='draft')
+    typed_question_thread.message_set.filter(co='draft')
+    typed_question_thread.message_set.exclude(co='draft')
+
+
+class CompanyQuestionServiceExamples:
+    def __init__(self, company: Company) -> None:
+        self.company: "Company" = company
+
+    def method_examples(self):
+        self.company.question_thread_set.create(ti='draft')
+        self.company.question_thread_set.filter(ti='draft')
+        self.company.question_thread_set.exclude(ti='draft')
+
+
+class MultilineInitServiceExamples:
+    def __init__(
+        self, *, company: "Company", title: str
+    ) -> None:
+        self.company: "Company" = company
+
+    def multiline_create_assignment_examples(self):
+        company_question_thread = self.company.question_thread_set.create(
+            title='test'
+        )
+        company_question_thread.message_set.create(con='multiline')
+        company_question_thread.message_set.filter(con='multiline')
+        company_question_thread.message_set.exclude(con='multiline')
+
+    def multiline_self_member_examples(self):
+        self.company.question_thread_set.create(ti='multiline_init')
+        self.company.question_thread_set.filter(ti='multiline_init')
+        self.company.question_thread_set.exclude(ti='multiline_init')
+
+
+class CaptainCompanyQuestionServiceExamples:
+    def __init__(self, company: CaptainCompany) -> None:
+        self.company: "CaptainCompany" = company
+
+    def get_company_question_thread(
+        self, *, company_question_thread_id: int
+    ) -> "CaptainQuestionThread":
+        return (
+            self.company.question_thread_set.get_queryset()
+            .exclude_deleted()
+            .get(id=company_question_thread_id)
+        )
+
+    def method_examples(self):
+        self.company.question_thread_set.create()
+        self.company.question_thread_set.create(he='captain')
+        self.company.question_thread_set.filter(he='captain')
+        self.company.question_thread_set.exclude(he='captain')
+        self.get_company_question_thread(
+            company_question_thread_id=1
+        ).message_set.create(co='captain')
+        self.get_company_question_thread(
+            company_question_thread_id=1
+        ).message_set.filter(co='captain')
+        self.get_company_question_thread(
+            company_question_thread_id=1
+        ).message_set.exclude(co='captain')

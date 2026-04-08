@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 from django.db import models
 from django.db.models.lookups import Lookup
@@ -109,6 +109,15 @@ class QuestionThread(models.Model):
     objects = QuestionThreadManager()
 
 
+class Message(models.Model):
+    question_thread = models.ForeignKey(
+        QuestionThread,
+        on_delete=models.CASCADE,
+    )
+    content = models.CharField(max_length=255)
+    is_visible = models.BooleanField(default=True)
+
+
 class CorporateRegistration(models.Model):
     company = models.OneToOneField(
         Company,
@@ -179,3 +188,83 @@ class AppLabelCorporateRegistration(models.Model):
 
     class Meta:
         app_label = 'db'
+
+
+_CaptainThreadT = TypeVar(
+    '_CaptainThreadT',
+    bound='CaptainQuestionThread',
+    covariant=True,
+)
+_CaptainMessageT = TypeVar(
+    '_CaptainMessageT',
+    bound='CaptainQuestionThreadMessage',
+    covariant=True,
+)
+
+
+class DeletedQuerySetMixin:
+    def exclude_deleted(self):
+        return self.exclude(is_deleted=True)
+
+
+class CaptainQuestionThreadQuerySet(
+    DeletedQuerySetMixin,
+    models.QuerySet[_CaptainThreadT],
+):
+    pass
+
+
+class CaptainQuestionThreadManager(models.Manager[_CaptainThreadT]):
+    def get_queryset(self) -> CaptainQuestionThreadQuerySet[_CaptainThreadT]:
+        return CaptainQuestionThreadQuerySet(self.model, using=self._db)
+
+
+class CaptainQuestionThreadMessageQuerySet(
+    DeletedQuerySetMixin,
+    models.QuerySet[_CaptainMessageT],
+):
+    pass
+
+
+class CaptainQuestionThreadMessageManager(models.Manager[_CaptainMessageT]):
+    def get_queryset(self) -> CaptainQuestionThreadMessageQuerySet[_CaptainMessageT]:
+        return CaptainQuestionThreadMessageQuerySet(self.model, using=self._db)
+
+
+class CaptainCompany(models.Model):
+    if TYPE_CHECKING:
+        question_thread_set: 'CaptainQuestionThreadManager'
+
+    name = models.CharField(max_length=255)
+
+
+class CaptainQuestionThread(models.Model):
+    if TYPE_CHECKING:
+        message_set: 'CaptainQuestionThreadMessageManager'
+
+    company = models.ForeignKey(
+        CaptainCompany,
+        related_name='question_thread_set',
+        on_delete=models.CASCADE,
+    )
+    title = models.CharField(max_length=255)
+    help_type = models.CharField(max_length=50, default='etc_help')
+    is_deleted = models.BooleanField(default=False)
+
+    objects = CaptainQuestionThreadManager.from_queryset(
+        CaptainQuestionThreadQuerySet
+    )()
+
+
+class CaptainQuestionThreadMessage(models.Model):
+    question_thread = models.ForeignKey(
+        CaptainQuestionThread,
+        related_name='message_set',
+        on_delete=models.CASCADE,
+    )
+    content = models.CharField(max_length=255)
+    is_deleted = models.BooleanField(default=False)
+
+    objects = CaptainQuestionThreadMessageManager.from_queryset(
+        CaptainQuestionThreadMessageQuerySet
+    )()

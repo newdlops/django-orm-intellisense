@@ -8,6 +8,7 @@ import { isRelevantConfigurationChange, getExtensionSettings } from './config/se
 import { AnalysisDaemon } from './daemon/analysisDaemon';
 import { HealthDiagnostics } from './diagnostics/healthDiagnostics';
 import { registerPythonProviders } from './providers/pythonProviders';
+import { excludeDjangoStubsFromPylance } from './pylance/excludeDjangoStubs';
 import { normalizePythonInterpreterSettings } from './python/interpreter';
 import { isPylanceAvailable } from './python/pylance';
 import { HealthStatusView } from './status/healthStatus';
@@ -77,6 +78,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       });
     })
   );
+
+  void excludeDjangoStubsFromPylance(output).catch((error) => {
+    output.appendLine(
+      `[pylance] Failed to exclude django-stubs from Pylance analysis: ${String(error)}`
+    );
+  });
 
   void normalizePythonInterpreterSettings()
     .then((normalization) => {
