@@ -30,7 +30,9 @@ from ..features.lookup_paths import (
 )
 from ..features.orm_members import (
     list_orm_member_completions,
+    prebuild_member_surface_cache,
     resolve_orm_member,
+    resolve_orm_member_chain,
 )
 from ..features.reexports import resolve_export_origin
 from ..features.relation_targets import (
@@ -106,6 +108,8 @@ class DaemonServer:
                     result = self._orm_member_completions(params)
                 elif method == 'resolveOrmMember':
                     result = self._resolve_orm_member(params)
+                elif method == 'resolveOrmMemberChain':
+                    result = self._resolve_orm_member_chain(params)
                 else:
                     raise ValueError(f'Unsupported method: {method}')
         except Exception as error:  # pragma: no cover - scaffold safety net
@@ -243,6 +247,7 @@ class DaemonServer:
             semantic_graph=semantic_graph,
             health_snapshot=health_snapshot,
         )
+        surface_index = prebuild_member_surface_cache(static_index, runtime)
         _log_initialize_step(
             f'complete elapsed={time.perf_counter() - started_at:.2f}s'
         )
@@ -257,10 +262,18 @@ class DaemonServer:
                 settings_module=effective_settings_module,
             )
 
+        model_names = sorted({
+            c.object_name
+            for c in static_index.model_candidates
+            if not c.is_abstract
+        })
+
         return {
             'serverName': 'django-orm-intellisense',
             'protocolVersion': '0.1',
             'health': health_snapshot,
+            'modelNames': model_names,
+            'surfaceIndex': surface_index,
         }
 
     def _health(self) -> dict[str, Any]:
@@ -390,6 +403,26 @@ class DaemonServer:
             model_label=model_label,
             receiver_kind=receiver_kind,
             name=name,
+            manager_name=manager_name,
+        )
+
+    def _resolve_orm_member_chain(self, params: dict[str, Any]) -> dict[str, Any]:
+        static_index, runtime = self._require_feature_state()
+        model_label = _clean_optional_string(params.get('modelLabel'))
+        receiver_kind = _clean_optional_string(params.get('receiverKind'))
+        chain = params.get('chain')
+        manager_name = _clean_optional_string(params.get('managerName'))
+        if model_label is None or receiver_kind is None or not isinstance(chain, list):
+            raise ValueError(
+                '`modelLabel`, `receiverKind`, and `chain` are required.'
+            )
+
+        return resolve_orm_member_chain(
+            static_index=static_index,
+            runtime=runtime,
+            model_label=model_label,
+            receiver_kind=receiver_kind,
+            chain=[str(name) for name in chain],
             manager_name=manager_name,
         )
 

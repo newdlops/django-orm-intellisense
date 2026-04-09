@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -201,6 +202,7 @@ class ModuleIndex:
     explicit_all: list[str] | None
     model_candidates: list[ModelCandidate]
     pending_fields: list[PendingFieldCandidate]
+    class_base_refs: dict[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -216,6 +218,7 @@ class ModuleIndex:
             'explicitAll': list(self.explicit_all) if self.explicit_all is not None else None,
             'modelCandidates': [candidate.to_dict() for candidate in self.model_candidates],
             'pendingFields': [field.to_dict() for field in self.pending_fields],
+            'classBaseRefs': {k: list(v) for k, v in self.class_base_refs.items()},
         }
 
     @classmethod
@@ -260,6 +263,11 @@ class ModuleIndex:
                 for field in raw_pending_fields
                 if isinstance(field, dict)
             ],
+            class_base_refs={
+                str(k): tuple(str(v) for v in vs)
+                for k, vs in (payload.get('classBaseRefs') or {}).items()
+                if isinstance(vs, list)
+            },
         )
 
 
@@ -857,6 +865,7 @@ def build_static_index(
     modules: dict[str, ModuleIndex] = {}
     source_files = list(python_files) if python_files is not None else iter_python_files(root)
     cached_modules = cached_module_indices or {}
+    has_fresh_modules = False
 
     for python_file in source_files:
         relative_path = python_file.relative_to(root).as_posix()
@@ -871,6 +880,7 @@ def build_static_index(
                 modules[module_name] = cached_module
             continue
 
+        has_fresh_modules = True
         try:
             file_text = python_file.read_text(encoding='utf-8')
             parsed_module = ast.parse(file_text)
@@ -888,6 +898,7 @@ def build_static_index(
     return _static_index_from_modules(
         python_file_count=len(source_files),
         modules=modules,
+        expand_inheritance=has_fresh_modules,
     )
 
 
@@ -911,6 +922,7 @@ def _build_module_index(
     import_bindings: list[ImportBinding] = []
     explicit_all: list[str] | None = None
     model_candidates: list[ModelCandidate] = []
+    class_base_refs: dict[str, tuple[str, ...]] = {}
     pending_fields: list[PendingFieldCandidate] = []
     is_package_init = python_file.name == '__init__.py'
 
@@ -923,6 +935,9 @@ def _build_module_index(
                 _definition_location(str(python_file), node.lineno, node.col_offset),
             )
             class_nodes.append(node)
+            bases = tuple(b for b in (_dotted_name(base) for base in node.bases) if b)
+            if bases:
+                class_base_refs[node.name] = bases
 
             if _looks_like_model_candidate(node):
                 model_app_label = _model_app_label(
@@ -1070,6 +1085,7 @@ def _build_module_index(
         explicit_all=explicit_all,
         model_candidates=model_candidates,
         pending_fields=pending_fields,
+        class_base_refs=class_base_refs,
     )
 
 
@@ -1479,90 +1495,135 @@ def _expand_model_candidates_via_imports(
     modules: dict[str, ModuleIndex],
     initial_candidates: list[ModelCandidate],
 ) -> list[ModelCandidate]:
-    """등록된 model candidate를 import해서 상속하는 클래스를 추가 등록."""
+    """등록된 model candidate를 import해서 상속하는 클래스를 추가 등록.
+    class_base_refs + 역방향 import 인덱스로 파일 재파싱 없이 O(1) 조회."""
     registered: set[tuple[str, str]] = {
         (c.module, c.object_name) for c in initial_candidates
     }
     all_candidates = list(initial_candidates)
 
-    # model candidate가 정의된 모듈별 이름 set
     names_by_module: dict[str, set[str]] = {}
     for c in initial_candidates:
         names_by_module.setdefault(c.module, set()).add(c.object_name)
 
-    # model candidate를 import하는 모듈 → {local_alias: symbol}
-    importers: dict[str, dict[str, str]] = {}
+    # 역방향 import 인덱스: (source_module, symbol) → [(importing_module, alias)]
+    reverse_imports: dict[tuple[str, str], list[tuple[str, str]]] = {}
     for module_name, module_index in modules.items():
-        aliases: dict[str, str] = {}
         for binding in module_index.import_bindings:
             if binding.symbol is None or binding.is_star:
                 continue
-            source = names_by_module.get(binding.module, set())
-            if binding.symbol in source:
-                aliases[binding.alias] = binding.symbol
-        if aliases:
-            importers[module_name] = aliases
+            key = (binding.module, binding.symbol)
+            reverse_imports.setdefault(key, []).append(
+                (module_name, binding.alias)
+            )
 
-    # import alias가 있는 모듈만 재파싱 (대상 모듈 수가 제한적)
-    class_cache: dict[str, list[ast.ClassDef]] = {}
-    changed = True
-    while changed:
-        changed = False
-        for module_name in list(importers.keys()):
-            module_index = modules[module_name]
-            local_names = names_by_module.get(module_name, set())
-            known = local_names | set(importers.get(module_name, {}).keys())
-            if not known:
+    # importers: model candidate를 import하는 모듈 → {local_alias}
+    importers: dict[str, set[str]] = {}
+    for c in initial_candidates:
+        for importing_module, alias in reverse_imports.get(
+            (c.module, c.object_name), []
+        ):
+            importers.setdefault(importing_module, set()).add(alias)
+
+    pending_parse_queue: list[tuple[str, ModuleIndex, str, str]] = []
+
+    # BFS: 처리할 모듈 큐
+    queue = list(importers.keys())
+    visited_modules: set[str] = set()
+    while queue:
+        module_name = queue.pop(0)
+        if module_name in visited_modules:
+            continue
+        visited_modules.add(module_name)
+
+        module_index = modules[module_name]
+        local_names = names_by_module.get(module_name, set())
+        known = local_names | importers.get(module_name, set())
+
+        for class_name, bases in module_index.class_base_refs.items():
+            if (module_name, class_name) in registered:
+                continue
+            if not any(
+                b in known or b.rsplit('.', 1)[-1] in known
+                for b in bases
+            ):
                 continue
 
-            if module_name not in class_cache:
-                class_cache[module_name] = _parse_class_nodes(
-                    module_index.file_path
-                )
+            app_label = module_name.split('.', 1)[0]
+            candidate = ModelCandidate(
+                app_label=app_label,
+                object_name=class_name,
+                label=f'{app_label}.{class_name}',
+                module=module_name,
+                file_path=module_index.file_path,
+                line=0,
+                column=0,
+                is_abstract=False,
+                base_class_refs=bases,
+            )
+            all_candidates.append(candidate)
+            module_index.model_candidates.append(candidate)
+            pending_parse_queue.append(
+                (module_name, module_index, app_label, class_name)
+            )
+            registered.add((module_name, class_name))
+            names_by_module.setdefault(module_name, set()).add(
+                class_name
+            )
+            # O(1) 조회: 이 새 candidate를 import하는 모듈을 큐에 추가
+            for importing_module, alias in reverse_imports.get(
+                (module_name, class_name), []
+            ):
+                importers.setdefault(importing_module, set()).add(alias)
+                if importing_module not in visited_modules:
+                    queue.append(importing_module)
 
-            for node in class_cache[module_name]:
-                if (module_name, node.name) in registered:
-                    continue
-                bases = [_dotted_name(b) for b in node.bases]
-                if not any(
-                    b in known or b.rsplit('.', 1)[-1] in known
-                    for b in bases if b
-                ):
-                    continue
+    # 새로 발견된 candidate의 pending fields만 개별 재파싱
+    files_to_parse: dict[str, list[tuple[str, ModuleIndex, str, str]]] = {}
+    for item in pending_parse_queue:
+        files_to_parse.setdefault(item[1].file_path, []).append(item)
 
-                app_label = (
-                    _extract_model_meta_string(node, 'app_label')
-                    or module_name.split('.', 1)[0]
-                )
-                candidate = _build_expanded_candidate(
-                    module_index, module_name, app_label, node,
-                )
-                all_candidates.append(candidate)
-                module_index.model_candidates.append(candidate)
-                module_index.pending_fields.extend(
-                    _extract_pending_fields_from_model_class(
-                        python_file=Path(module_index.file_path),
-                        module_name=module_name,
-                        app_label=app_label,
-                        model_name=node.name,
-                        class_node=node,
+    for file_path, items in files_to_parse.items():
+        class_nodes = _parse_class_nodes(file_path)
+        node_by_name = {n.name: n for n in class_nodes}
+        for module_name, module_index, app_label, class_name in items:
+            node = node_by_name.get(class_name)
+            if node is None:
+                continue
+            # app_label, is_abstract, line 정보를 AST에서 보정
+            real_app_label = (
+                _extract_model_meta_string(node, 'app_label')
+                or app_label
+            )
+            is_abstract = _is_abstract_model_class(node)
+            # model_candidates에서 해당 candidate 업데이트
+            for i, c in enumerate(all_candidates):
+                if c.module == module_name and c.object_name == class_name:
+                    all_candidates[i] = ModelCandidate(
+                        app_label=real_app_label,
+                        object_name=class_name,
+                        label=f'{real_app_label}.{class_name}',
+                        module=module_name,
+                        file_path=file_path,
+                        line=node.lineno,
+                        column=node.col_offset + 1,
+                        is_abstract=is_abstract,
+                        base_class_refs=tuple(
+                            b for b in (
+                                _dotted_name(base) for base in node.bases
+                            ) if b
+                        ),
                     )
+                    break
+            module_index.pending_fields.extend(
+                _extract_pending_fields_from_model_class(
+                    python_file=Path(file_path),
+                    module_name=module_name,
+                    app_label=real_app_label,
+                    model_name=class_name,
+                    class_node=node,
                 )
-                registered.add((module_name, node.name))
-                names_by_module.setdefault(module_name, set()).add(
-                    node.name
-                )
-                # 새 candidate를 import하는 다른 모듈도 대상에 추가
-                for other_name, other_mod in modules.items():
-                    for binding in other_mod.import_bindings:
-                        if (
-                            binding.symbol == node.name
-                            and binding.module == module_name
-                        ):
-                            importers.setdefault(other_name, {})[
-                                binding.alias
-                            ] = node.name
-                changed = True
+            )
 
     return all_candidates
 
@@ -1604,6 +1665,7 @@ def _static_index_from_modules(
     *,
     python_file_count: int,
     modules: dict[str, ModuleIndex],
+    expand_inheritance: bool = True,
 ) -> StaticIndex:
     package_init_count = 0
     reexport_module_count = 0
@@ -1634,11 +1696,23 @@ def _static_index_from_modules(
         star_import_count += module_star_imports
         model_candidates.extend(module_index.model_candidates)
 
-    # Cross-module 상속: 이미 등록된 model candidate를 import해서 상속하는 클래스도 등록
-    model_candidates = _expand_model_candidates_via_imports(
-        modules=modules,
-        initial_candidates=model_candidates,
-    )
+    # Cross-module 상속: 파일 변경이 있을 때만 확장 (캐시에서 로드 시 이미 확장됨)
+    if expand_inheritance:
+        import time as _time
+        _expand_start = _time.perf_counter()
+        _initial_count = len(model_candidates)
+        model_candidates = _expand_model_candidates_via_imports(
+            modules=modules,
+            initial_candidates=model_candidates,
+        )
+        _expand_elapsed = _time.perf_counter() - _expand_start
+        _added = len(model_candidates) - _initial_count
+        print(
+            f'[PERF] expand_model_candidates: +{_added} models '
+            f'{_expand_elapsed:.2f}s '
+            f'(total={len(model_candidates)})',
+            file=__import__("sys").stderr,
+        )
 
     return StaticIndex(
         python_file_count=python_file_count,

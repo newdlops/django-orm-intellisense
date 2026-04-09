@@ -4,11 +4,88 @@ import ast
 import inspect
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, get_args, get_origin, get_type_hints
 
 from ..runtime.inspector import RuntimeInspection
 from ..static_index.indexer import FieldCandidate, ModelCandidate, ModuleIndex, StaticIndex
+
+
+class _MemberSurfaceCache:
+    """(model_label, receiver_kind, manager_name) → {name: OrmMemberItem} 캐시.
+    surface 리스트 구성을 1회만 수행하고 이후 O(1) 조회.
+    static_index/runtime 인스턴스가 바뀌면 자동 무효화."""
+
+    def __init__(self) -> None:
+        self._owner: tuple[int, int] = (0, 0)
+        self._list_cache: dict[
+            tuple[str, str, str | None], list[OrmMemberItem]
+        ] = {}
+        self._dict_cache: dict[
+            tuple[str, str, str | None], dict[str, OrmMemberItem]
+        ] = {}
+        self._hits = 0
+        self._misses = 0
+
+    def _check_owner(
+        self, static_index: StaticIndex, runtime: RuntimeInspection
+    ) -> None:
+        owner = (id(static_index), id(runtime))
+        if owner != self._owner:
+            self._list_cache.clear()
+            self._dict_cache.clear()
+            self._owner = owner
+
+    def get_list(
+        self,
+        static_index: StaticIndex,
+        runtime: RuntimeInspection,
+        model_label: str,
+        receiver_kind: str,
+        manager_name: str | None,
+    ) -> list[OrmMemberItem]:
+        self._check_owner(static_index, runtime)
+        key = (model_label, receiver_kind, manager_name)
+        cached = self._list_cache.get(key)
+        if cached is not None:
+            self._hits += 1
+            return cached
+        self._misses += 1
+        surface = _member_surface(
+            static_index=static_index,
+            runtime=runtime,
+            model_label=model_label,
+            receiver_kind=receiver_kind,
+            manager_name=manager_name,
+        )
+        self._list_cache[key] = surface
+        self._dict_cache[key] = {item.name: item for item in surface}
+        return surface
+
+    def find(
+        self,
+        static_index: StaticIndex,
+        runtime: RuntimeInspection,
+        model_label: str,
+        receiver_kind: str,
+        name: str,
+        manager_name: str | None,
+    ) -> OrmMemberItem | None:
+        self._check_owner(static_index, runtime)
+        key = (model_label, receiver_kind, manager_name)
+        name_dict = self._dict_cache.get(key)
+        if name_dict is not None:
+            self._hits += 1
+            return name_dict.get(name)
+        self._misses += 1
+        self.get_list(
+            static_index, runtime, model_label, receiver_kind, manager_name
+        )
+        return self._dict_cache[key].get(name)
+
+
+_surface_cache = _MemberSurfaceCache()
 
 BUILTIN_QUERYSET_METHODS: dict[str, tuple[str, str]] = {
     'all': ('Django queryset method', 'queryset'),
@@ -78,6 +155,119 @@ class OrmMemberItem:
         }
 
 
+def build_surface_index(
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+) -> dict[str, object]:
+    """전체 model surface를 경량 dict로 빌드. TS에 전송하여 로컬 O(1) 해석."""
+    index: dict[str, dict[str, dict[str, list[str | None]]]] = {}
+    receiver_kinds = ['instance', 'model_class', 'manager', 'queryset', 'related_manager']
+    for candidate in static_index.model_candidates:
+        if candidate.is_abstract:
+            continue
+        model_entry: dict[str, dict[str, list[str | None]]] = {}
+        for kind in receiver_kinds:
+            surface = _surface_cache.get_list(
+                static_index, runtime,
+                candidate.label, kind, None,
+            )
+            kind_entry: dict[str, list[str | None]] = {}
+            for item in surface:
+                if item.return_kind:
+                    kind_entry[item.name] = [
+                        item.return_kind,
+                        item.return_model_label or item.model_label,
+                    ]
+            if kind_entry:
+                model_entry[kind] = kind_entry
+        if model_entry:
+            index[candidate.label] = model_entry
+    return index
+
+
+def prebuild_member_surface_cache(
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+) -> dict[str, object]:
+    """초기화 시 모든 모델의 member surface를 프리빌드하고 surface index를 반환."""
+    import time
+    started = time.perf_counter()
+    receiver_kinds = ['instance', 'model_class', 'manager', 'queryset', 'related_manager']
+    count = 0
+    for candidate in static_index.model_candidates:
+        if candidate.is_abstract:
+            continue
+        for kind in receiver_kinds:
+            _surface_cache.get_list(
+                static_index, runtime,
+                candidate.label, kind, None,
+            )
+            count += 1
+    surface_index = build_surface_index(static_index, runtime)
+    elapsed = time.perf_counter() - started
+    print(
+        f'[PERF] prebuild_member_surface_cache: {count} surfaces '
+        f'{elapsed:.2f}s '
+        f'cache={_surface_cache._hits}hit/{_surface_cache._misses}miss '
+        f'surfaceIndex={len(surface_index)} models',
+        file=__import__("sys").stderr,
+    )
+    return surface_index
+
+
+def resolve_orm_member_chain(
+    *,
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+    model_label: str,
+    receiver_kind: str,
+    chain: list[str],
+    manager_name: str | None = None,
+) -> dict[str, object]:
+    """멤버 체인을 한 번에 해석. IPC 1회로 여러 단계 해석."""
+    current_label = model_label
+    current_kind = receiver_kind
+    current_manager = manager_name
+
+    for name in chain:
+        item = _surface_cache.find(
+            static_index, runtime,
+            current_label, current_kind, name, current_manager,
+        )
+        if item is None:
+            return {
+                'resolved': False,
+                'reason': 'not_found',
+                'failedAt': name,
+                'modelLabel': current_label,
+                'receiverKind': current_kind,
+            }
+
+        return_kind = item.return_kind
+        if not return_kind:
+            return {
+                'resolved': False,
+                'reason': 'no_return_kind',
+                'failedAt': name,
+            }
+
+        return_label = item.return_model_label or item.model_label
+        current_label = return_label
+        current_kind = return_kind
+        current_manager = (
+            item.manager_name or item.name
+            if return_kind == 'manager'
+            else item.manager_name
+        )
+
+    return {
+        'resolved': True,
+        'modelLabel': current_label,
+        'receiverKind': current_kind,
+        'managerName': current_manager,
+    }
+
+
 def list_orm_member_completions(
     *,
     static_index: StaticIndex,
@@ -87,12 +277,8 @@ def list_orm_member_completions(
     prefix: str | None = None,
     manager_name: str | None = None,
 ) -> dict[str, object]:
-    items = _member_surface(
-        static_index=static_index,
-        runtime=runtime,
-        model_label=model_label,
-        receiver_kind=receiver_kind,
-        manager_name=manager_name,
+    items = _surface_cache.get_list(
+        static_index, runtime, model_label, receiver_kind, manager_name,
     )
 
     return {
@@ -117,19 +303,9 @@ def resolve_orm_member(
     if not normalized_name:
         return {'resolved': False, 'reason': 'empty'}
 
-    item = next(
-        (
-            candidate
-            for candidate in _member_surface(
-                static_index=static_index,
-                runtime=runtime,
-                model_label=model_label,
-                receiver_kind=receiver_kind,
-                manager_name=manager_name,
-            )
-            if candidate.name == normalized_name
-        ),
-        None,
+    item = _surface_cache.find(
+        static_index, runtime, model_label, receiver_kind,
+        normalized_name, manager_name,
     )
     if item is None:
         return {

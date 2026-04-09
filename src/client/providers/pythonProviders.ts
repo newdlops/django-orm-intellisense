@@ -5523,7 +5523,68 @@ function isPlausibleMemberReceiverExpression(value: string): boolean {
   return Boolean(normalized) && /^[A-Za-z_]/.test(normalized);
 }
 
+const _ormReceiverCacheByDocument = new Map<string, { version: number; entries: Map<string, OrmReceiverInfo | undefined> }>();
+
+function getCachedOrmReceiver(
+  document: vscode.TextDocument,
+  expression: string
+): OrmReceiverInfo | undefined | null {
+  const docKey = document.uri.toString();
+  const docCache = _ormReceiverCacheByDocument.get(docKey);
+  if (!docCache || docCache.version !== document.version) {
+    return null;
+  }
+  if (docCache.entries.has(expression)) {
+    return docCache.entries.get(expression)!;
+  }
+  return null;
+}
+
+function setCachedOrmReceiver(
+  document: vscode.TextDocument,
+  expression: string,
+  result: OrmReceiverInfo | undefined
+): void {
+  const docKey = document.uri.toString();
+  let docCache = _ormReceiverCacheByDocument.get(docKey);
+  if (!docCache || docCache.version !== document.version) {
+    docCache = { version: document.version, entries: new Map() };
+    _ormReceiverCacheByDocument.set(docKey, docCache);
+  }
+  docCache.entries.set(expression, result);
+}
+
 async function resolveOrmReceiverAtOffset(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  receiverExpression: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  const normalizedExpression = normalizeReceiverExpression(receiverExpression);
+  if (!normalizedExpression) {
+    return undefined;
+  }
+
+  const cacheKey = `${normalizedExpression}@${beforeOffset}`;
+  const cached = getCachedOrmReceiver(document, cacheKey);
+  if (cached !== null) {
+    return cached;
+  }
+
+  const result = await resolveOrmReceiverAtOffsetCore(
+    daemon,
+    document,
+    receiverExpression,
+    beforeOffset,
+    visited
+  );
+
+  setCachedOrmReceiver(document, cacheKey, result);
+  return result;
+}
+
+async function resolveOrmReceiverAtOffsetCore(
   daemon: AnalysisDaemon,
   document: vscode.TextDocument,
   receiverExpression: string,
@@ -5841,6 +5902,59 @@ async function resolveOrmReceiverFromCallExpression(
   const parsedCall = parseCalledExpression(expression);
   if (!parsedCall) {
     return undefined;
+  }
+
+  // Fast path: try to resolve the full chain locally via surfaceIndex
+  const chain = collectOrmMemberChain(expression);
+  if (chain) {
+    const hasUnsafe = chain.members.some(
+      (m) => m === 'annotate' || m === 'alias'
+    );
+    const STANDARD_ORM_CHAIN_METHODS = new Set([
+      'objects', 'all', 'filter', 'exclude', 'get', 'aggregate',
+      'update', 'create', 'get_or_create', 'update_or_create',
+      'values', 'values_list', 'order_by', 'only', 'defer',
+      'select_related', 'prefetch_related', 'distinct', 'reverse',
+      'none', 'union', 'intersection', 'difference', 'using',
+      'first', 'last', 'earliest', 'latest', 'count', 'exists',
+      'bulk_create', 'bulk_update', 'in_bulk', 'iterator',
+      'delete', 'dates', 'datetimes', 'raw',
+    ]);
+    const allStandard = chain.members.every((m) => STANDARD_ORM_CHAIN_METHODS.has(m));
+    if (!hasUnsafe && allStandard) {
+      const baseLabel = daemon.modelLabelByName.get(chain.base);
+      if (baseLabel) {
+        const localResult = daemon.resolveOrmMemberChainLocal(
+          baseLabel,
+          'model_class',
+          chain.members
+        );
+        if (localResult.resolved && localResult.modelLabel && localResult.receiverKind) {
+          if (isOrmReceiverKind(localResult.receiverKind)) {
+            return {
+              kind: localResult.receiverKind,
+              modelLabel: localResult.modelLabel,
+              managerName: localResult.managerName,
+            };
+          }
+        }
+        // Fall back to daemon IPC if local resolution failed
+        const ipcResult = await daemon.resolveOrmMemberChain(
+          baseLabel,
+          'model_class',
+          chain.members
+        );
+        if (ipcResult.resolved && ipcResult.modelLabel && ipcResult.receiverKind) {
+          if (isOrmReceiverKind(ipcResult.receiverKind)) {
+            return {
+              kind: ipcResult.receiverKind,
+              modelLabel: ipcResult.modelLabel,
+              managerName: ipcResult.managerName,
+            };
+          }
+        }
+      }
+    }
   }
 
   if (parsedCall.kind === 'function') {
@@ -7125,6 +7239,12 @@ async function resolveModelLabelFromSymbol(
   symbol: string,
   beforeOffset: number
 ): Promise<string | undefined> {
+  const simpleName = symbol.includes('.') ? symbol.split('.').at(-1)! : symbol;
+  const localLabel = daemon.modelLabelByName.get(simpleName);
+  if (localLabel) {
+    return localLabel;
+  }
+
   const resolution = await daemon.resolveRelationTarget(symbol);
   if (resolution.resolved && resolution.target) {
     return resolution.target.label;
@@ -8698,6 +8818,40 @@ function parseCalledExpression(expression: string): ParsedCallExpression | undef
   return undefined;
 }
 
+function collectOrmMemberChain(
+  expression: string
+): { base: string; members: string[] } | undefined {
+  const members: string[] = [];
+  let current = expression;
+
+  while (true) {
+    const parsed = parseCalledExpression(current);
+    if (!parsed) {
+      break;
+    }
+
+    if (parsed.kind === 'function') {
+      // base is a simple call like Model()
+      break;
+    }
+
+    members.unshift(parsed.memberName);
+    current = parsed.objectExpression;
+  }
+
+  if (members.length === 0) {
+    return undefined;
+  }
+
+  // current should be a simple identifier (the model class name)
+  const base = current.trim();
+  if (!/^[A-Za-z_][\w]*$/.test(base)) {
+    return undefined;
+  }
+
+  return { base, members };
+}
+
 function parseCallExpressionDetails(
   expression: string
 ): { parsedCall: ParsedCallExpression; argsText: string } | undefined {
@@ -9948,6 +10102,14 @@ async function resolveModelLabelFromTypeAnnotation(
     const strippedCandidate = stripStringLiteralQuotes(candidate);
     if (!strippedCandidate) {
       continue;
+    }
+
+    const simpleName = strippedCandidate.includes('.')
+      ? strippedCandidate.split('.').at(-1)!
+      : strippedCandidate;
+    const localLabel = daemon.modelLabelByName.get(simpleName);
+    if (localLabel) {
+      return localLabel;
     }
 
     const resolvedLabel = await resolveModelLabelFromSymbol(

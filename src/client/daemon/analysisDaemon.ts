@@ -15,6 +15,7 @@ import type {
   LookupPathCompletionsResult,
   LookupPathResolution,
   ModuleResolution,
+  OrmMemberChainResolution,
   OrmMemberCompletionsResult,
   OrmMemberResolution,
   OrmReceiverKind,
@@ -114,6 +115,9 @@ export class AnalysisDaemon implements vscode.Disposable {
   private restartQueued = false;
   private queuedRestartScope?: vscode.ConfigurationScope;
   private stopRequested = false;
+  modelNames: Set<string> = new Set();
+  modelLabelByName: Map<string, string> = new Map();
+  surfaceIndex: Record<string, Record<string, Record<string, [string, string | null]>>> = {};
   private lastLaunchContext?: LaunchContext;
   private interpreterCheck?: Promise<void>;
   private currentState: HealthSnapshot = {
@@ -136,6 +140,13 @@ export class AnalysisDaemon implements vscode.Disposable {
 
   getState(): HealthSnapshot {
     return this.currentState;
+  }
+
+  isReady(): boolean {
+    return this.process !== null && (
+      this.currentState.phase === 'ready' ||
+      this.currentState.phase === 'degraded'
+    );
   }
 
   async start(scope?: vscode.ConfigurationScope): Promise<HealthSnapshot> {
@@ -355,6 +366,54 @@ export class AnalysisDaemon implements vscode.Disposable {
     });
   }
 
+  /** 로컬 surface index에서 O(1) chain resolution. daemon IPC 불필요. */
+  resolveOrmMemberChainLocal(
+    modelLabel: string,
+    receiverKind: string,
+    chain: string[],
+    managerName?: string
+  ): OrmMemberChainResolution {
+    let currentLabel = modelLabel;
+    let currentKind = receiverKind;
+
+    for (const name of chain) {
+      const modelEntry = this.surfaceIndex[currentLabel];
+      if (!modelEntry) {
+        return { resolved: false, reason: 'model_not_found', failedAt: name };
+      }
+      const kindEntry = modelEntry[currentKind];
+      if (!kindEntry) {
+        return { resolved: false, reason: 'kind_not_found', failedAt: name };
+      }
+      const member = kindEntry[name];
+      if (!member) {
+        return { resolved: false, reason: 'member_not_found', failedAt: name };
+      }
+      currentKind = member[0];
+      currentLabel = member[1] ?? currentLabel;
+    }
+
+    return {
+      resolved: true,
+      modelLabel: currentLabel,
+      receiverKind: currentKind,
+    };
+  }
+
+  async resolveOrmMemberChain(
+    modelLabel: string,
+    receiverKind: OrmReceiverKind,
+    chain: string[],
+    managerName?: string
+  ): Promise<OrmMemberChainResolution> {
+    return this.cachedRequest<OrmMemberChainResolution>('resolveOrmMemberChain', {
+      modelLabel,
+      receiverKind,
+      chain,
+      managerName,
+    });
+  }
+
   async stop(): Promise<void> {
     this.stopRequested = true;
     this.clearResponseCache();
@@ -515,6 +574,17 @@ export class AnalysisDaemon implements vscode.Disposable {
         INITIALIZE_REQUEST_TIMEOUT_MS
       );
       const snapshot = this.decorateSnapshot(initializeResult.health);
+      this.modelNames = new Set(initializeResult.modelNames ?? []);
+      this.surfaceIndex = initializeResult.surfaceIndex ?? {};
+      // objectName → modelLabel 역매핑 구축
+      this.modelLabelByName = new Map();
+      for (const label of Object.keys(this.surfaceIndex)) {
+        const name = label.split('.').at(-1);
+        if (name) {
+          this.modelLabelByName.set(name, label);
+        }
+      }
+      console.log(`[PERF] daemon initialized: modelNames=${this.modelNames.size} surfaceIndex=${Object.keys(this.surfaceIndex).length} modelLabelByName=${this.modelLabelByName.size}`);
       this.updateState(snapshot);
       return snapshot;
     } catch (error) {

@@ -33,23 +33,23 @@
     "commands": [
       {
         "command": "djangoOrmIntellisense.showStatus",
-        "title": "Django ORM Intellisense: Show Status"
+        "title": "Django ORM: Show Status (daemon health, workspace, model index)"
       },
       {
         "command": "djangoOrmIntellisense.restartDaemon",
-        "title": "Django ORM Intellisense: Restart Daemon"
+        "title": "Django ORM: Restart Analysis Daemon"
       },
       {
         "command": "djangoOrmIntellisense.configurePylanceDiagnostics",
-        "title": "Django ORM Intellisense: Configure Pylance Diagnostics"
+        "title": "Django ORM: Suppress Pylance False Positives (attribute-access, unknown-type)"
       },
       {
         "command": "djangoOrmIntellisense.selectSettingsModule",
-        "title": "Django ORM Intellisense: Select Settings Module"
+        "title": "Django ORM: Select DJANGO_SETTINGS_MODULE"
       },
       {
         "command": "djangoOrmIntellisense.selectPythonInterpreter",
-        "title": "Django ORM Intellisense: Select Python Interpreter"
+        "title": "Django ORM: Select Python Interpreter (.venv)"
       }
     ],
     "configuration": {
@@ -58,25 +58,25 @@
         "djangoOrmIntellisense.autoStart": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically start the Python analysis daemon when the extension activates."
+          "description": "Python 파일을 열 때 분석 데몬을 자동으로 시작합니다. false로 설정하면 수동으로 Restart Daemon 명령을 실행해야 합니다."
         },
         "djangoOrmIntellisense.pythonInterpreter": {
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "Python interpreter used by the analysis daemon. You can point it either at the executable itself or at a virtualenv root such as .venv. Use the command 'Django ORM Intellisense: Select Python Interpreter' to choose it. If empty, the extension falls back to python3."
+          "description": "분석 데몬이 사용할 Python 인터프리터 경로. .venv 디렉토리 또는 python 실행 파일 경로를 지정합니다. 비어 있으면 python3을 사용합니다. Cmd+Shift+P → 'Django ORM: Select Python Interpreter'로 선택 가능."
         },
         "djangoOrmIntellisense.settingsModule": {
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "Optional DJANGO_SETTINGS_MODULE override passed to the analysis daemon. Use the command 'Django ORM Intellisense: Select Settings Module' to choose from discovered candidates."
+          "description": "DJANGO_SETTINGS_MODULE 값. 비어 있으면 manage.py에서 자동 감지합니다. 여러 settings 파일이 있는 프로젝트에서 명시적으로 지정합니다."
         },
         "djangoOrmIntellisense.workspaceRoot": {
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "Optional workspace root override for the Python analysis daemon. Useful when the VS Code workspace is a larger monorepo and the Django project lives in a subdirectory."
+          "description": "Django 프로젝트 루트 경로. VS Code 워크스페이스가 모노레포인 경우 Django 프로젝트가 위치한 하위 디렉토리를 지정합니다."
         },
         "djangoOrmIntellisense.logLevel": {
           "type": "string",

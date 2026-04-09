@@ -50,6 +50,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR = testCacheRoot;
     process.env.DJLS_DISABLE_AUTO_RESTARTS = '1';
+    process.env.DJLS_DISABLE_PROVIDER_TIMEOUT = '1';
     const extension = vscode.extensions.getExtension(EXTENSION_ID);
     assert.ok(extension, `Extension ${EXTENSION_ID} is not available.`);
     await extension.activate();
@@ -66,6 +67,7 @@ suite('Django ORM Intellisense UI', () => {
     }
     delete process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR;
     delete process.env.DJLS_DISABLE_AUTO_RESTARTS;
+    delete process.env.DJLS_DISABLE_PROVIDER_TIMEOUT;
     if (testCacheRoot) {
       fs.rmSync(testCacheRoot, { recursive: true, force: true });
       testCacheRoot = undefined;

@@ -158,6 +158,15 @@ export interface OrmMemberResolution {
   item?: OrmMemberItem;
 }
 
+export interface OrmMemberChainResolution {
+  resolved: boolean;
+  reason?: string;
+  failedAt?: string;
+  modelLabel?: string;
+  receiverKind?: string;
+  managerName?: string;
+}
+
 export interface HealthSnapshot {
   phase: ServerPhase;
   detail: string;
@@ -179,6 +188,8 @@ export interface InitializeResult {
   serverName: string;
   protocolVersion: string;
   health: HealthSnapshot;
+  modelNames?: string[];
+  surfaceIndex?: Record<string, Record<string, Record<string, [string, string | null]>>>;
 }
 
 export interface RequestMessage {
