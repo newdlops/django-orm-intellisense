@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -74,6 +76,84 @@ class WorkspaceProfile:
         }
 
 
+@dataclass(frozen=True)
+class VenvInfo:
+    root: str
+    site_packages: str | None
+    python_version: str | None
+    include_system_site: bool
+
+    def to_dict(self) -> dict[str, str | bool | None]:
+        return {
+            'root': self.root,
+            'sitePackages': self.site_packages,
+            'pythonVersion': self.python_version,
+            'includeSystemSite': self.include_system_site,
+        }
+
+
+def resolve_venv_info(workspace_root: Path) -> VenvInfo | None:
+    """Detect and parse a virtual environment in the workspace."""
+    for candidate_name in ('.venv', 'venv', '.env', 'env'):
+        venv_root = workspace_root / candidate_name
+        pyvenv_cfg = venv_root / 'pyvenv.cfg'
+        if pyvenv_cfg.exists():
+            return _parse_venv(venv_root, pyvenv_cfg)
+    return None
+
+
+def _parse_venv(venv_root: Path, pyvenv_cfg: Path) -> VenvInfo:
+    cfg: dict[str, str] = {}
+    try:
+        for line in pyvenv_cfg.read_text(encoding='utf-8').splitlines():
+            if '=' in line:
+                key, _, value = line.partition('=')
+                cfg[key.strip().lower()] = value.strip()
+    except OSError:
+        pass
+
+    python_version = cfg.get('version') or cfg.get('version_info')
+    if python_version:
+        # Normalize to X.Y
+        parts = python_version.split('.')
+        if len(parts) >= 2:
+            python_version = f'{parts[0]}.{parts[1]}'
+
+    include_system = cfg.get('include-system-site-packages', 'false').lower() == 'true'
+
+    # Find site-packages directory
+    site_packages: str | None = None
+    if python_version:
+        if sys.platform == 'win32':
+            candidate = venv_root / 'Lib' / 'site-packages'
+        else:
+            candidate = venv_root / 'lib' / f'python{python_version}' / 'site-packages'
+        if candidate.is_dir():
+            site_packages = str(candidate)
+
+    # Fallback: search for site-packages
+    if site_packages is None:
+        lib_dir = venv_root / ('Lib' if sys.platform == 'win32' else 'lib')
+        if lib_dir.is_dir():
+            for child in lib_dir.iterdir():
+                sp = child / 'site-packages'
+                if sp.is_dir():
+                    site_packages = str(sp)
+                    if python_version is None:
+                        # Extract version from directory name (e.g. python3.11)
+                        name = child.name
+                        if name.startswith('python'):
+                            python_version = name[len('python'):]
+                    break
+
+    return VenvInfo(
+        root=str(venv_root),
+        site_packages=site_packages,
+        python_version=python_version,
+        include_system_site=include_system,
+    )
+
+
 def iter_python_files(root: Path) -> list[Path]:
     python_files: list[Path] = []
 
@@ -93,29 +173,37 @@ def iter_python_files(root: Path) -> list[Path]:
 
 
 def snapshot_python_sources(root: Path) -> PythonSourceSnapshot:
-    entries: list[PythonSourceEntry] = []
-    files: list[Path] = []
+    python_files = iter_python_files(root)
 
-    for python_file in iter_python_files(root):
+    def _stat_one(python_file: Path) -> tuple[Path, PythonSourceEntry] | None:
         try:
             stat_result = python_file.stat()
         except OSError:
-            continue
-
+            return None
         relative_path = python_file.relative_to(root).as_posix()
         fingerprint = _file_fingerprint(
             relative_path=relative_path,
             size=stat_result.st_size,
             mtime_ns=stat_result.st_mtime_ns,
         )
-        entry = PythonSourceEntry(
-            relative_path=relative_path,
-            size=stat_result.st_size,
-            mtime_ns=stat_result.st_mtime_ns,
-            fingerprint=fingerprint,
+        return (
+            python_file,
+            PythonSourceEntry(
+                relative_path=relative_path,
+                size=stat_result.st_size,
+                mtime_ns=stat_result.st_mtime_ns,
+                fingerprint=fingerprint,
+            ),
         )
-        entries.append(entry)
-        files.append(python_file)
+
+    entries: list[PythonSourceEntry] = []
+    files: list[Path] = []
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for result in executor.map(_stat_one, python_files):
+            if result is not None:
+                files.append(result[0])
+                entries.append(result[1])
 
     directory_fingerprints = _build_directory_fingerprints(entries)
 

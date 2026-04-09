@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import os
 import sys
@@ -126,6 +127,7 @@ class RuntimeInspection:
     manager_count: int
     model_catalog: list[RuntimeModelSummary]
     model_preview: list[RuntimeModelSummary]
+    custom_lookups: dict[str, list[str]] = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -160,6 +162,7 @@ class RuntimeInspection:
             'managerCount': self.manager_count,
             'modelCatalog': [model.to_dict() for model in self.model_catalog],
             'modelPreview': [model.to_dict() for model in self.model_preview],
+            'customLookups': {k: list(v) for k, v in self.custom_lookups.items()},
         }
 
     @classmethod
@@ -196,6 +199,11 @@ class RuntimeInspection:
             manager_count=int(payload['managerCount']),
             model_catalog=model_catalog,
             model_preview=model_preview,
+            custom_lookups={
+                str(k): [str(v) for v in vs]
+                for k, vs in (payload.get('customLookups') or {}).items()
+                if isinstance(vs, list)
+            },
         )
 
 
@@ -361,6 +369,8 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
 
     _set_runtime_field_registry(settings_module, runtime_field_registry)
 
+    custom_lookups = _collect_custom_lookups()
+
     return RuntimeInspection(
         python_executable=sys.executable,
         django_importable=True,
@@ -376,7 +386,57 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
         manager_count=manager_count,
         model_catalog=model_preview,
         model_preview=model_preview[:10],
+        custom_lookups=custom_lookups,
     )
+
+
+def _collect_custom_lookups() -> dict[str, list[str]]:
+    """Collect registered lookups per field class from Django's field registry.
+
+    Returns a dict mapping field class name (e.g. 'CharField') to a list of
+    lookup names that are registered beyond the Django defaults.
+    """
+    try:
+        from django.db import models  # type: ignore
+    except ImportError:
+        return {}
+
+    # Django built-in lookup names (always available on all fields)
+    BUILTIN_LOOKUPS = {
+        'exact', 'iexact', 'contains', 'icontains', 'gt', 'gte', 'lt', 'lte',
+        'in', 'startswith', 'istartswith', 'endswith', 'iendswith', 'range',
+        'isnull', 'regex', 'iregex',
+        # Date/time extracts registered as lookups in Django
+        'year', 'month', 'day', 'week', 'week_day', 'iso_year', 'iso_week_day',
+        'quarter', 'hour', 'minute', 'second', 'date', 'time',
+        # JSON lookups
+        'contains', 'contained_by', 'has_key', 'has_keys', 'has_any_keys',
+    }
+
+    result: dict[str, list[str]] = {}
+    field_classes = [
+        models.CharField, models.TextField, models.IntegerField,
+        models.FloatField, models.DecimalField, models.BooleanField,
+        models.DateField, models.DateTimeField, models.TimeField,
+        models.ForeignKey, models.OneToOneField, models.ManyToManyField,
+        models.JSONField, models.UUIDField, models.BinaryField,
+        models.FileField, models.ImageField, models.DurationField,
+        models.AutoField, models.BigAutoField,
+    ]
+
+    for field_cls in field_classes:
+        try:
+            registered = field_cls.get_lookups()
+        except (AttributeError, Exception):
+            continue
+        custom = [
+            name for name in registered
+            if name not in BUILTIN_LOOKUPS
+        ]
+        if custom:
+            result[field_cls.__name__] = sorted(custom)
+
+    return result
 
 
 def can_defer_runtime_inspection(settings_module: str | None) -> bool:

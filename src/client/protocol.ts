@@ -190,6 +190,7 @@ export interface InitializeResult {
   health: HealthSnapshot;
   modelNames?: string[];
   surfaceIndex?: Record<string, Record<string, Record<string, [string, string | null]>>>;
+  customLookups?: Record<string, string[]>;
 }
 
 export interface RequestMessage {

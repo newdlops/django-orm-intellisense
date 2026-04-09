@@ -13,41 +13,56 @@ from ..discovery.workspace import PythonSourceSnapshot
 from ..runtime.inspector import RuntimeInspection
 from ..static_index.indexer import ModuleIndex, StaticIndex, build_static_index
 
-CACHE_SCHEMA_VERSION = 7
+CACHE_SCHEMA_VERSION = 8
 STATIC_INDEX_CACHE_NAME = 'static-index.json'
+STATIC_INDEX_FULL_CACHE_NAME = 'static-index-full.json'
 RUNTIME_CACHE_NAME = 'runtime-inspection.json'
+SURFACE_INDEX_CACHE_NAME = 'surface-index.json'
 
 
 def load_cached_static_index(
     workspace_root: Path,
     source_snapshot: PythonSourceSnapshot,
-) -> StaticIndex | None:
+) -> tuple[StaticIndex | None, str]:
+    """Load a cached StaticIndex.
+
+    Returns ``(static_index, hit_kind)`` where *hit_kind* is one of:
+    ``'full'`` (exact fingerprint match, StaticIndex restored directly),
+    ``'partial'`` (per-module reuse with incremental rebuild),
+    or ``'miss'`` (no usable cache, static_index is None).
+    """
+    # --- Fast path: full StaticIndex restoration --------------------------
+    full_result = _try_load_full_static_index(workspace_root, source_snapshot)
+    if full_result is not None:
+        return full_result, 'full'
+
+    # --- Slow path: per-module reuse + incremental rebuild ----------------
     payload = _read_cache_payload(
         _workspace_cache_dir(workspace_root) / STATIC_INDEX_CACHE_NAME
     )
     if payload is None:
-        return None
+        return None, 'miss'
 
     metadata = payload.get('metadata')
     if not isinstance(metadata, dict):
-        return None
+        return None, 'miss'
 
     if (
         metadata.get('schemaVersion') != CACHE_SCHEMA_VERSION
         or metadata.get('workspaceRoot') != str(workspace_root)
     ):
-        return None
+        return None, 'miss'
 
     cached_payload = payload.get('payload')
     if not isinstance(cached_payload, dict):
-        return None
+        return None, 'miss'
 
     cached_directory_fingerprints = cached_payload.get('directoryFingerprints')
     cached_module_entries = cached_payload.get('moduleEntries')
     if not isinstance(cached_directory_fingerprints, dict) or not isinstance(
         cached_module_entries, dict
     ):
-        return None
+        return None, 'miss'
 
     try:
         reusable_module_indices = _load_reusable_module_indices(
@@ -59,16 +74,51 @@ def load_cached_static_index(
         _unlink_quietly(
             _workspace_cache_dir(workspace_root) / STATIC_INDEX_CACHE_NAME
         )
-        return None
+        return None, 'miss'
 
     if not reusable_module_indices:
-        return None
+        return None, 'miss'
 
-    return build_static_index(
+    result = build_static_index(
         workspace_root,
         python_files=source_snapshot.files,
         cached_module_indices=reusable_module_indices,
     )
+    return result, 'partial'
+
+
+def _try_load_full_static_index(
+    workspace_root: Path,
+    source_snapshot: PythonSourceSnapshot,
+) -> StaticIndex | None:
+    payload = _read_cache_payload(
+        _workspace_cache_dir(workspace_root) / STATIC_INDEX_FULL_CACHE_NAME
+    )
+    if payload is None:
+        return None
+
+    metadata = payload.get('metadata')
+    if not isinstance(metadata, dict):
+        return None
+
+    if (
+        metadata.get('schemaVersion') != CACHE_SCHEMA_VERSION
+        or metadata.get('workspaceRoot') != str(workspace_root)
+        or metadata.get('rootTreeFingerprint') != source_snapshot.fingerprint
+    ):
+        return None
+
+    cached_payload = payload.get('payload')
+    if not isinstance(cached_payload, dict):
+        return None
+
+    try:
+        return StaticIndex.from_cache_dict(dict(cached_payload))
+    except (KeyError, TypeError, ValueError):
+        _unlink_quietly(
+            _workspace_cache_dir(workspace_root) / STATIC_INDEX_FULL_CACHE_NAME
+        )
+        return None
 
 
 def save_static_index(
@@ -108,6 +158,20 @@ def save_static_index(
                 'directoryFingerprints': source_snapshot.directory_fingerprints,
                 'moduleEntries': module_entries,
             },
+        },
+    )
+
+    # Also save full StaticIndex for fast restoration on exact fingerprint match
+    _write_cache_payload(
+        _workspace_cache_dir(workspace_root) / STATIC_INDEX_FULL_CACHE_NAME,
+        {
+            'metadata': {
+                'schemaVersion': CACHE_SCHEMA_VERSION,
+                'workspaceRoot': str(workspace_root),
+                'rootTreeFingerprint': source_snapshot.fingerprint,
+                'createdAt': datetime.now(timezone.utc).isoformat(),
+            },
+            'payload': static_index.to_cache_dict(),
         },
     )
 
@@ -167,6 +231,57 @@ def save_runtime_inspection(
                 'createdAt': datetime.now(timezone.utc).isoformat(),
             },
             'payload': runtime.to_cache_dict(),
+        },
+    )
+
+
+def load_cached_surface_index(
+    workspace_root: Path,
+    source_fingerprint: str,
+    runtime_fingerprint: str,
+) -> dict[str, object] | None:
+    payload = _read_cache_payload(
+        _workspace_cache_dir(workspace_root) / SURFACE_INDEX_CACHE_NAME
+    )
+    if payload is None:
+        return None
+
+    metadata = payload.get('metadata')
+    if not isinstance(metadata, dict):
+        return None
+
+    if (
+        metadata.get('schemaVersion') != CACHE_SCHEMA_VERSION
+        or metadata.get('workspaceRoot') != str(workspace_root)
+        or metadata.get('sourceFingerprint') != source_fingerprint
+        or metadata.get('runtimeFingerprint') != runtime_fingerprint
+    ):
+        return None
+
+    cached_payload = payload.get('payload')
+    if not isinstance(cached_payload, dict):
+        return None
+
+    return dict(cached_payload)
+
+
+def save_surface_index(
+    workspace_root: Path,
+    source_fingerprint: str,
+    runtime_fingerprint: str,
+    surface_index: dict[str, object],
+) -> None:
+    _write_cache_payload(
+        _workspace_cache_dir(workspace_root) / SURFACE_INDEX_CACHE_NAME,
+        {
+            'metadata': {
+                'schemaVersion': CACHE_SCHEMA_VERSION,
+                'workspaceRoot': str(workspace_root),
+                'sourceFingerprint': source_fingerprint,
+                'runtimeFingerprint': runtime_fingerprint,
+                'createdAt': datetime.now(timezone.utc).isoformat(),
+            },
+            'payload': surface_index,
         },
     )
 

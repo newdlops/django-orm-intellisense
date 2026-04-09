@@ -14,13 +14,16 @@ from typing import Any
 from ..cache import (
     load_cached_runtime_inspection,
     load_cached_static_index,
+    load_cached_surface_index,
     save_runtime_inspection,
     save_static_index,
+    save_surface_index,
 )
 from ..discovery.workspace import (
     PythonSourceSnapshot,
     WorkspaceProfile,
     discover_workspace,
+    resolve_venv_info,
     snapshot_python_sources,
 )
 from ..features.health import build_health_snapshot
@@ -159,7 +162,15 @@ class DaemonServer:
             f'elapsed={time.perf_counter() - started_at:.2f}s'
         )
         effective_settings_module = settings_module or workspace_profile.settings_module
-        static_index = load_cached_static_index(workspace_root, source_snapshot)
+        venv_info = resolve_venv_info(workspace_root)
+        if venv_info:
+            _log_initialize_step(
+                f'resolve_venv_info root={venv_info.root} '
+                f'python={venv_info.python_version or "<unknown>"} '
+                f'site_packages={"yes" if venv_info.site_packages else "no"} '
+                f'elapsed={time.perf_counter() - started_at:.2f}s'
+            )
+        static_index, cache_hit_kind = load_cached_static_index(workspace_root, source_snapshot)
         if static_index is None:
             static_index = build_static_index(
                 workspace_root,
@@ -172,14 +183,22 @@ class DaemonServer:
                 f'reexports={static_index.reexport_module_count} '
                 f'elapsed={time.perf_counter() - started_at:.2f}s'
             )
-        else:
+            save_static_index(workspace_root, source_snapshot, static_index)
+        elif cache_hit_kind == 'partial':
             _log_initialize_step(
-                'load_cached_static_index '
+                'load_cached_static_index(partial) '
                 f'files={static_index.python_file_count} '
                 f'models={static_index.model_candidate_count} '
                 f'elapsed={time.perf_counter() - started_at:.2f}s'
             )
-        save_static_index(workspace_root, source_snapshot, static_index)
+            save_static_index(workspace_root, source_snapshot, static_index)
+        else:
+            _log_initialize_step(
+                'load_cached_static_index(full) '
+                f'files={static_index.python_file_count} '
+                f'models={static_index.model_candidate_count} '
+                f'elapsed={time.perf_counter() - started_at:.2f}s'
+            )
 
         runtime_source_fingerprint = _runtime_source_fingerprint(
             source_snapshot=source_snapshot,
@@ -247,7 +266,30 @@ class DaemonServer:
             semantic_graph=semantic_graph,
             health_snapshot=health_snapshot,
         )
-        surface_index = prebuild_member_surface_cache(static_index, runtime)
+        runtime_cache_fingerprint = _runtime_cache_fingerprint(runtime)
+        cached_surface = load_cached_surface_index(
+            workspace_root,
+            source_fingerprint=source_snapshot.fingerprint,
+            runtime_fingerprint=runtime_cache_fingerprint,
+        )
+        if cached_surface is not None:
+            surface_index = cached_surface
+            _log_initialize_step(
+                f'load_cached_surface_index models={len(surface_index)} '
+                f'elapsed={time.perf_counter() - started_at:.2f}s'
+            )
+        else:
+            surface_index = prebuild_member_surface_cache(static_index, runtime)
+            save_surface_index(
+                workspace_root,
+                source_fingerprint=source_snapshot.fingerprint,
+                runtime_fingerprint=runtime_cache_fingerprint,
+                surface_index=surface_index,
+            )
+            _log_initialize_step(
+                f'prebuild_member_surface_cache models={len(surface_index)} '
+                f'elapsed={time.perf_counter() - started_at:.2f}s'
+            )
         _log_initialize_step(
             f'complete elapsed={time.perf_counter() - started_at:.2f}s'
         )
@@ -274,6 +316,8 @@ class DaemonServer:
             'health': health_snapshot,
             'modelNames': model_names,
             'surfaceIndex': surface_index,
+            'customLookups': runtime.custom_lookups if runtime else {},
+            'venvInfo': venv_info.to_dict() if venv_info else None,
         }
 
     def _health(self) -> dict[str, Any]:
@@ -607,6 +651,18 @@ def _clean_optional_string(value: Any) -> str | None:
 
 def _log_initialize_step(message: str) -> None:
     print(f'[initialize] {message}', file=sys.stderr, flush=True)
+
+
+def _runtime_cache_fingerprint(runtime: RuntimeInspection) -> str:
+    digest = hashlib.sha256()
+    digest.update(runtime.bootstrap_status.encode('utf-8'))
+    digest.update(b'\0')
+    digest.update(str(runtime.model_count).encode('ascii'))
+    digest.update(b'\0')
+    digest.update(str(runtime.field_count).encode('ascii'))
+    digest.update(b'\0')
+    digest.update((runtime.django_version or 'none').encode('utf-8'))
+    return digest.hexdigest()
 
 
 def _runtime_source_fingerprint(

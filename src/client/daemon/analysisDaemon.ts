@@ -118,6 +118,7 @@ export class AnalysisDaemon implements vscode.Disposable {
   modelNames: Set<string> = new Set();
   modelLabelByName: Map<string, string> = new Map();
   surfaceIndex: Record<string, Record<string, Record<string, [string, string | null]>>> = {};
+  customLookups: Record<string, string[]> = {};
   private lastLaunchContext?: LaunchContext;
   private interpreterCheck?: Promise<void>;
   private currentState: HealthSnapshot = {
@@ -576,6 +577,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       const snapshot = this.decorateSnapshot(initializeResult.health);
       this.modelNames = new Set(initializeResult.modelNames ?? []);
       this.surfaceIndex = initializeResult.surfaceIndex ?? {};
+      this.customLookups = initializeResult.customLookups ?? {};
       // objectName → modelLabel 역매핑 구축
       this.modelLabelByName = new Map();
       for (const label of Object.keys(this.surfaceIndex)) {

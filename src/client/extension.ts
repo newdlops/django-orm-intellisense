@@ -1,4 +1,6 @@
+import * as path from 'path';
 import * as vscode from 'vscode';
+import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind } from 'vscode-languageclient/node';
 import { registerConfigurePylanceDiagnosticsCommand } from './commands/configurePylanceDiagnostics';
 import { registerRestartDaemonCommand } from './commands/restartDaemon';
 import { registerSelectSettingsModuleCommand } from './commands/selectSettingsModule';
@@ -14,6 +16,7 @@ import { isPylanceAvailable } from './python/pylance';
 import { HealthStatusView } from './status/healthStatus';
 
 let activeDaemon: AnalysisDaemon | undefined;
+let languageClient: LanguageClient | undefined;
 
 export function getActiveDaemonForTesting(): AnalysisDaemon | undefined {
   return activeDaemon;
@@ -103,6 +106,44 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
     });
 
+  // --- Language Server 시작 ---
+  const serverModule = context.asAbsolutePath(path.join('out', 'server', 'server.js'));
+  const serverOptions: ServerOptions = {
+    run: { module: serverModule, transport: TransportKind.ipc },
+    debug: { module: serverModule, transport: TransportKind.ipc },
+  };
+  const clientOptions: LanguageClientOptions = {
+    documentSelector: [{ scheme: 'file', language: 'python' }],
+    outputChannel: output,
+  };
+  languageClient = new LanguageClient(
+    'djangoOrmLs',
+    'Django ORM Language Server',
+    serverOptions,
+    clientOptions
+  );
+  context.subscriptions.push(languageClient);
+  void languageClient.start().then(() => {
+    output.appendLine('[ls] Language Server started');
+    // daemon이 ready되면 surfaceIndex를 서버에 전달
+    feedSurfaceIndexToServer(daemon, output);
+
+    // LS에서 파일 재인덱싱 요청 수신 → surfaceIndex 재전송 (debounce)
+    let reindexTimer: ReturnType<typeof setTimeout> | undefined;
+    languageClient!.onNotification('django/fileNeedsReindex', () => {
+      if (reindexTimer) clearTimeout(reindexTimer);
+      reindexTimer = setTimeout(() => {
+        output.appendLine('[ls] re-sending surfaceIndex after file save');
+        if (languageClient && Object.keys(daemon.surfaceIndex).length > 0) {
+          void languageClient.sendNotification('django/updateSurfaceIndex', {
+            surfaceIndex: daemon.surfaceIndex,
+            modelNames: Array.from(daemon.modelNames),
+          });
+        }
+      }, 300);
+    });
+  });
+
   const settings = getExtensionSettings();
   const initialEditor = vscode.window.activeTextEditor;
   if (settings.autoStart && initialEditor?.document.languageId === 'python') {
@@ -112,7 +153,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 }
 
+function feedSurfaceIndexToServer(
+  daemon: AnalysisDaemon,
+  output: vscode.OutputChannel
+): void {
+  // daemon 상태 변경 시마다 surfaceIndex를 서버에 전달
+  const trySend = (): void => {
+    if (
+      !languageClient ||
+      Object.keys(daemon.surfaceIndex).length === 0
+    ) {
+      return;
+    }
+    const modelNames = Array.from(daemon.modelNames);
+    output.appendLine(
+      `[ls] sending surfaceIndex to server: ${modelNames.length} models`
+    );
+    void languageClient.sendNotification('django/updateSurfaceIndex', {
+      surfaceIndex: daemon.surfaceIndex,
+      modelNames,
+      customLookups: daemon.customLookups,
+    });
+  };
+
+  // 즉시 시도 (이미 ready일 수 있음)
+  trySend();
+
+  // daemon 상태 변경 시 재시도
+  daemon.onDidChangeState(() => {
+    trySend();
+  });
+}
+
 export async function deactivate(): Promise<void> {
+  if (languageClient) {
+    await languageClient.stop();
+    languageClient = undefined;
+  }
   if (!activeDaemon) {
     return;
   }

@@ -7973,6 +7973,17 @@ function django5BaseInterpreterCandidates(): string[] {
 
   addAsdfPythonInterpreterCandidates(candidates);
 
+  // Project-local e2e venvs (e.g. .e2e-homebrew313)
+  const projectRoot = path.resolve(__dirname, '../..');
+  try {
+    for (const entry of fs.readdirSync(projectRoot)) {
+      if (entry.startsWith('.e2e-')) {
+        candidates.add(path.join(projectRoot, entry, 'bin', 'python'));
+        candidates.add(path.join(projectRoot, entry, 'bin', 'python3'));
+      }
+    }
+  } catch { /* ignore */ }
+
   const homeDirectory = os.homedir();
   const pyenvVersionsRoot = path.join(homeDirectory, '.pyenv', 'versions');
   if (fs.existsSync(pyenvVersionsRoot)) {
