@@ -5647,6 +5647,24 @@ async function resolveOrmReceiverAtOffsetCore(
         }
       }
 
+      // Try local surface index first (O(1), no IPC) for chain resolution.
+      // Falls back to daemon IPC if member not found in local index.
+      const localRes = daemon.resolveOrmMemberLocal(
+        objectReceiver.modelLabel,
+        objectReceiver.kind,
+        memberAccess.memberName
+      );
+      if (localRes) {
+        const localReceiver = receiverFromOrmMemberResolution(
+          localRes, objectReceiver, memberAccess.memberName
+        );
+        if (localReceiver) {
+          return preferAnnotatedMemberReceiver(
+            localReceiver, annotatedMemberReceiver, objectReceiver
+          );
+        }
+      }
+
       const resolution = await daemon.resolveOrmMember(
         objectReceiver.modelLabel,
         objectReceiver.kind,
@@ -5858,6 +5876,13 @@ async function resolveDynamicInstanceReceiverAtOffset(
         }
       }
 
+      const localRes2 = daemon.resolveOrmMemberLocal(
+        objectReceiver.modelLabel, objectReceiver.kind, memberAccess.memberName
+      );
+      if (localRes2) {
+        const lr = receiverFromOrmMemberResolution(localRes2, objectReceiver, memberAccess.memberName);
+        if (lr) return lr;
+      }
       const resolution = await daemon.resolveOrmMember(
         objectReceiver.modelLabel,
         objectReceiver.kind,
@@ -6913,6 +6938,13 @@ async function resolveLookupReceiverAtOffset(
       )
     );
     if (objectReceiver) {
+      const localRes4 = daemon.resolveOrmMemberLocal(
+        objectReceiver.modelLabel, objectReceiver.kind, memberAccess.memberName
+      );
+      if (localRes4) {
+        const lr = asLookupReceiver(receiverFromOrmMemberResolution(localRes4));
+        if (lr) return preferAnnotatedMemberReceiver(lr, annotatedMemberReceiver, objectReceiver);
+      }
       const resolution = await daemon.resolveOrmMember(
         objectReceiver.modelLabel,
         objectReceiver.kind,

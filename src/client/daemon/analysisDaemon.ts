@@ -390,6 +390,41 @@ export class AnalysisDaemon implements vscode.Disposable {
     });
   }
 
+  /**
+   * Resolve an ORM member from the local surface index without IPC.
+   * Returns undefined if the member is not in the surface index.
+   * The returned item has enough fields for chain resolution (returnKind,
+   * returnModelLabel, managerName) but NOT for display (detail, filePath).
+   */
+  resolveOrmMemberLocal(
+    modelLabel: string,
+    receiverKind: string,
+    name: string
+  ): OrmMemberResolution | undefined {
+    const modelEntry = this.surfaceIndex[modelLabel];
+    if (!modelEntry) return undefined;
+    const kindEntry = modelEntry[receiverKind];
+    if (!kindEntry) return undefined;
+    const member = kindEntry[name];
+    if (!member) return undefined;
+    const [returnKind, returnModelLabel] = member;
+    // surfaceIndex member found
+    return {
+      resolved: true,
+      item: {
+        name,
+        memberKind: 'field',
+        modelLabel,
+        receiverKind,
+        detail: '',
+        source: 'local',
+        isRelation: !!returnModelLabel,
+        returnKind,
+        returnModelLabel: returnModelLabel || undefined,
+      },
+    };
+  }
+
   /** 로컬 surface index에서 O(1) chain resolution. daemon IPC 불필요. */
   resolveOrmMemberChainLocal(
     modelLabel: string,
@@ -670,6 +705,7 @@ export class AnalysisDaemon implements vscode.Disposable {
 
     const id = `req-${++this.requestSequence}`;
     const message: RequestMessage = { id, method, params };
+    const ipcStart = performance.now();
 
     return new Promise<T>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -678,7 +714,16 @@ export class AnalysisDaemon implements vscode.Disposable {
       }, timeoutMs);
 
       this.pendingRequests.set(id, {
-        resolve,
+        resolve: (value: T) => {
+          const ipcMs = performance.now() - ipcStart;
+          const paramSummary = Object.entries(params).map(([k, v]) =>
+            `${k}=${typeof v === 'string' ? v.slice(0, 40) : JSON.stringify(v)}`.slice(0, 60)
+          ).join(', ');
+          this.output.appendLine(
+            `  [IPC] ${method}(${paramSummary}): ${ipcMs.toFixed(1)}ms`
+          );
+          resolve(value);
+        },
         reject,
         timeout,
       });

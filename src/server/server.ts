@@ -652,6 +652,73 @@ connection.onRequest('django/perfReport', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Batch lookup path validation (replaces N individual daemon IPC calls)
+// ---------------------------------------------------------------------------
+
+interface ValidateLookupPathsParams {
+  paths: Array<{
+    baseModelLabel: string;
+    value: string;
+    method: string;
+  }>;
+}
+
+interface ValidateLookupPathResult {
+  resolved: boolean;
+  reason?: string;
+  missingSegment?: string;
+}
+
+connection.onRequest('django/validateLookupPaths', (params: ValidateLookupPathsParams): ValidateLookupPathResult[] => {
+  const _t0 = performance.now();
+  const results = params.paths.map(({ baseModelLabel, value }) => {
+    if (!workspaceIndex.models.has(baseModelLabel)) {
+      return { resolved: true };  // Unknown model — skip (don't flag as error)
+    }
+
+    const parsed = parseLookupChain(value, baseModelLabel, workspaceIndex);
+
+    if (parsed.state === 'error') {
+      const errorIdx = parsed.errorAt ?? parsed.segments.length - 1;
+      const errorSegment = parsed.segments[errorIdx] ?? value;
+      const lastResolved = parsed.resolvedPath[parsed.resolvedPath.length - 1];
+
+      // Determine reason based on FSM state
+      let reason = 'segment_not_found';
+      if (lastResolved?.kind === 'field' && errorIdx > 0) {
+        // A non-relation field was followed by more segments
+        reason = 'non_relation_intermediate';
+      } else if (
+        parsed.resolvedPath.length > 0 &&
+        lastResolved?.kind !== 'relation' &&
+        lastResolved?.kind !== 'reverse_relation'
+      ) {
+        // After a field, the next segment should be a lookup operator
+        reason = 'invalid_lookup_operator';
+      }
+
+      return {
+        resolved: false,
+        reason,
+        missingSegment: errorSegment,
+      };
+    }
+
+    return { resolved: true };
+  });
+
+  const elapsed = performance.now() - _t0;
+  if (params.paths.length > 0) {
+    connection.console.log(
+      `[ls] validateLookupPaths: ${params.paths.length} paths, ` +
+      `${results.filter(r => !r.resolved).length} errors, ${elapsed.toFixed(1)}ms`
+    );
+  }
+
+  return results;
+});
+
+// ---------------------------------------------------------------------------
 // Start listening
 // ---------------------------------------------------------------------------
 

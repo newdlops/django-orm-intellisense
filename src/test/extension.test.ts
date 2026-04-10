@@ -2531,7 +2531,7 @@ suite('Django ORM Intellisense UI', () => {
     const multilineInitSelfCreatePosition = positionAfterTextInContainer(
       document,
       "self.company.question_thread_set.create(ti='multiline_init')",
-      'ti'
+      'create(ti'
     );
     const multilineInitSelfCreateList =
       await vscode.commands.executeCommand<vscode.CompletionList>(
