@@ -21,6 +21,7 @@ interface PerfStats {
 
 const timings = new Map<string, TimingSeries>();
 const counters = new Map<string, number>();
+const gauges = new Map<string, number>();
 
 function getOrCreateSeries(metric: string): TimingSeries {
   let series = timings.get(metric);
@@ -46,6 +47,14 @@ export function incrementCounter(name: string, delta = 1): void {
 
 export function getCounter(name: string): number {
   return counters.get(name) ?? 0;
+}
+
+export function setGauge(name: string, value: number): void {
+  gauges.set(name, value);
+}
+
+export function getAllGauges(): Record<string, number> {
+  return Object.fromEntries(gauges);
 }
 
 export function getStats(metric: string): PerfStats | undefined {
@@ -95,4 +104,5 @@ export function getAllCounters(): Record<string, number> {
 export function reset(): void {
   timings.clear();
   counters.clear();
+  gauges.clear();
 }

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 SKIP_DIRS = {
@@ -77,19 +78,86 @@ class WorkspaceProfile:
 
 
 @dataclass(frozen=True)
+class EditableInstall:
+    """A pip editable install detected in site-packages."""
+    name: str
+    path: str   # absolute path to the source directory
+    kind: str   # 'egg-link' | 'direct-url'
+
+    def to_dict(self) -> dict[str, str]:
+        return {'name': self.name, 'path': self.path, 'kind': self.kind}
+
+
+@dataclass(frozen=True)
 class VenvInfo:
     root: str
     site_packages: str | None
     python_version: str | None
     include_system_site: bool
+    editable_installs: tuple[EditableInstall, ...] = ()
 
-    def to_dict(self) -> dict[str, str | bool | None]:
-        return {
+    def to_dict(self) -> dict[str, object]:
+        d: dict[str, object] = {
             'root': self.root,
             'sitePackages': self.site_packages,
             'pythonVersion': self.python_version,
             'includeSystemSite': self.include_system_site,
         }
+        if self.editable_installs:
+            d['editableInstalls'] = [ei.to_dict() for ei in self.editable_installs]
+        return d
+
+
+def find_editable_installs(site_packages: str) -> list[EditableInstall]:
+    """Detect pip editable installs in site-packages.
+
+    Supports two formats:
+    1. Legacy .egg-link files (pip < 21.3)
+    2. Modern PEP 610 direct_url.json with editable flag (pip >= 21.3)
+    """
+    installs: list[EditableInstall] = []
+    sp = Path(site_packages)
+    if not sp.is_dir():
+        return installs
+
+    # Legacy: .egg-link files
+    for egg_link in sp.glob('*.egg-link'):
+        try:
+            lines = egg_link.read_text(encoding='utf-8').splitlines()
+            if lines:
+                target = lines[0].strip()
+                if target and Path(target).is_dir():
+                    installs.append(EditableInstall(
+                        name=egg_link.stem,
+                        path=target,
+                        kind='egg-link',
+                    ))
+        except OSError:
+            continue
+
+    # Modern: PEP 610 direct_url.json in .dist-info directories
+    for dist_info in sp.glob('*.dist-info'):
+        du = dist_info / 'direct_url.json'
+        if not du.exists():
+            continue
+        try:
+            data = json.loads(du.read_text(encoding='utf-8'))
+            if data.get('dir_info', {}).get('editable', False):
+                url = data.get('url', '')
+                if url.startswith('file://'):
+                    path = url[7:]
+                    if Path(path).is_dir():
+                        # Extract package name from dist-info dir name
+                        name = dist_info.name.split('-')[0] if '-' in dist_info.name else dist_info.stem
+                        installs.append(EditableInstall(
+                            name=name,
+                            path=path,
+                            kind='direct-url',
+                        ))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+    return installs
 
 
 def resolve_venv_info(workspace_root: Path) -> VenvInfo | None:
@@ -146,11 +214,17 @@ def _parse_venv(venv_root: Path, pyvenv_cfg: Path) -> VenvInfo:
                             python_version = name[len('python'):]
                     break
 
+    # Detect editable installs in site-packages
+    editable: tuple[EditableInstall, ...] = ()
+    if site_packages:
+        editable = tuple(find_editable_installs(site_packages))
+
     return VenvInfo(
         root=str(venv_root),
         site_packages=site_packages,
         python_version=python_version,
         include_system_site=include_system,
+        editable_installs=editable,
     )
 
 

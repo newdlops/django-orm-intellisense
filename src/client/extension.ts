@@ -138,6 +138,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           void languageClient.sendNotification('django/updateSurfaceIndex', {
             surfaceIndex: daemon.surfaceIndex,
             modelNames: Array.from(daemon.modelNames),
+            staticFallback: daemon.staticFallback,
           });
         }
       }, 300);
@@ -173,6 +174,7 @@ function feedSurfaceIndexToServer(
       surfaceIndex: daemon.surfaceIndex,
       modelNames,
       customLookups: daemon.customLookups,
+      staticFallback: daemon.staticFallback,
     });
   };
 

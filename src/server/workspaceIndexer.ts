@@ -22,6 +22,7 @@ import {
   getLookupsForField,
   getTransformsForField,
 } from './fieldLookups.js';
+import { recordTiming, incrementCounter } from './perfTracker.js';
 
 // ---------------------------------------------------------------------------
 // Radix Trie helpers (minimal implementation against RadixTrieNode<T>)
@@ -289,124 +290,337 @@ export type SurfaceIndex = Record<
   Record<string, Record<string, [string, string | null]>>
 >;
 
+// ---------------------------------------------------------------------------
+// Surface index diffing
+// ---------------------------------------------------------------------------
+
+export interface SurfaceIndexDiff {
+  added: string[];
+  removed: string[];
+  changed: string[];
+}
+
+/**
+ * Compute the diff between two surface indices using cached fingerprints.
+ *
+ * @param prev           Previous surface index.
+ * @param next           New surface index.
+ * @param fingerprints   Mutable fingerprint cache — updated in-place with
+ *                       the new fingerprints for `next`.
+ */
+export function diffSurfaceIndex(
+  prev: SurfaceIndex,
+  next: SurfaceIndex,
+  fingerprints: Map<string, string>,
+): SurfaceIndexDiff {
+  const _t0 = performance.now();
+  const added: string[] = [];
+  const removed: string[] = [];
+  const changed: string[] = [];
+
+  const prevKeys = new Set(Object.keys(prev));
+  const nextKeys = Object.keys(next);
+
+  // Build new fingerprints and detect added/changed
+  const newFingerprints = new Map<string, string>();
+  for (const label of nextKeys) {
+    const fp = JSON.stringify(next[label]);
+    newFingerprints.set(label, fp);
+
+    if (!prevKeys.has(label)) {
+      added.push(label);
+    } else {
+      const oldFp = fingerprints.get(label);
+      if (oldFp !== fp) {
+        changed.push(label);
+      }
+    }
+  }
+
+  // Detect removed
+  const nextKeySet = new Set(nextKeys);
+  for (const label of prevKeys) {
+    if (!nextKeySet.has(label)) {
+      removed.push(label);
+    }
+  }
+
+  // Update fingerprint cache to reflect new state
+  fingerprints.clear();
+  for (const [k, v] of newFingerprints) {
+    fingerprints.set(k, v);
+  }
+
+  recordTiming('index.diff', performance.now() - _t0);
+  return { added, removed, changed };
+}
+
+// ---------------------------------------------------------------------------
+// Incremental update
+// ---------------------------------------------------------------------------
+
+/**
+ * Apply an incremental diff to an existing WorkspaceIndex.
+ * Only the affected models are touched; lookup/transform tries are only
+ * rebuilt when customLookups has changed.
+ */
+export function updateWorkspaceIndexIncremental(
+  index: WorkspaceIndex,
+  surfaceIndex: SurfaceIndex,
+  diff: SurfaceIndexDiff,
+  customLookups?: Record<string, string[]>,
+  prevCustomLookups?: Record<string, string[]>,
+): void {
+  const _t0 = performance.now();
+
+  // --- Removed models ---
+  for (const label of diff.removed) {
+    const model = index.models.get(label);
+    if (model) {
+      index.modelLabelByName.delete(model.objectName);
+    }
+    index.models.delete(label);
+    index.fieldTrieByModel.delete(label);
+  }
+
+  // --- Added models ---
+  for (const label of diff.added) {
+    const receivers = surfaceIndex[label];
+    if (!receivers) continue;
+    const modelInfo = buildModelInfo(label, receivers, customLookups);
+    index.models.set(label, modelInfo);
+    index.modelLabelByName.set(modelInfo.objectName, label);
+    // Field trie is NOT built here — lazy on first access
+  }
+
+  // --- Changed models ---
+  for (const label of diff.changed) {
+    const receivers = surfaceIndex[label];
+    if (!receivers) continue;
+    const oldModel = index.models.get(label);
+    if (oldModel) {
+      index.modelLabelByName.delete(oldModel.objectName);
+    }
+    const modelInfo = buildModelInfo(label, receivers, customLookups);
+    index.models.set(label, modelInfo);
+    index.modelLabelByName.set(modelInfo.objectName, label);
+    // Invalidate cached field trie so it's rebuilt lazily
+    index.fieldTrieByModel.delete(label);
+  }
+
+  // --- Rebuild lookup/transform tries only if customLookups changed ---
+  const lookupsChanged = JSON.stringify(customLookups) !== JSON.stringify(prevCustomLookups);
+  if (lookupsChanged) {
+    index.lookupTrie = buildLookupTrie(customLookups);
+    index.transformTrie = buildTransformTrie();
+  }
+
+  recordTiming('index.incremental', performance.now() - _t0);
+  incrementCounter('index.incremental_update');
+}
+
+// ---------------------------------------------------------------------------
+// Lazy field trie
+// ---------------------------------------------------------------------------
+
+/**
+ * Get or lazily build the per-model field RadixTrie.
+ */
+export function getOrBuildFieldTrie(
+  index: WorkspaceIndex,
+  modelLabel: string,
+): RadixTrieNode<FieldInfo> | undefined {
+  const existing = index.fieldTrieByModel.get(modelLabel);
+  if (existing) return existing;
+
+  const model = index.models.get(modelLabel);
+  if (!model) return undefined;
+
+  const _t0 = performance.now();
+  const trie = createTrieNode<FieldInfo>();
+  for (const [name, info] of model.fields) {
+    trieInsert(trie, name, info);
+  }
+  index.fieldTrieByModel.set(modelLabel, trie);
+  recordTiming('trie.lazy_build', performance.now() - _t0);
+  incrementCounter('trie.lazy_builds');
+  return trie;
+}
+
+// ---------------------------------------------------------------------------
+// Single model builder (shared by full build and incremental update)
+// ---------------------------------------------------------------------------
+
+function buildModelInfo(
+  modelLabel: string,
+  receivers: Record<string, Record<string, [string, string | null]>>,
+  customLookups?: Record<string, string[]>,
+): ModelInfo {
+  const objectName = modelLabel.includes('.')
+    ? modelLabel.split('.').pop()!
+    : modelLabel;
+
+  const fields = new Map<string, FieldInfo>();
+  const relations = new Map<string, RelationInfo>();
+  const reverseRelations = new Map<string, RelationInfo>();
+
+  const instanceMembers = receivers['instance'] ?? {};
+  for (const [memberName, [typeStr, returnKind]] of Object.entries(instanceMembers)) {
+    const { fieldKind, isRelation } = inferFieldKind(typeStr, returnKind);
+    let lookups = getLookupsForField(fieldKind);
+    const transforms = getTransformsForField(fieldKind);
+
+    const extraLookups = customLookups?.[fieldKind];
+    if (extraLookups && extraLookups.length > 0) {
+      const lookupSet = new Set(lookups);
+      for (const cl of extraLookups) {
+        lookupSet.add(cl);
+      }
+      lookups = [...lookupSet];
+    }
+
+    const fieldInfo: FieldInfo = {
+      name: memberName,
+      fieldKind,
+      isRelation,
+      lookups,
+      transforms,
+    };
+    fields.set(memberName, fieldInfo);
+
+    if (isRelation) {
+      const targetModelLabel = extractTargetModel(typeStr) ?? '';
+      const direction: 'forward' | 'reverse' =
+        returnKind === 'related_manager' ? 'reverse' : 'forward';
+
+      const relationInfo: RelationInfo = {
+        name: memberName,
+        fieldKind,
+        targetModelLabel,
+        direction,
+      };
+
+      if (direction === 'reverse') {
+        reverseRelations.set(memberName, relationInfo);
+      } else {
+        relations.set(memberName, relationInfo);
+      }
+    }
+  }
+
+  return {
+    label: modelLabel,
+    objectName,
+    module: '',
+    filePath: '',
+    fields,
+    relations,
+    reverseRelations,
+    isAbstract: false,
+    baseLabels: [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Full build (first load)
+// ---------------------------------------------------------------------------
+
 /**
  * Convert the Python daemon's surfaceIndex into a WorkspaceIndex.
  *
- * @param surfaceIndex  The raw surface index from daemon initialisation.
- * @param modelNames    Ordered list of model labels present in the project.
- * @returns A fully populated WorkspaceIndex.
+ * Field tries are NOT built eagerly — they are created lazily on first
+ * access via {@link getOrBuildFieldTrie}.
  */
+/**
+ * Static fallback data for models missing from runtime inspection.
+ * Keys are model labels; values list field and relation names.
+ */
+export type StaticFallback = Record<string, { fields: string[]; relations: string[] }>;
+
 export function buildWorkspaceIndex(
   surfaceIndex: SurfaceIndex,
   modelNames: string[],
   customLookups?: Record<string, string[]>,
+  staticFallback?: StaticFallback,
 ): WorkspaceIndex {
   const _t0 = performance.now();
   const models = new Map<string, ModelInfo>();
   const modelLabelByName = new Map<string, string>();
-  const fieldTrieByModel = new Map<string, RadixTrieNode<FieldInfo>>();
 
-  // surfaceIndex 키는 "db.Company" 형식 (label), modelNames는 "Company" 형식 (objectName)
-  // surfaceIndex의 키를 직접 순회
   for (const modelLabel of Object.keys(surfaceIndex)) {
     const receivers = surfaceIndex[modelLabel];
     if (!receivers) continue;
 
-    const objectName = modelLabel.includes('.')
-      ? modelLabel.split('.').pop()!
-      : modelLabel;
-
-    const fields = new Map<string, FieldInfo>();
-    const relations = new Map<string, RelationInfo>();
-    const reverseRelations = new Map<string, RelationInfo>();
-
-    // --- Process "instance" receiver kind for fields & relations ----------
-    const instanceMembers = receivers['instance'] ?? {};
-    for (const [memberName, [typeStr, returnKind]] of Object.entries(instanceMembers)) {
-      const { fieldKind, isRelation } = inferFieldKind(typeStr, returnKind);
-      let lookups = getLookupsForField(fieldKind);
-      const transforms = getTransformsForField(fieldKind);
-
-      // Merge custom lookups registered via register_lookup()
-      const extraLookups = customLookups?.[fieldKind];
-      if (extraLookups && extraLookups.length > 0) {
-        const lookupSet = new Set(lookups);
-        for (const cl of extraLookups) {
-          lookupSet.add(cl);
-        }
-        lookups = [...lookupSet];
-      }
-
-      const fieldInfo: FieldInfo = {
-        name: memberName,
-        fieldKind,
-        isRelation,
-        lookups,
-        transforms,
-      };
-      fields.set(memberName, fieldInfo);
-
-      if (isRelation) {
-        const targetModelLabel = extractTargetModel(typeStr) ?? '';
-        const direction: 'forward' | 'reverse' =
-          returnKind === 'related_manager' ? 'reverse' : 'forward';
-
-        const relationInfo: RelationInfo = {
-          name: memberName,
-          fieldKind,
-          targetModelLabel,
-          direction,
-        };
-
-        if (direction === 'reverse') {
-          reverseRelations.set(memberName, relationInfo);
-        } else {
-          relations.set(memberName, relationInfo);
-        }
-      }
-    }
-
-    // --- Build per-model field trie -------------------------------------
-    const fieldTrie = createTrieNode<FieldInfo>();
-    for (const [name, info] of fields) {
-      trieInsert(fieldTrie, name, info);
-    }
-    fieldTrieByModel.set(modelLabel, fieldTrie);
-
-    // --- Construct ModelInfo ---------------------------------------------
-    const modelInfo: ModelInfo = {
-      label: modelLabel,
-      objectName,
-      module: '',       // not available from surfaceIndex alone
-      filePath: '',     // not available from surfaceIndex alone
-      fields,
-      relations,
-      reverseRelations,
-      isAbstract: false,
-      baseLabels: [],
-    };
+    const modelInfo = buildModelInfo(modelLabel, receivers, customLookups);
     models.set(modelLabel, modelInfo);
-    modelLabelByName.set(objectName, modelLabel);
+    modelLabelByName.set(modelInfo.objectName, modelLabel);
   }
 
-  // --- Build global lookup & transform tries ----------------------------
+  // Add fallback models that exist in static index but not in runtime
+  if (staticFallback) {
+    for (const [label, info] of Object.entries(staticFallback)) {
+      if (models.has(label)) continue; // runtime data takes priority
+
+      const objectName = label.includes('.') ? label.split('.').pop()! : label;
+      const fields = new Map<string, FieldInfo>();
+      const defaultLookups = getLookupsForField('CharField');
+      const defaultTransforms = getTransformsForField('CharField');
+
+      for (const fieldName of info.fields) {
+        fields.set(fieldName, {
+          name: fieldName,
+          fieldKind: 'CharField',
+          isRelation: false,
+          lookups: defaultLookups,
+          transforms: defaultTransforms,
+        });
+      }
+
+      for (const relName of info.relations) {
+        fields.set(relName, {
+          name: relName,
+          fieldKind: 'ForeignKey',
+          isRelation: true,
+          lookups: getLookupsForField('ForeignKey'),
+          transforms: [],
+        });
+      }
+
+      models.set(label, {
+        label,
+        objectName,
+        module: '',
+        filePath: '',
+        fields,
+        relations: new Map(),
+        reverseRelations: new Map(),
+        isAbstract: false,
+        baseLabels: [],
+      });
+      modelLabelByName.set(objectName, label);
+    }
+  }
+
   const lookupTrie = buildLookupTrie(customLookups);
   const transformTrie = buildTransformTrie();
 
+  const runtimeCount = Object.keys(surfaceIndex).length;
+  const fallbackCount = models.size - runtimeCount;
   const _elapsed = performance.now() - _t0;
-  // Log will be visible via connection.console when wired up
   if (typeof console !== 'undefined') {
     console.log(
-      `[ls:indexer] buildWorkspaceIndex: ${models.size} models ` +
-      `${fieldTrieByModel.size} tries ${_elapsed.toFixed(0)}ms`
+      `[ls:indexer] buildWorkspaceIndex: ${models.size} models` +
+      (fallbackCount > 0 ? ` (${fallbackCount} static fallback)` : '') +
+      ` ${_elapsed.toFixed(0)}ms (tries=lazy)`
     );
   }
+  incrementCounter('index.full_rebuild');
 
   return {
     models,
     perFile: new Map<string, FileIndexEntry>(),
     modelLabelByName,
-    fieldTrieByModel,
+    fieldTrieByModel: new Map<string, RadixTrieNode<FieldInfo>>(),
     lookupTrie,
     transformTrie,
   };

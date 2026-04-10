@@ -19,6 +19,62 @@ import { CompressedRadixTrie } from './radixTrie.js';
 export type FsmState = ResolutionState['fsmState'];
 
 // ---------------------------------------------------------------------------
+// Levenshtein distance (for typo correction)
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute the Levenshtein edit distance between two strings.
+ * Uses O(min(n,m)) space via a single-row DP approach.
+ */
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+
+  // Ensure a is the shorter string for space efficiency
+  if (a.length > b.length) {
+    [a, b] = [b, a];
+  }
+
+  const aLen = a.length;
+  const bLen = b.length;
+  const row = new Uint16Array(aLen + 1);
+
+  for (let i = 0; i <= aLen; i++) row[i] = i;
+
+  for (let j = 1; j <= bLen; j++) {
+    let prev = row[0];
+    row[0] = j;
+    for (let i = 1; i <= aLen; i++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const temp = row[i];
+      row[i] = Math.min(
+        row[i] + 1,         // deletion
+        row[i - 1] + 1,     // insertion
+        prev + cost,         // substitution
+      );
+      prev = temp;
+    }
+  }
+
+  return row[aLen];
+}
+
+/**
+ * Find fuzzy matches using Levenshtein distance.
+ * Returns candidates with distance ≤ maxDist, sorted by distance.
+ */
+function fuzzyMatch(partial: string, candidates: string[], maxDist = 2): string[] {
+  if (partial.length === 0) return [];
+  const lowerPartial = partial.toLowerCase();
+  return candidates
+    .map((c) => ({ name: c, dist: levenshtein(lowerPartial, c.toLowerCase()) }))
+    .filter((c) => c.dist <= maxDist && c.dist > 0)
+    .sort((a, b) => a.dist - b.dist)
+    .map((c) => c.name);
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -508,7 +564,13 @@ function buildSuggestions(
     return candidates;
   }
   const lowerPartial = partial.toLowerCase();
-  return candidates.filter((c) => c.toLowerCase().startsWith(lowerPartial));
+  // 1. Prefix match first
+  const prefixMatches = candidates.filter((c) => c.toLowerCase().startsWith(lowerPartial));
+  if (prefixMatches.length > 0) {
+    return prefixMatches;
+  }
+  // 2. Fuzzy match fallback (Levenshtein distance ≤ 2)
+  return fuzzyMatch(partial, candidates, 2);
 }
 
 /**
@@ -594,8 +656,21 @@ export function getCompletionCandidates(
   parsed: ParsedLookup,
   partialSegment: string,
   index: WorkspaceIndex,
+  usageFrequency?: Map<string, number>,
 ): PrefixCandidate[] {
   const _t0 = performance.now();
+
+  // --- Error state recovery: use suggestions from parsed lookup ---
+  if (parsed.state === 'error' && parsed.suggestions && parsed.suggestions.length > 0) {
+    return parsed.suggestions.map((name, i) => ({
+      name,
+      kind: 'field' as const,
+      detail: '(did you mean?)',
+      source: 'workspace' as const,
+      sortPriority: 10 + i,
+    }));
+  }
+
   const state = inferState(parsed, index);
   if (!state) {
     return [];
@@ -608,9 +683,12 @@ export function getCompletionCandidates(
     const model = resolveModel(state.currentModel, index);
     if (!model) return [];
 
+    let hasPrefixMatch = false;
+
     // Scalar fields.
     for (const [name, field] of model.fields) {
       if (!field.isRelation && matchesPrefix(name, lowerPartial)) {
+        hasPrefixMatch = true;
         candidates.push({
           name,
           kind: 'field',
@@ -624,6 +702,7 @@ export function getCompletionCandidates(
     // Forward relations.
     for (const [name, rel] of model.relations) {
       if (matchesPrefix(name, lowerPartial)) {
+        hasPrefixMatch = true;
         candidates.push({
           name,
           kind: 'relation',
@@ -637,6 +716,7 @@ export function getCompletionCandidates(
     // Reverse relations.
     for (const [name, rel] of model.reverseRelations) {
       if (matchesPrefix(name, lowerPartial)) {
+        hasPrefixMatch = true;
         candidates.push({
           name,
           kind: 'relation',
@@ -646,13 +726,33 @@ export function getCompletionCandidates(
         });
       }
     }
+
+    // Fuzzy fallback when no prefix matches found
+    if (!hasPrefixMatch && partialSegment.length > 0) {
+      const allNames = getCandidateNames(state, index);
+      const fuzzyResults = fuzzyMatch(partialSegment, allNames, 2);
+      for (const name of fuzzyResults) {
+        const field = model.fields.get(name);
+        const rel = model.relations.get(name) ?? model.reverseRelations.get(name);
+        candidates.push({
+          name,
+          kind: field && !field.isRelation ? 'field' : 'relation',
+          detail: field ? `${field.fieldKind} (did you mean?)` : rel ? `${rel.fieldKind} (did you mean?)` : '(did you mean?)',
+          source: 'workspace',
+          sortPriority: 10,
+        });
+      }
+    }
   } else if (state.fsmState === 'EXPECT_TRANSFORM_OR_LOOKUP') {
     const field = state.currentField;
     if (!field) return [];
 
+    let hasPrefixMatch = false;
+
     // Lookups.
     for (const lookupName of field.lookups) {
       if (matchesPrefix(lookupName, lowerPartial)) {
+        hasPrefixMatch = true;
         candidates.push({
           name: lookupName,
           kind: 'lookup',
@@ -666,6 +766,7 @@ export function getCompletionCandidates(
     // Transforms.
     for (const transformName of field.transforms) {
       if (matchesPrefix(transformName, lowerPartial)) {
+        hasPrefixMatch = true;
         const tInfo = trieSearch<TransformInfo>(index.transformTrie, transformName);
         candidates.push({
           name: transformName,
@@ -678,12 +779,38 @@ export function getCompletionCandidates(
         });
       }
     }
+
+    // Fuzzy fallback for lookups/transforms
+    if (!hasPrefixMatch && partialSegment.length > 0) {
+      const allNames = [...field.lookups, ...field.transforms];
+      const fuzzyResults = fuzzyMatch(partialSegment, allNames, 2);
+      for (const name of fuzzyResults) {
+        const isLookup = field.lookups.includes(name);
+        candidates.push({
+          name,
+          kind: isLookup ? 'lookup' : 'transform',
+          detail: `${isLookup ? 'lookup' : 'transform'} (did you mean?)`,
+          source: 'builtin',
+          sortPriority: 10,
+        });
+      }
+    }
   }
 
-  // Sort by priority, then alphabetically.
+  // Sort: priority → exact prefix over fuzzy → usage frequency → alphabetical
   candidates.sort((a, b) => {
     if (a.sortPriority !== b.sortPriority) {
       return a.sortPriority - b.sortPriority;
+    }
+    // Exact prefix > fuzzy (within same priority tier)
+    const aExact = a.name.toLowerCase().startsWith(lowerPartial) ? 0 : 1;
+    const bExact = b.name.toLowerCase().startsWith(lowerPartial) ? 0 : 1;
+    if (aExact !== bExact) return aExact - bExact;
+    // Usage frequency (higher = better)
+    if (usageFrequency) {
+      const aFreq = usageFrequency.get(a.name) ?? 0;
+      const bFreq = usageFrequency.get(b.name) ?? 0;
+      if (aFreq !== bFreq) return bFreq - aFreq;
     }
     return a.name.localeCompare(b.name);
   });

@@ -28,9 +28,15 @@ import type {
 } from './types.js';
 
 import { provideCompletions } from './completionProvider.js';
-import { buildWorkspaceIndex } from './workspaceIndexer.js';
+import {
+  buildWorkspaceIndex,
+  diffSurfaceIndex,
+  updateWorkspaceIndexIncremental,
+  type SurfaceIndex,
+  type SurfaceIndexDiff,
+} from './workspaceIndexer.js';
 import { parseLookupChain, getCompletionCandidates } from './lookupResolver.js';
-import { recordTiming, incrementCounter, getAllStats, getAllCounters } from './perfTracker.js';
+import { recordTiming, incrementCounter, setGauge, getAllStats, getAllCounters, getAllGauges } from './perfTracker.js';
 import { CompletionItemKind } from 'vscode-languageserver/node';
 import type { CompletionItem } from 'vscode-languageserver/node';
 
@@ -73,6 +79,30 @@ function emptyTrieNode<T>(): RadixTrieNode<T> {
 
 const completionCache = new Map<string, CompletionItem[]>();
 const COMPLETION_CACHE_MAX = 256;
+
+// ---------------------------------------------------------------------------
+// Incremental update state
+// ---------------------------------------------------------------------------
+
+let previousSurfaceIndex: SurfaceIndex | null = null;
+let previousCustomLookups: Record<string, string[]> | undefined;
+const modelVersions = new Map<string, number>();
+const modelFingerprints = new Map<string, string>();
+
+// ---------------------------------------------------------------------------
+// Usage frequency tracking (for completion ranking)
+// ---------------------------------------------------------------------------
+
+/** Tracks how often each field/lookup name is used in completions. */
+const usageFrequency = new Map<string, number>();
+
+/** Record resolved segments from the previous completion as "used". */
+function recordUsage(parsedLookup: ParsedLookup): void {
+  for (const seg of parsedLookup.resolvedPath) {
+    const key = seg.name;
+    usageFrequency.set(key, (usageFrequency.get(key) ?? 0) + 1);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Lifecycle: initialize
@@ -141,12 +171,12 @@ async function startWorkspaceIndexing(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 connection.onNotification('django/updateSurfaceIndex', (params: {
-  surfaceIndex: Record<string, Record<string, Record<string, [string, string | null]>>>;
+  surfaceIndex: SurfaceIndex;
   modelNames: string[];
   customLookups?: Record<string, string[]>;
+  staticFallback?: Record<string, { fields: string[]; relations: string[] }>;
 }) => {
   const _t0 = performance.now();
-  completionCache.clear();
   const surfaceKeys = Object.keys(params.surfaceIndex);
   const customLookupCount = params.customLookups
     ? Object.values(params.customLookups).reduce((sum, v) => sum + v.length, 0)
@@ -156,22 +186,67 @@ connection.onNotification('django/updateSurfaceIndex', (params: {
     (customLookupCount > 0 ? ` customLookups=${customLookupCount}` : '') +
     (surfaceKeys.length > 0 ? ` first=${surfaceKeys[0]}` : '')
   );
-  const built = buildWorkspaceIndex(params.surfaceIndex, params.modelNames, params.customLookups);
 
-  // Copy into the module-level workspaceIndex
-  workspaceIndex.models = built.models;
-  workspaceIndex.perFile = built.perFile;
-  workspaceIndex.modelLabelByName = built.modelLabelByName;
-  workspaceIndex.fieldTrieByModel = built.fieldTrieByModel;
-  workspaceIndex.lookupTrie = built.lookupTrie;
-  workspaceIndex.transformTrie = built.transformTrie;
+  if (previousSurfaceIndex === null) {
+    // --- First load: full build ---
+    completionCache.clear();
+    const built = buildWorkspaceIndex(params.surfaceIndex, params.modelNames, params.customLookups, params.staticFallback);
+    workspaceIndex.models = built.models;
+    workspaceIndex.perFile = built.perFile;
+    workspaceIndex.modelLabelByName = built.modelLabelByName;
+    workspaceIndex.fieldTrieByModel = built.fieldTrieByModel;
+    workspaceIndex.lookupTrie = built.lookupTrie;
+    workspaceIndex.transformTrie = built.transformTrie;
 
-  const _buildMs = performance.now() - _t0;
-  recordTiming('index.build', _buildMs);
-  connection.console.log(
-    `[ls] surfaceIndex loaded: ${built.models.size} models ` +
-    `${built.fieldTrieByModel.size} tries ${_buildMs.toFixed(0)}ms`
-  );
+    // Initialise fingerprint cache for future diffs
+    for (const label of Object.keys(params.surfaceIndex)) {
+      modelFingerprints.set(label, JSON.stringify(params.surfaceIndex[label]));
+    }
+
+    const _buildMs = performance.now() - _t0;
+    recordTiming('index.build', _buildMs);
+    connection.console.log(
+      `[ls] full build: ${built.models.size} models ${_buildMs.toFixed(0)}ms (tries=lazy)`
+    );
+  } else {
+    // --- Incremental update ---
+    const diff = diffSurfaceIndex(previousSurfaceIndex, params.surfaceIndex, modelFingerprints);
+    const totalChanges = diff.added.length + diff.removed.length + diff.changed.length;
+
+    if (totalChanges === 0) {
+      // No-op: surfaceIndex is identical
+      incrementCounter('index.noop_update');
+      const _noop = performance.now() - _t0;
+      connection.console.log(`[ls] incremental update: no-op ${_noop.toFixed(1)}ms`);
+    } else {
+      updateWorkspaceIndexIncremental(
+        workspaceIndex,
+        params.surfaceIndex,
+        diff,
+        params.customLookups,
+        previousCustomLookups,
+      );
+
+      // Bump version for changed/added models (removed ones no longer exist)
+      for (const label of [...diff.added, ...diff.changed]) {
+        modelVersions.set(label, (modelVersions.get(label) ?? 0) + 1);
+      }
+      for (const label of diff.removed) {
+        modelVersions.delete(label);
+      }
+
+      const _buildMs = performance.now() - _t0;
+      recordTiming('index.build', _buildMs);
+      connection.console.log(
+        `[ls] incremental update: +${diff.added.length} ~${diff.changed.length} -${diff.removed.length} ${_buildMs.toFixed(0)}ms`
+      );
+    }
+  }
+
+  previousSurfaceIndex = params.surfaceIndex;
+  previousCustomLookups = params.customLookups;
+  setGauge('models.total', workspaceIndex.models.size);
+  setGauge('tries.built', workspaceIndex.fieldTrieByModel.size);
 });
 
 // ---------------------------------------------------------------------------
@@ -262,8 +337,10 @@ connection.onCompletion((params: CompletionParams) => {
     return [];
   }
 
-  // Cache lookup
-  const cacheKey = `${context.currentModel}::${context.parsedLookup.segments.join('__')}`;
+  // Cache lookup (includes model version + partial segment for correctness)
+  const modelVer = modelVersions.get(context.currentModel) ?? 0;
+  const resolvedKey = context.parsedLookup.segments.slice(0, -1).join('__');
+  const cacheKey = `${context.currentModel}@${modelVer}::${resolvedKey}::${context.partialSegment}`;
   const cached = completionCache.get(cacheKey);
   if (cached) {
     const _totalMs = performance.now() - _t0;
@@ -275,6 +352,11 @@ connection.onCompletion((params: CompletionParams) => {
 
   const _t2 = performance.now();
 
+  // Record resolved segments as "used" for frequency-based ranking
+  if (context.parsedLookup.resolvedPath.length > 0) {
+    recordUsage(context.parsedLookup);
+  }
+
   let items: CompletionItem[];
   // If the FSM resolved at least one segment, use getCompletionCandidates for
   // precise field-type-aware completions. Otherwise fall back to flat trie.
@@ -283,6 +365,7 @@ connection.onCompletion((params: CompletionParams) => {
       context.parsedLookup,
       context.partialSegment,
       workspaceIndex,
+      usageFrequency,
     );
     items = candidates.map((c, i) => ({
       label: c.name,
@@ -461,6 +544,12 @@ connection.onRequest('django/perfReport', () => {
   return {
     stats: getAllStats(),
     counters: getAllCounters(),
+    gauges: getAllGauges(),
+    snapshot: {
+      modelCount: workspaceIndex.models.size,
+      triesBuilt: workspaceIndex.fieldTrieByModel.size,
+      completionCacheSize: completionCache.size,
+    },
   };
 });
 

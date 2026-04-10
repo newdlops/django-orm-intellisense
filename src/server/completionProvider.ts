@@ -15,6 +15,7 @@ import type {
   FieldInfo,
   RadixTrieNode,
 } from './types.js';
+import { getOrBuildFieldTrie } from './workspaceIndexer.js';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -61,7 +62,7 @@ export function provideCompletions(
     const targetModel = index.models.get(targetModelLabel) ?? modelInfo;
 
     // --- Field candidates via radix trie (fast prefix search) -----------
-    const fieldTrie = index.fieldTrieByModel.get(targetModel.label);
+    const fieldTrie = getOrBuildFieldTrie(index, targetModel.label);
     if (fieldTrie) {
       const trieResults = prefixSearch(fieldTrie, partialSegment);
       for (const { key, payload } of trieResults) {

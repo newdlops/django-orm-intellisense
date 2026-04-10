@@ -191,6 +191,7 @@ export interface InitializeResult {
   modelNames?: string[];
   surfaceIndex?: Record<string, Record<string, Record<string, [string, string | null]>>>;
   customLookups?: Record<string, string[]>;
+  staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
 }
 
 export interface RequestMessage {

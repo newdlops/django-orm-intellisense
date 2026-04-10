@@ -310,6 +310,27 @@ class DaemonServer:
             if not c.is_abstract
         })
 
+        # Build staticFallback for models present in static_index but missing
+        # from the runtime surfaceIndex (e.g. import errors, circular deps).
+        static_fallback: dict[str, dict[str, list[str]]] = {}
+        runtime_labels = set(surface_index.keys())
+        for candidate in static_index.model_candidates:
+            if candidate.is_abstract or candidate.label in runtime_labels:
+                continue
+            fields_for = static_index.fields_for_model(candidate.label)
+            scalar_names: list[str] = []
+            relation_names: list[str] = []
+            for f in fields_for:
+                if f.is_relation:
+                    relation_names.append(f.name)
+                else:
+                    scalar_names.append(f.name)
+            if scalar_names or relation_names:
+                static_fallback[candidate.label] = {
+                    'fields': scalar_names,
+                    'relations': relation_names,
+                }
+
         return {
             'serverName': 'django-orm-intellisense',
             'protocolVersion': '0.1',
@@ -318,6 +339,7 @@ class DaemonServer:
             'surfaceIndex': surface_index,
             'customLookups': runtime.custom_lookups if runtime else {},
             'venvInfo': venv_info.to_dict() if venv_info else None,
+            'staticFallback': static_fallback if static_fallback else None,
         }
 
     def _health(self) -> dict[str, Any]:
