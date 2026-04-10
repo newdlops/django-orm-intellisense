@@ -599,6 +599,20 @@ function detectModelFromLine(lineText: string): string | undefined {
         const label = workspaceIndex.modelLabelByName.get(receiverObjMatch[1]);
         if (label) return label;
       }
+
+      // Pattern 3: Reverse relation manager — e.g. xxx.question_thread_set.create(
+      // Extract the last dotted segment before .method( and check if it's a
+      // known reverse relation name on any model.
+      const lastSegmentMatch = beforeMethod.match(/\.(\w+)\s*$/);
+      if (lastSegmentMatch) {
+        const possibleRelName = lastSegmentMatch[1];
+        for (const [, modelInfo] of workspaceIndex.models) {
+          const reverseRel = modelInfo.reverseRelations.get(possibleRelName);
+          if (reverseRel) {
+            return reverseRel.targetModelLabel;
+          }
+        }
+      }
     }
   }
 

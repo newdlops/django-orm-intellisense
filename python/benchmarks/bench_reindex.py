@@ -244,7 +244,7 @@ def check_budgets(results: dict) -> list[dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Django ORM Intellisense Python benchmark")
-    parser.add_argument("--models", type=int, default=500, help="Number of synthetic models")
+    parser.add_argument("--models", type=int, default=1500, help="Number of synthetic models")
     parser.add_argument("--json", action="store_true", help="Output JSON")
     args = parser.parse_args()
 

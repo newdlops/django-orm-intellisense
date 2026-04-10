@@ -86,32 +86,32 @@ const BUDGETS: Record<number, Budget> = {
   // Budgets for synthetic data (27 fields/model including FKs + reverse relations).
   // Real-world projects typically have fewer fields per model, so these are
   // conservative upper bounds.
-  1000: {
-    buildWorkspaceIndex: 50,
-    diffNoOp: 5,
+  3000: {
+    buildWorkspaceIndex: 150,
+    diffNoOp: 10,
     singleModelReindex: 20,
     completionP50: 5,
     completionP95: 15,
     trieP95: 1,
-    heapMB: 20,
+    heapMB: 60,
   },
-  5000: {
-    buildWorkspaceIndex: 200,
-    diffNoOp: 15,
-    singleModelReindex: 20,
-    completionP50: 5,
-    completionP95: 20,
-    trieP95: 1,
-    heapMB: 80,
-  },
-  10000: {
-    buildWorkspaceIndex: 500,
-    diffNoOp: 30,
+  15000: {
+    buildWorkspaceIndex: 600,
+    diffNoOp: 45,
     singleModelReindex: 20,
     completionP50: 5,
     completionP95: 25,
     trieP95: 1,
-    heapMB: 160,
+    heapMB: 250,
+  },
+  30000: {
+    buildWorkspaceIndex: 1500,
+    diffNoOp: 90,
+    singleModelReindex: 20,
+    completionP50: 5,
+    completionP95: 30,
+    trieP95: 1,
+    heapMB: 500,
   },
 };
 
@@ -121,15 +121,15 @@ function getBudget(modelCount: number): Budget {
   for (const k of keys) {
     if (modelCount <= k) return BUDGETS[k];
   }
-  // Scale linearly from 10K budget
-  const base = BUDGETS[10000];
-  const scale = modelCount / 10000;
+  // Scale linearly from 30K budget
+  const base = BUDGETS[30000];
+  const scale = modelCount / 30000;
   return {
     buildWorkspaceIndex: base.buildWorkspaceIndex * scale,
     diffNoOp: base.diffNoOp * scale,
     singleModelReindex: base.singleModelReindex,
     completionP50: base.completionP50,
-    completionP95: base.completionP95 + (modelCount - 10000) * 0.001,
+    completionP95: base.completionP95 + (modelCount - 30000) * 0.001,
     trieP95: base.trieP95,
     heapMB: base.heapMB * scale,
   };
@@ -396,7 +396,7 @@ if (jsonMode) {
   // Suppress all console.log during benchmark runs
   console.log = () => {};
 
-  const scales = fullMode ? [1000, 5000, 10000] : [parseInt(countArg || '5000', 10)];
+  const scales = fullMode ? [3000, 15000, 30000] : [parseInt(countArg || '15000', 10)];
   const results: BenchmarkResult[] = [];
   for (const scale of scales) {
     if (global.gc) global.gc();
@@ -408,7 +408,7 @@ if (jsonMode) {
   console.log(JSON.stringify(toJsonReport(results), null, 2));
   process.exit(results.every((r) => r.allPassed) ? 0 : 1);
 } else if (fullMode) {
-  const scales = [1000, 5000, 10000];
+  const scales = [3000, 15000, 30000];
   const results: BenchmarkResult[] = [];
 
   for (const scale of scales) {
@@ -419,7 +419,7 @@ if (jsonMode) {
   printBudgetReport(results);
   process.exit(results.every((r) => r.allPassed) ? 0 : 1);
 } else {
-  const count = parseInt(countArg || '5000', 10);
+  const count = parseInt(countArg || '15000', 10);
   const result = runBenchmark(count);
   console.log('');
   printBudgetReport([result]);

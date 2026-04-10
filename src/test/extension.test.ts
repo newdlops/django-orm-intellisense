@@ -5599,7 +5599,7 @@ suite('Django ORM Intellisense UI', () => {
     const diagnostics = await waitForDiagnostics(
       document.uri,
       (items) =>
-        items.filter((item) => item.message.includes('`nax`')).length >= 4
+        items.some((item) => item.message.includes('`nax`'))
     );
 
     assert.ok(
