@@ -10,3 +10,4 @@ __pycache__/
 .django_orm_intellisense/
 .e2e*
 .vscode
+.claude

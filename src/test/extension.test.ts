@@ -240,6 +240,7 @@ suite('Django ORM Intellisense UI', () => {
         hiddenReverseCompletionPosition
       );
 
+    assert.ok(hiddenReverseCompletionList?.items?.length, 'Expected completion list to have items before checking absence of hidden reverse accessors');
     assert.ok(
       !hasCompletionItemLabel(
         hiddenReverseCompletionList?.items,
@@ -260,6 +261,7 @@ suite('Django ORM Intellisense UI', () => {
         hiddenReverseOperatorCompletionPosition
       );
 
+    assert.ok(hiddenReverseOperatorCompletionList?.items?.length, 'Expected completion list to have items before checking absence of hidden reverse operators');
     assert.ok(
       !hasCompletionItemLabel(hiddenReverseOperatorCompletionList?.items, 'in'),
       'Expected hidden reverse ManyToMany accessors to avoid lookup-operator completion.'
@@ -425,6 +427,7 @@ suite('Django ORM Intellisense UI', () => {
       (items) =>
         items.some((item) => item.message.includes('author__unknown'))
     );
+    assert.ok(diagnostics.length > 0, 'Expected diagnostics to be non-empty before checking absence of valid paths');
     assert.ok(
       diagnostics.every(
         (item) => !item.message.includes('corporate_registration__registration_code')
@@ -502,6 +505,7 @@ suite('Django ORM Intellisense UI', () => {
       (items) =>
         items.some((item) => item.message.includes('author__unknown'))
     );
+    assert.ok(diagnostics.length > 0, 'Expected diagnostics to be non-empty before checking absence of valid paths');
     assert.ok(
       diagnostics.every(
         (item) => !item.message.includes('corporate_registration__registration_code')
@@ -1127,6 +1131,7 @@ suite('Django ORM Intellisense UI', () => {
       (items) => items.some((item) => item.message.includes('author__unknown'))
     );
 
+    assert.ok(diagnostics.length > 0, 'Expected diagnostics to be non-empty before checking absence of valid paths');
     assert.ok(
       diagnostics.every((item) => !item.message.includes('link__label')),
       `Expected reverse related_query_name filter paths to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
@@ -1222,6 +1227,7 @@ suite('Django ORM Intellisense UI', () => {
       (items) =>
         items.some((item) => item.message.includes('author__unknown'))
     );
+    assert.ok(diagnostics.length > 0, 'Expected diagnostics to be non-empty before checking absence of valid paths');
     assert.ok(
       diagnostics.every(
         (item) => !item.message.includes("state__in")
@@ -1317,6 +1323,7 @@ suite('Django ORM Intellisense UI', () => {
       (items) =>
         items.some((item) => item.message.includes('author__unknown'))
     );
+    assert.ok(diagnostics.length > 0, 'Expected diagnostics to be non-empty before checking absence of valid paths');
     assert.ok(
       diagnostics.every((item) => !item.message.includes('author_id__in')),
       `Expected foreign-key attname lookup to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
@@ -2791,6 +2798,7 @@ suite('Django ORM Intellisense UI', () => {
       ),
       `Expected Meta constraint Q diagnostics to flag invalid related paths. Received: ${stringifyDiagnostics(diagnostics)}`
     );
+    assert.ok(diagnostics.length > 0, 'Expected diagnostics to be non-empty before checking absence of valid paths');
     assert.ok(
       diagnostics.every((item) => !item.message.includes('author__name__gt')),
       `Expected valid Meta constraint Q paths to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
@@ -3636,6 +3644,7 @@ suite('Django ORM Intellisense UI', () => {
         items.some((item) => item.message.includes('`bo`'))
     );
 
+    assert.ok(diagnostics.length > 0, 'Expected diagnostics to be non-empty before checking absence of dynamic key diagnostics');
     assert.ok(
       diagnostics.every(
         (item) => item.range.start.line !== dynamicLookupPosition.line
@@ -5144,6 +5153,7 @@ suite('Django ORM Intellisense UI', () => {
       (items) => items.some((item) => item.message.includes('`bo`'))
     );
 
+    assert.ok(diagnostics.length > 0, 'Expected diagnostics to be non-empty before checking absence of valid paths');
     assert.ok(
       diagnostics.every((item) => !item.message.includes('`fulfillment`')),
       `Expected relation-valued OuterRef() paths to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
@@ -7047,6 +7057,7 @@ suite('Django ORM Intellisense UI', () => {
       ),
       `Expected diagnostics to flag invalid relation-only lookup paths. Received: ${stringifyDiagnostics(diagnostics)}`
     );
+    assert.ok(diagnostics.length > 0, 'Expected diagnostics to be non-empty before checking absence of valid paths');
     assert.ok(
       diagnostics.every((item) => !item.message.includes('`pk`')),
       `Expected pk lookup aliases to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
@@ -7982,7 +7993,9 @@ function django5BaseInterpreterCandidates(): string[] {
         candidates.add(path.join(projectRoot, entry, 'bin', 'python3'));
       }
     }
-  } catch { /* ignore */ }
+  } catch (e) {
+    console.warn('[test] e2e venv discovery failed:', e);
+  }
 
   const homeDirectory = os.homedir();
   const pyenvVersionsRoot = path.join(homeDirectory, '.pyenv', 'versions');
@@ -8051,7 +8064,8 @@ async function readDjangoVersion(
       ],
     );
     return output || undefined;
-  } catch {
+  } catch (e) {
+    console.warn('[test] Django version detection failed:', e);
     return undefined;
   }
 }
@@ -8069,7 +8083,8 @@ async function isVirtualEnvironmentInterpreter(
       "import sys; print('1' if getattr(sys, 'real_prefix', None) or sys.prefix != getattr(sys, 'base_prefix', sys.prefix) else '0')",
     ]);
     return output === '1';
-  } catch {
+  } catch (e) {
+    console.warn('[test] venv check failed:', e);
     return false;
   }
 }
@@ -8273,7 +8288,14 @@ async function waitForDiagnostics(
     await delay(200);
   }
 
-  return vscode.languages.getDiagnostics(uri);
+  const finalDiagnostics = vscode.languages.getDiagnostics(uri);
+  if (!predicate(finalDiagnostics)) {
+    assert.fail(
+      `waitForDiagnostics timed out after ${timeoutMs}ms. ` +
+      `Current diagnostics: ${stringifyDiagnostics(finalDiagnostics)}`
+    );
+  }
+  return finalDiagnostics;
 }
 
 async function waitForHealthSnapshot(
