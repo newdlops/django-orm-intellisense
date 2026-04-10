@@ -668,6 +668,7 @@ export function getCompletionCandidates(
       detail: '(did you mean?)',
       source: 'workspace' as const,
       sortPriority: 10 + i,
+      isFuzzyMatch: true,
     }));
   }
 
@@ -740,6 +741,7 @@ export function getCompletionCandidates(
           detail: field ? `${field.fieldKind} (did you mean?)` : rel ? `${rel.fieldKind} (did you mean?)` : '(did you mean?)',
           source: 'workspace',
           sortPriority: 10,
+          isFuzzyMatch: true,
         });
       }
     }
@@ -792,6 +794,7 @@ export function getCompletionCandidates(
           detail: `${isLookup ? 'lookup' : 'transform'} (did you mean?)`,
           source: 'builtin',
           sortPriority: 10,
+          isFuzzyMatch: true,
         });
       }
     }

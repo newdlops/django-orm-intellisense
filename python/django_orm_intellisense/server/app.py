@@ -34,6 +34,7 @@ from ..features.lookup_paths import (
 from ..features.orm_members import (
     list_orm_member_completions,
     prebuild_member_surface_cache,
+    rebuild_surface_for_models,
     resolve_orm_member,
     resolve_orm_member_chain,
 )
@@ -49,7 +50,7 @@ from ..runtime.inspector import (
     inspect_runtime,
 )
 from ..semantic.graph import SemanticGraphSummary, build_semantic_graph
-from ..static_index.indexer import StaticIndex, build_static_index
+from ..static_index.indexer import StaticIndex, build_static_index, reindex_single_file
 
 
 class DaemonServer:
@@ -64,6 +65,9 @@ class DaemonServer:
         self._state_generation = 0
         self._state_lock = threading.RLock()
         self._write_lock = threading.Lock()
+        self._last_surface_index: dict[str, object] | None = None
+        self._last_model_names: list[str] | None = None
+        self._last_static_fallback: dict[str, dict[str, list[str]]] | None = None
 
     def run_stdio(self) -> None:
         for raw_line in sys.stdin:
@@ -113,6 +117,8 @@ class DaemonServer:
                     result = self._resolve_orm_member(params)
                 elif method == 'resolveOrmMemberChain':
                     result = self._resolve_orm_member_chain(params)
+                elif method == 'reindexFile':
+                    result = self._reindex_file(params)
                 else:
                     raise ValueError(f'Unsupported method: {method}')
         except Exception as error:  # pragma: no cover - scaffold safety net
@@ -145,7 +151,19 @@ class DaemonServer:
             f'settings={settings_module or "<unset>"} '
             f'defer_runtime={defer_runtime}'
         )
-        source_snapshot = snapshot_python_sources(workspace_root)
+        # Resolve venv first so editable installs can be included in snapshot
+        venv_info = resolve_venv_info(workspace_root)
+        editable_roots: list[Path] = []
+        if venv_info and venv_info.editable_installs:
+            editable_roots = [Path(ei.path) for ei in venv_info.editable_installs]
+            _log_initialize_step(
+                f'editable_installs count={len(editable_roots)} '
+                f'paths={[str(p) for p in editable_roots]}'
+            )
+        source_snapshot = snapshot_python_sources(
+            workspace_root,
+            extra_roots=editable_roots or None,
+        )
         _log_initialize_step(
             f'snapshot_python_sources files={source_snapshot.file_count} elapsed={time.perf_counter() - started_at:.2f}s'
         )
@@ -162,7 +180,6 @@ class DaemonServer:
             f'elapsed={time.perf_counter() - started_at:.2f}s'
         )
         effective_settings_module = settings_module or workspace_profile.settings_module
-        venv_info = resolve_venv_info(workspace_root)
         if venv_info:
             _log_initialize_step(
                 f'resolve_venv_info root={venv_info.root} '
@@ -331,6 +348,11 @@ class DaemonServer:
                     'relations': relation_names,
                 }
 
+        # Cache for incremental reindex
+        self._last_surface_index = surface_index
+        self._last_model_names = model_names
+        self._last_static_fallback = static_fallback if static_fallback else None
+
         return {
             'serverName': 'django-orm-intellisense',
             'protocolVersion': '0.1',
@@ -339,6 +361,122 @@ class DaemonServer:
             'surfaceIndex': surface_index,
             'customLookups': runtime.custom_lookups if runtime else {},
             'venvInfo': venv_info.to_dict() if venv_info else None,
+            'staticFallback': static_fallback if static_fallback else None,
+        }
+
+    def _reindex_file(self, params: dict[str, Any]) -> dict[str, Any]:
+        file_path_str = params.get('filePath')
+        if not file_path_str:
+            return {'error': 'filePath is required'}
+
+        file_path = Path(str(file_path_str)).resolve()
+
+        with self._state_lock:
+            static_index = self.static_index
+            runtime = self.runtime_inspection
+
+        if static_index is None:
+            return {'error': 'not initialized'}
+
+        # Verify file is within workspace
+        try:
+            file_path.relative_to(self.workspace_root)
+        except ValueError:
+            return {'error': 'file outside workspace'}
+
+        started = time.perf_counter()
+        new_static_index, old_labels, new_labels = reindex_single_file(
+            root=self.workspace_root,
+            file_path=file_path,
+            existing_static_index=static_index,
+        )
+
+        affected_labels = old_labels | new_labels
+        if not affected_labels and new_static_index is static_index:
+            # No changes (e.g. syntax error, no model changes)
+            elapsed = time.perf_counter() - started
+            print(
+                f'[PERF] reindexFile: no changes {elapsed:.3f}s',
+                file=sys.stderr,
+            )
+            return {
+                'surfaceIndex': self._last_surface_index or {},
+                'modelNames': self._last_model_names or [],
+                'staticFallback': self._last_static_fallback,
+            }
+
+        # Also invalidate reverse-relation targets: models that reference
+        # affected models may have changed reverse relations.
+        reverse_affected: set[str] = set()
+        for candidate in new_static_index.model_candidates:
+            if candidate.is_abstract:
+                continue
+            for field in new_static_index.fields_for_model(candidate.label):
+                if field.is_relation and field.related_model_label in affected_labels:
+                    reverse_affected.add(candidate.label)
+        affected_labels = affected_labels | reverse_affected
+
+        # Update static index
+        with self._state_lock:
+            self.static_index = new_static_index
+
+        # Rebuild surface for affected models only
+        existing_surface = self._last_surface_index or {}
+        if runtime is None:
+            runtime = create_pending_runtime_inspection()
+
+        surface_index = rebuild_surface_for_models(
+            new_static_index, runtime, affected_labels, existing_surface,
+        )
+
+        # Build model names
+        model_names = sorted({
+            c.object_name
+            for c in new_static_index.model_candidates
+            if not c.is_abstract
+        })
+
+        # Build staticFallback for affected models
+        static_fallback: dict[str, dict[str, list[str]]] = {}
+        if self._last_static_fallback:
+            static_fallback = dict(self._last_static_fallback)
+        runtime_labels = set(surface_index.keys())
+        for label in affected_labels:
+            static_fallback.pop(label, None)
+        for candidate in new_static_index.model_candidates:
+            if candidate.is_abstract or candidate.label in runtime_labels:
+                continue
+            if candidate.label not in affected_labels:
+                continue
+            fields_for = new_static_index.fields_for_model(candidate.label)
+            scalar_names: list[str] = []
+            relation_names: list[str] = []
+            for f in fields_for:
+                if f.is_relation:
+                    relation_names.append(f.name)
+                else:
+                    scalar_names.append(f.name)
+            if scalar_names or relation_names:
+                static_fallback[candidate.label] = {
+                    'fields': scalar_names,
+                    'relations': relation_names,
+                }
+
+        # Cache for next request
+        self._last_surface_index = surface_index
+        self._last_model_names = model_names
+        self._last_static_fallback = static_fallback if static_fallback else None
+
+        elapsed = time.perf_counter() - started
+        print(
+            f'[PERF] reindexFile: {len(affected_labels)} affected '
+            f'{elapsed:.3f}s',
+            file=sys.stderr,
+        )
+
+        return {
+            'surfaceIndex': surface_index,
+            'modelNames': model_names,
             'staticFallback': static_fallback if static_fallback else None,
         }
 

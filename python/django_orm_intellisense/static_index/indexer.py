@@ -351,7 +351,10 @@ class StaticIndex:
             self._model_candidates_by_name.setdefault(candidate.object_name, []).append(
                 candidate
             )
-        self.fields: list[FieldCandidate] = self._resolve_fields()
+        # Allow skipping expensive _resolve_fields() when cached fields are
+        # injected via class variable (used by reindex_single_file fast path).
+        pre = getattr(StaticIndex, '_pre_resolved_fields', None)
+        self.fields: list[FieldCandidate] = list(pre) if pre is not None else self._resolve_fields()
         self._fields_by_model_label: dict[str, list[FieldCandidate]] = {}
         self._fields_by_model_and_name: dict[tuple[str, str], FieldCandidate] = {}
         for field in self.fields:
@@ -900,6 +903,88 @@ def build_static_index(
         modules=modules,
         expand_inheritance=has_fresh_modules,
     )
+
+
+def _module_models_unchanged(
+    old_module: ModuleIndex | None,
+    new_module: ModuleIndex | None,
+) -> bool:
+    """Check if model definitions are unchanged between two versions of a module.
+
+    Compares model_candidates, pending_fields, class_base_refs, and import_bindings
+    (imports affect cross-module inheritance resolution).
+    """
+    if old_module is None and new_module is None:
+        return True
+    if old_module is None or new_module is None:
+        return False
+    return (
+        old_module.model_candidates == new_module.model_candidates
+        and old_module.pending_fields == new_module.pending_fields
+        and old_module.class_base_refs == new_module.class_base_refs
+        and old_module.import_bindings == new_module.import_bindings
+    )
+
+
+def reindex_single_file(
+    root: Path,
+    file_path: Path,
+    existing_static_index: StaticIndex,
+) -> tuple[StaticIndex, set[str], set[str]]:
+    """Re-parse a single file and return an updated StaticIndex.
+
+    Returns:
+        (new_static_index, old_labels, new_labels)
+        - old_labels: model labels from the previous version of this file
+        - new_labels: model labels from the new version of this file
+    """
+    module_name = _module_name_from_path(root, file_path)
+
+    # Collect old model labels from this module
+    old_labels: set[str] = set()
+    old_module = existing_static_index.modules.get(module_name)
+    if old_module is not None:
+        old_labels = {c.label for c in old_module.model_candidates}
+
+    # Copy existing modules and replace the changed one
+    modules = dict(existing_static_index.modules)
+
+    new_module: ModuleIndex | None = None
+    new_labels: set[str] = set()
+    if file_path.exists():
+        try:
+            file_text = file_path.read_text(encoding='utf-8')
+            parsed_module = ast.parse(file_text)
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            # Syntax error or unreadable: keep old module, report no changes
+            return existing_static_index, set(), set()
+
+        new_module = _build_module_index(root, file_path, module_name, parsed_module)
+        modules[module_name] = new_module
+        new_labels = {c.label for c in new_module.model_candidates}
+    else:
+        # File deleted
+        modules.pop(module_name, None)
+
+    # Fast path: if model definitions are unchanged, skip expensive
+    # _expand_model_candidates_via_imports and _resolve_fields.
+    # This covers the common case of editing views, utils, tests, etc.
+    if _module_models_unchanged(old_module, new_module):
+        new_static_index = _static_index_from_modules(
+            python_file_count=existing_static_index.python_file_count,
+            modules=modules,
+            expand_inheritance=False,
+            cached_fields=existing_static_index.fields,
+        )
+        return new_static_index, old_labels, new_labels
+
+    # Slow path: model definitions changed, full rebuild needed.
+    new_static_index = _static_index_from_modules(
+        python_file_count=existing_static_index.python_file_count,
+        modules=modules,
+        expand_inheritance=True,
+    )
+    return new_static_index, old_labels, new_labels
 
 
 def _should_replace_module_index(existing: ModuleIndex, candidate: ModuleIndex) -> bool:
@@ -1666,6 +1751,7 @@ def _static_index_from_modules(
     python_file_count: int,
     modules: dict[str, ModuleIndex],
     expand_inheritance: bool = True,
+    cached_fields: list[FieldCandidate] | None = None,
 ) -> StaticIndex:
     package_init_count = 0
     reexport_module_count = 0
@@ -1714,12 +1800,17 @@ def _static_index_from_modules(
             file=__import__("sys").stderr,
         )
 
-    return StaticIndex(
-        python_file_count=python_file_count,
-        package_init_count=package_init_count,
-        reexport_module_count=reexport_module_count,
-        star_import_count=star_import_count,
-        explicit_all_count=explicit_all_count,
-        modules=modules,
-        model_candidates=model_candidates,
-    )
+    # Inject cached fields to skip expensive _resolve_fields() in __post_init__
+    StaticIndex._pre_resolved_fields = cached_fields
+    try:
+        return StaticIndex(
+            python_file_count=python_file_count,
+            package_init_count=package_init_count,
+            reexport_module_count=reexport_module_count,
+            star_import_count=star_import_count,
+            explicit_all_count=explicit_all_count,
+            modules=modules,
+            model_candidates=model_candidates,
+        )
+    finally:
+        StaticIndex._pre_resolved_fields = None

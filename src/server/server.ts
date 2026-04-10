@@ -39,6 +39,8 @@ import { parseLookupChain, getCompletionCandidates } from './lookupResolver.js';
 import { recordTiming, incrementCounter, setGauge, getAllStats, getAllCounters, getAllGauges } from './perfTracker.js';
 import { CompletionItemKind } from 'vscode-languageserver/node';
 import type { CompletionItem } from 'vscode-languageserver/node';
+import * as fs from 'fs';
+import * as path from 'path';
 
 // ---------------------------------------------------------------------------
 // Connection & document manager
@@ -90,11 +92,80 @@ const modelVersions = new Map<string, number>();
 const modelFingerprints = new Map<string, string>();
 
 // ---------------------------------------------------------------------------
-// Usage frequency tracking (for completion ranking)
+// Usage frequency tracking (for completion ranking, persisted across sessions)
 // ---------------------------------------------------------------------------
+
+const USAGE_FREQUENCY_MAX = 500;
+const USAGE_SAVE_DEBOUNCE_MS = 5_000;
 
 /** Tracks how often each field/lookup name is used in completions. */
 const usageFrequency = new Map<string, number>();
+let usageFrequencyDirty = false;
+let usageSaveTimer: ReturnType<typeof setTimeout> | undefined;
+
+function getUsageFilePath(): string | null {
+  if (!workspaceRoot) return null;
+  let root = workspaceRoot;
+  // Strip file:// prefix if present
+  if (root.startsWith('file://')) {
+    root = root.replace(/^file:\/\//, '');
+  }
+  const vscodeDirPath = path.join(root, '.vscode');
+  return path.join(vscodeDirPath, '.django-orm-usage.json');
+}
+
+function loadUsageFrequency(): void {
+  const filePath = getUsageFilePath();
+  if (!filePath) return;
+  try {
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    const data = JSON.parse(raw) as Record<string, number>;
+    usageFrequency.clear();
+    for (const [key, count] of Object.entries(data)) {
+      if (typeof count === 'number' && count > 0) {
+        usageFrequency.set(key, count);
+      }
+    }
+    connection.console.log(`[ls] loaded usage frequency: ${usageFrequency.size} entries`);
+  } catch {
+    // File doesn't exist or corrupted — start fresh
+  }
+}
+
+function saveUsageFrequency(): void {
+  if (!usageFrequencyDirty) return;
+  const filePath = getUsageFilePath();
+  if (!filePath) return;
+
+  // Prune to max entries (keep highest frequency)
+  if (usageFrequency.size > USAGE_FREQUENCY_MAX) {
+    const sorted = [...usageFrequency.entries()].sort((a, b) => b[1] - a[1]);
+    usageFrequency.clear();
+    for (const [key, count] of sorted.slice(0, USAGE_FREQUENCY_MAX)) {
+      usageFrequency.set(key, count);
+    }
+  }
+
+  try {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const data: Record<string, number> = {};
+    for (const [key, count] of usageFrequency) {
+      data[key] = count;
+    }
+    fs.writeFileSync(filePath, JSON.stringify(data), 'utf-8');
+    usageFrequencyDirty = false;
+  } catch {
+    // Silently fail — non-critical
+  }
+}
+
+function scheduleSaveUsageFrequency(): void {
+  if (usageSaveTimer) clearTimeout(usageSaveTimer);
+  usageSaveTimer = setTimeout(saveUsageFrequency, USAGE_SAVE_DEBOUNCE_MS);
+}
 
 /** Record resolved segments from the previous completion as "used". */
 function recordUsage(parsedLookup: ParsedLookup): void {
@@ -102,6 +173,8 @@ function recordUsage(parsedLookup: ParsedLookup): void {
     const key = seg.name;
     usageFrequency.set(key, (usageFrequency.get(key) ?? 0) + 1);
   }
+  usageFrequencyDirty = true;
+  scheduleSaveUsageFrequency();
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +214,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 connection.onInitialized(() => {
   void connection.client.register(DidChangeConfigurationNotification.type, undefined);
 
+  loadUsageFrequency();
   connection.console.log('[ls] initialized — starting workspace indexing');
   void startWorkspaceIndexing();
 });
@@ -367,12 +441,22 @@ connection.onCompletion((params: CompletionParams) => {
       workspaceIndex,
       usageFrequency,
     );
-    items = candidates.map((c, i) => ({
-      label: c.name,
-      kind: candidateKindToLsp(c.kind),
-      detail: c.detail,
-      sortText: String(i).padStart(4, '0'),
-    }));
+    items = candidates.map((c, i) => {
+      const item: CompletionItem = {
+        label: c.name,
+        kind: candidateKindToLsp(c.kind),
+        detail: c.detail,
+        sortText: String(i).padStart(4, '0'),
+      };
+      if (c.isFuzzyMatch) {
+        // Typo correction: show with visual distinction
+        item.detail = `\u26A0 did you mean '${c.name}'?`;
+        item.sortText = `z_${String(i).padStart(4, '0')}`;
+        item.filterText = c.name;
+        item.insertText = c.name;
+      }
+      return item;
+    });
   } else {
     items = provideCompletions(context, workspaceIndex);
   }

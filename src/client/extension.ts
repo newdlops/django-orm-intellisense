@@ -128,19 +128,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // daemon이 ready되면 surfaceIndex를 서버에 전달
     feedSurfaceIndexToServer(daemon, output);
 
-    // LS에서 파일 재인덱싱 요청 수신 → surfaceIndex 재전송 (debounce)
+    // LS에서 파일 재인덱싱 요청 수신 → daemon에 단일 파일 reindex 후 결과 전송
     let reindexTimer: ReturnType<typeof setTimeout> | undefined;
-    languageClient!.onNotification('django/fileNeedsReindex', () => {
+    const pendingReindexFiles = new Set<string>();
+    languageClient!.onNotification('django/fileNeedsReindex', (params: { uri: string }) => {
+      const uri = params?.uri;
+      if (uri) {
+        // Convert file:// URI to local path
+        try {
+          pendingReindexFiles.add(vscode.Uri.parse(uri).fsPath);
+        } catch {
+          pendingReindexFiles.add(uri);
+        }
+      }
       if (reindexTimer) clearTimeout(reindexTimer);
       reindexTimer = setTimeout(() => {
-        output.appendLine('[ls] re-sending surfaceIndex after file save');
-        if (languageClient && Object.keys(daemon.surfaceIndex).length > 0) {
-          void languageClient.sendNotification('django/updateSurfaceIndex', {
-            surfaceIndex: daemon.surfaceIndex,
-            modelNames: Array.from(daemon.modelNames),
-            staticFallback: daemon.staticFallback,
-          });
-        }
+        const files = [...pendingReindexFiles];
+        pendingReindexFiles.clear();
+        if (files.length === 0 || !languageClient || !daemon.isReady()) return;
+
+        void (async () => {
+          for (const filePath of files) {
+            try {
+              output.appendLine(`[ls] reindexing file: ${filePath}`);
+              await daemon.reindexFile(filePath);
+            } catch (e) {
+              output.appendLine(`[ls] reindex failed: ${String(e)}`);
+            }
+          }
+          // Send updated surfaceIndex to LS
+          if (languageClient && Object.keys(daemon.surfaceIndex).length > 0) {
+            output.appendLine(
+              `[ls] re-sending surfaceIndex after reindex: ${Object.keys(daemon.surfaceIndex).length} models`
+            );
+            void languageClient.sendNotification('django/updateSurfaceIndex', {
+              surfaceIndex: daemon.surfaceIndex,
+              modelNames: Array.from(daemon.modelNames),
+              staticFallback: daemon.staticFallback,
+            });
+          }
+        })();
       }, 300);
     });
   });

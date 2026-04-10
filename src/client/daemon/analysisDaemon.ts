@@ -19,6 +19,7 @@ import type {
   OrmMemberCompletionsResult,
   OrmMemberResolution,
   OrmReceiverKind,
+  ReindexFileResult,
   RelationTargetResolution,
   RelationTargetsResult,
   RequestMessage,
@@ -314,6 +315,27 @@ export class AnalysisDaemon implements vscode.Disposable {
     return this.cachedRequest<ModuleResolution>('resolveModule', {
       module: moduleName,
     });
+  }
+
+  async reindexFile(filePath: string): Promise<ReindexFileResult> {
+    const result = await this.request<ReindexFileResult>(
+      'reindexFile',
+      { filePath },
+      INITIALIZE_REQUEST_TIMEOUT_MS
+    );
+    // Update local state with new surface data
+    this.surfaceIndex = result.surfaceIndex ?? {};
+    this.modelNames = new Set(result.modelNames ?? []);
+    this.staticFallback = result.staticFallback ?? null;
+    // Rebuild objectName → label reverse map
+    this.modelLabelByName = new Map();
+    for (const label of Object.keys(this.surfaceIndex)) {
+      const name = label.split('.').at(-1);
+      if (name) {
+        this.modelLabelByName.set(name, label);
+      }
+    }
+    return result;
   }
 
   async listLookupPathCompletions(

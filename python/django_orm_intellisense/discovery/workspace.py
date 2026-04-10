@@ -246,15 +246,33 @@ def iter_python_files(root: Path) -> list[Path]:
     return python_files
 
 
-def snapshot_python_sources(root: Path) -> PythonSourceSnapshot:
+def snapshot_python_sources(
+    root: Path,
+    extra_roots: list[Path] | None = None,
+) -> PythonSourceSnapshot:
     python_files = iter_python_files(root)
+
+    # Include files from extra roots (e.g. editable installs)
+    if extra_roots:
+        seen = set(python_files)
+        for extra_root in extra_roots:
+            if extra_root.is_dir() and extra_root != root:
+                for f in iter_python_files(extra_root):
+                    if f not in seen:
+                        python_files.append(f)
+                        seen.add(f)
+        python_files.sort()
 
     def _stat_one(python_file: Path) -> tuple[Path, PythonSourceEntry] | None:
         try:
             stat_result = python_file.stat()
         except OSError:
             return None
-        relative_path = python_file.relative_to(root).as_posix()
+        # For files outside workspace root, use absolute path as relative
+        try:
+            relative_path = python_file.relative_to(root).as_posix()
+        except ValueError:
+            relative_path = str(python_file)
         fingerprint = _file_fingerprint(
             relative_path=relative_path,
             size=stat_result.st_size,

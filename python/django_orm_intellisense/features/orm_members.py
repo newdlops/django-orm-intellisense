@@ -63,6 +63,25 @@ class _MemberSurfaceCache:
         self._dict_cache[key] = {item.name: item for item in surface}
         return surface
 
+    def invalidate_model(self, model_label: str) -> None:
+        """Invalidate cache entries for a specific model label."""
+        keys_to_remove = [
+            key for key in self._list_cache if key[0] == model_label
+        ]
+        for key in keys_to_remove:
+            self._list_cache.pop(key, None)
+            self._dict_cache.pop(key, None)
+
+    def force_owner(
+        self, static_index: StaticIndex, runtime: RuntimeInspection
+    ) -> None:
+        """Update the owner without clearing the cache.
+
+        Used when static_index is replaced but most cache entries are still
+        valid (e.g. single-file reindex).
+        """
+        self._owner = (id(static_index), id(runtime))
+
     def find(
         self,
         static_index: StaticIndex,
@@ -182,6 +201,70 @@ def build_surface_index(
                 model_entry[kind] = kind_entry
         if model_entry:
             index[candidate.label] = model_entry
+    return index
+
+
+def rebuild_surface_for_models(
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+    affected_labels: set[str],
+    existing_surface_index: dict[str, object],
+) -> dict[str, object]:
+    """Rebuild surface entries for affected models and merge into existing index.
+
+    - Invalidates only the affected model cache entries.
+    - Updates force_owner so _check_owner doesn't clear the entire cache.
+    - Returns the full updated surface_index.
+    """
+    import time
+    started = time.perf_counter()
+
+    # Update owner reference without clearing cache
+    _surface_cache.force_owner(static_index, runtime)
+    # Invalidate only affected models
+    for label in affected_labels:
+        _surface_cache.invalidate_model(label)
+
+    # Build a shallow copy of the existing surface index
+    index: dict[str, dict[str, dict[str, list[str | None]]]] = dict(existing_surface_index)  # type: ignore[arg-type]
+
+    # Remove labels that no longer exist
+    current_labels = {c.label for c in static_index.model_candidates if not c.is_abstract}
+    for label in affected_labels:
+        if label not in current_labels:
+            index.pop(label, None)
+
+    # Rebuild affected labels
+    receiver_kinds = ['instance', 'model_class', 'manager', 'queryset', 'related_manager']
+    for candidate in static_index.model_candidates:
+        if candidate.is_abstract or candidate.label not in affected_labels:
+            continue
+        model_entry: dict[str, dict[str, list[str | None]]] = {}
+        for kind in receiver_kinds:
+            surface = _surface_cache.get_list(
+                static_index, runtime,
+                candidate.label, kind, None,
+            )
+            kind_entry: dict[str, list[str | None]] = {}
+            for item in surface:
+                if item.return_kind:
+                    kind_entry[item.name] = [
+                        item.return_kind,
+                        item.return_model_label or item.model_label,
+                    ]
+            if kind_entry:
+                model_entry[kind] = kind_entry
+        if model_entry:
+            index[candidate.label] = model_entry
+        else:
+            index.pop(candidate.label, None)
+
+    elapsed = time.perf_counter() - started
+    print(
+        f'[PERF] rebuild_surface_for_models: {len(affected_labels)} affected '
+        f'{elapsed:.3f}s',
+        file=__import__("sys").stderr,
+    )
     return index
 
 

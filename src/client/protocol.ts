@@ -194,6 +194,12 @@ export interface InitializeResult {
   staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
 }
 
+export interface ReindexFileResult {
+  surfaceIndex: Record<string, Record<string, Record<string, [string, string | null]>>>;
+  modelNames: string[];
+  staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
+}
+
 export interface RequestMessage {
   id: string;
   method: string;

@@ -146,6 +146,7 @@ export interface PrefixCandidate {
   detail: string;
   source: 'builtin' | 'custom' | 'workspace' | 'dependency';
   sortPriority: number;
+  isFuzzyMatch?: boolean;
 }
 
 // ---------------------------------------------------------------------------
