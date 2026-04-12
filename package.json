@@ -107,7 +107,8 @@
     "benchmark": "node out/test/benchmark.js",
     "benchmark:full": "node out/test/benchmark.js --full",
     "benchmark:json": "node out/test/benchmark.js --full --json",
-    "benchmark:python": "cd python && python -m benchmarks.bench_reindex"
+    "benchmark:python": "cd python && python -m benchmarks.bench_reindex",
+    "stress": "node out/test/stress.js"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",

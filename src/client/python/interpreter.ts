@@ -126,11 +126,13 @@ export async function normalizePythonInterpreterSettings(
   }
 
   if (!configuredInterpreter) {
-    await configuration.update(
+    await updateConfigurationSetting(
+      configuration,
       'pythonInterpreter',
       legacyInterpreter,
       resolveLegacySettingTarget(configuration, resource) ??
-        resolveInterpreterConfigurationTarget(resource)
+        resolveInterpreterConfigurationTarget(resource),
+      resource
     );
     await clearLegacyPythonPathSetting(configuration, resource);
     return 'migrated';
@@ -255,17 +257,46 @@ export async function savePythonInterpreterSetting(
   settings: ExtensionSettings = getExtensionSettings()
 ): Promise<string> {
   const resource = getInterpreterResource(settings);
+  const configurationResource = resolveConfigurationResource(
+    resource,
+    selectedPath
+  );
   const value = resolveStoredInterpreterPath(selectedPath, settings);
   const target = resolveInterpreterConfigurationTarget(
-    resource ?? vscode.Uri.file(selectedPath)
+    configurationResource ?? vscode.Uri.file(selectedPath)
   );
+  const workspaceSettingsPath = workspaceSettingsFilePath(configurationResource);
+  if (
+    target !== vscode.ConfigurationTarget.Global &&
+    configurationResource &&
+    workspaceSettingsPath
+  ) {
+    await saveDirtyWorkspaceSettingsDocument(workspaceSettingsPath);
+    updateWorkspaceSettingsValues(configurationResource, {
+      [`${CONFIGURATION_SECTION}.pythonInterpreter`]: value,
+      [`${CONFIGURATION_SECTION}.pythonPath`]: undefined,
+    });
+    await waitForConfigurationValue(
+      'pythonInterpreter',
+      value,
+      configurationResource
+    );
+    return value;
+  }
+
   const configuration = vscode.workspace.getConfiguration(
     CONFIGURATION_SECTION,
-    resource
+    configurationResource
   );
 
-  await configuration.update('pythonInterpreter', value, target);
-  await clearLegacyPythonPathSetting(configuration);
+  await updateConfigurationSetting(
+    configuration,
+    'pythonInterpreter',
+    value,
+    target,
+    configurationResource
+  );
+  await clearLegacyPythonPathSetting(configuration, configurationResource);
 
   return value;
 }
@@ -665,7 +696,7 @@ function resolveLegacySettingTarget(
   resource?: vscode.Uri
 ): vscode.ConfigurationTarget | undefined {
   const inspected = configuration.inspect<string>('pythonPath');
-  if (inspected?.workspaceFolderValue !== undefined) {
+  if (inspected?.workspaceFolderValue !== undefined && resource) {
     return vscode.ConfigurationTarget.WorkspaceFolder;
   }
 
@@ -703,32 +734,38 @@ async function clearLegacyPythonPathSetting(
   const inspected = configuration.inspect<string>('pythonPath');
   const updates: Thenable<void>[] = [];
 
-  if (inspected?.workspaceFolderValue !== undefined) {
+  if (inspected?.workspaceFolderValue !== undefined && resource) {
     updates.push(
-      configuration.update(
+      updateConfigurationSetting(
+        configuration,
         'pythonPath',
         undefined,
-        vscode.ConfigurationTarget.WorkspaceFolder
+        vscode.ConfigurationTarget.WorkspaceFolder,
+        resource
       )
     );
   }
 
   if (inspected?.workspaceValue !== undefined) {
     updates.push(
-      configuration.update(
+      updateConfigurationSetting(
+        configuration,
         'pythonPath',
         undefined,
-        vscode.ConfigurationTarget.Workspace
+        vscode.ConfigurationTarget.Workspace,
+        resource
       )
     );
   }
 
   if (inspected?.globalValue !== undefined) {
     updates.push(
-      configuration.update(
+      updateConfigurationSetting(
+        configuration,
         'pythonPath',
         undefined,
-        vscode.ConfigurationTarget.Global
+        vscode.ConfigurationTarget.Global,
+        resource
       )
     );
   }
@@ -740,7 +777,7 @@ async function clearLegacyPythonPathSetting(
 function resolveInterpreterConfigurationTarget(
   resource?: vscode.Uri
 ): vscode.ConfigurationTarget {
-  return vscode.workspace.getWorkspaceFolder(resource ?? vscode.Uri.file(process.cwd()))
+  return resource && vscode.workspace.getWorkspaceFolder(resource)
     ? vscode.ConfigurationTarget.WorkspaceFolder
     : vscode.ConfigurationTarget.Workspace;
 }
@@ -763,6 +800,86 @@ function resolveExistingWorkspaceRootSetting(
 
   const resolvedWorkspaceRoot = resolveWorkspaceRootSetting(workspaceRoot);
   return fs.existsSync(resolvedWorkspaceRoot) ? resolvedWorkspaceRoot : undefined;
+}
+
+function resolveConfigurationResource(
+  resource: vscode.Uri | undefined,
+  fallbackPath?: string
+): vscode.Uri | undefined {
+  if (!resource || resource.scheme !== 'file') {
+    return fallbackPath ? vscode.Uri.file(fallbackPath) : resource;
+  }
+
+  try {
+    if (fs.statSync(resource.fsPath).isDirectory()) {
+      const scopedFilePath =
+        fallbackPath && isPathInside(resource.fsPath, fallbackPath)
+          ? path.resolve(fallbackPath)
+          : path.join(resource.fsPath, '.vscode', 'settings.json');
+      return vscode.Uri.file(scopedFilePath);
+    }
+  } catch {
+    // Fall through — the original resource is still the best scope we have.
+  }
+
+  return resource;
+}
+
+function isPathInside(rootPath: string, candidatePath: string): boolean {
+  const relativePath = path.relative(rootPath, candidatePath);
+  return (
+    relativePath === '' ||
+    (!relativePath.startsWith('..') && !path.isAbsolute(relativePath))
+  );
+}
+
+async function updateConfigurationSetting(
+  configuration: vscode.WorkspaceConfiguration,
+  key: string,
+  value: unknown,
+  target: vscode.ConfigurationTarget,
+  resource?: vscode.Uri
+): Promise<void> {
+  try {
+    await configuration.update(key, value, target);
+  } catch (error) {
+    if (
+      target === vscode.ConfigurationTarget.WorkspaceFolder &&
+      resource &&
+      shouldFallbackWorkspaceFolderUpdate(resource, error)
+    ) {
+      await configuration.update(
+        key,
+        value,
+        vscode.ConfigurationTarget.Workspace
+      );
+      return;
+    }
+    throw error;
+  }
+}
+
+function shouldFallbackWorkspaceFolderUpdate(
+  resource: vscode.Uri,
+  error: unknown
+): boolean {
+  if (
+    !(
+      error instanceof Error &&
+      error.message.includes('Folder Settings') &&
+      error.message.includes('no resource')
+    )
+  ) {
+    return false;
+  }
+
+  const workspaceFolders = vscode.workspace.workspaceFolders;
+  if (!workspaceFolders || workspaceFolders.length !== 1) {
+    return false;
+  }
+
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(resource);
+  return workspaceFolder?.uri.fsPath === workspaceFolders[0]?.uri.fsPath;
 }
 
 function replaceToken(
@@ -823,6 +940,59 @@ function workspaceSettingsFilePath(resource?: vscode.Uri): string | undefined {
   return workspaceFolderPath
     ? path.join(workspaceFolderPath, '.vscode', 'settings.json')
     : undefined;
+}
+
+function updateWorkspaceSettingsValues(
+  resource: vscode.Uri,
+  updates: Record<string, unknown>
+): void {
+  const settingsPath = workspaceSettingsFilePath(resource);
+  if (!settingsPath) {
+    return;
+  }
+
+  const settings = readWorkspaceSettingsFile(resource) ?? {};
+  for (const [key, value] of Object.entries(updates)) {
+    if (value === undefined) {
+      delete settings[key];
+      continue;
+    }
+    settings[key] = value;
+  }
+
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+}
+
+async function saveDirtyWorkspaceSettingsDocument(settingsPath: string): Promise<void> {
+  const settingsDocument = vscode.workspace.textDocuments.find(
+    (document) =>
+      document.uri.scheme === 'file' &&
+      path.normalize(document.uri.fsPath) === path.normalize(settingsPath)
+  );
+  if (settingsDocument?.isDirty) {
+    await settingsDocument.save();
+  }
+}
+
+async function waitForConfigurationValue(
+  key: string,
+  expectedValue: string,
+  resource: vscode.Uri
+): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const currentValue = vscode.workspace
+      .getConfiguration(CONFIGURATION_SECTION, resource)
+      .get<string>(key);
+    if (currentValue === expectedValue) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  throw new Error(
+    `Timed out waiting for ${CONFIGURATION_SECTION}.${key} to persist.`
+  );
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

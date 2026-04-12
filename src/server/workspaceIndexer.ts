@@ -131,82 +131,32 @@ const RELATION_FIELD_KINDS = new Set([
 ]);
 
 /**
- * Infer a Django field kind from the surfaceIndex entry's type string
- * and returnKind.
+ * Infer a best-effort Django field kind from a surfaceIndex entry.
  *
- * The surfaceIndex stores entries as `[typeStr, returnKind]` where:
- *   - typeStr is the Python type annotation (e.g. "int", "str",
- *     "Optional[str]", "ForeignKey", "RelatedManager[Post]", etc.)
- *   - returnKind is one of "instance", "related_manager", "queryset",
- *     "model_class", "manager", or null.
+ * The Python daemon stores entries as `[returnKind, returnModelLabel]` where:
+ *   - returnKind is one of "scalar", "instance", "related_manager",
+ *     "queryset", "model_class", "manager", or null
+ *   - returnModelLabel is the related model label (for relations) or the
+ *     owner model label (for scalar fields / methods)
  */
-function inferFieldKind(typeStr: string, returnKind: string | null): { fieldKind: string; isRelation: boolean } {
-  // If returnKind indicates a relation
-  if (returnKind === 'instance' || returnKind === 'related_manager') {
-    // Try to detect the specific relation type from the typeStr
-    if (typeStr.includes('ManyToMany') || returnKind === 'related_manager') {
-      return { fieldKind: 'ManyToManyField', isRelation: true };
-    }
-    if (typeStr.includes('OneToOne')) {
-      return { fieldKind: 'OneToOneField', isRelation: true };
-    }
-    if (typeStr.includes('ForeignKey')) {
-      return { fieldKind: 'ForeignKey', isRelation: true };
-    }
+function inferFieldKind(returnKind: string | null): { fieldKind: string; isRelation: boolean } {
+  if (returnKind === 'related_manager') {
+    return { fieldKind: 'ManyToManyField', isRelation: true };
   }
-
-  // Check if the typeStr directly names a known field class
-  for (const kind of Object.keys(FIELD_LOOKUPS)) {
-    if (typeStr.includes(kind)) {
-      return { fieldKind: kind, isRelation: RELATION_FIELD_KINDS.has(kind) };
-    }
+  if (returnKind === 'instance') {
+    return { fieldKind: 'ForeignKey', isRelation: true };
   }
-
-  // Heuristic: map Python primitive types to Django field kinds
-  const stripped = typeStr.replace(/Optional\[|\]/g, '').trim();
-  switch (stripped) {
-    case 'str':
-      return { fieldKind: 'CharField', isRelation: false };
-    case 'int':
-      return { fieldKind: 'IntegerField', isRelation: false };
-    case 'float':
-      return { fieldKind: 'FloatField', isRelation: false };
-    case 'bool':
-      return { fieldKind: 'BooleanField', isRelation: false };
-    case 'datetime':
-    case 'datetime.datetime':
-      return { fieldKind: 'DateTimeField', isRelation: false };
-    case 'date':
-    case 'datetime.date':
-      return { fieldKind: 'DateField', isRelation: false };
-    case 'time':
-    case 'datetime.time':
-      return { fieldKind: 'TimeField', isRelation: false };
-    case 'timedelta':
-    case 'datetime.timedelta':
-      return { fieldKind: 'DurationField', isRelation: false };
-    case 'Decimal':
-    case 'decimal.Decimal':
-      return { fieldKind: 'DecimalField', isRelation: false };
-    case 'UUID':
-    case 'uuid.UUID':
-      return { fieldKind: 'UUIDField', isRelation: false };
-    case 'bytes':
-      return { fieldKind: 'BinaryField', isRelation: false };
-    case 'dict':
-      return { fieldKind: 'JSONField', isRelation: false };
-    default:
-      return { fieldKind: 'CharField', isRelation: false };
-  }
+  return { fieldKind: 'CharField', isRelation: false };
 }
 
 /**
- * Try to extract a target model label from a relation type string.
- * E.g. "RelatedManager[Post]" -> "Post", "ForeignKey[Author]" -> "Author".
+ * Try to extract a target model label from a surfaceIndex entry.
  */
-function extractTargetModel(typeStr: string): string | undefined {
-  const match = typeStr.match(/\[([^\]]+)\]/);
-  return match ? match[1] : undefined;
+function extractTargetModel(returnKind: string | null, returnModelLabel: string | null): string | undefined {
+  if (returnKind === 'instance' || returnKind === 'related_manager') {
+    return returnModelLabel ?? undefined;
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +231,7 @@ function buildTransformTrie(): RadixTrieNode<TransformInfo> {
 /**
  * Surface index shape coming from the Python daemon.
  *
- * Structure: `{ [modelLabel]: { [receiverKind]: { [memberName]: [typeStr, returnKind] } } }`
+ * Structure: `{ [modelLabel]: { [receiverKind]: { [memberName]: [returnKind, returnModelLabel] } } }`
  *
  * Receiver kinds include "instance", "model_class", "manager", etc.
  */
@@ -465,8 +415,8 @@ function buildModelInfo(
   const reverseRelations = new Map<string, RelationInfo>();
 
   const instanceMembers = receivers['instance'] ?? {};
-  for (const [memberName, [typeStr, returnKind]] of Object.entries(instanceMembers)) {
-    const { fieldKind, isRelation } = inferFieldKind(typeStr, returnKind);
+  for (const [memberName, [returnKind, returnModelLabel]] of Object.entries(instanceMembers)) {
+    const { fieldKind, isRelation } = inferFieldKind(returnKind);
     let lookups = getLookupsForField(fieldKind);
     const transforms = getTransformsForField(fieldKind);
 
@@ -489,7 +439,7 @@ function buildModelInfo(
     fields.set(memberName, fieldInfo);
 
     if (isRelation) {
-      const targetModelLabel = extractTargetModel(typeStr) ?? '';
+      const targetModelLabel = extractTargetModel(returnKind, returnModelLabel) ?? '';
       const direction: 'forward' | 'reverse' =
         returnKind === 'related_manager' ? 'reverse' : 'forward';
 
@@ -519,6 +469,64 @@ function buildModelInfo(
     isAbstract: false,
     baseLabels: [],
   };
+}
+
+function normalizeRelationTargetLabel(
+  modelLabel: string,
+  targetModelLabel: string,
+  models: Map<string, ModelInfo>,
+  modelLabelByName: Map<string, string>,
+): string {
+  if (!targetModelLabel) {
+    return targetModelLabel;
+  }
+
+  if (models.has(targetModelLabel)) {
+    return targetModelLabel;
+  }
+
+  const byShortName = modelLabelByName.get(targetModelLabel);
+  if (byShortName) {
+    return byShortName;
+  }
+
+  if (!targetModelLabel.includes('.')) {
+    const appLabel = modelLabel.includes('.')
+      ? modelLabel.slice(0, modelLabel.lastIndexOf('.'))
+      : '';
+    const scopedLabel = appLabel
+      ? `${appLabel}.${targetModelLabel}`
+      : targetModelLabel;
+    if (models.has(scopedLabel)) {
+      return scopedLabel;
+    }
+  }
+
+  return targetModelLabel;
+}
+
+function normalizeModelRelationTargets(
+  models: Map<string, ModelInfo>,
+  modelLabelByName: Map<string, string>,
+): void {
+  for (const [modelLabel, modelInfo] of models) {
+    for (const relationInfo of modelInfo.relations.values()) {
+      relationInfo.targetModelLabel = normalizeRelationTargetLabel(
+        modelLabel,
+        relationInfo.targetModelLabel,
+        models,
+        modelLabelByName,
+      );
+    }
+    for (const relationInfo of modelInfo.reverseRelations.values()) {
+      relationInfo.targetModelLabel = normalizeRelationTargetLabel(
+        modelLabel,
+        relationInfo.targetModelLabel,
+        models,
+        modelLabelByName,
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -600,6 +608,8 @@ export function buildWorkspaceIndex(
       modelLabelByName.set(objectName, label);
     }
   }
+
+  normalizeModelRelationTargets(models, modelLabelByName);
 
   const lookupTrie = buildLookupTrie(customLookups);
   const transformTrie = buildTransformTrie();

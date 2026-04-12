@@ -5,6 +5,7 @@ import { AnalysisDaemon } from '../daemon/analysisDaemon';
 import { isPylanceAvailable } from '../python/pylance';
 import type {
   ExportOriginResolution,
+  LookupPathCompletionsResult,
   LookupPathItem,
   LookupPathResolution,
   ModuleResolution,
@@ -692,7 +693,13 @@ export function registerPythonProviders(
   );
   const diagnosticsEnabled = isPylanceAvailable();
   const diagnosticTimers = new Map<string, NodeJS.Timeout>();
+  const lastDiagnosedDocumentVersions = new Map<string, number>();
   let fullDiagnosticsRefreshTimer: NodeJS.Timeout | undefined;
+
+  const isVisibleDocument = (document: vscode.TextDocument): boolean =>
+    vscode.window.visibleTextEditors.some(
+      (editor) => editor.document.uri.toString() === document.uri.toString()
+    );
 
   const clearScheduledDiagnostics = (): void => {
     if (fullDiagnosticsRefreshTimer) {
@@ -715,6 +722,10 @@ export function registerPythonProviders(
     }
 
     const key = document.uri.toString();
+    if (lastDiagnosedDocumentVersions.get(key) === document.version) {
+      return;
+    }
+
     const existingTimer = diagnosticTimers.get(key);
     if (existingTimer) {
       clearTimeout(existingTimer);
@@ -732,21 +743,6 @@ export function registerPythonProviders(
 
     for (const editor of vscode.window.visibleTextEditors) {
       documents.set(editor.document.uri.toString(), editor.document);
-    }
-
-    for (const document of vscode.workspace.textDocuments) {
-      const key = document.uri.toString();
-      if (documents.has(key)) {
-        continue;
-      }
-
-      const existingDiagnostics = diagnosticCollection.get(document.uri);
-      if (
-        diagnosticTimers.has(key) ||
-        (existingDiagnostics !== undefined && existingDiagnostics.length > 0)
-      ) {
-        documents.set(key, document);
-      }
     }
 
     return [...documents.values()];
@@ -778,9 +774,16 @@ export function registerPythonProviders(
 
   const refreshDiagnostics = async (
     document: vscode.TextDocument
-  ): Promise<void> => {
+  ): Promise<void> => daemon.withRequestSource('diagnostic', async () => {
+    const key = document.uri.toString();
+    const documentVersion = document.version;
+    if (lastDiagnosedDocumentVersions.get(key) === documentVersion) {
+      return;
+    }
+
     if (!shouldAnalyzeDocument(document, daemon.getState().workspaceRoot)) {
       diagnosticCollection.delete(document.uri);
+      lastDiagnosedDocumentVersions.delete(key);
       return;
     }
 
@@ -796,7 +799,7 @@ export function registerPythonProviders(
 
     for (const context of findRelationDiagnosticContexts(document)) {
       try {
-        const resolution = await daemon.resolveRelationTarget(context.value);
+        const resolution = await daemon.resolveRelationTarget(context.value, /* background */ true);
         const diagnostic = buildRelationDiagnostic(context, resolution);
         if (!diagnostic) {
           continue;
@@ -813,62 +816,87 @@ export function registerPythonProviders(
       }
     }
 
+    // Pass 1: Resolve receivers and collect items needing daemon lookup
+    const _lookupPending: Array<{
+      context: ReturnType<typeof findLookupDiagnosticContexts> extends Iterable<infer T> ? T : never;
+      receiver: OrmReceiverInfo;
+      baseModelLabel: string;
+      batchIdx: number;
+    }> = [];
+    const _batchItems: Array<{ baseModelLabel: string; value: string; method: string }> = [];
+    const _receiverCache = new Map<string, OrmReceiverInfo | null>();
+
     for (const context of findLookupDiagnosticContexts(document)) {
       try {
         const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
-          daemon,
-          document,
-          context.receiverExpression,
-          context.range.end
+          daemon, document, context.receiverExpression, context.range.end
         );
-        if (!lookupReceiver) {
+        if (!lookupReceiver) continue;
+
+        const virtualRes = resolveVirtualLookupPath(lookupReceiver, context.value, context.method);
+        if (virtualRes?.resolved) {
+          // Virtual lookup resolved successfully — skip daemon
           continue;
         }
+        // virtualRes is null or { resolved: false } — need daemon resolution
 
-        const baseModelLabel = lookupReceiver.modelLabel;
-        const resolution =
-          resolveVirtualLookupPath(lookupReceiver, context.value, context.method) ??
-          (await daemon.resolveLookupPath(
-            baseModelLabel,
-            context.value,
-            context.method
-          ));
+        _lookupPending.push({
+          context, receiver: lookupReceiver,
+          baseModelLabel: lookupReceiver.modelLabel,
+          batchIdx: _batchItems.length,
+        });
+        _batchItems.push({
+          baseModelLabel: lookupReceiver.modelLabel,
+          value: context.value,
+          method: context.method,
+        });
+      } catch {
+        continue;
+      }
+    }
+
+    // Pass 2: Batch resolve lookup paths
+    let _batchRes: import('../protocol').LookupPathResolution[] | undefined;
+    // Only use batch when there are enough items to justify the overhead,
+    // and batch size is manageable for the daemon's single-threaded processing.
+    // Batch only when enough items exist — small files use individual calls
+    // which return results incrementally (important for waitForDiagnostics timeout)
+    const BATCH_THRESHOLD = 200;
+    if (_batchItems.length >= BATCH_THRESHOLD) {
+      try {
+        _batchRes = await daemon.resolveLookupPathBatch(_batchItems);
+        if (!Array.isArray(_batchRes) || _batchRes.length !== _batchItems.length) {
+          _batchRes = undefined;
+        }
+      } catch {
+        // fall back to individual
+      }
+    }
+
+    // Pass 3: Build diagnostics
+    for (const { context, receiver, baseModelLabel, batchIdx } of _lookupPending) {
+      try {
+        const resolution = _batchRes?.[batchIdx]
+          ?? await daemon.resolveLookupPath(baseModelLabel, context.value, context.method, /* background */ true);
         if (!resolution.resolved) {
           const partialCompletions = {
             items: mergeLookupCompletionItems(
-              await (async () => {
-                const result = await daemon.listLookupPathCompletions(
-                  baseModelLabel,
-                  context.value,
-                  context.method
-                );
-                return result.items;
-              })(),
-              virtualLookupCompletionItems(
-                lookupReceiver,
+              (await listLookupPathCompletionsFast(
+                daemon,
+                baseModelLabel,
                 context.value,
                 context.method
-              )
+              )).items,
+              virtualLookupCompletionItems(receiver, context.value, context.method)
             ),
             resolved: true,
           };
-          if (partialCompletions.resolved && partialCompletions.items.length > 0) {
-            continue;
-          }
+          if (partialCompletions.items.length > 0) continue;
         }
-        const diagnostic = buildLookupDiagnostic(
-          context,
-          baseModelLabel,
-          resolution
-        );
-        if (!diagnostic) {
-          continue;
-        }
-
+        const diagnostic = buildLookupDiagnostic(context, baseModelLabel, resolution);
+        if (!diagnostic) continue;
         const key = diagnostic.range.start.toString() + diagnostic.message;
-        if (seenRanges.has(key)) {
-          continue;
-        }
+        if (seenRanges.has(key)) continue;
         seenRanges.add(key);
         diagnostics.push(diagnostic);
       } catch {
@@ -891,7 +919,8 @@ export function registerPythonProviders(
         const resolution = await daemon.resolveLookupPath(
           baseModelLabel,
           context.value,
-          'filter'
+          'filter',
+          /* background */ true
         );
         const diagnostic = buildDirectFieldDiagnostic(
           context,
@@ -927,7 +956,8 @@ export function registerPythonProviders(
         const resolution = await daemon.resolveLookupPath(
           baseModelLabel,
           context.value,
-          'filter'
+          'filter',
+          /* background */ true
         );
         const diagnostic = buildSchemaFieldDiagnostic(
           context,
@@ -963,7 +993,8 @@ export function registerPythonProviders(
         const resolution = await daemon.resolveLookupPath(
           baseModelLabel,
           context.value,
-          'filter'
+          'filter',
+          /* background */ true
         );
         const diagnostic = buildLookupDiagnostic(
           {
@@ -1005,7 +1036,8 @@ export function registerPythonProviders(
         const resolution = await daemon.resolveLookupPath(
           baseModelLabel,
           context.value,
-          'filter'
+          'filter',
+          /* background */ true
         );
         const diagnostic = buildBulkUpdateFieldDiagnostic(
           context,
@@ -1027,13 +1059,19 @@ export function registerPythonProviders(
       }
     }
 
+    if (document.version !== documentVersion) {
+      return;
+    }
+
     diagnosticCollection.set(document.uri, diagnostics);
-  };
+    lastDiagnosedDocumentVersions.set(key, documentVersion);
+  });
 
   const completionProvider = vscode.languages.registerCompletionItemProvider(
     PYTHON_SELECTOR,
     {
       async provideCompletionItems(document, position, token) {
+        return daemon.withRequestSource('completion', async () => {
         const relationContext = relationCompletionContext(document, position);
         if (relationContext) {
           try {
@@ -1108,7 +1146,8 @@ export function registerPythonProviders(
             }
 
             const baseModelLabel = lookupReceiver.modelLabel;
-            const result = await daemon.listLookupPathCompletions(
+            const result = await listLookupPathCompletionsFast(
+              daemon,
               baseModelLabel,
               lookupContext.prefix,
               lookupContext.method
@@ -1179,7 +1218,8 @@ export function registerPythonProviders(
               return undefined;
             }
 
-            const result = await daemon.listLookupPathCompletions(
+            const result = await listLookupPathCompletionsFast(
+              daemon,
               baseModelLabel,
               directFieldContext.prefix,
               'filter'
@@ -1233,7 +1273,8 @@ export function registerPythonProviders(
               return undefined;
             }
 
-            const result = await daemon.listLookupPathCompletions(
+            const result = await listLookupPathCompletionsFast(
+              daemon,
               baseModelLabel,
               metaConstraintLookupContext.prefix,
               'filter'
@@ -1291,7 +1332,8 @@ export function registerPythonProviders(
               return undefined;
             }
 
-            const result = await daemon.listLookupPathCompletions(
+            const result = await listLookupPathCompletionsFast(
+              daemon,
               baseModelLabel,
               schemaFieldContext.prefix,
               'filter'
@@ -1341,7 +1383,8 @@ export function registerPythonProviders(
               return undefined;
             }
 
-            const result = await daemon.listLookupPathCompletions(
+            const result = await listLookupPathCompletionsFast(
+              daemon,
               baseModelLabel,
               bulkUpdateFieldContext.prefix,
               'filter'
@@ -1386,12 +1429,19 @@ export function registerPythonProviders(
             return cancelledCompletionResult(token);
           }
           if (memberContext) {
-            const result = await daemon.listOrmMemberCompletions(
-              memberContext.receiver.modelLabel,
-              memberContext.receiver.kind,
-              memberContext.prefix,
-              memberContext.receiver.managerName
-            );
+            const result =
+              daemon.listOrmMemberCompletionsLocal(
+                memberContext.receiver.modelLabel,
+                memberContext.receiver.kind,
+                memberContext.prefix,
+                memberContext.receiver.managerName
+              ) ??
+              await daemon.listOrmMemberCompletions(
+                memberContext.receiver.modelLabel,
+                memberContext.receiver.kind,
+                memberContext.prefix,
+                memberContext.receiver.managerName
+              );
             if (token.isCancellationRequested) {
               return cancelledCompletionResult(token);
             }
@@ -1471,6 +1521,7 @@ export function registerPythonProviders(
         } catch {
           return undefined;
         }
+        });
       },
     },
     "'",
@@ -1485,6 +1536,7 @@ export function registerPythonProviders(
     PYTHON_SELECTOR,
     {
       async provideHover(document, position, token) {
+        return daemon.withRequestSource('hover', async () => {
         const ensureStarted = createEnsureStartedOnce(daemon, document.uri);
         const relationLiteral = relationHoverLiteral(document, position);
         if (relationLiteral) {
@@ -1788,6 +1840,7 @@ export function registerPythonProviders(
         }
 
         return undefined;
+        });
       },
     }
   );
@@ -1796,6 +1849,7 @@ export function registerPythonProviders(
     PYTHON_SELECTOR,
     {
       async provideDefinition(document, position) {
+        return daemon.withRequestSource('definition', async () => {
         const ensureStarted = createEnsureStartedOnce(daemon, document.uri);
         const relationLiteral = relationHoverLiteral(document, position);
         if (relationLiteral) {
@@ -2014,6 +2068,7 @@ export function registerPythonProviders(
         }
 
         return undefined;
+        });
       },
     }
   );
@@ -2031,10 +2086,16 @@ export function registerPythonProviders(
       if (!diagnosticsEnabled) {
         return;
       }
+      if (!isVisibleDocument(document)) {
+        return;
+      }
       scheduleDiagnosticsRefresh(document);
     }),
     vscode.workspace.onDidChangeTextDocument((event) => {
       if (!diagnosticsEnabled) {
+        return;
+      }
+      if (!isVisibleDocument(event.document)) {
         return;
       }
       scheduleDiagnosticsRefresh(event.document);
@@ -2048,6 +2109,7 @@ export function registerPythonProviders(
     vscode.workspace.onDidCloseTextDocument((document) => {
       diagnosticCollection.delete(document.uri);
       const key = document.uri.toString();
+      lastDiagnosedDocumentVersions.delete(key);
       const timer = diagnosticTimers.get(key);
       if (timer) {
         clearTimeout(timer);
@@ -2063,6 +2125,7 @@ export function registerPythonProviders(
       resetProviderResolutionCaches();
       if (!diagnosticsEnabled) {
         diagnosticCollection.clear();
+        lastDiagnosedDocumentVersions.clear();
         return;
       }
 
@@ -2073,6 +2136,7 @@ export function registerPythonProviders(
       if (snapshot.phase === 'stopped' || snapshot.phase === 'error') {
         clearScheduledDiagnostics();
         diagnosticCollection.clear();
+        lastDiagnosedDocumentVersions.clear();
         return;
       }
 
@@ -2080,6 +2144,7 @@ export function registerPythonProviders(
     }),
     new vscode.Disposable(() => {
       clearScheduledDiagnostics();
+      lastDiagnosedDocumentVersions.clear();
     }),
   ];
 }
@@ -2087,16 +2152,16 @@ export function registerPythonProviders(
 function lookupCompletionLabel(
   item: LookupPathItem
 ): string | vscode.CompletionItemLabel {
-  if (
-    item.fieldKind === 'lookup_operator' ||
-    item.fieldKind === 'lookup_transform'
-  ) {
+  const detail = lookupCompletionLabelDetail(item);
+  const description = lookupCompletionDescription(item);
+  if (!detail && !description) {
     return item.name;
   }
 
   return {
     label: item.name,
-    description: 'Django',
+    detail,
+    description,
   };
 }
 
@@ -2113,13 +2178,69 @@ function lookupCompletionKind(item: LookupPathItem): vscode.CompletionItemKind {
 
 function lookupCompletionDetail(item: LookupPathItem): string {
   if (item.fieldKind === 'lookup_operator') {
-    return `Django lookup · ${item.modelLabel}`;
+    return `Django lookup · ${lookupCompletionOwnerField(item) ?? lookupCompletionShortModelLabel(item.modelLabel)}`;
   }
   if (item.fieldKind === 'lookup_transform') {
-    return `Django transform · ${item.modelLabel}`;
+    return `Django transform · ${lookupCompletionOwnerField(item) ?? lookupCompletionShortModelLabel(item.modelLabel)}`;
   }
 
-  return `${item.fieldKind} · ${item.modelLabel}${item.relatedModelLabel ? ` -> ${item.relatedModelLabel}` : ''}`;
+  return `${lookupCompletionDisplayFieldKind(item.fieldKind)} · ${lookupCompletionShortModelLabel(item.modelLabel)}${item.relatedModelLabel ? ` -> ${lookupCompletionShortModelLabel(item.relatedModelLabel)}` : ''}`;
+}
+
+function lookupCompletionLabelDetail(item: LookupPathItem): string | undefined {
+  if (
+    item.fieldKind === 'lookup_operator' ||
+    item.fieldKind === 'lookup_transform'
+  ) {
+    return undefined;
+  }
+
+  const displayFieldKind = lookupCompletionDisplayFieldKind(item.fieldKind);
+  return displayFieldKind ? ` (${displayFieldKind})` : undefined;
+}
+
+function lookupCompletionDescription(item: LookupPathItem): string | undefined {
+  if (item.fieldKind === 'lookup_operator') {
+    return lookupCompletionOwnerField(item)
+      ? `lookup · ${lookupCompletionOwnerField(item)}`
+      : 'Django lookup';
+  }
+  if (item.fieldKind === 'lookup_transform') {
+    return lookupCompletionOwnerField(item)
+      ? `transform · ${lookupCompletionOwnerField(item)}`
+      : 'Django transform';
+  }
+
+  const ownerModel = lookupCompletionShortModelLabel(item.modelLabel);
+  if (item.relatedModelLabel) {
+    return `${ownerModel} -> ${lookupCompletionShortModelLabel(item.relatedModelLabel)}`;
+  }
+
+  return ownerModel;
+}
+
+function lookupCompletionOwnerField(item: LookupPathItem): string | undefined {
+  const fieldPath = item.fieldPath ?? item.name;
+  const fieldName = fieldPath.split('__').filter(Boolean).at(-1);
+  if (!fieldName) {
+    return undefined;
+  }
+
+  return `${lookupCompletionShortModelLabel(item.modelLabel)}.${fieldName}`;
+}
+
+function lookupCompletionShortModelLabel(modelLabel: string): string {
+  const trimmed = modelLabel.trim();
+  if (!trimmed) {
+    return modelLabel;
+  }
+
+  const segments = trimmed.split('.');
+  return segments[segments.length - 1] ?? modelLabel;
+}
+
+function lookupCompletionDisplayFieldKind(fieldKind: string): string {
+  return fieldKind.replace(/^reverse_/, '');
 }
 
 function lookupCompletionInsertText(
@@ -3985,6 +4106,9 @@ function buildLookupItemMarkdown(
   markdown.appendMarkdown(`Method: \`${lookupMethodLabel(method)}\`\n\n`);
   markdown.appendMarkdown(`Base model: \`${baseModelLabel}\`\n\n`);
   markdown.appendMarkdown(`Owner model: \`${item.modelLabel}\`\n\n`);
+  if (item.fieldPath) {
+    markdown.appendMarkdown(`Field path: \`${item.fieldPath}\`\n\n`);
+  }
   if (item.fieldKind === 'lookup_operator') {
     markdown.appendMarkdown(`Lookup operator: \`${item.lookupOperator ?? item.name}\``);
     return markdown;
@@ -4039,6 +4163,22 @@ async function listAllRelationTargets(
     }
     throw error;
   }
+}
+
+async function listLookupPathCompletionsFast(
+  daemon: AnalysisDaemon,
+  baseModelLabel: string,
+  prefix: string,
+  method: string
+): Promise<LookupPathCompletionsResult> {
+  if (process.env.DJLS_ENABLE_LOCAL_LOOKUP_FAST_PATH === '1') {
+    return (
+      daemon.listLookupPathCompletionsLocal(baseModelLabel, prefix, method) ??
+      await daemon.listLookupPathCompletions(baseModelLabel, prefix, method)
+    );
+  }
+
+  return daemon.listLookupPathCompletions(baseModelLabel, prefix, method);
 }
 
 function mergeLookupCompletionItems(

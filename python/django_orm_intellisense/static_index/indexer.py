@@ -15,6 +15,51 @@ RELATION_FIELD_KINDS = {
     'ParentalManyToManyField',
 }
 
+DJANGO_FIELD_CLASS_NAMES = {
+    'AutoField',
+    'BigAutoField',
+    'BigIntegerField',
+    'BinaryField',
+    'BooleanField',
+    'CharField',
+    'CommaSeparatedIntegerField',
+    'CompositePrimaryKey',
+    'DateField',
+    'DateTimeField',
+    'DecimalField',
+    'DurationField',
+    'EmailField',
+    'Field',
+    'FileField',
+    'FilePathField',
+    'FloatField',
+    'ForeignKey',
+    'GeneratedField',
+    'GenericIPAddressField',
+    'IPAddressField',
+    'ImageField',
+    'IntegerField',
+    'JSONField',
+    'ManyToManyField',
+    'NullBooleanField',
+    'OneToOneField',
+    'PositiveBigIntegerField',
+    'PositiveIntegerField',
+    'PositiveSmallIntegerField',
+    'SlugField',
+    'SmallAutoField',
+    'SmallIntegerField',
+    'TextField',
+    'TimeField',
+    'URLField',
+    'UUIDField',
+}
+
+KNOWN_EXTERNAL_FIELD_CLASS_NAMES = {
+    'ParentalKey',
+    'ParentalManyToManyField',
+}
+
 
 @dataclass(frozen=True)
 class DefinitionLocation:
@@ -92,6 +137,7 @@ class PendingFieldCandidate:
     file_path: str
     line: int
     column: int
+    field_call_ref: str
     field_kind: str
     is_relation: bool
     related_model_ref_kind: str | None
@@ -108,6 +154,7 @@ class PendingFieldCandidate:
             'filePath': self.file_path,
             'line': self.line,
             'column': self.column,
+            'fieldCallRef': self.field_call_ref,
             'fieldKind': self.field_kind,
             'isRelation': self.is_relation,
             'relatedModelRefKind': self.related_model_ref_kind,
@@ -126,6 +173,7 @@ class PendingFieldCandidate:
             file_path=str(payload['filePath']),
             line=int(payload['line']),
             column=int(payload['column']),
+            field_call_ref=str(payload.get('fieldCallRef', payload['fieldKind'])),
             field_kind=str(payload['fieldKind']),
             is_relation=bool(payload['isRelation']),
             related_model_ref_kind=_string_or_none(payload.get('relatedModelRefKind')),
@@ -203,6 +251,8 @@ class ModuleIndex:
     model_candidates: list[ModelCandidate]
     pending_fields: list[PendingFieldCandidate]
     class_base_refs: dict[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
+    field_class_names: tuple[str, ...] = ()
+    field_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -219,6 +269,8 @@ class ModuleIndex:
             'modelCandidates': [candidate.to_dict() for candidate in self.model_candidates],
             'pendingFields': [field.to_dict() for field in self.pending_fields],
             'classBaseRefs': {k: list(v) for k, v in self.class_base_refs.items()},
+            'fieldClassNames': list(self.field_class_names),
+            'fieldAliases': dict(self.field_aliases),
         }
 
     @classmethod
@@ -228,9 +280,12 @@ class ModuleIndex:
         raw_model_candidates = payload.get('modelCandidates') or []
         raw_pending_fields = payload.get('pendingFields') or []
         raw_explicit_all = payload.get('explicitAll')
+        raw_field_aliases = payload.get('fieldAliases') or {}
 
         if not isinstance(raw_symbol_definitions, dict):
             raise ValueError('Invalid static index cache payload: symbolDefinitions.')
+        if not isinstance(raw_field_aliases, dict):
+            raise ValueError('Invalid static index cache payload: fieldAliases.')
 
         return cls(
             module_name=str(payload['moduleName']),
@@ -267,6 +322,13 @@ class ModuleIndex:
                 str(k): tuple(str(v) for v in vs)
                 for k, vs in (payload.get('classBaseRefs') or {}).items()
                 if isinstance(vs, list)
+            },
+            field_class_names=tuple(
+                str(name) for name in payload.get('fieldClassNames', [])
+            ),
+            field_aliases={
+                str(alias): str(kind)
+                for alias, kind in raw_field_aliases.items()
             },
         )
 
@@ -329,6 +391,7 @@ class StaticIndex:
 
     def __post_init__(self) -> None:
         self._module_export_cache: dict[str, dict[str, ExportResolution]] = {}
+        self._field_class_cache: dict[tuple[str, str], bool] = {}
         self._concrete_model_candidates = [
             candidate for candidate in self.model_candidates if not candidate.is_abstract
         ]
@@ -613,6 +676,9 @@ class StaticIndex:
         direct_fields_by_model: dict[str, list[FieldCandidate]] = {}
         for module in self.modules.values():
             for pending in module.pending_fields:
+                if not self._is_django_field_candidate(pending):
+                    continue
+
                 related_model_label = (
                     self._resolve_related_model_label(pending)
                     if pending.is_relation
@@ -724,6 +790,131 @@ class StaticIndex:
                 )
 
         return forward_fields + reverse_fields
+
+    def _is_django_field_candidate(
+        self,
+        pending: PendingFieldCandidate,
+    ) -> bool:
+        module = self.modules.get(pending.model_module)
+        if module is not None and _field_ref_kind_for_module(
+            pending.field_call_ref,
+            module,
+        ):
+            return True
+
+        return self._field_ref_resolves_to_field_class(
+            module_name=pending.model_module,
+            field_ref=pending.field_call_ref,
+            stack=(),
+        )
+
+    def _field_ref_resolves_to_field_class(
+        self,
+        *,
+        module_name: str,
+        field_ref: str,
+        stack: tuple[tuple[str, str], ...],
+    ) -> bool:
+        if not field_ref:
+            return False
+
+        field_ref = field_ref.strip()
+        if '.' in field_ref:
+            container_ref, class_name = field_ref.rsplit('.', 1)
+            if _is_django_model_namespace_ref(
+                container_ref,
+                self.modules.get(module_name),
+            ):
+                return _is_potential_field_class_name(class_name)
+
+            if container_ref in self.modules:
+                return self._is_field_class(
+                    module_name=container_ref,
+                    class_name=class_name,
+                    stack=stack,
+                )
+
+            resolution = self.resolve_export_origin(module_name, container_ref)
+            if resolution.resolved and resolution.origin_module is not None:
+                origin_module = resolution.origin_module
+                if resolution.origin_symbol is None:
+                    return self._is_field_class(
+                        module_name=origin_module,
+                        class_name=class_name,
+                        stack=stack,
+                    )
+
+                nested_module_name = f'{origin_module}.{resolution.origin_symbol}'
+                if nested_module_name in self.modules:
+                    return self._is_field_class(
+                        module_name=nested_module_name,
+                        class_name=class_name,
+                        stack=stack,
+                    )
+
+            return False
+
+        return self._is_field_class(
+            module_name=module_name,
+            class_name=field_ref,
+            stack=stack,
+        )
+
+    def _is_field_class(
+        self,
+        *,
+        module_name: str,
+        class_name: str,
+        stack: tuple[tuple[str, str], ...],
+    ) -> bool:
+        if _is_django_model_module(module_name):
+            return _is_potential_field_class_name(class_name)
+
+        key = (module_name, class_name)
+        cached = self._field_class_cache.get(key)
+        if cached is not None:
+            return cached
+
+        if key in stack:
+            return False
+
+        module = self.modules.get(module_name)
+        if module is None:
+            return False
+
+        if class_name in module.field_aliases or class_name in module.field_class_names:
+            self._field_class_cache[key] = True
+            return True
+
+        bases = module.class_base_refs.get(class_name, ())
+        if bases:
+            next_stack = stack + (key,)
+            for base_ref in bases:
+                if self._field_ref_resolves_to_field_class(
+                    module_name=module_name,
+                    field_ref=base_ref,
+                    stack=next_stack,
+                ):
+                    self._field_class_cache[key] = True
+                    return True
+
+        resolution = self.resolve_export_origin(module_name, class_name)
+        if (
+            resolution.resolved
+            and resolution.origin_module is not None
+            and resolution.origin_symbol is not None
+            and (resolution.origin_module, resolution.origin_symbol) != key
+        ):
+            result = self._is_field_class(
+                module_name=resolution.origin_module,
+                class_name=resolution.origin_symbol,
+                stack=stack + (key,),
+            )
+            self._field_class_cache[key] = result
+            return result
+
+        self._field_class_cache[key] = False
+        return False
 
     def _resolve_model_base_labels(self, candidate: ModelCandidate) -> list[str]:
         resolved_labels: list[str] = []
@@ -911,8 +1102,9 @@ def _module_models_unchanged(
 ) -> bool:
     """Check if model definitions are unchanged between two versions of a module.
 
-    Compares model_candidates, pending_fields, class_base_refs, and import_bindings
-    (imports affect cross-module inheritance resolution).
+    Compares model_candidates, pending_fields, class_base_refs, field-class
+    metadata, and import_bindings (imports affect cross-module inheritance and
+    field resolution).
     """
     if old_module is None and new_module is None:
         return True
@@ -922,6 +1114,8 @@ def _module_models_unchanged(
         old_module.model_candidates == new_module.model_candidates
         and old_module.pending_fields == new_module.pending_fields
         and old_module.class_base_refs == new_module.class_base_refs
+        and old_module.field_class_names == new_module.field_class_names
+        and old_module.field_aliases == new_module.field_aliases
         and old_module.import_bindings == new_module.import_bindings
     )
 
@@ -1008,6 +1202,7 @@ def _build_module_index(
     explicit_all: list[str] | None = None
     model_candidates: list[ModelCandidate] = []
     class_base_refs: dict[str, tuple[str, ...]] = {}
+    field_alias_refs: dict[str, str] = {}
     pending_fields: list[PendingFieldCandidate] = []
     is_package_init = python_file.name == '__init__.py'
 
@@ -1025,24 +1220,11 @@ def _build_module_index(
                 class_base_refs[node.name] = bases
 
             if _looks_like_model_candidate(node):
-                model_app_label = _model_app_label(
-                    module_name=module_name,
-                    node=node,
-                )
                 model_candidates.append(
                     _model_candidate_from_class(
                         python_file=python_file,
                         module_name=module_name,
                         node=node,
-                    )
-                )
-                pending_fields.extend(
-                    _extract_pending_fields_from_model_class(
-                        python_file=python_file,
-                        module_name=module_name,
-                        app_label=model_app_label,
-                        model_name=node.name,
-                        class_node=node,
                     )
                 )
 
@@ -1073,6 +1255,12 @@ def _build_module_index(
             ):
                 explicit_all = maybe_all
 
+            value_ref = _dotted_name(node.value)
+            if value_ref:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        field_alias_refs[target.id] = value_ref
+
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name):
                 defined_symbols.add(node.target.id)
@@ -1089,6 +1277,11 @@ def _build_module_index(
                     maybe_all = _extract_string_sequence(node.value)
                     if maybe_all is not None:
                         explicit_all = maybe_all
+
+                if node.value is not None:
+                    value_ref = _dotted_name(node.value)
+                    if value_ref:
+                        field_alias_refs[node.target.id] = value_ref
 
         elif isinstance(node, ast.Import):
             for alias in node.names:
@@ -1121,6 +1314,36 @@ def _build_module_index(
                         is_star=alias.name == '*',
                     )
                 )
+
+    field_aliases = _resolve_field_aliases(
+        field_alias_refs=field_alias_refs,
+        import_bindings=import_bindings,
+    )
+    field_class_names = _discover_local_field_class_names(
+        class_base_refs=class_base_refs,
+        import_bindings=import_bindings,
+        field_aliases=field_aliases,
+    )
+    class_node_by_name = {node.name: node for node in class_nodes}
+    known_class_names = set(class_node_by_name)
+
+    for candidate in model_candidates:
+        node = class_node_by_name.get(candidate.object_name)
+        if node is None:
+            continue
+        pending_fields.extend(
+            _extract_pending_fields_from_model_class(
+                python_file=python_file,
+                module_name=module_name,
+                app_label=candidate.app_label,
+                model_name=candidate.object_name,
+                class_node=node,
+                import_bindings=import_bindings,
+                field_class_names=field_class_names,
+                field_aliases=field_aliases,
+                known_class_names=known_class_names,
+            )
+        )
 
     # 2차 패스: 같은 모듈 내 model candidate를 상속하는 클래스도 model candidate로 등록
     registered_names = {c.object_name for c in model_candidates}
@@ -1155,6 +1378,10 @@ def _build_module_index(
                         app_label=model_app_label,
                         model_name=node.name,
                         class_node=node,
+                        import_bindings=import_bindings,
+                        field_class_names=field_class_names,
+                        field_aliases=field_aliases,
+                        known_class_names=known_class_names,
                     )
                 )
                 registered_names.add(node.name)
@@ -1171,6 +1398,8 @@ def _build_module_index(
         model_candidates=model_candidates,
         pending_fields=pending_fields,
         class_base_refs=class_base_refs,
+        field_class_names=tuple(sorted(field_class_names)),
+        field_aliases=field_aliases,
     )
 
 
@@ -1245,6 +1474,10 @@ def _extract_pending_fields_from_model_class(
     app_label: str,
     model_name: str,
     class_node: ast.ClassDef,
+    import_bindings: list[ImportBinding],
+    field_class_names: set[str],
+    field_aliases: dict[str, str],
+    known_class_names: set[str],
 ) -> list[PendingFieldCandidate]:
     fields: list[PendingFieldCandidate] = []
     model_label = f'{app_label}.{model_name}'
@@ -1265,11 +1498,18 @@ def _extract_pending_fields_from_model_class(
         if target_name is None or value_node is None or not isinstance(value_node, ast.Call):
             continue
 
-        field_kind = _field_kind_name(value_node.func)
+        field_kind = _field_kind_name(
+            value_node.func,
+            import_bindings=import_bindings,
+            field_class_names=field_class_names,
+            field_aliases=field_aliases,
+            known_class_names=known_class_names,
+        )
         if field_kind is None:
             continue
 
         is_relation = field_kind in RELATION_FIELD_KINDS
+        field_call_ref = _dotted_name(value_node.func)
         related_model_ref_kind: str | None = None
         related_model_ref_value: str | None = None
 
@@ -1291,6 +1531,7 @@ def _extract_pending_fields_from_model_class(
                 file_path=str(python_file),
                 line=node.lineno,
                 column=node.col_offset + 1,
+                field_call_ref=field_call_ref,
                 field_kind=field_kind,
                 is_relation=is_relation,
                 related_model_ref_kind=related_model_ref_kind,
@@ -1303,16 +1544,219 @@ def _extract_pending_fields_from_model_class(
     return fields
 
 
-def _field_kind_name(function_node: ast.expr) -> str | None:
+def _field_kind_name(
+    function_node: ast.expr,
+    *,
+    import_bindings: list[ImportBinding],
+    field_class_names: set[str],
+    field_aliases: dict[str, str],
+    known_class_names: set[str],
+) -> str | None:
     name = _dotted_name(function_node)
     if not name:
         return None
 
+    module_stub = ModuleIndex(
+        module_name='',
+        file_path='',
+        is_package_init=False,
+        defined_symbols=set(),
+        symbol_definitions={},
+        import_bindings=import_bindings,
+        explicit_all=None,
+        model_candidates=[],
+        pending_fields=[],
+        class_base_refs={},
+        field_class_names=tuple(field_class_names),
+        field_aliases=field_aliases,
+    )
+    resolved_kind = _field_ref_kind_for_module(name, module_stub)
+    if resolved_kind is not None:
+        return resolved_kind
+
     field_name = name.split('.')[-1]
-    if field_name.endswith('Field') or field_name in {'ForeignKey', 'ParentalKey'}:
+    if '.' not in name and field_name in known_class_names:
+        return None
+
+    if _is_potential_field_class_name(field_name):
         return field_name
 
     return None
+
+
+def _resolve_field_aliases(
+    *,
+    field_alias_refs: dict[str, str],
+    import_bindings: list[ImportBinding],
+) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    module_stub = ModuleIndex(
+        module_name='',
+        file_path='',
+        is_package_init=False,
+        defined_symbols=set(),
+        symbol_definitions={},
+        import_bindings=import_bindings,
+        explicit_all=None,
+        model_candidates=[],
+        pending_fields=[],
+        class_base_refs={},
+    )
+
+    for alias, field_ref in field_alias_refs.items():
+        field_kind = _field_ref_kind_for_module(field_ref, module_stub)
+        if field_kind is not None:
+            aliases[alias] = field_kind
+
+    return aliases
+
+
+def _discover_local_field_class_names(
+    *,
+    class_base_refs: dict[str, tuple[str, ...]],
+    import_bindings: list[ImportBinding],
+    field_aliases: dict[str, str],
+) -> set[str]:
+    field_class_names: set[str] = set()
+    changed = True
+
+    while changed:
+        changed = False
+        module_stub = ModuleIndex(
+            module_name='',
+            file_path='',
+            is_package_init=False,
+            defined_symbols=set(),
+            symbol_definitions={},
+            import_bindings=import_bindings,
+            explicit_all=None,
+            model_candidates=[],
+            pending_fields=[],
+            class_base_refs=class_base_refs,
+            field_class_names=tuple(field_class_names),
+            field_aliases=field_aliases,
+        )
+
+        for class_name, base_refs in class_base_refs.items():
+            if class_name in field_class_names:
+                continue
+            if any(
+                _field_ref_kind_for_module(base_ref, module_stub) is not None
+                for base_ref in base_refs
+            ):
+                field_class_names.add(class_name)
+                changed = True
+
+    return field_class_names
+
+
+def _field_ref_kind_for_module(
+    field_ref: str,
+    module: ModuleIndex,
+) -> str | None:
+    if not field_ref:
+        return None
+
+    field_ref = field_ref.strip()
+    field_name = field_ref.rsplit('.', 1)[-1]
+
+    if '.' not in field_ref:
+        if field_ref in module.field_aliases:
+            return module.field_aliases[field_ref]
+        if field_ref in module.field_class_names:
+            return field_ref
+        if _is_direct_django_field_import(field_ref, module.import_bindings):
+            return field_ref
+        if _is_direct_known_external_field_import(field_ref, module.import_bindings):
+            return field_ref
+        return None
+
+    container_ref, field_name = field_ref.rsplit('.', 1)
+    if (
+        _is_django_model_namespace_ref(container_ref, module)
+        and _is_potential_field_class_name(field_name)
+    ):
+        return field_name
+
+    if field_name in module.field_class_names and container_ref in {'self', module.module_name}:
+        return field_name
+
+    return None
+
+
+def _is_direct_django_field_import(
+    field_name: str,
+    import_bindings: list[ImportBinding],
+) -> bool:
+    if not _is_potential_field_class_name(field_name):
+        return False
+
+    for binding in import_bindings:
+        if binding.alias != field_name or binding.symbol is None:
+            continue
+        if _is_django_model_module(binding.module):
+            return True
+
+    return False
+
+
+def _is_direct_known_external_field_import(
+    field_name: str,
+    import_bindings: list[ImportBinding],
+) -> bool:
+    if not _is_known_external_field_class_name(field_name):
+        return False
+
+    return any(
+        binding.alias == field_name and binding.symbol == field_name
+        for binding in import_bindings
+    )
+
+
+def _is_django_model_namespace_ref(
+    container_ref: str,
+    module: ModuleIndex | None,
+) -> bool:
+    if _is_django_model_module(container_ref):
+        return True
+
+    if module is None or not container_ref:
+        return False
+
+    root_name = container_ref.split('.', 1)[0]
+    for binding in module.import_bindings:
+        if binding.alias != root_name:
+            continue
+        if binding.symbol is None and _is_django_model_module(binding.module):
+            return True
+        if binding.module in {'django.db', 'django.contrib.gis.db'} and binding.symbol == 'models':
+            return True
+
+    return False
+
+
+def _is_django_model_module(module_name: str | None) -> bool:
+    if not module_name:
+        return False
+
+    return (
+        module_name == 'django.db.models'
+        or module_name.startswith('django.db.models.')
+        or module_name == 'django.contrib.gis.db.models'
+        or module_name.startswith('django.contrib.gis.db.models.')
+    )
+
+
+def _is_potential_field_class_name(name: str) -> bool:
+    return (
+        name in DJANGO_FIELD_CLASS_NAMES
+        or name in KNOWN_EXTERNAL_FIELD_CLASS_NAMES
+        or name.endswith('Field')
+    )
+
+
+def _is_known_external_field_class_name(name: str) -> bool:
+    return name in KNOWN_EXTERNAL_FIELD_CLASS_NAMES
 
 
 def _extract_related_model_reference_node(
@@ -1707,6 +2151,10 @@ def _expand_model_candidates_via_imports(
                     app_label=real_app_label,
                     model_name=class_name,
                     class_node=node,
+                    import_bindings=module_index.import_bindings,
+                    field_class_names=set(module_index.field_class_names),
+                    field_aliases=module_index.field_aliases,
+                    known_class_names=module_index.defined_symbols,
                 )
             )
 

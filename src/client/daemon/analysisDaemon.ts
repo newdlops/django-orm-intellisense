@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import { AsyncLocalStorage } from 'async_hooks';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
@@ -11,12 +12,14 @@ import {
 import type {
   ExportOriginResolution,
   HealthSnapshot,
+  LookupPathItem,
   InitializeResult,
   LookupPathCompletionsResult,
   LookupPathResolution,
   ModuleResolution,
   OrmMemberChainResolution,
   OrmMemberCompletionsResult,
+  OrmMemberItem,
   OrmMemberResolution,
   OrmReceiverKind,
   ReindexFileResult,
@@ -26,10 +29,72 @@ import type {
   ResponseMessage,
   ServerMessage,
 } from '../protocol';
+import {
+  buildWorkspaceIndex,
+  diffSurfaceIndex,
+  updateWorkspaceIndexIncremental,
+  type StaticFallback,
+  type SurfaceIndex,
+} from '../../server/workspaceIndexer';
+import { parseLookupChain, getCompletionCandidates } from '../../server/lookupResolver';
+import type {
+  FieldInfo,
+  ModelInfo,
+  ParsedLookup,
+  PrefixCandidate,
+  WorkspaceIndex,
+} from '../../server/types';
 
 const REQUEST_TIMEOUT_MS = 8_000;
 const INITIALIZE_REQUEST_TIMEOUT_MS = 60_000;
 const RESPONSE_CACHE_LIMIT = 512;
+const LOCAL_LOOKUP_RELATION_ONLY_METHODS = new Set([
+  'select_related',
+  'prefetch_related',
+]);
+const LOCAL_LOOKUP_ALIAS_SENSITIVE_METHODS = new Set([
+  'only',
+  'defer',
+  'select_related',
+  'prefetch_related',
+]);
+const LOCAL_LOOKUP_OPERATOR_METHODS = new Set([
+  'filter',
+  'exclude',
+  'get',
+  'get_or_create',
+  'update_or_create',
+]);
+const LOCAL_LOOKUP_CHAIN_DEPTH = 2;
+
+type IpcRequestSource =
+  | 'completion'
+  | 'diagnostic'
+  | 'hover'
+  | 'definition'
+  | 'initialSync'
+  | 'reindex'
+  | 'health'
+  | 'command'
+  | 'unknown';
+
+function createEmptyWorkspaceIndex(): WorkspaceIndex {
+  return {
+    models: new Map(),
+    perFile: new Map(),
+    modelLabelByName: new Map(),
+    fieldTrieByModel: new Map(),
+    lookupTrie: { children: new Map(), isTerminal: false },
+    transformTrie: { children: new Map(), isTerminal: false },
+  };
+}
+
+interface LocalLookupTraversal {
+  completionMode: 'field' | 'field_and_lookup' | 'lookup';
+  currentModelLabel: string;
+  lookupField?: FieldInfo;
+  lookupFieldOwnerLabel?: string;
+}
 
 interface PendingRequest {
   resolve: (value: any) => void;
@@ -107,6 +172,7 @@ export class AnalysisDaemon implements vscode.Disposable {
   private readonly pendingRequests = new Map<string, PendingRequest>();
   private readonly responseCache = new Map<string, Promise<unknown>>();
   private readonly intentionalExitProcessIds = new Set<number>();
+  private readonly requestSourceContext = new AsyncLocalStorage<IpcRequestSource>();
   private readonly output: vscode.OutputChannel;
   private process?: ChildProcessWithoutNullStreams;
   private stdoutReader?: readline.Interface;
@@ -118,9 +184,11 @@ export class AnalysisDaemon implements vscode.Disposable {
   private stopRequested = false;
   modelNames: Set<string> = new Set();
   modelLabelByName: Map<string, string> = new Map();
-  surfaceIndex: Record<string, Record<string, Record<string, [string, string | null]>>> = {};
+  surfaceIndex: SurfaceIndex = {};
   customLookups: Record<string, string[]> = {};
-  staticFallback: Record<string, { fields: string[]; relations: string[] }> | null = null;
+  staticFallback: StaticFallback | null = null;
+  private localWorkspaceIndex: WorkspaceIndex = createEmptyWorkspaceIndex();
+  private localModelFingerprints = new Map<string, string>();
   private lastLaunchContext?: LaunchContext;
   private interpreterCheck?: Promise<void>;
   private currentState: HealthSnapshot = {
@@ -150,6 +218,62 @@ export class AnalysisDaemon implements vscode.Disposable {
       this.currentState.phase === 'ready' ||
       this.currentState.phase === 'degraded'
     );
+  }
+
+  withRequestSource<T>(source: IpcRequestSource, callback: () => T): T {
+    return this.requestSourceContext.run(source, callback);
+  }
+
+  private rebuildLocalWorkspaceIndex(): void {
+    this.localWorkspaceIndex = buildWorkspaceIndex(
+      this.surfaceIndex,
+      Array.from(this.modelNames),
+      this.customLookups,
+      this.staticFallback ?? undefined,
+    );
+    this.localModelFingerprints.clear();
+    for (const [label, receivers] of Object.entries(this.surfaceIndex)) {
+      this.localModelFingerprints.set(label, JSON.stringify(receivers));
+    }
+  }
+
+  private updateLocalWorkspaceIndex(
+    nextSurfaceIndex: SurfaceIndex,
+    nextStaticFallback: StaticFallback | null,
+  ): void {
+    if (
+      this.localWorkspaceIndex.models.size === 0 ||
+      JSON.stringify(this.staticFallback) !== JSON.stringify(nextStaticFallback)
+    ) {
+      this.surfaceIndex = nextSurfaceIndex;
+      this.staticFallback = nextStaticFallback;
+      this.rebuildLocalWorkspaceIndex();
+      return;
+    }
+
+    const diff = diffSurfaceIndex(
+      this.surfaceIndex,
+      nextSurfaceIndex,
+      this.localModelFingerprints,
+    );
+
+    updateWorkspaceIndexIncremental(
+      this.localWorkspaceIndex,
+      nextSurfaceIndex,
+      diff,
+      this.customLookups,
+      this.customLookups,
+    );
+  }
+
+  private rebuildModelLabelByName(): void {
+    this.modelLabelByName = new Map();
+    for (const label of Object.keys(this.surfaceIndex)) {
+      const name = label.split('.').at(-1);
+      if (name) {
+        this.modelLabelByName.set(name, label);
+      }
+    }
   }
 
   async start(scope?: vscode.ConfigurationScope): Promise<HealthSnapshot> {
@@ -183,7 +307,13 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
 
     const snapshot = this.decorateSnapshot(
-      await this.request<HealthSnapshot>('health', {})
+      await this.request<HealthSnapshot>(
+        'health',
+        {},
+        REQUEST_TIMEOUT_MS,
+        false,
+        'health'
+      )
     );
     this.updateState(snapshot);
     return snapshot;
@@ -294,11 +424,12 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   async resolveRelationTarget(
-    value: string
+    value: string,
+    background: boolean = false
   ): Promise<RelationTargetResolution> {
     return this.cachedRequest<RelationTargetResolution>('resolveRelationTarget', {
       value,
-    });
+    }, background);
   }
 
   async resolveExportOrigin(
@@ -321,20 +452,19 @@ export class AnalysisDaemon implements vscode.Disposable {
     const result = await this.request<ReindexFileResult>(
       'reindexFile',
       { filePath },
-      INITIALIZE_REQUEST_TIMEOUT_MS
+      INITIALIZE_REQUEST_TIMEOUT_MS,
+      false,
+      'reindex'
     );
+    const nextSurfaceIndex = result.surfaceIndex ?? {};
+    const nextModelNames = new Set(result.modelNames ?? []);
+    const nextStaticFallback = result.staticFallback ?? null;
+    this.updateLocalWorkspaceIndex(nextSurfaceIndex, nextStaticFallback);
     // Update local state with new surface data
-    this.surfaceIndex = result.surfaceIndex ?? {};
-    this.modelNames = new Set(result.modelNames ?? []);
-    this.staticFallback = result.staticFallback ?? null;
-    // Rebuild objectName → label reverse map
-    this.modelLabelByName = new Map();
-    for (const label of Object.keys(this.surfaceIndex)) {
-      const name = label.split('.').at(-1);
-      if (name) {
-        this.modelLabelByName.set(name, label);
-      }
-    }
+    this.surfaceIndex = nextSurfaceIndex;
+    this.modelNames = nextModelNames;
+    this.staticFallback = nextStaticFallback;
+    this.rebuildModelLabelByName();
     return result;
   }
 
@@ -350,16 +480,130 @@ export class AnalysisDaemon implements vscode.Disposable {
     });
   }
 
+  /**
+   * List lookup-path completions from the local workspace index without IPC.
+   *
+   * This reuses the language-server lookup FSM and trie-backed field metadata
+   * so the extension host does not have to guess from raw surfaceIndex tuples.
+   * Alias-sensitive attribute-path methods still fall back to the daemon until
+   * source provenance is preserved in the local index.
+   */
+  listLookupPathCompletionsLocal(
+    baseModelLabel: string,
+    prefix: string,
+    method: string
+  ): LookupPathCompletionsResult | undefined {
+    if (LOCAL_LOOKUP_ALIAS_SENSITIVE_METHODS.has(method)) {
+      return undefined;
+    }
+
+    const index = this.localWorkspaceIndex;
+    if (!index.models.has(baseModelLabel)) {
+      return undefined;
+    }
+
+    const { completedSegments, currentPartial } = this.splitLocalLookupPrefix(
+      prefix,
+      method,
+    );
+    const parsed: ParsedLookup = completedSegments.length > 0
+      ? parseLookupChain(completedSegments.join('__'), baseModelLabel, index)
+      : {
+          segments: [],
+          resolvedPath: [],
+          state: 'partial',
+          startModel: baseModelLabel,
+        };
+    if (parsed.state === 'error') {
+      return undefined;
+    }
+
+    const traversal = this.analyzeLocalLookupTraversal(
+      baseModelLabel,
+      parsed,
+      method,
+    );
+    if (!traversal) {
+      return undefined;
+    }
+
+    const itemsByName = new Map<string, LookupPathItem>();
+    const includePrefixedLookupItems =
+      LOCAL_LOOKUP_OPERATOR_METHODS.has(method) &&
+      (currentPartial.length > 0 || completedSegments.length === 0);
+
+    if (
+      traversal.completionMode === 'field' ||
+      traversal.completionMode === 'field_and_lookup'
+    ) {
+      const directItems = this.buildLocalFieldCompletionItems(
+        traversal.currentModelLabel,
+        parsed,
+        currentPartial,
+      );
+      for (const item of directItems) {
+        itemsByName.set(item.name, item);
+      }
+
+      if (includePrefixedLookupItems) {
+        for (const item of this.buildPrefixedLocalLookupItems(
+          traversal.currentModelLabel,
+          directItems,
+          currentPartial,
+        )) {
+          itemsByName.set(item.name, item);
+        }
+      }
+
+      for (const item of this.buildLocalDescendantCompletionItems(
+        traversal.currentModelLabel,
+        currentPartial,
+        method,
+      )) {
+        itemsByName.set(item.name, item);
+      }
+
+      if (
+        traversal.completionMode === 'field_and_lookup' &&
+        traversal.lookupField &&
+        traversal.lookupFieldOwnerLabel
+      ) {
+        for (const item of this.buildLocalLookupItems(
+          traversal.lookupFieldOwnerLabel,
+          traversal.lookupField,
+          currentPartial,
+        )) {
+          itemsByName.set(item.name, item);
+        }
+      }
+    } else if (traversal.lookupField && traversal.lookupFieldOwnerLabel) {
+      for (const item of this.buildLocalLookupItems(
+        traversal.lookupFieldOwnerLabel,
+        traversal.lookupField,
+        currentPartial,
+      )) {
+        itemsByName.set(item.name, item);
+      }
+    }
+
+    return {
+      items: [...itemsByName.values()],
+      resolved: true,
+      currentModelLabel: traversal.currentModelLabel,
+    };
+  }
+
   async resolveLookupPath(
     baseModelLabel: string,
     value: string,
-    method: string
+    method: string,
+    background: boolean = false
   ): Promise<LookupPathResolution> {
     return this.cachedRequest<LookupPathResolution>('resolveLookupPath', {
       baseModelLabel,
       value,
       method,
-    });
+    }, background);
   }
 
   async listOrmMemberCompletions(
@@ -376,6 +620,79 @@ export class AnalysisDaemon implements vscode.Disposable {
     });
   }
 
+  /**
+   * List ORM members from the local surface index without IPC.
+   *
+   * This is intentionally limited to receiver kinds whose surface entries are
+   * stable enough to classify locally. Instance receivers still fall back to
+   * daemon IPC because surfaceIndex does not preserve enough metadata to
+   * distinguish fields from instance methods safely.
+   */
+  listOrmMemberCompletionsLocal(
+    modelLabel: string,
+    receiverKind: OrmReceiverKind,
+    prefix: string,
+    managerName?: string
+  ): OrmMemberCompletionsResult | undefined {
+    if (receiverKind === 'instance' || receiverKind === 'scalar' || receiverKind === 'unknown') {
+      return undefined;
+    }
+
+    const modelEntry = this.surfaceIndex[modelLabel];
+    if (!modelEntry) {
+      return undefined;
+    }
+
+    const kindEntry = modelEntry[receiverKind];
+    if (!kindEntry) {
+      return undefined;
+    }
+
+    const normalizedPrefix = prefix.trim();
+    const items: OrmMemberItem[] = [];
+
+    for (const [name, [returnKind, returnModelLabel]] of Object.entries(kindEntry)) {
+      if (normalizedPrefix && !name.startsWith(normalizedPrefix)) {
+        continue;
+      }
+
+      const memberKind = returnKind === 'manager' ? 'manager' : 'method';
+      let detail = 'Django ORM member';
+      if (memberKind === 'manager') {
+        detail = 'Django manager';
+      } else if (receiverKind === 'model_class') {
+        detail = 'Django model class method';
+      } else if (receiverKind === 'manager') {
+        detail = 'Django manager method';
+      } else if (receiverKind === 'queryset') {
+        detail = 'Django queryset method';
+      } else if (receiverKind === 'related_manager') {
+        detail = 'Django related manager method';
+      }
+
+      items.push({
+        name,
+        memberKind,
+        modelLabel,
+        receiverKind,
+        detail,
+        source: 'local',
+        isRelation: false,
+        returnKind,
+        returnModelLabel: returnModelLabel || undefined,
+        managerName,
+      });
+    }
+
+    return {
+      resolved: true,
+      items,
+      receiverKind,
+      modelLabel,
+      managerName,
+    };
+  }
+
   async resolveOrmMember(
     modelLabel: string,
     receiverKind: OrmReceiverKind,
@@ -388,6 +705,32 @@ export class AnalysisDaemon implements vscode.Disposable {
       name,
       managerName,
     });
+  }
+
+  async resolveOrmMemberBatch(
+    items: Array<{ modelLabel: string; receiverKind: string; name: string; managerName?: string }>
+  ): Promise<OrmMemberResolution[]> {
+    const result = await this.request<{ results: OrmMemberResolution[] }>(
+      'resolveOrmMemberBatch',
+      { items },
+      INITIALIZE_REQUEST_TIMEOUT_MS,
+      true,  // always background — batch is never user-interactive
+      this.currentRequestSource()
+    );
+    return result.results;
+  }
+
+  async resolveLookupPathBatch(
+    items: Array<{ baseModelLabel: string; value: string; method: string }>
+  ): Promise<LookupPathResolution[]> {
+    const result = await this.request<{ results: LookupPathResolution[] }>(
+      'resolveLookupPathBatch',
+      { items },
+      INITIALIZE_REQUEST_TIMEOUT_MS,
+      true,  // always background
+      this.currentRequestSource()
+    );
+    return result.results;
   }
 
   /**
@@ -456,6 +799,325 @@ export class AnalysisDaemon implements vscode.Disposable {
       resolved: true,
       modelLabel: currentLabel,
       receiverKind: currentKind,
+    };
+  }
+
+  private splitLocalLookupPrefix(
+    prefix: string,
+    method: string,
+  ): { completedSegments: string[]; currentPartial: string } {
+    const normalizedPrefix =
+      method === 'order_by' && prefix.trim().startsWith('-')
+        ? prefix.trim().slice(1)
+        : prefix.trim();
+    const endsWithSeparator = normalizedPrefix.endsWith('__');
+    const rawSegments = normalizedPrefix.split('__').filter(Boolean);
+    const currentPartial = endsWithSeparator
+      ? ''
+      : (rawSegments.pop() ?? '');
+
+    return {
+      completedSegments: rawSegments,
+      currentPartial,
+    };
+  }
+
+  private analyzeLocalLookupTraversal(
+    baseModelLabel: string,
+    parsed: ParsedLookup,
+    method: string,
+  ): LocalLookupTraversal | undefined {
+    if (parsed.resolvedPath.length === 0) {
+      return {
+        completionMode: 'field',
+        currentModelLabel: baseModelLabel,
+      };
+    }
+
+    const lastResolved = parsed.resolvedPath[parsed.resolvedPath.length - 1];
+    if (!lastResolved) {
+      return undefined;
+    }
+
+    if (
+      lastResolved.kind === 'relation' ||
+      lastResolved.kind === 'reverse_relation'
+    ) {
+      const ownerModelLabel = lastResolved.modelLabel ?? baseModelLabel;
+      const relation = this.getLocalRelationInfo(ownerModelLabel, lastResolved.name);
+      if (!relation) {
+        return undefined;
+      }
+
+      const lookupField = this.localWorkspaceIndex.models
+        .get(ownerModelLabel)
+        ?.fields.get(lastResolved.name);
+      if (LOCAL_LOOKUP_OPERATOR_METHODS.has(method) && lookupField) {
+        return {
+          completionMode: 'field_and_lookup',
+          currentModelLabel: relation.targetModelLabel,
+          lookupField,
+          lookupFieldOwnerLabel: ownerModelLabel,
+        };
+      }
+
+      return {
+        completionMode: 'field',
+        currentModelLabel: relation.targetModelLabel,
+      };
+    }
+
+    if (
+      (lastResolved.kind === 'field' || lastResolved.kind === 'transform') &&
+      parsed.finalField &&
+      LOCAL_LOOKUP_OPERATOR_METHODS.has(method)
+    ) {
+      return {
+        completionMode: 'lookup',
+        currentModelLabel: lastResolved.modelLabel ?? baseModelLabel,
+        lookupField: parsed.finalField,
+        lookupFieldOwnerLabel: lastResolved.modelLabel ?? baseModelLabel,
+      };
+    }
+
+    return undefined;
+  }
+
+  private buildLocalFieldCompletionItems(
+    currentModelLabel: string,
+    parsed: ParsedLookup,
+    currentPartial: string,
+  ): LookupPathItem[] {
+    const items: LookupPathItem[] = [];
+    const candidates = getCompletionCandidates(
+      parsed,
+      currentPartial,
+      this.localWorkspaceIndex,
+    );
+
+    for (const candidate of candidates) {
+      if (candidate.kind !== 'field' && candidate.kind !== 'relation') {
+        continue;
+      }
+      if (candidate.name.includes('__') || this.isHiddenLookupFieldName(candidate.name)) {
+        continue;
+      }
+
+      const item = this.localLookupItemFromCandidate(currentModelLabel, candidate);
+      if (item) {
+        items.push(item);
+      }
+    }
+
+    return items;
+  }
+
+  private buildPrefixedLocalLookupItems(
+    currentModelLabel: string,
+    directItems: LookupPathItem[],
+    currentPartial: string,
+  ): LookupPathItem[] {
+    const model = this.localWorkspaceIndex.models.get(currentModelLabel);
+    if (!model) {
+      return [];
+    }
+
+    const lowerPartial = currentPartial.toLowerCase();
+    const itemsByName = new Map<string, LookupPathItem>();
+
+    for (const item of directItems) {
+      if (
+        item.name.includes('__') ||
+        item.fieldKind === 'lookup_operator' ||
+        item.fieldKind === 'lookup_transform' ||
+        this.isHiddenLookupFieldName(item.name)
+      ) {
+        continue;
+      }
+      if (lowerPartial && !item.name.toLowerCase().startsWith(lowerPartial)) {
+        continue;
+      }
+
+      const field = model.fields.get(item.name);
+      if (!field) {
+        continue;
+      }
+
+      for (const lookupItem of this.buildLocalLookupItems(
+        currentModelLabel,
+        field,
+        '',
+        item.name,
+      )) {
+        const prefixedName = `${item.name}__${lookupItem.name}`;
+        if (lowerPartial && !prefixedName.toLowerCase().startsWith(lowerPartial)) {
+          continue;
+        }
+        itemsByName.set(prefixedName, {
+          ...lookupItem,
+          name: prefixedName,
+        });
+      }
+    }
+
+    return [...itemsByName.values()];
+  }
+
+  private buildLocalDescendantCompletionItems(
+    currentModelLabel: string,
+    currentPartial: string,
+    method: string,
+  ): LookupPathItem[] {
+    const relationOnly = LOCAL_LOOKUP_RELATION_ONLY_METHODS.has(method);
+    const lowerPartial = currentPartial.toLowerCase();
+    const itemsByName = new Map<string, LookupPathItem>();
+
+    const walk = (
+      modelLabel: string,
+      prefixParts: string[],
+      depth: number,
+      visitedModels: Set<string>,
+    ): void => {
+      if (depth >= LOCAL_LOOKUP_CHAIN_DEPTH) {
+        return;
+      }
+
+      for (const field of this.getLocalLookupFieldsForModel(modelLabel)) {
+        const pathParts = [...prefixParts, field.name];
+        const pathName = pathParts.join('__');
+        if (
+          prefixParts.length > 0 &&
+          (!lowerPartial || pathName.toLowerCase().startsWith(lowerPartial)) &&
+          (field.isRelation || !relationOnly)
+        ) {
+          const item = this.localLookupFieldItem(modelLabel, field.name, pathName);
+          if (item) {
+            itemsByName.set(pathName, item);
+          }
+        }
+
+        const relation = field.isRelation
+          ? this.getLocalRelationInfo(modelLabel, field.name)
+          : undefined;
+        if (!relation?.targetModelLabel || visitedModels.has(relation.targetModelLabel)) {
+          continue;
+        }
+
+        const nextVisitedModels = new Set(visitedModels);
+        nextVisitedModels.add(relation.targetModelLabel);
+        walk(
+          relation.targetModelLabel,
+          pathParts,
+          depth + 1,
+          nextVisitedModels,
+        );
+      }
+    };
+
+    walk(currentModelLabel, [], 0, new Set([currentModelLabel]));
+    return [...itemsByName.values()];
+  }
+
+  private buildLocalLookupItems(
+    ownerModelLabel: string,
+    field: FieldInfo,
+    currentPartial: string,
+    fieldPath: string = field.name,
+  ): LookupPathItem[] {
+    const lowerPartial = currentPartial.toLowerCase();
+    const itemsByName = new Map<string, LookupPathItem>();
+
+    for (const transform of field.transforms) {
+      if (lowerPartial && !transform.toLowerCase().startsWith(lowerPartial)) {
+        continue;
+      }
+      itemsByName.set(
+        transform,
+        this.localLookupOperatorItem(ownerModelLabel, transform, true, fieldPath),
+      );
+    }
+
+    for (const lookup of field.lookups) {
+      if (lowerPartial && !lookup.toLowerCase().startsWith(lowerPartial)) {
+        continue;
+      }
+      itemsByName.set(
+        lookup,
+        this.localLookupOperatorItem(ownerModelLabel, lookup, false, fieldPath),
+      );
+    }
+
+    return [...itemsByName.values()];
+  }
+
+  private getLocalLookupFieldsForModel(modelLabel: string): FieldInfo[] {
+    const model = this.localWorkspaceIndex.models.get(modelLabel);
+    if (!model) {
+      return [];
+    }
+
+    return [...model.fields.values()].filter(
+      (field) => !this.isHiddenLookupFieldName(field.name),
+    );
+  }
+
+  private getLocalRelationInfo(
+    modelLabel: string,
+    fieldName: string,
+  ) {
+    const model = this.localWorkspaceIndex.models.get(modelLabel);
+    return model?.relations.get(fieldName) ?? model?.reverseRelations.get(fieldName);
+  }
+
+  private localLookupItemFromCandidate(
+    ownerModelLabel: string,
+    candidate: PrefixCandidate,
+  ): LookupPathItem | undefined {
+    return this.localLookupFieldItem(ownerModelLabel, candidate.name);
+  }
+
+  private isHiddenLookupFieldName(name: string): boolean {
+    return name.endsWith('+');
+  }
+
+  private localLookupFieldItem(
+    ownerModelLabel: string,
+    fieldName: string,
+    itemName: string = fieldName,
+  ): LookupPathItem | undefined {
+    const model = this.localWorkspaceIndex.models.get(ownerModelLabel);
+    const field = model?.fields.get(fieldName);
+    if (!field || this.isHiddenLookupFieldName(field.name)) {
+      return undefined;
+    }
+
+    const relation = this.getLocalRelationInfo(ownerModelLabel, fieldName);
+    return {
+      name: itemName,
+      modelLabel: ownerModelLabel,
+      relatedModelLabel: relation?.targetModelLabel,
+      fieldKind: field.fieldKind,
+      isRelation: field.isRelation,
+      fieldPath: itemName,
+      relationDirection: relation?.direction,
+      source: 'local',
+    };
+  }
+
+  private localLookupOperatorItem(
+    ownerModelLabel: string,
+    operator: string,
+    isTransform: boolean,
+    fieldPath?: string,
+  ): LookupPathItem {
+    return {
+      name: operator,
+      modelLabel: ownerModelLabel,
+      fieldKind: isTransform ? 'lookup_transform' : 'lookup_operator',
+      isRelation: false,
+      fieldPath,
+      source: isTransform ? 'django_transform' : 'django_lookup',
+      lookupOperator: isTransform ? undefined : operator,
     };
   }
 
@@ -630,21 +1292,17 @@ export class AnalysisDaemon implements vscode.Disposable {
           settingsModule: launchContext.settingsModule,
           deferRuntime: true,
         },
-        INITIALIZE_REQUEST_TIMEOUT_MS
+        INITIALIZE_REQUEST_TIMEOUT_MS,
+        false,
+        'initialSync'
       );
       const snapshot = this.decorateSnapshot(initializeResult.health);
       this.modelNames = new Set(initializeResult.modelNames ?? []);
       this.surfaceIndex = initializeResult.surfaceIndex ?? {};
       this.customLookups = initializeResult.customLookups ?? {};
       this.staticFallback = initializeResult.staticFallback ?? null;
-      // objectName → modelLabel 역매핑 구축
-      this.modelLabelByName = new Map();
-      for (const label of Object.keys(this.surfaceIndex)) {
-        const name = label.split('.').at(-1);
-        if (name) {
-          this.modelLabelByName.set(name, label);
-        }
-      }
+      this.rebuildModelLabelByName();
+      this.rebuildLocalWorkspaceIndex();
       console.log(`[PERF] daemon initialized: modelNames=${this.modelNames.size} surfaceIndex=${Object.keys(this.surfaceIndex).length} modelLabelByName=${this.modelLabelByName.size}`);
       this.updateState(snapshot);
       return snapshot;
@@ -697,14 +1355,19 @@ export class AnalysisDaemon implements vscode.Disposable {
   private request<T>(
     method: string,
     params: Record<string, unknown>,
-    timeoutMs: number = REQUEST_TIMEOUT_MS
+    timeoutMs: number = REQUEST_TIMEOUT_MS,
+    background: boolean = false,
+    source: IpcRequestSource = this.currentRequestSource()
   ): Promise<T> {
     if (!this.process || !this.process.stdin.writable) {
       return Promise.reject(new Error('Analysis daemon is not running.'));
     }
 
     const id = `req-${++this.requestSequence}`;
-    const message: RequestMessage = { id, method, params };
+    const message: RequestMessage = { id, method, params, source };
+    if (background) {
+      message.background = true;
+    }
     const ipcStart = performance.now();
 
     return new Promise<T>((resolve, reject) => {
@@ -719,8 +1382,12 @@ export class AnalysisDaemon implements vscode.Disposable {
           const paramSummary = Object.entries(params).map(([k, v]) =>
             `${k}=${typeof v === 'string' ? v.slice(0, 40) : JSON.stringify(v)}`.slice(0, 60)
           ).join(', ');
+          const sourceSummary = `source=${source}`;
+          const summary = paramSummary
+            ? `${sourceSummary}, ${paramSummary}`
+            : sourceSummary;
           this.output.appendLine(
-            `  [IPC] ${method}(${paramSummary}): ${ipcMs.toFixed(1)}ms`
+            `  [IPC] ${method}(${summary}): ${ipcMs.toFixed(1)}ms`
           );
           resolve(value);
         },
@@ -744,15 +1411,24 @@ export class AnalysisDaemon implements vscode.Disposable {
 
   private cachedRequest<T>(
     method: string,
-    params: Record<string, unknown>
+    params: Record<string, unknown>,
+    background: boolean = false
   ): Promise<T> {
-    const cacheKey = JSON.stringify({ method, params });
+    const source = this.currentRequestSource();
+    const effectiveBackground = background || source === 'diagnostic';
+    const cacheKey = JSON.stringify({ method, params, background: effectiveBackground });
     const cached = this.responseCache.get(cacheKey);
     if (cached) {
       return cached as Promise<T>;
     }
 
-    const requestPromise = this.request<T>(method, params);
+    const requestPromise = this.request<T>(
+      method,
+      params,
+      REQUEST_TIMEOUT_MS,
+      effectiveBackground,
+      source
+    );
     this.responseCache.set(cacheKey, requestPromise);
     this.evictOldestCachedResponse();
     requestPromise.catch(() => {
@@ -918,15 +1594,41 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
   }
 
+  private currentRequestSource(): IpcRequestSource {
+    return this.requestSourceContext.getStore() ?? 'unknown';
+  }
+
   private handleServerNotification(
-    message: Extract<ServerMessage, { event: 'healthChanged' }>
+    message: Extract<ServerMessage, { event: string }>
   ): void {
-    if (message.event !== 'healthChanged' || !message.params?.health) {
+    if (message.event === 'healthChanged') {
+      if (!message.params?.health) {
+        return;
+      }
+
+      this.clearResponseCache();
+      this.updateState(this.decorateSnapshot(message.params.health));
+      return;
+    }
+
+    if (message.event !== 'surfaceIndexChanged') {
       return;
     }
 
     this.clearResponseCache();
-    this.updateState(this.decorateSnapshot(message.params.health));
+    if (message.params?.surfaceIndex) {
+      this.surfaceIndex = message.params.surfaceIndex;
+      this.modelNames = new Set(message.params.modelNames ?? []);
+      this.customLookups = message.params.customLookups ?? {};
+      this.staticFallback = message.params.staticFallback ?? null;
+      this.rebuildModelLabelByName();
+      this.rebuildLocalWorkspaceIndex();
+    }
+
+    const nextSnapshot = message.params?.health
+      ? this.decorateSnapshot(message.params.health)
+      : this.currentState;
+    this.updateState(nextSnapshot);
   }
 
   private parseServerMessage(line: string): ServerMessage | undefined {

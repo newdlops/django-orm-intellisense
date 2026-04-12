@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+from typing import cast
+
 from ..runtime.inspector import RuntimeInspection, get_runtime_field
-from ..semantic.graph import ModelGraph, build_model_graph
-from ..static_index.indexer import FieldCandidate, StaticIndex
+from ..semantic.graph import ModelGraph
+from ..static_index.indexer import FieldCandidate
 
 RELATION_ONLY_METHODS = {'select_related', 'prefetch_related'}
 ATTRIBUTE_PATH_METHODS = {'select_related', 'prefetch_related', 'only', 'defer'}
 FILTER_LOOKUP_METHODS = {'filter', 'exclude', 'get', 'get_or_create', 'update_or_create'}
-MAX_CHAINED_FIELD_COMPLETION_DEPTH = 3
 DEFAULT_LOOKUP_OPERATORS = (
     'exact',
     'iexact',
@@ -39,16 +40,21 @@ DEFAULT_LOOKUP_OPERATORS = (
     'second',
 )
 
+_ONE_HOP_DESCENDANT_CACHE_OWNER = 0
+_ONE_HOP_DESCENDANT_CACHE: dict[
+    tuple[str, str, bool],
+    tuple[dict[str, object], ...],
+] = {}
+
 
 def list_lookup_path_completions(
     *,
-    static_index: StaticIndex,
+    model_graph: ModelGraph,
     runtime: RuntimeInspection,
     base_model_label: str,
     prefix: str,
     method: str,
 ) -> dict[str, object]:
-    model_graph = build_model_graph(static_index, runtime)
     normalized_prefix = _normalize_lookup_path(prefix, method)
     completed_segments, current_partial = _split_lookup_prefix(normalized_prefix)
     traversal = _analyze_lookup_completion_context(
@@ -69,6 +75,7 @@ def list_lookup_path_completions(
         method in FILTER_LOOKUP_METHODS
         and (bool(current_partial) or not completed_segments)
     )
+    include_eager_descendants = not completed_segments
 
     items: list[dict[str, object]]
     if traversal['completionMode'] == 'field':
@@ -95,15 +102,16 @@ def list_lookup_path_completions(
                     fields=matching_fields,
                 )
             )
-        items.extend(
-            _lookup_descendant_completion_items(
-                model_graph=model_graph,
-                model_label=current_model_label,
-                current_partial=current_partial,
-                relation_only=relation_only,
-                method=method,
+        if include_eager_descendants:
+            items.extend(
+                _lookup_descendant_completion_items(
+                    model_graph=model_graph,
+                    model_label=current_model_label,
+                    current_partial=current_partial,
+                    relation_only=relation_only,
+                    method=method,
+                )
             )
-        )
     elif traversal['completionMode'] == 'field_and_lookup':
         current_model_label = str(traversal['currentModelLabel'])
         relation_only = method in RELATION_ONLY_METHODS
@@ -128,15 +136,16 @@ def list_lookup_path_completions(
                     fields=matching_fields,
                 )
             )
-        items.extend(
-            _lookup_descendant_completion_items(
-                model_graph=model_graph,
-                model_label=current_model_label,
-                current_partial=current_partial,
-                relation_only=relation_only,
-                method=method,
+        if include_eager_descendants:
+            items.extend(
+                _lookup_descendant_completion_items(
+                    model_graph=model_graph,
+                    model_label=current_model_label,
+                    current_partial=current_partial,
+                    relation_only=relation_only,
+                    method=method,
+                )
             )
-        )
         items.extend(
             _lookup_chain_completion_items(
                 runtime=runtime,
@@ -169,13 +178,12 @@ def list_lookup_path_completions(
 
 def resolve_lookup_path(
     *,
-    static_index: StaticIndex,
+    model_graph: ModelGraph,
     runtime: RuntimeInspection,
     base_model_label: str,
     path: str,
     method: str,
 ) -> dict[str, object]:
-    model_graph = build_model_graph(static_index, runtime)
     normalized_path = _normalize_lookup_path(path, method)
     if not normalized_path:
         return {
@@ -321,6 +329,7 @@ def _analyze_lookup_completion_context(
     current_model_label = base_model_label
     last_field: FieldCandidate | None = None
     index = 0
+    visited_models: set[str] = {base_model_label}
 
     while index < len(segments):
         segment = segments[index]
@@ -381,6 +390,14 @@ def _analyze_lookup_completion_context(
                 method=method,
             )
             if next_field is not None:
+                if field.related_model_label in visited_models:
+                    # Cycle detected — stop traversal, return what we have.
+                    return {
+                        'resolved': True,
+                        'currentModelLabel': field.related_model_label,
+                        'completionMode': 'field',
+                    }
+                visited_models.add(field.related_model_label)
                 current_model_label = field.related_model_label
                 index += 1
                 continue
@@ -478,6 +495,7 @@ def _lookup_path_item_dict(
         'column': field.column,
         'fieldKind': field.field_kind,
         'isRelation': field.is_relation,
+        'fieldPath': path_name,
         'relationDirection': field.relation_direction,
         'source': field.source,
         'lookupOperator': None,
@@ -492,38 +510,67 @@ def _lookup_descendant_completion_items(
     relation_only: bool,
     method: str,
 ) -> list[dict[str, object]]:
+    items = _one_hop_descendant_completion_items(
+        model_graph=model_graph,
+        model_label=model_label,
+        relation_only=relation_only,
+        method=method,
+    )
+    return [
+        item
+        for item in items
+        if str(item['name']).startswith(current_partial)
+    ]
+
+
+def _one_hop_descendant_completion_items(
+    *,
+    model_graph: ModelGraph,
+    model_label: str,
+    relation_only: bool,
+    method: str,
+) -> tuple[dict[str, object], ...]:
+    global _ONE_HOP_DESCENDANT_CACHE_OWNER
+
+    owner = id(model_graph)
+    if owner != _ONE_HOP_DESCENDANT_CACHE_OWNER:
+        _ONE_HOP_DESCENDANT_CACHE.clear()
+        _ONE_HOP_DESCENDANT_CACHE_OWNER = owner
+
+    key = (model_label, method, relation_only)
+    cached = _ONE_HOP_DESCENDANT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     items_by_name: dict[str, dict[str, object]] = {}
+    for relation_field in _lookup_fields_for_method(
+        model_graph=model_graph,
+        model_label=model_label,
+        method=method,
+    ):
+        if not relation_field.is_relation or not relation_field.related_model_label:
+            continue
 
-    def walk(
-        current_model_label: str,
-        prefix_parts: list[str],
-        depth: int,
-    ) -> None:
-        if depth >= MAX_CHAINED_FIELD_COMPLETION_DEPTH:
-            return
-
-        for field in _lookup_fields_for_method(
+        for child_field in _lookup_fields_for_method(
             model_graph=model_graph,
-            model_label=current_model_label,
+            model_label=relation_field.related_model_label,
             method=method,
         ):
-            path_parts = [*prefix_parts, field.name]
-            path_name = '__'.join(path_parts)
-            if (
-                prefix_parts
-                and path_name.startswith(current_partial)
-                and (field.is_relation or not relation_only)
-            ):
-                items_by_name.setdefault(
-                    path_name,
-                    _lookup_path_item_dict(path_name, field),
-                )
+            if relation_only and not child_field.is_relation:
+                continue
 
-            if field.is_relation and field.related_model_label:
-                walk(field.related_model_label, path_parts, depth + 1)
+            path_name = f'{relation_field.name}__{child_field.name}'
+            items_by_name.setdefault(
+                path_name,
+                _lookup_path_item_dict(path_name, child_field),
+            )
 
-    walk(model_label, [], 0)
-    return list(items_by_name.values())
+    cached_items = tuple(
+        cast(dict[str, object], items_by_name[name])
+        for name in sorted(items_by_name)
+    )
+    _ONE_HOP_DESCENDANT_CACHE[key] = cached_items
+    return cached_items
 
 
 def _lookup_fields_for_method(
@@ -607,6 +654,7 @@ def _lookup_operator_item_dict(
     *,
     owner_model_label: str,
     operator: str,
+    field_path: str | None = None,
 ) -> dict[str, object]:
     return {
         'name': operator,
@@ -617,6 +665,7 @@ def _lookup_operator_item_dict(
         'column': None,
         'fieldKind': 'lookup_operator',
         'isRelation': False,
+        'fieldPath': field_path,
         'relationDirection': None,
         'source': 'django_lookup',
         'lookupOperator': operator,
@@ -627,6 +676,7 @@ def _lookup_transform_item_dict(
     *,
     owner_model_label: str,
     transform: str,
+    field_path: str | None = None,
 ) -> dict[str, object]:
     return {
         'name': transform,
@@ -637,6 +687,7 @@ def _lookup_transform_item_dict(
         'column': None,
         'fieldKind': 'lookup_transform',
         'isRelation': False,
+        'fieldPath': field_path,
         'relationDirection': None,
         'source': 'django_transform',
         'lookupOperator': None,
@@ -648,9 +699,11 @@ def _lookup_chain_completion_items(
     runtime: RuntimeInspection,
     field: FieldCandidate,
     current_partial: str,
+    field_path: str | None = None,
     runtime_field: object | None = None,
 ) -> list[dict[str, object]]:
     owner_model_label = field.model_label
+    operator_field_path = field_path or field.name
     field_object = _runtime_lookup_field(
         runtime=runtime,
         field=field,
@@ -661,6 +714,7 @@ def _lookup_chain_completion_items(
             _lookup_operator_item_dict(
                 owner_model_label=owner_model_label,
                 operator=operator,
+                field_path=operator_field_path,
             )
             for operator in DEFAULT_LOOKUP_OPERATORS
             if operator.startswith(current_partial)
@@ -672,6 +726,7 @@ def _lookup_chain_completion_items(
             items[transform_name] = _lookup_transform_item_dict(
                 owner_model_label=owner_model_label,
                 transform=transform_name,
+                field_path=operator_field_path,
             )
 
     for lookup_name in _runtime_lookup_names(field_object):
@@ -679,6 +734,7 @@ def _lookup_chain_completion_items(
             items[lookup_name] = _lookup_operator_item_dict(
                 owner_model_label=owner_model_label,
                 operator=lookup_name,
+                field_path=operator_field_path,
             )
 
     return list(items.values())

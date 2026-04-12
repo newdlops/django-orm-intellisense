@@ -95,6 +95,7 @@ export interface LookupPathItem {
   column?: number;
   fieldKind: string;
   isRelation: boolean;
+  fieldPath?: string;
   relationDirection?: string;
   source: string;
   lookupOperator?: string;
@@ -204,6 +205,10 @@ export interface RequestMessage {
   id: string;
   method: string;
   params?: Record<string, unknown>;
+  source?: string;
+  /** When true, the daemon processes this on a background thread pool
+   *  instead of the main thread, keeping hover responsive. */
+  background?: boolean;
 }
 
 export interface ResponseMessage {
@@ -223,6 +228,18 @@ export interface HealthChangedNotificationMessage {
   };
 }
 
+export interface SurfaceIndexChangedNotificationMessage {
+  event: 'surfaceIndexChanged';
+  params?: {
+    health?: HealthSnapshot;
+    modelNames?: string[];
+    surfaceIndex?: Record<string, Record<string, Record<string, [string, string | null]>>>;
+    customLookups?: Record<string, string[]>;
+    staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
+  };
+}
+
 export type ServerMessage =
   | ResponseMessage
-  | HealthChangedNotificationMessage;
+  | HealthChangedNotificationMessage
+  | SurfaceIndexChangedNotificationMessage;

@@ -311,8 +311,19 @@ def resolve_orm_member_chain(
     current_label = model_label
     current_kind = receiver_kind
     current_manager = manager_name
+    visited: set[tuple[str, str, str]] = set()
 
     for name in chain:
+        visit_key = (current_label, current_kind, name)
+        if visit_key in visited:
+            return {
+                'resolved': False,
+                'reason': 'cycle_detected',
+                'failedAt': name,
+                'modelLabel': current_label,
+                'receiverKind': current_kind,
+            }
+        visited.add(visit_key)
         item = _surface_cache.find(
             static_index, runtime,
             current_label, current_kind, name, current_manager,

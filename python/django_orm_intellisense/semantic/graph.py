@@ -1,16 +1,51 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 
 from ..discovery.workspace import WorkspaceProfile
-from ..runtime.inspector import RuntimeInspection, get_runtime_field
-from ..static_index.indexer import FieldCandidate
-from ..static_index.indexer import StaticIndex
+from ..runtime.inspector import (
+    RuntimeInspection,
+    RuntimeModelSummary,
+    get_runtime_field,
+)
+from ..static_index.indexer import FieldCandidate, ModelCandidate, StaticIndex
+
+
+@dataclass(frozen=True)
+class ModelGraphNode:
+    label: str
+    app_label: str
+    object_name: str
+    module: str
+    import_path: str
+    file_path: str | None
+    line: int | None
+    column: int | None
+    field_names: tuple[str, ...]
+    relation_names: tuple[str, ...]
+    reverse_relation_names: tuple[str, ...]
+    manager_names: tuple[str, ...]
+    model_candidate: ModelCandidate | None
+    runtime_model: RuntimeModelSummary | None
+
+
+@dataclass(frozen=True)
+class ModelGraphEdge:
+    source_label: str
+    target_label: str
+    direction: str
+    field_names: tuple[str, ...]
+    field_kinds: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class ModelGraph:
     fields_by_model_label: dict[str, dict[str, FieldCandidate]]
+    nodes_by_label: dict[str, ModelGraphNode]
+    nodes_by_object_name: dict[str, tuple[ModelGraphNode, ...]]
+    node_by_import_path: dict[str, ModelGraphNode]
+    edges_by_source_label: dict[str, tuple[ModelGraphEdge, ...]]
 
     def fields_for_model(self, model_label: str) -> list[FieldCandidate]:
         return list(self.fields_by_model_label.get(model_label, {}).values())
@@ -21,6 +56,94 @@ class ModelGraph:
         field_name: str,
     ) -> FieldCandidate | None:
         return self.fields_by_model_label.get(model_label, {}).get(field_name)
+
+    def node_for_model(self, model_label: str) -> ModelGraphNode | None:
+        return self.nodes_by_label.get(model_label)
+
+    def nodes_for_object_name(self, object_name: str) -> list[ModelGraphNode]:
+        return list(self.nodes_by_object_name.get(object_name, ()))
+
+    def unique_node_for_object_name(self, object_name: str) -> ModelGraphNode | None:
+        nodes = self.nodes_by_object_name.get(object_name, ())
+        if len(nodes) != 1:
+            return None
+
+        return nodes[0]
+
+    def node_for_import_path(self, import_path: str) -> ModelGraphNode | None:
+        return self.node_by_import_path.get(import_path)
+
+    def edges_for_model(
+        self,
+        model_label: str,
+        *,
+        direction: str | None = None,
+    ) -> list[ModelGraphEdge]:
+        edges = self.edges_by_source_label.get(model_label, ())
+        if direction is None:
+            return list(edges)
+
+        return [edge for edge in edges if edge.direction == direction]
+
+    def adjacent_model_labels(
+        self,
+        model_label: str,
+        *,
+        include_reverse: bool = True,
+    ) -> list[str]:
+        adjacent: list[str] = []
+        seen: set[str] = set()
+        for edge in self.edges_by_source_label.get(model_label, ()):
+            if edge.direction == 'reverse' and not include_reverse:
+                continue
+            if edge.target_label in seen:
+                continue
+            seen.add(edge.target_label)
+            adjacent.append(edge.target_label)
+
+        return adjacent
+
+    def bfs_labels(
+        self,
+        root_model_label: str,
+        *,
+        include_reverse: bool = True,
+    ) -> list[str]:
+        if root_model_label not in self.nodes_by_label:
+            return []
+
+        ordered_labels: list[str] = []
+        queue: deque[str] = deque([root_model_label])
+        visited = {root_model_label}
+
+        while queue:
+            current_label = queue.popleft()
+            ordered_labels.append(current_label)
+            for adjacent_label in self.adjacent_model_labels(
+                current_label,
+                include_reverse=include_reverse,
+            ):
+                if adjacent_label in visited:
+                    continue
+                visited.add(adjacent_label)
+                queue.append(adjacent_label)
+
+        return ordered_labels
+
+    def bfs(
+        self,
+        root_model_label: str,
+        *,
+        include_reverse: bool = True,
+    ) -> list[ModelGraphNode]:
+        return [
+            self.nodes_by_label[label]
+            for label in self.bfs_labels(
+                root_model_label,
+                include_reverse=include_reverse,
+            )
+            if label in self.nodes_by_label
+        ]
 
 
 @dataclass(frozen=True)
@@ -104,6 +227,7 @@ def build_model_graph(
     )
 
     fields_by_model_label: dict[str, dict[str, FieldCandidate]] = {}
+    static_source_labels: dict[str, str] = {}
     for model_label in model_labels:
         static_source_label = model_label
         if static_index.find_model_candidate(static_source_label) is None:
@@ -111,6 +235,7 @@ def build_model_graph(
                 model_label,
                 model_label,
             )
+        static_source_labels[model_label] = static_source_label
 
         fields_by_name = {
             field.name: _remap_field_candidate_labels(
@@ -171,18 +296,174 @@ def build_model_graph(
         if fields_by_name:
             fields_by_model_label[model_label] = fields_by_name
 
-    return ModelGraph(fields_by_model_label=fields_by_model_label)
+    nodes_by_label = {
+        model_label: _build_model_graph_node(
+            model_label=model_label,
+            static_source_label=static_source_labels.get(model_label, model_label),
+            fields_by_name=fields_by_model_label.get(model_label, {}),
+            static_index=static_index,
+            runtime_model=runtime_model_by_label.get(model_label),
+        )
+        for model_label in sorted(model_labels)
+    }
+    nodes_by_object_name = _index_nodes_by_object_name(nodes_by_label)
+    node_by_import_path = {
+        node.import_path: node
+        for node in nodes_by_label.values()
+        if node.import_path
+    }
+    edges_by_source_label = _build_edges_by_source_label(fields_by_model_label)
+
+    return ModelGraph(
+        fields_by_model_label=fields_by_model_label,
+        nodes_by_label=nodes_by_label,
+        nodes_by_object_name=nodes_by_object_name,
+        node_by_import_path=node_by_import_path,
+        edges_by_source_label=edges_by_source_label,
+    )
 
 
-def _runtime_model_summary(
-    runtime: RuntimeInspection,
+def _build_model_graph_node(
+    *,
     model_label: str,
-):
-    for model in runtime.model_catalog:
-        if model.label == model_label:
-            return model
+    static_source_label: str,
+    fields_by_name: dict[str, FieldCandidate],
+    static_index: StaticIndex,
+    runtime_model: RuntimeModelSummary | None,
+) -> ModelGraphNode:
+    model_candidate = static_index.find_model_candidate(model_label)
+    if model_candidate is None and static_source_label != model_label:
+        model_candidate = static_index.find_model_candidate(static_source_label)
 
-    return None
+    app_label = (
+        model_candidate.app_label
+        if model_candidate is not None
+        else model_label.split('.', 1)[0]
+    )
+    object_name = (
+        model_candidate.object_name
+        if model_candidate is not None
+        else _model_object_name(model_label)
+    )
+    module = (
+        runtime_model.module
+        if runtime_model is not None
+        else model_candidate.module
+        if model_candidate is not None
+        else ''
+    )
+    import_path = f'{module}.{object_name}' if module else object_name
+
+    derived_relation_names = [
+        field.name
+        for field in fields_by_name.values()
+        if field.is_relation and field.relation_direction != 'reverse'
+    ]
+    derived_reverse_relation_names = [
+        field.name
+        for field in fields_by_name.values()
+        if field.relation_direction == 'reverse'
+    ]
+
+    return ModelGraphNode(
+        label=model_label,
+        app_label=app_label,
+        object_name=object_name,
+        module=module,
+        import_path=import_path,
+        file_path=model_candidate.file_path if model_candidate is not None else None,
+        line=model_candidate.line if model_candidate is not None else None,
+        column=model_candidate.column if model_candidate is not None else None,
+        field_names=tuple(fields_by_name.keys()),
+        relation_names=_dedupe_names(
+            runtime_model.relation_names if runtime_model is not None else (),
+            derived_relation_names,
+        ),
+        reverse_relation_names=_dedupe_names(
+            runtime_model.reverse_relation_names if runtime_model is not None else (),
+            derived_reverse_relation_names,
+        ),
+        manager_names=tuple(runtime_model.manager_names) if runtime_model is not None else (),
+        model_candidate=model_candidate,
+        runtime_model=runtime_model,
+    )
+
+
+def _index_nodes_by_object_name(
+    nodes_by_label: dict[str, ModelGraphNode],
+) -> dict[str, tuple[ModelGraphNode, ...]]:
+    nodes_by_object_name: dict[str, list[ModelGraphNode]] = {}
+    for node in nodes_by_label.values():
+        nodes_by_object_name.setdefault(node.object_name, []).append(node)
+
+    return {
+        object_name: tuple(
+            sorted(nodes, key=lambda node: node.label)
+        )
+        for object_name, nodes in nodes_by_object_name.items()
+    }
+
+
+def _build_edges_by_source_label(
+    fields_by_model_label: dict[str, dict[str, FieldCandidate]],
+) -> dict[str, tuple[ModelGraphEdge, ...]]:
+    aggregated_edges: dict[
+        str,
+        dict[tuple[str, str], dict[str, set[str]]],
+    ] = {}
+
+    for source_label, fields_by_name in fields_by_model_label.items():
+        for field in fields_by_name.values():
+            if not field.is_relation or not field.related_model_label:
+                continue
+
+            direction = field.relation_direction or 'forward'
+            target_label = field.related_model_label
+            payload = aggregated_edges.setdefault(source_label, {}).setdefault(
+                (target_label, direction),
+                {
+                    'field_names': set(),
+                    'field_kinds': set(),
+                },
+            )
+            payload['field_names'].add(field.name)
+            payload['field_kinds'].add(field.field_kind)
+
+    edges_by_source_label: dict[str, tuple[ModelGraphEdge, ...]] = {}
+    for source_label, edge_map in aggregated_edges.items():
+        edges = [
+            ModelGraphEdge(
+                source_label=source_label,
+                target_label=target_label,
+                direction=direction,
+                field_names=tuple(sorted(payload['field_names'])),
+                field_kinds=tuple(sorted(payload['field_kinds'])),
+            )
+            for (target_label, direction), payload in edge_map.items()
+        ]
+        edges.sort(
+            key=lambda edge: (
+                0 if edge.direction == 'forward' else 1,
+                edge.target_label,
+                edge.field_names[0] if edge.field_names else '',
+            )
+        )
+        edges_by_source_label[source_label] = tuple(edges)
+
+    return edges_by_source_label
+
+
+def _dedupe_names(*name_groups: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    ordered_names: list[str] = []
+    for name_group in name_groups:
+        for name in name_group:
+            if name in seen:
+                continue
+            seen.add(name)
+            ordered_names.append(name)
+
+    return tuple(ordered_names)
 
 
 def _remap_field_candidate_labels(

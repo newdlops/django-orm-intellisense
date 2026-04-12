@@ -17,6 +17,22 @@ import { HealthStatusView } from './status/healthStatus';
 
 let activeDaemon: AnalysisDaemon | undefined;
 let languageClient: LanguageClient | undefined;
+const WATCHER_IGNORED_SEGMENTS = new Set([
+  '.git',
+  '.hg',
+  '.mypy_cache',
+  '.pytest_cache',
+  '.ruff_cache',
+  '.svn',
+  '.tox',
+  '.venv',
+  '__pycache__',
+  'build',
+  'dist',
+  'node_modules',
+  'out',
+  'venv',
+]);
 
 export function getActiveDaemonForTesting(): AnalysisDaemon | undefined {
   return activeDaemon;
@@ -28,6 +44,106 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const statusView = new HealthStatusView();
   const diagnostics = new HealthDiagnostics();
   const autoRestartsEnabled = process.env.DJLS_DISABLE_AUTO_RESTARTS !== '1';
+  let pythonSourceWatcher: vscode.FileSystemWatcher | undefined;
+  let watchedPythonRoot: string | undefined;
+  let reindexTimer: ReturnType<typeof setTimeout> | undefined;
+  const pendingReindexFiles = new Set<string>();
+
+  const disposePythonSourceWatcher = (): void => {
+    pythonSourceWatcher?.dispose();
+    pythonSourceWatcher = undefined;
+    watchedPythonRoot = undefined;
+  };
+
+  const queueReindexFile = (filePath: string): void => {
+    const normalizedPath = path.resolve(filePath);
+    if (
+      watchedPythonRoot &&
+      shouldIgnoreWatcherPath(watchedPythonRoot, normalizedPath)
+    ) {
+      return;
+    }
+    pendingReindexFiles.add(normalizedPath);
+    if (reindexTimer) {
+      clearTimeout(reindexTimer);
+    }
+    reindexTimer = setTimeout(() => {
+      void flushPendingReindexFiles();
+    }, 300);
+  };
+
+  const flushPendingReindexFiles = async (): Promise<void> => {
+    reindexTimer = undefined;
+    if (pendingReindexFiles.size === 0) {
+      return;
+    }
+    if (!languageClient || !daemon.isReady()) {
+      reindexTimer = setTimeout(() => {
+        void flushPendingReindexFiles();
+      }, 300);
+      return;
+    }
+
+    const files = [...pendingReindexFiles];
+    pendingReindexFiles.clear();
+
+    for (const filePath of files) {
+      try {
+        output.appendLine(`[ls] reindexing file: ${filePath}`);
+        await daemon.reindexFile(filePath);
+      } catch (error) {
+        output.appendLine(`[ls] reindex failed: ${String(error)}`);
+      }
+    }
+
+    if (Object.keys(daemon.surfaceIndex).length === 0) {
+      return;
+    }
+
+    output.appendLine(
+      `[ls] re-sending surfaceIndex after reindex: ${Object.keys(daemon.surfaceIndex).length} models`
+    );
+    void languageClient.sendNotification('django/updateSurfaceIndex', {
+      surfaceIndex: daemon.surfaceIndex,
+      modelNames: Array.from(daemon.modelNames),
+      customLookups: daemon.customLookups,
+      staticFallback: daemon.staticFallback,
+    });
+  };
+
+  const updatePythonSourceWatcher = (workspaceRoot?: string): void => {
+    if (!workspaceRoot) {
+      pendingReindexFiles.clear();
+      disposePythonSourceWatcher();
+      return;
+    }
+
+    const normalizedRoot = path.resolve(workspaceRoot);
+    if (watchedPythonRoot === normalizedRoot && pythonSourceWatcher) {
+      return;
+    }
+
+    pendingReindexFiles.clear();
+    disposePythonSourceWatcher();
+    watchedPythonRoot = normalizedRoot;
+    pythonSourceWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(normalizedRoot, '**/*.py')
+    );
+
+    const onWatcherEvent = (uri: vscode.Uri): void => {
+      if (uri.scheme !== 'file') {
+        return;
+      }
+      queueReindexFile(uri.fsPath);
+    };
+
+    pythonSourceWatcher.onDidCreate(onWatcherEvent);
+    pythonSourceWatcher.onDidChange(onWatcherEvent);
+    pythonSourceWatcher.onDidDelete(onWatcherEvent);
+    output.appendLine(
+      `[watcher] watching configured workspace root: ${normalizedRoot}`
+    );
+  };
 
   activeDaemon = daemon;
 
@@ -40,6 +156,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   daemon.onDidChangeState((snapshot) => {
     statusView.update(snapshot);
     diagnostics.update(snapshot);
+    updatePythonSourceWatcher(snapshot.workspaceRoot);
+    if (daemon.isReady() && pendingReindexFiles.size > 0) {
+      if (reindexTimer) {
+        clearTimeout(reindexTimer);
+      }
+      reindexTimer = setTimeout(() => {
+        void flushPendingReindexFiles();
+      }, 50);
+    }
   });
 
   statusView.update(daemon.getState());
@@ -56,6 +181,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerSelectSettingsModuleCommand(daemon, output),
     registerSelectPythonInterpreterCommand(daemon, output),
     ...registerPythonProviders(daemon),
+    new vscode.Disposable(() => {
+      if (reindexTimer) {
+        clearTimeout(reindexTimer);
+      }
+      disposePythonSourceWatcher();
+    }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (!autoRestartsEnabled) {
         return;
@@ -127,48 +258,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     output.appendLine('[ls] Language Server started');
     // daemon이 ready되면 surfaceIndex를 서버에 전달
     feedSurfaceIndexToServer(daemon, output);
-
-    // LS에서 파일 재인덱싱 요청 수신 → daemon에 단일 파일 reindex 후 결과 전송
-    let reindexTimer: ReturnType<typeof setTimeout> | undefined;
-    const pendingReindexFiles = new Set<string>();
     languageClient!.onNotification('django/fileNeedsReindex', (params: { uri: string }) => {
       const uri = params?.uri;
-      if (uri) {
-        // Convert file:// URI to local path
-        try {
-          pendingReindexFiles.add(vscode.Uri.parse(uri).fsPath);
-        } catch {
-          pendingReindexFiles.add(uri);
-        }
+      if (!uri) {
+        return;
       }
-      if (reindexTimer) clearTimeout(reindexTimer);
-      reindexTimer = setTimeout(() => {
-        const files = [...pendingReindexFiles];
-        pendingReindexFiles.clear();
-        if (files.length === 0 || !languageClient || !daemon.isReady()) return;
-
-        void (async () => {
-          for (const filePath of files) {
-            try {
-              output.appendLine(`[ls] reindexing file: ${filePath}`);
-              await daemon.reindexFile(filePath);
-            } catch (e) {
-              output.appendLine(`[ls] reindex failed: ${String(e)}`);
-            }
-          }
-          // Send updated surfaceIndex to LS
-          if (languageClient && Object.keys(daemon.surfaceIndex).length > 0) {
-            output.appendLine(
-              `[ls] re-sending surfaceIndex after reindex: ${Object.keys(daemon.surfaceIndex).length} models`
-            );
-            void languageClient.sendNotification('django/updateSurfaceIndex', {
-              surfaceIndex: daemon.surfaceIndex,
-              modelNames: Array.from(daemon.modelNames),
-              staticFallback: daemon.staticFallback,
-            });
-          }
-        })();
-      }, 300);
+      try {
+        queueReindexFile(vscode.Uri.parse(uri).fsPath);
+      } catch {
+        queueReindexFile(uri);
+      }
     });
   });
 
@@ -225,4 +324,19 @@ export async function deactivate(): Promise<void> {
 
   await activeDaemon.stop();
   activeDaemon = undefined;
+}
+
+function shouldIgnoreWatcherPath(workspaceRoot: string, filePath: string): boolean {
+  const relativePath = path.relative(workspaceRoot, filePath);
+  if (
+    relativePath === '' ||
+    relativePath.startsWith('..') ||
+    path.isAbsolute(relativePath)
+  ) {
+    return true;
+  }
+
+  return relativePath
+    .split(path.sep)
+    .some((segment) => WATCHER_IGNORED_SEGMENTS.has(segment));
 }

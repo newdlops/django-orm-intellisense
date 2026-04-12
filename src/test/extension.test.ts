@@ -98,10 +98,6 @@ suite('Django ORM Intellisense UI', () => {
       hasCompletionItemLabel(completionList.items, 'profile'),
       'Expected lookup path completion to include `profile`.'
     );
-    assert.ok(
-      hasCompletionItemLabel(completionList.items, 'profile__timezone'),
-      'Expected lookup path completion to include chained lookup suggestions.'
-    );
     const relationCompletionItem = findCompletionItemByLabel(
       completionList.items,
       'profile'
@@ -116,19 +112,51 @@ suite('Django ORM Intellisense UI', () => {
       'editor.action.triggerSuggest',
       'Expected string lookup relation completion to reopen suggestions.'
     );
-    const chainedCompletionItem = findCompletionItemByLabel(
-      completionList.items,
-      'profile__timezone'
+    assert.strictEqual(
+      relationCompletionItem?.detail,
+      'OneToOneField · Author -> Profile',
+      'Expected relation lookup completion detail to stay compact while showing the related model.'
     );
     assert.strictEqual(
-      chainedCompletionItem?.insertText,
-      'profile__timezone',
-      'Expected string lookup chained completion to insert the full lookup path.'
+      completionItemLabelDetail(relationCompletionItem!),
+      ' (OneToOneField)',
+      'Expected relation lookup completion to show the field kind inline in the suggestion list.'
     );
     assert.strictEqual(
-      completionItemFilterValue(chainedCompletionItem!),
+      completionItemDescription(relationCompletionItem!),
+      'Author -> Profile',
+      'Expected relation lookup completion to show the owner and related model inline in the suggestion list.'
+    );
+
+    const nestedCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Post.objects.values("author__profile__timezone")',
+      'author__profile__tim'
+    );
+    const nestedCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        nestedCompletionPosition
+      );
+    const nestedCompletionItem = findCompletionItemByLabel(
+      nestedCompletionList?.items,
+      'timezone'
+    );
+
+    assert.ok(
+      nestedCompletionItem,
+      'Expected nested lookup completion to include `timezone` after typing `author__profile__`.'
+    );
+    assert.strictEqual(
+      nestedCompletionItem?.insertText,
+      'timezone',
+      'Expected nested string lookup completion to insert the visible field segment.'
+    );
+    assert.strictEqual(
+      completionItemFilterValue(nestedCompletionItem!),
       'author__profile__timezone',
-      'Expected string lookup chained completion to preserve the full lookup prefix for editor filtering.'
+      'Expected nested string lookup completion to preserve the full lookup prefix for editor filtering.'
     );
 
     const operatorCompletionPosition = positionAfterTextInContainer(
@@ -155,6 +183,15 @@ suite('Django ORM Intellisense UI', () => {
       hasCompletionItemLabel(operatorCompletionList?.items, 'in'),
       'Expected lookup operator completion to include `in` after a completed field path.'
     );
+    const containsOperatorItem = findCompletionItemByLabel(
+      operatorCompletionList?.items,
+      'contains'
+    );
+    assert.strictEqual(
+      completionItemDescription(containsOperatorItem!),
+      'lookup · Profile.timezone',
+      'Expected lookup operator completion to expose the owning Django field inline in the suggestion list.'
+    );
 
     const directPkCompletionPosition = positionAfterTextInContainer(
       document,
@@ -170,7 +207,7 @@ suite('Django ORM Intellisense UI', () => {
     const directPkCompletionItem = (directPkCompletionList?.items ?? []).find(
       (item) =>
         completionItemLabel(item) === 'pk' &&
-        item.detail === 'BigAutoField · blog.Post'
+        item.detail === 'BigAutoField · Post'
     );
 
     assert.ok(
@@ -200,7 +237,7 @@ suite('Django ORM Intellisense UI', () => {
     const relatedPkCompletionItem = (relatedPkCompletionList?.items ?? []).find(
       (item) =>
         completionItemLabel(item) === 'pk' &&
-        item.detail === 'BigAutoField · blog.Author'
+        item.detail === 'BigAutoField · Author'
     );
 
     assert.ok(
@@ -356,6 +393,151 @@ suite('Django ORM Intellisense UI', () => {
       ),
       `Expected pk definition to target blog/models.py. Received: ${directPkDefinitionTarget!.uri.fsPath}`
     );
+  });
+
+  test('preserves chained lookup completions when the local fast path is enabled', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    await withProcessEnv('DJLS_ENABLE_LOCAL_LOOKUP_FAST_PATH', '1', async () => {
+      const document = await openFixtureDocument(
+        fixtureRoot,
+        'blog/query_examples.py'
+      );
+
+      const blankCompletionPosition = positionAfterTextInContainer(
+        document,
+        'Post.objects.filter()',
+        'filter('
+      );
+      const blankCompletionList =
+        await vscode.commands.executeCommand<vscode.CompletionList>(
+          'vscode.executeCompletionItemProvider',
+          document.uri,
+          blankCompletionPosition
+        );
+
+      assert.ok(
+        hasCompletionItemLabel(blankCompletionList?.items, 'author__profile'),
+        `Expected local fast path completion to include eager chained lookups. Received: ${(blankCompletionList?.items ?? [])
+          .slice(0, 20)
+          .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
+          .join(', ')}`
+      );
+      assert.ok(
+        hasCompletionItemLabel(blankCompletionList?.items, 'author__in'),
+        'Expected local fast path completion to include prefixed lookup operators.'
+      );
+
+      const nestedCompletionPosition = positionAfterTextInContainer(
+        document,
+        'Post.objects.values("author__profile__timezone")',
+        'author__profile__tim'
+      );
+      const nestedCompletionList =
+        await vscode.commands.executeCommand<vscode.CompletionList>(
+          'vscode.executeCompletionItemProvider',
+          document.uri,
+          nestedCompletionPosition
+        );
+
+      assert.ok(
+        hasCompletionItemLabel(nestedCompletionList?.items, 'timezone'),
+        `Expected local fast path completion to preserve nested segment suggestions. Received: ${(nestedCompletionList?.items ?? [])
+          .slice(0, 20)
+          .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
+          .join(', ')}`
+      );
+    });
+  });
+
+  test('reindexes configured workspaceRoot files through the file watcher', async function () {
+    this.timeout(30_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+    assert.ok(environment, 'Expected a reusable E2E environment for the fixture project.');
+
+    const tempRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-watcher-root-')
+    );
+    copyDirectory(fixtureRoot, tempRoot);
+
+    const queryExamplesPath = path.join(tempRoot, 'blog', 'query_examples.py');
+    fs.appendFileSync(queryExamplesPath, "\nPost.objects.filter(sub='watcher')\n", 'utf8');
+
+    await removeWorkspaceFoldersFrom(0);
+
+    try {
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon, 'Expected the analysis daemon to be active after extension activation.');
+
+      const fixtureWorkspace = ensureFixtureWorkspace(tempRoot, environment);
+      await addWorkspaceFolder(fixtureWorkspace);
+      await applyFixtureWorkspaceSettings(fixtureWorkspace, tempRoot, environment);
+
+      const initialSnapshot = await daemon.restart(vscode.Uri.file(fixtureWorkspace));
+      const snapshot =
+        initialSnapshot.phase === 'ready' &&
+        initialSnapshot.runtime?.bootstrapStatus === 'ready'
+          ? initialSnapshot
+          : await waitForHealthSnapshot(
+              daemon,
+              (candidate) =>
+                candidate.phase === 'ready' &&
+                candidate.runtime?.bootstrapStatus === 'ready',
+              30_000
+            );
+      assertFixtureE2EHealth(snapshot, tempRoot, environment);
+
+      const modelsPath = path.join(tempRoot, 'blog', 'models.py');
+      const originalModels = fs.readFileSync(modelsPath, 'utf8');
+      const updatedModels = originalModels.replace(
+        "    title = models.CharField(max_length=255)\n",
+        "    title = models.CharField(max_length=255)\n    subtitle = models.CharField(max_length=255, blank=True)\n"
+      );
+      assert.notStrictEqual(
+        updatedModels,
+        originalModels,
+        'Expected to inject a watcher test field into blog.Post.'
+      );
+      fs.writeFileSync(modelsPath, updatedModels, 'utf8');
+
+      await waitForCondition(
+        () =>
+          Boolean(
+            daemon.surfaceIndex['blog.Post']?.queryset?.subtitle ??
+            daemon.surfaceIndex['blog.Post']?.manager?.subtitle ??
+            daemon.surfaceIndex['blog.Post']?.instance?.subtitle
+          ),
+        15_000
+      );
+
+      const document = await openFixtureDocument(
+        tempRoot,
+        'blog/query_examples.py'
+      );
+      const completionPosition = positionAfterText(document, 'Post.objects.filter(sub');
+      const completionList =
+        await vscode.commands.executeCommand<vscode.CompletionList>(
+          'vscode.executeCompletionItemProvider',
+          document.uri,
+          completionPosition
+        );
+
+      assert.ok(
+        hasCompletionItemLabel(completionList?.items ?? [], 'subtitle'),
+        `Expected file-watcher reindex to surface the new field. Received: ${(completionList?.items ?? [])
+          .slice(0, 20)
+          .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
+          .join(', ')}`
+      );
+    } finally {
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   test('resolves runtime-backed reverse lookup paths with non-literal related_name', async function () {
@@ -1470,8 +1652,35 @@ suite('Django ORM Intellisense UI', () => {
       'Expected empty keyword completion to include `author__in`.'
     );
     assert.ok(
+      hasCompletionItemLabel(blankCompletionList?.items, 'author__profile'),
+      'Expected empty keyword completion to include eager two-segment lookup fields.'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(blankCompletionList?.items, 'author__profile__timezone'),
+      'Expected empty keyword completion to stop eager lookup fields at two segments.'
+    );
+    assert.ok(
       hasCompletionItemLabel(blankCompletionList?.items, 'title__endswith'),
       'Expected empty keyword completion to include `title__endswith`.'
+    );
+    const blankRelationFieldItem = findCompletionItemByLabel(
+      blankCompletionList?.items,
+      'author__profile'
+    );
+    assert.strictEqual(
+      blankRelationFieldItem?.detail,
+      'OneToOneField · Author -> Profile',
+      'Expected nested lookup completion detail to stay compact while showing the related model.'
+    );
+    assert.strictEqual(
+      completionItemLabelDetail(blankRelationFieldItem!),
+      ' (OneToOneField)',
+      'Expected eager chained lookup completion to show the field kind inline in the suggestion list.'
+    );
+    assert.strictEqual(
+      completionItemDescription(blankRelationFieldItem!),
+      'Author -> Profile',
+      'Expected eager chained lookup completion to show the owner and related model inline in the suggestion list.'
     );
     const blankCompletionLabels = (blankCompletionList?.items ?? []).map((item) =>
       completionItemLabel(item)
@@ -1508,9 +1717,20 @@ suite('Django ORM Intellisense UI', () => {
       stringCompletionList?.items,
       'profile'
     );
+    const nestedStringCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Post.objects.values("author__profile__timezone")',
+      'author__profile__tim'
+    );
+    const nestedStringCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        nestedStringCompletionPosition
+      );
     const stringChainedItem = findCompletionItemByLabel(
-      stringCompletionList?.items,
-      'profile__timezone'
+      nestedStringCompletionList?.items,
+      'timezone'
     );
 
     assert.ok(stringFieldItem, 'Expected string lookup completion to include `profile`.');
@@ -1521,12 +1741,12 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.ok(
       stringChainedItem,
-      'Expected string lookup completion to include `profile__timezone`.'
+      'Expected string lookup completion to include `timezone` after typing `author__profile__`.'
     );
     assert.strictEqual(
       completionItemFilterValue(stringChainedItem!),
       'author__profile__timezone',
-      'Expected string lookup chained completion to preserve the full lookup prefix for editor filtering.'
+      'Expected nested string lookup completion to preserve the full lookup prefix for editor filtering.'
     );
 
     const keywordCompletionPosition = positionAfterTextInContainer(
@@ -3029,10 +3249,6 @@ suite('Django ORM Intellisense UI', () => {
       hasCompletionItemLabel(fieldCompletionList?.items, 'profile'),
       'Expected keyword lookup completion to include `profile`.'
     );
-    assert.ok(
-      hasCompletionItemLabel(fieldCompletionList?.items, 'profile__timezone'),
-      'Expected keyword lookup completion to include chained lookup suggestions.'
-    );
     const fieldCompletionItem = findCompletionItemByLabel(
       fieldCompletionList?.items,
       'profile'
@@ -3052,24 +3268,36 @@ suite('Django ORM Intellisense UI', () => {
       'editor.action.triggerSuggest',
       'Expected keyword lookup relation completion to reopen suggestions.'
     );
+
+    const nestedFieldCompletionPosition = positionAfterTextInContainer(
+      document,
+      "filter(author__profile__timezone='Asia/Seoul')",
+      'author__profile__tim'
+    );
+    const nestedFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        nestedFieldCompletionPosition
+      );
     const chainedFieldCompletionItem = findCompletionItemByLabel(
-      fieldCompletionList?.items,
-      'profile__timezone'
+      nestedFieldCompletionList?.items,
+      'timezone'
     );
     assert.strictEqual(
       completionItemFilterValue(chainedFieldCompletionItem!),
       'author__profile__timezone',
-      'Expected keyword lookup chained completion to preserve the full lookup prefix for editor filtering.'
+      'Expected nested keyword lookup completion to preserve the full lookup prefix for editor filtering.'
     );
     assert.strictEqual(
       chainedFieldCompletionItem?.insertText,
-      'profile__timezone__',
-      'Expected keyword lookup chained completion to continue lookup operators.'
+      'timezone__',
+      'Expected nested keyword lookup completion to continue lookup operators.'
     );
     assert.strictEqual(
       chainedFieldCompletionItem?.command?.command,
       'editor.action.triggerSuggest',
-      'Expected keyword lookup chained completion to reopen suggestions.'
+      'Expected nested keyword lookup completion to reopen suggestions.'
     );
 
     const blankOperatorCompletionPosition = positionAfterTextInContainer(
@@ -4876,7 +5104,7 @@ suite('Django ORM Intellisense UI', () => {
     const outerRefCompletionItem = (outerRefCompletionList?.items ?? []).find(
       (item) =>
         completionItemLabel(item) === 'name' &&
-        item.detail === 'CharField · sales.Product'
+        item.detail === 'CharField · Product'
     );
     assert.ok(
       outerRefCompletionItem,
@@ -5081,8 +5309,7 @@ suite('Django ORM Intellisense UI', () => {
     ).find(
       (item) =>
         completionItemLabel(item) === 'fulfillment' &&
-        item.detail ===
-          'ForeignKey · sales.FulfillmentDetail -> sales.Fulfillment'
+        item.detail === 'ForeignKey · FulfillmentDetail -> Fulfillment'
     );
     assert.ok(
       relationOuterRefCompletionItem,
@@ -7477,13 +7704,6 @@ suite('Django ORM Intellisense UI', () => {
         selectedInterpreter
       );
     } finally {
-      await vscode.workspace
-        .getConfiguration('djangoOrmIntellisense', vscode.Uri.file(tempWorkspace))
-        .update(
-          'pythonInterpreter',
-          undefined,
-          vscode.ConfigurationTarget.WorkspaceFolder
-        );
       await removeWorkspaceFoldersFrom(0);
       fs.rmSync(tempWorkspace, { recursive: true, force: true });
     }
@@ -7544,13 +7764,6 @@ suite('Django ORM Intellisense UI', () => {
         virtualEnvInterpreter
       );
     } finally {
-      await vscode.workspace
-        .getConfiguration('djangoOrmIntellisense', vscode.Uri.file(tempWorkspace))
-        .update(
-          'pythonInterpreter',
-          undefined,
-          vscode.ConfigurationTarget.WorkspaceFolder
-        );
       await removeWorkspaceFoldersFrom(0);
       fs.rmSync(tempWorkspace, { recursive: true, force: true });
     }
@@ -7920,20 +8133,29 @@ async function applyFixtureWorkspaceSettings(
     vscode.Uri.file(workspacePath)
   );
 
-  await configuration.update(
-    'workspaceRoot',
-    rootPath,
-    vscode.ConfigurationTarget.WorkspaceFolder
+  await retryWorkspaceFolderUpdate(
+    () =>
+      configuration.update(
+        'workspaceRoot',
+        rootPath,
+        vscode.ConfigurationTarget.WorkspaceFolder
+      )
   );
-  await configuration.update(
-    'pythonInterpreter',
-    environment.interpreterPath,
-    vscode.ConfigurationTarget.WorkspaceFolder
+  await retryWorkspaceFolderUpdate(
+    () =>
+      configuration.update(
+        'pythonInterpreter',
+        environment.interpreterPath,
+        vscode.ConfigurationTarget.WorkspaceFolder
+      )
   );
-  await configuration.update(
-    'settingsModule',
-    environment.settingsModule,
-    vscode.ConfigurationTarget.WorkspaceFolder
+  await retryWorkspaceFolderUpdate(
+    () =>
+      configuration.update(
+        'settingsModule',
+        environment.settingsModule,
+        vscode.ConfigurationTarget.WorkspaceFolder
+      )
   );
 }
 
@@ -8122,7 +8344,10 @@ function assertFixtureE2EHealth(
   rootPath: string,
   environment: FixtureE2EEnvironment
 ): void {
-  assert.strictEqual(snapshot.workspaceRoot, rootPath);
+  assert.strictEqual(
+    normalizeRealPath(snapshot.workspaceRoot),
+    normalizeRealPath(rootPath)
+  );
   assert.strictEqual(snapshot.pythonPath, environment.interpreterPath);
   assert.strictEqual(snapshot.settingsModule, environment.settingsModule);
   assert.strictEqual(snapshot.phase, 'ready');
@@ -8134,6 +8359,18 @@ function assertFixtureE2EHealth(
     snapshot.runtime?.djangoVersion?.startsWith(`${DJANGO_E2E_MAJOR_VERSION}.`),
     `Expected Django ${DJANGO_E2E_MAJOR_VERSION}.x in runtime health. Received: ${snapshot.runtime?.djangoVersion}`
   );
+}
+
+function normalizeRealPath(targetPath: string | undefined): string | undefined {
+  if (!targetPath) {
+    return targetPath;
+  }
+
+  try {
+    return fs.realpathSync.native(targetPath);
+  } catch {
+    return path.resolve(targetPath);
+  }
 }
 
 async function openFixtureDocument(
@@ -8341,16 +8578,29 @@ function stringifyDiagnostics(items: readonly vscode.Diagnostic[]): string {
 }
 
 async function addWorkspaceFolder(rootPath: string): Promise<void> {
-  const updated = vscode.workspace.updateWorkspaceFolders(
-    0,
-    0,
-    {
-      uri: vscode.Uri.file(rootPath),
-      name: path.basename(rootPath),
+  let updated = false;
+  for (let attempt = 0; attempt < 10 && !updated; attempt += 1) {
+    updated =
+      vscode.workspace.updateWorkspaceFolders(
+        0,
+        0,
+        {
+          uri: vscode.Uri.file(rootPath),
+          name: path.basename(rootPath),
+        }
+      ) ?? false;
+    if (!updated) {
+      await delay(100);
     }
-  );
+  }
   assert.ok(updated, `Failed to add workspace folder: ${rootPath}`);
-  await delay(500);
+  await waitForCondition(
+    () =>
+      vscode.workspace.workspaceFolders?.some(
+        (folder) => folder.uri.fsPath === rootPath
+      ) ?? false,
+    5_000
+  );
 }
 
 async function removeWorkspaceFoldersFrom(startIndex: number): Promise<void> {
@@ -8359,12 +8609,57 @@ async function removeWorkspaceFoldersFrom(startIndex: number): Promise<void> {
     return;
   }
 
-  const updated = vscode.workspace.updateWorkspaceFolders(
-    startIndex,
-    currentCount - startIndex
-  );
+  let updated = false;
+  for (let attempt = 0; attempt < 10 && !updated; attempt += 1) {
+    updated =
+      vscode.workspace.updateWorkspaceFolders(
+        startIndex,
+        currentCount - startIndex
+      ) ?? false;
+    if (!updated) {
+      await delay(100);
+    }
+  }
   assert.ok(updated, 'Failed to remove temporary workspace folders.');
-  await delay(500);
+  await waitForCondition(
+    () => (vscode.workspace.workspaceFolders?.length ?? 0) <= startIndex,
+    5_000
+  );
+}
+
+async function retryWorkspaceFolderUpdate(
+  operation: () => Thenable<void>
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      await operation();
+      return;
+    } catch (error) {
+      lastError = error;
+      await delay(100);
+    }
+  }
+
+  throw lastError;
+}
+
+async function withProcessEnv(
+  name: string,
+  value: string,
+  callback: () => Promise<void>
+): Promise<void> {
+  const previousValue = process.env[name];
+  process.env[name] = value;
+  try {
+    await callback();
+  } finally {
+    if (previousValue === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = previousValue;
+    }
+  }
 }
 
 function workspaceSettingsPath(rootPath: string): string {
@@ -8387,4 +8682,8 @@ function writeWorkspaceSettings(
   const settingsPath = workspaceSettingsPath(rootPath);
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   fs.writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+}
+
+function copyDirectory(sourcePath: string, targetPath: string): void {
+  fs.cpSync(sourcePath, targetPath, { recursive: true });
 }

@@ -13,11 +13,69 @@ from ..discovery.workspace import PythonSourceSnapshot
 from ..runtime.inspector import RuntimeInspection
 from ..static_index.indexer import ModuleIndex, StaticIndex, build_static_index
 
-CACHE_SCHEMA_VERSION = 8
+CACHE_SCHEMA_VERSION = 9
+SOURCE_SNAPSHOT_CACHE_NAME = 'source-snapshot.json'
 STATIC_INDEX_CACHE_NAME = 'static-index.json'
 STATIC_INDEX_FULL_CACHE_NAME = 'static-index-full.json'
 RUNTIME_CACHE_NAME = 'runtime-inspection.json'
 SURFACE_INDEX_CACHE_NAME = 'surface-index.json'
+
+
+def load_cached_source_snapshot(
+    workspace_root: Path,
+    *,
+    extra_roots: list[Path] | None = None,
+) -> PythonSourceSnapshot | None:
+    payload = _read_cache_payload(
+        _workspace_cache_dir(workspace_root) / SOURCE_SNAPSHOT_CACHE_NAME
+    )
+    if payload is None:
+        return None
+
+    metadata = payload.get('metadata')
+    if not isinstance(metadata, dict):
+        return None
+
+    normalized_extra_roots = sorted(str(root) for root in (extra_roots or []))
+    if (
+        metadata.get('schemaVersion') != CACHE_SCHEMA_VERSION
+        or metadata.get('workspaceRoot') != str(workspace_root)
+        or metadata.get('extraRoots') != normalized_extra_roots
+    ):
+        return None
+
+    cached_payload = payload.get('payload')
+    if not isinstance(cached_payload, dict):
+        return None
+
+    try:
+        return PythonSourceSnapshot.from_cache_dict(dict(cached_payload))
+    except (KeyError, TypeError, ValueError):
+        _unlink_quietly(
+            _workspace_cache_dir(workspace_root) / SOURCE_SNAPSHOT_CACHE_NAME
+        )
+        return None
+
+
+def save_source_snapshot(
+    workspace_root: Path,
+    source_snapshot: PythonSourceSnapshot,
+    *,
+    extra_roots: list[Path] | None = None,
+) -> None:
+    _write_cache_payload(
+        _workspace_cache_dir(workspace_root) / SOURCE_SNAPSHOT_CACHE_NAME,
+        {
+            'metadata': {
+                'schemaVersion': CACHE_SCHEMA_VERSION,
+                'workspaceRoot': str(workspace_root),
+                'rootTreeFingerprint': source_snapshot.fingerprint,
+                'extraRoots': sorted(str(root) for root in (extra_roots or [])),
+                'createdAt': datetime.now(timezone.utc).isoformat(),
+            },
+            'payload': source_snapshot.to_cache_dict(),
+        },
+    )
 
 
 def load_cached_static_index(

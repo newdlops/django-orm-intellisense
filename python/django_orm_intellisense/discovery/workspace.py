@@ -33,6 +33,23 @@ class PythonSourceEntry:
     mtime_ns: int
     fingerprint: str
 
+    def to_dict(self) -> dict[str, str | int]:
+        return {
+            'relativePath': self.relative_path,
+            'size': self.size,
+            'mtimeNs': self.mtime_ns,
+            'fingerprint': self.fingerprint,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> PythonSourceEntry:
+        return cls(
+            relative_path=str(payload['relativePath']),
+            size=int(payload['size']),
+            mtime_ns=int(payload['mtimeNs']),
+            fingerprint=str(payload['fingerprint']),
+        )
+
     @property
     def directory_path(self) -> str:
         parent = PurePosixPath(self.relative_path).parent.as_posix()
@@ -46,6 +63,48 @@ class PythonSourceSnapshot:
     entries: tuple[PythonSourceEntry, ...]
     files: tuple[Path, ...]
     directory_fingerprints: dict[str, str]
+
+    def to_cache_dict(self) -> dict[str, object]:
+        return {
+            'root': self.root,
+            'fingerprint': self.fingerprint,
+            'entries': [entry.to_dict() for entry in self.entries],
+            'directoryFingerprints': dict(self.directory_fingerprints),
+        }
+
+    @classmethod
+    def from_cache_dict(cls, payload: dict[str, object]) -> PythonSourceSnapshot:
+        root = str(payload['root'])
+        fingerprint = str(payload['fingerprint'])
+        raw_entries = payload.get('entries')
+        raw_directory_fingerprints = payload.get('directoryFingerprints')
+        if not isinstance(raw_entries, list):
+            raise ValueError('Invalid source snapshot cache payload: entries.')
+        if not isinstance(raw_directory_fingerprints, dict):
+            raise ValueError(
+                'Invalid source snapshot cache payload: directoryFingerprints.'
+            )
+
+        entries = tuple(
+            PythonSourceEntry.from_dict(dict(entry))
+            for entry in raw_entries
+            if isinstance(entry, dict)
+        )
+        root_path = Path(root)
+        files = tuple(
+            path if path.is_absolute() else root_path / path
+            for path in (Path(entry.relative_path) for entry in entries)
+        )
+        return cls(
+            root=root,
+            fingerprint=fingerprint,
+            entries=entries,
+            files=files,
+            directory_fingerprints={
+                str(directory_path): str(directory_fingerprint)
+                for directory_path, directory_fingerprint in raw_directory_fingerprints.items()
+            },
+        )
 
     @property
     def file_count(self) -> int:
