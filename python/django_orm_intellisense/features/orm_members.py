@@ -1414,6 +1414,42 @@ def _manager_assignment_metadata(
     if not isinstance(value_node, ast.Call):
         return None
 
+    if isinstance(value_node.func, ast.Call):
+        nested_call = value_node.func
+        nested_function_text = _expression_text(nested_call.func)
+        if nested_function_text.endswith('.from_queryset'):
+            manager_symbol = nested_function_text[: -len('.from_queryset')].split('.')[-1]
+            if not manager_symbol:
+                return None
+
+            manager_module, manager_class_name = _resolve_symbol_source(
+                symbol_name=manager_symbol,
+                module_name=module_index.module_name,
+                module_index=module_index,
+                static_index=static_index,
+            )
+
+            queryset_module: str | None = None
+            queryset_class_name: str | None = None
+            if nested_call.args:
+                queryset_symbol = _expression_text(nested_call.args[0]).split('.')[-1]
+                if queryset_symbol:
+                    queryset_module, queryset_class_name = _resolve_symbol_source(
+                        symbol_name=queryset_symbol,
+                        module_name=module_index.module_name,
+                        module_index=module_index,
+                        static_index=static_index,
+                    )
+
+            metadata: dict[str, object] = {
+                'managerModule': manager_module,
+                'managerClassName': manager_class_name,
+            }
+            if queryset_module and queryset_class_name:
+                metadata['querysetModule'] = queryset_module
+                metadata['querysetClassName'] = queryset_class_name
+            return metadata
+
     function_text = _expression_text(value_node.func)
     if not function_text:
         return None

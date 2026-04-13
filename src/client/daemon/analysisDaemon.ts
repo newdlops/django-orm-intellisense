@@ -71,6 +71,7 @@ type IpcRequestSource =
   | 'completion'
   | 'diagnostic'
   | 'hover'
+  | 'signature'
   | 'definition'
   | 'initialSync'
   | 'reindex'

@@ -493,6 +493,14 @@ class StaticIndex:
         if symbol in exports:
             return exports[symbol]
 
+        direct_resolution = self._resolve_direct_module_attribute(
+            module_name,
+            symbol,
+            stack=(),
+        )
+        if direct_resolution is not None:
+            return direct_resolution
+
         return ExportResolution(
             requested_module=module_name,
             symbol=symbol,
@@ -505,6 +513,99 @@ class StaticIndex:
             via_modules=[module_name],
             resolution_kind='unresolved',
         )
+
+    def _resolve_direct_module_attribute(
+        self,
+        module_name: str,
+        symbol: str,
+        stack: tuple[tuple[str, str], ...],
+    ) -> ExportResolution | None:
+        key = (module_name, symbol)
+        if key in stack:
+            return None
+
+        module = self.modules.get(module_name)
+        if module is None:
+            return None
+
+        location = module.symbol_definitions.get(symbol)
+        if symbol in module.defined_symbols:
+            return ExportResolution(
+                requested_module=module_name,
+                symbol=symbol,
+                resolved=True,
+                origin_module=module_name,
+                origin_symbol=symbol,
+                origin_file_path=location.file_path if location else module.file_path,
+                origin_line=location.line if location else 1,
+                origin_column=location.column if location else 1,
+                via_modules=[module_name],
+                resolution_kind='direct_defined',
+            )
+
+        next_stack = stack + (key,)
+        for binding in module.import_bindings:
+            if binding.is_star:
+                star_exports = self._resolve_module_exports(binding.module, stack=())
+                nested_resolution = star_exports.get(symbol)
+                if nested_resolution is not None and nested_resolution.resolved:
+                    return _prepend_module(
+                        nested_resolution,
+                        requested_module=module_name,
+                        module_name=module_name,
+                        resolution_kind='direct_star_import',
+                        symbol=symbol,
+                    )
+                continue
+
+            if binding.alias != symbol:
+                continue
+
+            if binding.symbol is None:
+                location = self.locate_symbol(binding.module, None)
+                return ExportResolution(
+                    requested_module=module_name,
+                    symbol=symbol,
+                    resolved=True,
+                    origin_module=binding.module,
+                    origin_symbol=None,
+                    origin_file_path=location.file_path if location else None,
+                    origin_line=location.line if location else None,
+                    origin_column=location.column if location else None,
+                    via_modules=[module_name, binding.module],
+                    resolution_kind='direct_module_import',
+                )
+
+            nested_resolution = self._resolve_direct_module_attribute(
+                binding.module,
+                binding.symbol,
+                next_stack,
+            )
+            if nested_resolution is not None and nested_resolution.resolved:
+                return _prepend_module(
+                    nested_resolution,
+                    requested_module=module_name,
+                    module_name=module_name,
+                    resolution_kind='direct_imported',
+                    symbol=symbol,
+                )
+
+            location = self.locate_symbol(binding.module, binding.symbol)
+            if location is not None:
+                return ExportResolution(
+                    requested_module=module_name,
+                    symbol=symbol,
+                    resolved=True,
+                    origin_module=binding.module,
+                    origin_symbol=binding.symbol,
+                    origin_file_path=location.file_path,
+                    origin_line=location.line,
+                    origin_column=location.column,
+                    via_modules=[module_name, binding.module],
+                    resolution_kind='direct_imported_fallback',
+                )
+
+        return None
 
     def resolve_module(self, module_name: str) -> ModuleResolution:
         location = self.locate_symbol(module_name, None)
@@ -745,34 +846,39 @@ class StaticIndex:
         for candidate in self.model_candidates:
             forward_fields.extend(expanded_forward_fields(candidate.label))
 
-        reverse_fields: list[FieldCandidate] = []
+        direct_reverse_fields: list[FieldCandidate] = []
         reverse_keys: set[tuple[str, str, str]] = set()
         for candidate in self._concrete_model_candidates:
             for field in expanded_forward_fields(candidate.label):
                 if not field.is_relation or field.related_model_label is None:
                     continue
 
+                reverse_related_model_label = _preferred_reverse_related_model_label(
+                    self,
+                    source_model_label=candidate.label,
+                    declared_model_label=field.declared_model_label,
+                )
                 reverse_name = field.related_name or _default_reverse_name(
                     field.field_kind,
-                    candidate.label,
+                    reverse_related_model_label,
                 )
                 if _is_hidden_related_name(reverse_name):
                     continue
 
                 reverse_query_name = _reverse_query_name(
                     field=field,
-                    source_model_label=candidate.label,
+                    source_model_label=reverse_related_model_label,
                 )
                 reverse_key = (
                     field.related_model_label,
                     reverse_name,
-                    candidate.label,
+                    reverse_related_model_label,
                 )
                 if reverse_key in reverse_keys:
                     continue
 
                 reverse_keys.add(reverse_key)
-                reverse_fields.append(
+                direct_reverse_fields.append(
                     FieldCandidate(
                         model_label=field.related_model_label,
                         name=reverse_name,
@@ -782,12 +888,68 @@ class StaticIndex:
                         field_kind=f'reverse_{field.field_kind}',
                         is_relation=True,
                         relation_direction='reverse',
-                        related_model_label=candidate.label,
+                        related_model_label=reverse_related_model_label,
                         declared_model_label=field.declared_model_label,
                         related_name=field.related_name,
                         related_query_name=reverse_query_name,
                     )
                 )
+
+        direct_reverse_fields_by_model: dict[str, list[FieldCandidate]] = {}
+        for field in direct_reverse_fields:
+            direct_reverse_fields_by_model.setdefault(field.model_label, []).append(
+                field
+            )
+
+        inherited_reverse_cache: dict[str, list[FieldCandidate]] = {}
+
+        def expanded_reverse_fields(
+            model_label: str,
+            stack: tuple[str, ...] = (),
+        ) -> list[FieldCandidate]:
+            cached = inherited_reverse_cache.get(model_label)
+            if cached is not None:
+                return cached
+
+            if model_label in stack:
+                return []
+
+            candidate = self._model_candidates_by_label.get(model_label)
+            direct_fields = list(direct_reverse_fields_by_model.get(model_label, []))
+            direct_names = {
+                field.name
+                for field in [
+                    *expanded_forward_fields(model_label),
+                    *direct_fields,
+                ]
+            }
+            inherited_fields: list[FieldCandidate] = []
+            inherited_names: set[str] = set()
+
+            if candidate is not None:
+                for base_model_label in self._resolve_model_base_labels(candidate):
+                    for base_field in expanded_reverse_fields(
+                        base_model_label,
+                        stack + (model_label,),
+                    ):
+                        if (
+                            base_field.name in direct_names
+                            or base_field.name in inherited_names
+                        ):
+                            continue
+
+                        inherited_names.add(base_field.name)
+                        inherited_fields.append(
+                            _clone_field_for_model(base_field, model_label)
+                        )
+
+            resolved_fields = direct_fields + inherited_fields
+            inherited_reverse_cache[model_label] = resolved_fields
+            return resolved_fields
+
+        reverse_fields: list[FieldCandidate] = []
+        for candidate in self.model_candidates:
+            reverse_fields.extend(expanded_reverse_fields(candidate.label))
 
         return forward_fields + reverse_fields
 
@@ -2017,6 +2179,22 @@ def _clone_field_for_model(field: FieldCandidate, model_label: str) -> FieldCand
         related_query_name=field.related_query_name,
         source=field.source,
     )
+
+
+def _preferred_reverse_related_model_label(
+    static_index: StaticIndex,
+    *,
+    source_model_label: str,
+    declared_model_label: str | None,
+) -> str:
+    if not declared_model_label or declared_model_label == source_model_label:
+        return source_model_label
+
+    declared_candidate = static_index.find_model_candidate(declared_model_label)
+    if declared_candidate is None or declared_candidate.is_abstract:
+        return source_model_label
+
+    return declared_model_label
 
 
 def _expand_model_candidates_via_imports(

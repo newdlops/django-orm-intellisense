@@ -218,6 +218,9 @@ class CaptainQuestionThreadManager(models.Manager[_CaptainThreadT]):
     def get_queryset(self) -> CaptainQuestionThreadQuerySet[_CaptainThreadT]:
         return CaptainQuestionThreadQuerySet(self.model, using=self._db)
 
+    def manager_only(self) -> CaptainQuestionThreadQuerySet[_CaptainThreadT]:
+        return self.get_queryset()
+
 
 class CaptainQuestionThreadMessageQuerySet(
     DeletedQuerySetMixin,
@@ -231,11 +234,32 @@ class CaptainQuestionThreadMessageManager(models.Manager[_CaptainMessageT]):
         return CaptainQuestionThreadMessageQuerySet(self.model, using=self._db)
 
 
+class CaptainMisleadingQuestionThreadManager(
+    models.Manager["CaptainMisleadingQuestionThread"],
+):
+    def misleading_only(self) -> "CaptainMisleadingQuestionThreadManager":
+        return self
+
+
 class CaptainCompany(models.Model):
     if TYPE_CHECKING:
         question_thread_set: 'CaptainQuestionThreadManager'
+        mismatched_question_thread_set: 'CaptainMisleadingQuestionThreadManager'
 
     name = models.CharField(max_length=255)
+
+
+class CaptainMisleadingQuestionThread(models.Model):
+    misleading_only = models.CharField(max_length=255)
+
+
+class CaptainActualQuestionThread(models.Model):
+    company = models.ForeignKey(
+        CaptainCompany,
+        related_name='mismatched_question_thread_set',
+        on_delete=models.CASCADE,
+    )
+    actual_only = models.CharField(max_length=255)
 
 
 class CaptainQuestionThread(models.Model):
@@ -267,4 +291,153 @@ class CaptainQuestionThreadMessage(models.Model):
 
     objects = CaptainQuestionThreadMessageManager.from_queryset(
         CaptainQuestionThreadMessageQuerySet
+    )()
+
+
+if TYPE_CHECKING:
+    from .captain_imported import CaptainImportedQuestionThreadManager
+
+
+class CaptainImportedCompany(  # type: ignore[django-manager-missing]
+    models.Model,
+):
+    if TYPE_CHECKING:
+        imported_question_thread_set: 'CaptainImportedQuestionThreadManager'
+
+    name = models.CharField(max_length=255)
+
+
+class RegistrationServiceQuestionThread(models.Model):
+    title = models.CharField(max_length=255)
+    help_type = models.CharField(max_length=50, default='etc_help')
+
+
+class RegistrationServiceQuestionThreadManager(
+    models.Manager["RegistrationServiceQuestionThread"],
+):
+    pass
+
+
+class CompanyQuestionThreadManager(RegistrationServiceQuestionThreadManager):
+    pass
+
+
+class InheritedManagerCompany(models.Model):
+    if TYPE_CHECKING:
+        company_question_thread_set: 'CompanyQuestionThreadManager'
+
+    name = models.CharField(max_length=255)
+
+
+class CompanyQuestionThread(RegistrationServiceQuestionThread):
+    company = models.ForeignKey(
+        InheritedManagerCompany,
+        related_name='company_question_thread_set',
+        on_delete=models.CASCADE,
+    )
+
+    objects = CompanyQuestionThreadManager()
+
+
+class CompanyQuestionThreadMessage(models.Model):
+    question_thread = models.ForeignKey(
+        RegistrationServiceQuestionThread,
+        related_name='message_set',
+        on_delete=models.CASCADE,
+    )
+    content = models.CharField(max_length=255)
+
+
+_ProxyCompanyQuestionThreadT = TypeVar(
+    '_ProxyCompanyQuestionThreadT',
+    bound='ProxyCompanyQuestionThread',
+    covariant=True,
+)
+_ProxyCompanyQuestionThreadMessageT = TypeVar(
+    '_ProxyCompanyQuestionThreadMessageT',
+    bound='ProxyCompanyQuestionThreadMessage',
+    covariant=True,
+)
+
+
+class ProxyCompanyQuestionThreadQuerySet(
+    models.QuerySet[_ProxyCompanyQuestionThreadT],
+):
+    pass
+
+
+class ProxyCompanyQuestionThreadManager(
+    models.Manager[_ProxyCompanyQuestionThreadT],
+):
+    def get_queryset(self) -> ProxyCompanyQuestionThreadQuerySet[_ProxyCompanyQuestionThreadT]:
+        return ProxyCompanyQuestionThreadQuerySet(self.model, using=self._db)
+
+
+class ProxyRegistrationServiceQuestionThreadManager(
+    models.Manager["ProxyCompanyQuestionThread"],
+):
+    def get_queryset(self) -> ProxyCompanyQuestionThreadQuerySet["ProxyCompanyQuestionThread"]:
+        return ProxyCompanyQuestionThreadQuerySet(self.model, using=self._db).filter(
+            help_type='registration_service'
+        )
+
+
+class ProxyCompany(models.Model):
+    if TYPE_CHECKING:
+        question_thread_set: 'ProxyCompanyQuestionThreadManager'
+
+    name = models.CharField(max_length=255)
+
+
+class ProxyCompanyQuestionThread(models.Model):
+    if TYPE_CHECKING:
+        message_set: 'ProxyCompanyQuestionThreadMessageManager'
+
+    company = models.ForeignKey(
+        ProxyCompany,
+        related_name='question_thread_set',
+        on_delete=models.CASCADE,
+    )
+    title = models.CharField(max_length=255)
+    help_type = models.CharField(max_length=50, default='etc_help')
+
+    objects = ProxyCompanyQuestionThreadManager.from_queryset(
+        ProxyCompanyQuestionThreadQuerySet
+    )()
+
+
+class ProxyRegistrationServiceQuestionThread(ProxyCompanyQuestionThread):
+    objects = ProxyRegistrationServiceQuestionThreadManager.from_queryset(
+        ProxyCompanyQuestionThreadQuerySet
+    )()
+
+    class Meta:
+        proxy = True
+
+
+class ProxyCompanyQuestionThreadMessageQuerySet(
+    models.QuerySet[_ProxyCompanyQuestionThreadMessageT],
+):
+    pass
+
+
+class ProxyCompanyQuestionThreadMessageManager(
+    models.Manager[_ProxyCompanyQuestionThreadMessageT],
+):
+    def get_queryset(
+        self,
+    ) -> ProxyCompanyQuestionThreadMessageQuerySet[_ProxyCompanyQuestionThreadMessageT]:
+        return ProxyCompanyQuestionThreadMessageQuerySet(self.model, using=self._db)
+
+
+class ProxyCompanyQuestionThreadMessage(models.Model):
+    question_thread = models.ForeignKey(
+        ProxyCompanyQuestionThread,
+        related_name='message_set',
+        on_delete=models.CASCADE,
+    )
+    content = models.CharField(max_length=255)
+
+    objects = ProxyCompanyQuestionThreadMessageManager.from_queryset(
+        ProxyCompanyQuestionThreadMessageQuerySet
     )()

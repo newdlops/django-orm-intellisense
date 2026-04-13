@@ -12,7 +12,7 @@ import { HealthDiagnostics } from './diagnostics/healthDiagnostics';
 import { registerPythonProviders } from './providers/pythonProviders';
 import { excludeDjangoStubsFromPylance } from './pylance/excludeDjangoStubs';
 import { normalizePythonInterpreterSettings } from './python/interpreter';
-import { isPylanceAvailable } from './python/pylance';
+import { isPylanceAvailable, PYLANCE_EXTENSION_ID } from './python/pylance';
 import { HealthStatusView } from './status/healthStatus';
 
 let activeDaemon: AnalysisDaemon | undefined;
@@ -47,6 +47,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let pythonSourceWatcher: vscode.FileSystemWatcher | undefined;
   let watchedPythonRoot: string | undefined;
   let reindexTimer: ReturnType<typeof setTimeout> | undefined;
+  const providerPromotionTimers = new Set<ReturnType<typeof setTimeout>>();
   const pendingReindexFiles = new Set<string>();
 
   const disposePythonSourceWatcher = (): void => {
@@ -169,6 +170,49 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   statusView.update(daemon.getState());
   diagnostics.update(daemon.getState());
+  let pythonProviderRegistration = vscode.Disposable.from(
+    ...registerPythonProviders(daemon)
+  );
+  let didPromoteProvidersAfterPylanceActivation = false;
+  let lastDaemonReady = daemon.isReady();
+
+  const promotePythonProviders = (reason: string): void => {
+    pythonProviderRegistration.dispose();
+    pythonProviderRegistration = vscode.Disposable.from(
+      ...registerPythonProviders(daemon)
+    );
+    output.appendLine(
+      `[extension] Re-registered Python providers (${reason}) to prioritize Django ORM hover/completion.`
+    );
+  };
+
+  const schedulePythonProviderPromotion = (
+    reason: string,
+    delayMs = 75
+  ): void => {
+    const timer = setTimeout(() => {
+      providerPromotionTimers.delete(timer);
+      promotePythonProviders(reason);
+    }, delayMs);
+    providerPromotionTimers.add(timer);
+  };
+
+  const clearProviderPromotionTimers = (): void => {
+    for (const timer of providerPromotionTimers) {
+      clearTimeout(timer);
+    }
+    providerPromotionTimers.clear();
+  };
+
+  const schedulePythonProviderPromotionBurst = (
+    reason: string,
+    delayMsList: number[]
+  ): void => {
+    clearProviderPromotionTimers();
+    for (const delayMs of delayMsList) {
+      schedulePythonProviderPromotion(reason, delayMs);
+    }
+  };
 
   context.subscriptions.push(
     output,
@@ -180,8 +224,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerConfigurePylanceDiagnosticsCommand(output),
     registerSelectSettingsModuleCommand(daemon, output),
     registerSelectPythonInterpreterCommand(daemon, output),
-    ...registerPythonProviders(daemon),
     new vscode.Disposable(() => {
+      pythonProviderRegistration.dispose();
+    }),
+    new vscode.Disposable(() => {
+      clearProviderPromotionTimers();
       if (reindexTimer) {
         clearTimeout(reindexTimer);
       }
@@ -210,8 +257,55 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void daemon.restart().catch((error) => {
         output.appendLine(`[extension] Failed to restart daemon: ${String(error)}`);
       });
+    }),
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (editor?.document.languageId !== 'python') {
+        return;
+      }
+      schedulePythonProviderPromotionBurst('active-python-editor', [
+        0,
+        150,
+        750,
+      ]);
     })
   );
+
+  const pylanceExtension = vscode.extensions.getExtension(PYLANCE_EXTENSION_ID);
+  if (pylanceExtension) {
+    void Promise.resolve(pylanceExtension.activate())
+      .then(() => {
+        if (didPromoteProvidersAfterPylanceActivation) {
+          return;
+        }
+        didPromoteProvidersAfterPylanceActivation = true;
+        schedulePythonProviderPromotionBurst('pylance-activate-promise', [
+          0,
+          250,
+          1000,
+        ]);
+      })
+      .catch((error: unknown) => {
+        output.appendLine(
+          `[extension] Failed to await Pylance activation: ${String(error)}`
+        );
+      });
+    context.subscriptions.push(
+      vscode.extensions.onDidChange(() => {
+        if (didPromoteProvidersAfterPylanceActivation) {
+          return;
+        }
+        if (!vscode.extensions.getExtension(PYLANCE_EXTENSION_ID)?.isActive) {
+          return;
+        }
+        didPromoteProvidersAfterPylanceActivation = true;
+        schedulePythonProviderPromotionBurst('pylance-activated', [
+          0,
+          250,
+          1000,
+        ]);
+      })
+    );
+  }
 
   void excludeDjangoStubsFromPylance(output).catch((error) => {
     output.appendLine(
@@ -256,6 +350,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(languageClient);
   void languageClient.start().then(() => {
     output.appendLine('[ls] Language Server started');
+    schedulePythonProviderPromotionBurst('language-client-started', [
+      0,
+      250,
+      1000,
+    ]);
     // daemon이 ready되면 surfaceIndex를 서버에 전달
     feedSurfaceIndexToServer(daemon, output);
     languageClient!.onNotification('django/fileNeedsReindex', (params: { uri: string }) => {
@@ -273,11 +372,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const settings = getExtensionSettings();
   const initialEditor = vscode.window.activeTextEditor;
+  if (initialEditor?.document.languageId === 'python') {
+    schedulePythonProviderPromotionBurst('initial-python-editor', [
+      75,
+      350,
+      1200,
+    ]);
+  }
   if (settings.autoStart && initialEditor?.document.languageId === 'python') {
     void daemon.start(initialEditor.document.uri).catch((error) => {
       output.appendLine(`[extension] Failed to start daemon: ${String(error)}`);
     });
   }
+
+  daemon.onDidChangeState(() => {
+    const isReady = daemon.isReady();
+    if (isReady && !lastDaemonReady) {
+      schedulePythonProviderPromotionBurst('daemon-ready', [
+        75,
+        350,
+        1200,
+      ]);
+    }
+    lastDaemonReady = isReady;
+  });
 }
 
 function feedSurfaceIndexToServer(

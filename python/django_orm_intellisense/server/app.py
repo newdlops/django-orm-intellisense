@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +63,9 @@ from ..semantic.graph import (
     build_semantic_graph,
 )
 from ..static_index.indexer import StaticIndex, build_static_index, reindex_single_file
+
+
+INITIAL_SYNC_SURFACE_INDEX_MODEL_LIMIT = 200
 
 
 # ---------------------------------------------------------------------------
@@ -606,52 +609,60 @@ class DaemonServer:
             f'coverage={semantic_graph.coverage_mode} '
             f'elapsed={time.perf_counter() - started_at:.2f}s'
         )
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            model_graph_future = executor.submit(
-                build_model_graph,
-                static_index,
-                runtime,
-            )
-            surface_index_future = executor.submit(
-                self._load_or_build_surface_index,
-                workspace_root,
-                source_snapshot,
-                static_index,
-                runtime,
-            )
+        health_snapshot = build_health_snapshot(
+            workspace=workspace_profile,
+            static_index=static_index,
+            runtime=runtime,
+            semantic_graph=semantic_graph,
+            initialized_at=initialized_at,
+        )
+        model_graph = build_model_graph(static_index, runtime)
+        edge_count = sum(
+            len(edges)
+            for edges in model_graph.edges_by_source_label.values()
+        )
+        _log_initialize_step(
+            'build_model_graph '
+            f'models={len(model_graph.nodes_by_label)} '
+            f'edges={edge_count} '
+            f'elapsed={time.perf_counter() - started_at:.2f}s'
+        )
 
-            health_snapshot = build_health_snapshot(
-                workspace=workspace_profile,
-                static_index=static_index,
-                runtime=runtime,
-                semantic_graph=semantic_graph,
-                initialized_at=initialized_at,
-            )
-            model_graph = model_graph_future.result()
-            edge_count = sum(
-                len(edges)
-                for edges in model_graph.edges_by_source_label.values()
-            )
-            _log_initialize_step(
-                'build_model_graph '
-                f'models={len(model_graph.nodes_by_label)} '
-                f'edges={edge_count} '
-                f'elapsed={time.perf_counter() - started_at:.2f}s'
-            )
-            if not self._apply_state(
-                generation=generation,
-                initialized_at=initialized_at,
-                source_snapshot=source_snapshot,
-                workspace_profile=workspace_profile,
-                static_index=static_index,
-                runtime=runtime,
-                model_graph=model_graph,
-                semantic_graph=semantic_graph,
-                health_snapshot=health_snapshot,
-            ):
-                return None
+        runtime_cache_fingerprint = _runtime_cache_fingerprint(runtime)
+        surface_index = load_cached_surface_index(
+            workspace_root,
+            source_fingerprint=source_snapshot.fingerprint,
+            runtime_fingerprint=runtime_cache_fingerprint,
+        )
+        surface_index_status = 'load_cached'
+        should_prebuild_surface_index = False
+        if surface_index is None:
+            if static_index.model_candidate_count <= INITIAL_SYNC_SURFACE_INDEX_MODEL_LIMIT:
+                surface_index = prebuild_member_surface_cache(static_index, runtime)
+                save_surface_index(
+                    workspace_root,
+                    source_fingerprint=source_snapshot.fingerprint,
+                    runtime_fingerprint=runtime_cache_fingerprint,
+                    surface_index=surface_index,
+                )
+                surface_index_status = 'prebuild'
+            else:
+                surface_index = {}
+                surface_index_status = 'defer_prebuild'
+                should_prebuild_surface_index = True
 
-            surface_index, surface_index_status = surface_index_future.result()
+        if not self._apply_state(
+            generation=generation,
+            initialized_at=initialized_at,
+            source_snapshot=source_snapshot,
+            workspace_profile=workspace_profile,
+            static_index=static_index,
+            runtime=runtime,
+            model_graph=model_graph,
+            semantic_graph=semantic_graph,
+            health_snapshot=health_snapshot,
+        ):
+            return None
 
         _log_initialize_step(
             f'{surface_index_status}_surface_index models={len(surface_index)} '
@@ -668,6 +679,17 @@ class DaemonServer:
         self._last_model_names = model_names
         self._last_static_fallback = static_fallback
         self._rebuild_bg_pool()
+        if should_prebuild_surface_index:
+            self._start_surface_index_prebuild(
+                generation=generation,
+                workspace_root=workspace_root,
+                source_snapshot=source_snapshot,
+                static_index=static_index,
+                runtime=runtime,
+                health_snapshot=health_snapshot,
+                model_graph=model_graph,
+                model_names=model_names,
+            )
         _log_initialize_step(
             f'complete elapsed={time.perf_counter() - started_at:.2f}s'
         )
@@ -749,30 +771,67 @@ class DaemonServer:
     def _build_model_names(self, model_graph: ModelGraph) -> list[str]:
         return sorted(model_graph.nodes_by_object_name.keys())
 
-    def _load_or_build_surface_index(
+    def _start_surface_index_prebuild(
         self,
+        *,
+        generation: int,
         workspace_root: Path,
         source_snapshot: PythonSourceSnapshot,
         static_index: StaticIndex,
         runtime: RuntimeInspection,
-    ) -> tuple[dict[str, object], str]:
-        runtime_cache_fingerprint = _runtime_cache_fingerprint(runtime)
-        cached_surface = load_cached_surface_index(
-            workspace_root,
-            source_fingerprint=source_snapshot.fingerprint,
-            runtime_fingerprint=runtime_cache_fingerprint,
-        )
-        if cached_surface is not None:
-            return cached_surface, 'load_cached'
+        health_snapshot: dict[str, Any],
+        model_graph: ModelGraph,
+        model_names: list[str],
+    ) -> None:
+        def worker() -> None:
+            started_at = time.perf_counter()
+            try:
+                surface_index = prebuild_member_surface_cache(static_index, runtime)
+                save_surface_index(
+                    workspace_root,
+                    source_fingerprint=source_snapshot.fingerprint,
+                    runtime_fingerprint=_runtime_cache_fingerprint(runtime),
+                    surface_index=surface_index,
+                )
+                static_fallback = self._build_static_fallback(
+                    model_graph=model_graph,
+                    surface_index=surface_index,
+                )
+                with self._state_lock:
+                    if generation != self._state_generation:
+                        return
+                    self._last_surface_index = surface_index
+                    self._last_model_names = model_names
+                    self._last_static_fallback = static_fallback
 
-        surface_index = prebuild_member_surface_cache(static_index, runtime)
-        save_surface_index(
-            workspace_root,
-            source_fingerprint=source_snapshot.fingerprint,
-            runtime_fingerprint=runtime_cache_fingerprint,
-            surface_index=surface_index,
-        )
-        return surface_index, 'prebuild'
+                _log_initialize_step(
+                    'prebuild_surface_index(background) '
+                    f'models={len(surface_index)} '
+                    f'elapsed={time.perf_counter() - started_at:.2f}s'
+                )
+                self._write_notification(
+                    'surfaceIndexChanged',
+                    {
+                        'health': health_snapshot,
+                        'modelNames': model_names,
+                        'surfaceIndex': surface_index,
+                        'customLookups': runtime.custom_lookups,
+                        'staticFallback': static_fallback,
+                    },
+                )
+            except Exception:
+                print(
+                    '[initialize] prebuild_surface_index(background) failed '
+                    f'{traceback.format_exc(limit=6)}',
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        threading.Thread(
+            target=worker,
+            name='surface-index-prebuild',
+            daemon=True,
+        ).start()
 
     def _start_source_snapshot_verification(
         self,

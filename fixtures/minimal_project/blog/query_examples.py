@@ -8,6 +8,8 @@ from blog.models import (
     CaptainQuestionThread,
     Faq,
     HiddenReverseTag,
+    InheritedManagerCompany,
+    ProxyCompany,
     QuestionThread,
 )
 
@@ -200,9 +202,24 @@ class CaptainCompanyQuestionServiceExamples:
             .get(id=company_question_thread_id)
         )
 
+    def create_company_question_thread(
+        self,
+        *,
+        title: str,
+        content: str,
+        help_type: str = 'etc_help',
+    ) -> "CaptainQuestionThread":
+        company_question_thread = self.company.question_thread_set.create(
+            title=title,
+            help_type=help_type,
+        )
+        company_question_thread.message_set.create(content=content)
+        return company_question_thread
+
     def method_examples(self):
         self.company.question_thread_set.create()
         self.company.question_thread_set.create(he='captain')
+        self.company.mismatched_question_thread_set.create()
         self.company.question_thread_set.filter(he='captain')
         self.company.question_thread_set.exclude(he='captain')
         self.get_company_question_thread(
@@ -214,3 +231,59 @@ class CaptainCompanyQuestionServiceExamples:
         self.get_company_question_thread(
             company_question_thread_id=1
         ).message_set.exclude(co='captain')
+
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from blog.models import CaptainImportedCompany
+
+
+class CaptainImportedCompanyQuestionServiceExamples:
+    def __init__(self, company: "CaptainImportedCompany") -> None:
+        self.company: "CaptainImportedCompany" = company
+
+    def method_examples(self):
+        self.company.imported_question_thread_set.create(he='captain_imported')
+        self.company.imported_question_thread_set.filter(he='captain_imported')
+        self.company.imported_question_thread_set.exclude(he='captain_imported')
+
+
+class InheritedManagerCompanyQuestionServiceExamples:
+    def __init__(self, company: InheritedManagerCompany) -> None:
+        self.company: "InheritedManagerCompany" = company
+
+    def create_company_question_thread(
+        self,
+        *,
+        title: str,
+        content: str,
+        help_type: str = 'etc_help',
+    ) -> "CompanyQuestionThread":
+        inherited_company_question_thread = (
+            self.company.company_question_thread_set.create(
+                title=title,
+                help_type=help_type,
+            )
+        )
+        inherited_company_question_thread.message_set.create(content=content)
+        return inherited_company_question_thread
+
+
+class ProxyManagerCompanyQuestionServiceExamples:
+    def __init__(self, company: ProxyCompany) -> None:
+        self.company: "ProxyCompany" = company
+
+    def create_company_question_thread(
+        self,
+        *,
+        title: str,
+        content: str,
+        help_type: str = 'registration_service',
+    ) -> "ProxyCompanyQuestionThread":
+        proxy_company_question_thread = self.company.question_thread_set.create(
+            title=title,
+            help_type=help_type,
+        )
+        proxy_company_question_thread.message_set.create(content=content)
+        return proxy_company_question_thread

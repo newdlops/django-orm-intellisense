@@ -2383,6 +2383,127 @@ suite('Django ORM Intellisense UI', () => {
       `Expected empty create() field completion to carry high-priority Django sortText. Received: ${customRelatedManagerEmptyCreateTitleItem?.sortText}`
     );
 
+    const customRelatedManagerMethodCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        'typed_company.question_thread_set.create()',
+        'typed_company.question_thread_set.'
+      );
+    const customRelatedManagerMethodCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        customRelatedManagerMethodCompletionPosition
+      );
+    const customRelatedManagerCreateMethodItem = findCompletionItemByLabel(
+      customRelatedManagerMethodCompletionList?.items,
+      'create'
+    );
+    const customRelatedManagerGetMethodItem = findCompletionItemByLabel(
+      customRelatedManagerMethodCompletionList?.items,
+      'get'
+    );
+
+    assert.ok(
+      customRelatedManagerCreateMethodItem,
+      'Expected related-manager method completion to surface `create` before duplicate stub items.'
+    );
+    assert.strictEqual(
+      completionItemLabelDetail(customRelatedManagerCreateMethodItem!),
+      ' -> QuestionThread',
+      `Expected related-manager create() completion to expose the inferred return model inline. Received: ${completionItemLabelDetail(
+        customRelatedManagerCreateMethodItem!
+      )}`
+    );
+    assert.strictEqual(
+      completionItemDescription(customRelatedManagerCreateMethodItem!),
+      'QuestionThread',
+      `Expected related-manager create() completion to expose the inferred model description inline. Received: ${completionItemDescription(
+        customRelatedManagerCreateMethodItem!
+      )}`
+    );
+    assert.ok(
+      (customRelatedManagerCreateMethodItem?.detail ?? '').includes(
+        'QuestionThreadManager'
+      ),
+      `Expected related-manager create() completion detail to mention the custom manager class. Received: ${customRelatedManagerCreateMethodItem?.detail}`
+    );
+    assert.ok(
+      (customRelatedManagerCreateMethodItem?.sortText ?? '').startsWith(
+        '\u0000\u0000django-'
+      ),
+      `Expected related-manager create() completion to keep high-priority Django sortText. Received: ${customRelatedManagerCreateMethodItem?.sortText}`
+    );
+
+    assert.ok(
+      customRelatedManagerGetMethodItem,
+      'Expected related-manager method completion to surface `get` before duplicate stub items.'
+    );
+    assert.strictEqual(
+      completionItemLabelDetail(customRelatedManagerGetMethodItem!),
+      ' -> QuestionThread',
+      `Expected related-manager get() completion to expose the inferred return model inline. Received: ${completionItemLabelDetail(
+        customRelatedManagerGetMethodItem!
+      )}`
+    );
+    assert.strictEqual(
+      completionItemDescription(customRelatedManagerGetMethodItem!),
+      'QuestionThread',
+      `Expected related-manager get() completion to expose the inferred model description inline. Received: ${completionItemDescription(
+        customRelatedManagerGetMethodItem!
+      )}`
+    );
+    assert.ok(
+      (customRelatedManagerGetMethodItem?.sortText ?? '').startsWith(
+        '\u0000\u0000django-'
+      ),
+      `Expected related-manager get() completion to keep high-priority Django sortText. Received: ${customRelatedManagerGetMethodItem?.sortText}`
+    );
+
+    const customRelatedManagerCreateSignaturePosition =
+      positionAfterTextInContainer(
+        document,
+        "typed_company.question_thread_set.create(ti='draft')",
+        'ti'
+      );
+    const customRelatedManagerCreateSignatureHelp =
+      await vscode.commands.executeCommand<vscode.SignatureHelp>(
+        'vscode.executeSignatureHelpProvider',
+        document.uri,
+        customRelatedManagerCreateSignaturePosition,
+        '('
+      );
+
+    assert.ok(
+      customRelatedManagerCreateSignatureHelp,
+      'Expected create() signature help to resolve for typed custom related managers.'
+    );
+    assert.ok(
+      customRelatedManagerCreateSignatureHelp!.signatures[0]?.label.includes(
+        'create(*,'
+      ),
+      `Expected create() signature help to render an ORM-aware create signature. Received: ${customRelatedManagerCreateSignatureHelp!.signatures[0]?.label}`
+    );
+    assert.ok(
+      customRelatedManagerCreateSignatureHelp!.signatures[0]?.label.includes(
+        'title: CharField'
+      ),
+      `Expected create() signature help to include the model field title. Received: ${customRelatedManagerCreateSignatureHelp!.signatures[0]?.label}`
+    );
+    assert.ok(
+      customRelatedManagerCreateSignatureHelp!.signatures[0]?.label.includes(
+        '-> QuestionThread'
+      ),
+      `Expected create() signature help to mention the created model. Received: ${customRelatedManagerCreateSignatureHelp!.signatures[0]?.label}`
+    );
+    assert.strictEqual(
+      activeSignatureParameterLabel(customRelatedManagerCreateSignatureHelp),
+      'title: CharField',
+      `Expected create() signature help to focus the inferred \`title\` parameter. Received: ${activeSignatureParameterLabel(
+        customRelatedManagerCreateSignatureHelp
+      )}`
+    );
+
     const customRelatedManagerFilterCompletionPosition = positionAfterTextInContainer(
       document,
       "typed_company.question_thread_set.filter(ti='draft')",
@@ -2649,6 +2770,34 @@ suite('Django ORM Intellisense UI', () => {
       `Expected Captain-style empty create() field completion to carry high-priority Django sortText. Received: ${captainSelfRelatedManagerEmptyCreateHelpTypeItem?.sortText}`
     );
 
+    const captainMismatchedAnnotationEmptyCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        'self.company.mismatched_question_thread_set.create()',
+        'create('
+      );
+    const captainMismatchedAnnotationEmptyCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainMismatchedAnnotationEmptyCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        captainMismatchedAnnotationEmptyCreateCompletionList?.items,
+        'actual_only'
+      ),
+      'Expected reverse relation target fields to win over a mismatched TYPE_CHECKING manager annotation.'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(
+        captainMismatchedAnnotationEmptyCreateCompletionList?.items,
+        'misleading_only'
+      ),
+      'Expected mismatched TYPE_CHECKING manager annotation fields not to drive create() field completion.'
+    );
+
     const captainSelfRelatedManagerFilterCompletionPosition =
       positionAfterTextInContainer(
         document,
@@ -2689,6 +2838,133 @@ suite('Django ORM Intellisense UI', () => {
         'help_type'
       ),
       'Expected Captain-style self.company reverse related-manager exclude() field completion to include `help_type`.'
+    );
+
+    const captainSelfRelatedManagerMemberCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.question_thread_set.create(he='captain')",
+        'question_thread_set.'
+      );
+    const captainSelfRelatedManagerMemberCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainSelfRelatedManagerMemberCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        captainSelfRelatedManagerMemberCompletionList?.items,
+        'manager_only'
+      ),
+      'Expected self.company reverse related-manager completion to include custom manager methods from the TYPE_CHECKING annotation.'
+    );
+    const captainSelfRelatedManagerCreateMethodItem = findCompletionItemByLabel(
+      captainSelfRelatedManagerMemberCompletionList?.items,
+      'create'
+    );
+    const captainSelfRelatedManagerGetMethodItem = findCompletionItemByLabel(
+      captainSelfRelatedManagerMemberCompletionList?.items,
+      'get'
+    );
+
+    assert.strictEqual(
+      completionItemLabelDetail(captainSelfRelatedManagerCreateMethodItem!),
+      ' -> CaptainQuestionThread',
+      `Expected self.company reverse related-manager create() completion to expose the inferred return model inline. Received: ${completionItemLabelDetail(
+        captainSelfRelatedManagerCreateMethodItem!
+      )}`
+    );
+    assert.strictEqual(
+      completionItemDescription(captainSelfRelatedManagerCreateMethodItem!),
+      'CaptainQuestionThread',
+      `Expected self.company reverse related-manager create() completion to expose the inferred model description inline. Received: ${completionItemDescription(
+        captainSelfRelatedManagerCreateMethodItem!
+      )}`
+    );
+    assert.ok(
+      (captainSelfRelatedManagerCreateMethodItem?.detail ?? '').includes(
+        'CaptainQuestionThreadManager'
+      ),
+      `Expected self.company reverse related-manager create() completion detail to mention the custom manager class. Received: ${captainSelfRelatedManagerCreateMethodItem?.detail}`
+    );
+    assert.strictEqual(
+      completionItemLabelDetail(captainSelfRelatedManagerGetMethodItem!),
+      ' -> CaptainQuestionThread',
+      `Expected self.company reverse related-manager get() completion to expose the inferred return model inline. Received: ${completionItemLabelDetail(
+        captainSelfRelatedManagerGetMethodItem!
+      )}`
+    );
+    assert.strictEqual(
+      completionItemDescription(captainSelfRelatedManagerGetMethodItem!),
+      'CaptainQuestionThread',
+      `Expected self.company reverse related-manager get() completion to expose the inferred model description inline. Received: ${completionItemDescription(
+        captainSelfRelatedManagerGetMethodItem!
+      )}`
+    );
+
+    const captainMismatchedManagerCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        'self.company.mismatched_question_thread_set.create()',
+        'mismatched_question_thread_set.'
+      );
+    const captainMismatchedManagerCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainMismatchedManagerCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        captainMismatchedManagerCompletionList?.items,
+        'misleading_only'
+      ),
+      'Expected annotation-only reverse related-manager completion to include custom manager methods even when they are not on the model default manager.'
+    );
+
+    const captainImportedRelatedManagerCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.imported_question_thread_set.create(he='captain_imported')",
+        'he'
+      );
+    const captainImportedRelatedManagerCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainImportedRelatedManagerCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        captainImportedRelatedManagerCreateCompletionList?.items,
+        'help_type'
+      ),
+      'Expected Captain-style imported TYPE_CHECKING manager create() field completion to include `help_type`.'
+    );
+
+    const captainImportedRelatedManagerMemberCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.imported_question_thread_set.create(he='captain_imported')",
+        'imported_question_thread_set.'
+      );
+    const captainImportedRelatedManagerMemberCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainImportedRelatedManagerMemberCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        captainImportedRelatedManagerMemberCompletionList?.items,
+        'manager_only'
+      ),
+      'Expected imported TYPE_CHECKING manager completion to resolve the manager class even when it is excluded from `__all__`.'
     );
 
     const captainMessageCreateCompletionPosition = positionAfterTextInContainer(
@@ -2746,6 +3022,208 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hasCompletionItemLabel(captainMessageExcludeCompletionList?.items, 'content'),
       'Expected Captain-style returned thread message_set exclude() field completion to include `content`.'
+    );
+
+    const captainAssignedMessageCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "company_question_thread.message_set.create(content=content)",
+        'content'
+      );
+    const captainAssignedMessageCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainAssignedMessageCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        captainAssignedMessageCreateCompletionList?.items,
+        'content'
+      ),
+      'Expected Captain-style create()-assigned variable message_set create() field completion to include `content`.'
+    );
+
+    const captainAssignedVariableCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "company_question_thread.message_set.create(content=content)",
+        'company_question_thread.'
+      );
+    const captainAssignedVariableCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainAssignedVariableCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        captainAssignedVariableCompletionList?.items,
+        'message_set'
+      ),
+      'Expected Captain-style create()-assigned variable member completion to include `message_set`.'
+    );
+
+    const inheritedManagerAssignedMessageCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "inherited_company_question_thread.message_set.create(content=content)",
+        'content'
+      );
+    const inheritedManagerAssignedMessageCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        inheritedManagerAssignedMessageCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        inheritedManagerAssignedMessageCreateCompletionList?.items,
+        'content'
+      ),
+      'Expected inherited-manager create()-assigned variable message_set create() field completion to include `content`.'
+    );
+
+    const inheritedManagerAssignedVariableCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "inherited_company_question_thread.message_set.create(content=content)",
+        'inherited_company_question_thread.'
+      );
+    const inheritedManagerAssignedVariableCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        inheritedManagerAssignedVariableCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        inheritedManagerAssignedVariableCompletionList?.items,
+        'message_set'
+      ),
+      'Expected inherited-manager create()-assigned variable member completion to include `message_set`.'
+    );
+
+    const proxyManagerAssignedMessageCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "proxy_company_question_thread.message_set.create(content=content)",
+        'content'
+      );
+    const proxyManagerAssignedMessageCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        proxyManagerAssignedMessageCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        proxyManagerAssignedMessageCreateCompletionList?.items,
+        'content'
+      ),
+      'Expected proxy-style create()-assigned variable message_set create() field completion to include `content`.'
+    );
+
+    const proxyManagerAssignedVariableCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "proxy_company_question_thread.message_set.create(content=content)",
+        'proxy_company_question_thread.'
+      );
+    const proxyManagerAssignedVariableCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        proxyManagerAssignedVariableCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        proxyManagerAssignedVariableCompletionList?.items,
+        'message_set'
+      ),
+      'Expected proxy-style create()-assigned variable member completion to include `message_set`.'
+    );
+
+    const captainCustomRelatedManagerCreateSignatureHelpPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.question_thread_set.create(he='captain')",
+        'he'
+      );
+    const captainCustomRelatedManagerCreateSignatureHelp =
+      await vscode.commands.executeCommand<vscode.SignatureHelp>(
+        'vscode.executeSignatureHelpProvider',
+        document.uri,
+        captainCustomRelatedManagerCreateSignatureHelpPosition,
+        '('
+      );
+
+    assert.ok(
+      captainCustomRelatedManagerCreateSignatureHelp?.signatures?.length,
+      'Expected Captain-style custom related-manager create() signature help.'
+    );
+    assert.ok(
+      captainCustomRelatedManagerCreateSignatureHelp!.signatures[0]?.label.includes(
+        'help_type: CharField'
+      ),
+      `Expected Captain-style create() signature help to mention the inferred \`help_type\` field. Received: ${captainCustomRelatedManagerCreateSignatureHelp!.signatures[0]?.label}`
+    );
+    assert.ok(
+      captainCustomRelatedManagerCreateSignatureHelp!.signatures[0]?.label.includes(
+        '-> CaptainQuestionThread'
+      ),
+      `Expected Captain-style create() signature help to mention the created model. Received: ${captainCustomRelatedManagerCreateSignatureHelp!.signatures[0]?.label}`
+    );
+    assert.strictEqual(
+      activeSignatureParameterLabel(captainCustomRelatedManagerCreateSignatureHelp),
+      'help_type: CharField',
+      `Expected Captain-style create() signature help to focus the inferred \`help_type\` parameter. Received: ${activeSignatureParameterLabel(
+        captainCustomRelatedManagerCreateSignatureHelp
+      )}`
+    );
+
+    const captainCustomRelatedManagerFilterSignatureHelpPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.question_thread_set.filter(he='captain')",
+        'he'
+      );
+    const captainCustomRelatedManagerFilterSignatureHelp =
+      await vscode.commands.executeCommand<vscode.SignatureHelp>(
+        'vscode.executeSignatureHelpProvider',
+        document.uri,
+        captainCustomRelatedManagerFilterSignatureHelpPosition,
+        '('
+      );
+
+    assert.ok(
+      captainCustomRelatedManagerFilterSignatureHelp?.signatures?.length,
+      'Expected Captain-style custom related-manager filter() signature help.'
+    );
+    assert.ok(
+      captainCustomRelatedManagerFilterSignatureHelp!.signatures[0]?.label.includes(
+        'filter(*,'
+      ),
+      `Expected Captain-style filter() signature help to render an ORM-aware filter signature. Received: ${captainCustomRelatedManagerFilterSignatureHelp!.signatures[0]?.label}`
+    );
+    assert.ok(
+      captainCustomRelatedManagerFilterSignatureHelp!.signatures[0]?.label.includes(
+        'help_type: CharField'
+      ),
+      `Expected Captain-style filter() signature help to mention the inferred \`help_type\` field. Received: ${captainCustomRelatedManagerFilterSignatureHelp!.signatures[0]?.label}`
+    );
+    assert.strictEqual(
+      activeSignatureParameterLabel(captainCustomRelatedManagerFilterSignatureHelp),
+      'help_type: CharField',
+      `Expected Captain-style filter() signature help to focus the inferred \`help_type\` parameter. Received: ${activeSignatureParameterLabel(
+        captainCustomRelatedManagerFilterSignatureHelp
+      )}`
     );
 
     const multilineInitSelfCreatePosition = positionAfterTextInContainer(
@@ -3477,14 +3955,14 @@ suite('Django ORM Intellisense UI', () => {
       'name'
     );
     assert.strictEqual(
-      completionItemDisplayLabel(auditLogNameCompletionItem!),
-      'name (CharField)',
-      'Expected inherited-instance field completion to show the Django field kind inline in the suggestion label.'
+      completionItemLabelDetail(auditLogNameCompletionItem!),
+      ' (CharField)',
+      'Expected inherited-instance field completion to show the Django field kind inline in the suggestion list.'
     );
     assert.strictEqual(
       completionItemDescription(auditLogNameCompletionItem!),
-      'Django model',
-      'Expected inherited-instance field completion to be marked as a Django model suggestion.'
+      'AuditLog',
+      'Expected inherited-instance field completion to show the inferred Django model inline in the suggestion list.'
     );
 
     const multiInheritedCompletionPosition = positionAfterTextInContainer(
@@ -3508,6 +3986,387 @@ suite('Django ORM Intellisense UI', () => {
       `Expected MultiInheritedLog direct fields to come before inherited fields. Received: ${multiInheritedLabels
         .slice(0, 8)
         .join(', ')}`
+    );
+  });
+
+  test('shows hover for self and annotated self attributes as instances', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const selfHoverPosition = positionInsideText(
+      document,
+      "self.company.question_thread_set.create(ti='draft')",
+      'self'
+    );
+    const selfHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      selfHoverPosition
+    );
+    const selfHoverText = stringifyHovers(selfHovers);
+
+    assert.ok(
+      selfHoverText.includes('**self**: `CompanyQuestionServiceExamples` instance'),
+      `Expected self hover to resolve the enclosing service instance. Received: ${selfHoverText}`
+    );
+    assert.ok(
+      selfHoverText.includes('Resolved symbol: `blog.query_examples.CompanyQuestionServiceExamples`'),
+      `Expected self hover to mention the enclosing class symbol. Received: ${selfHoverText}`
+    );
+    assert.ok(
+      selfHoverText.includes('Class category: `general`'),
+      `Expected self hover to mark the enclosing class as general. Received: ${selfHoverText}`
+    );
+
+    const selfCompanyHoverPosition = positionInsideText(
+      document,
+      "self.company.question_thread_set.create(ti='draft')",
+      'company'
+    );
+    const selfCompanyHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        selfCompanyHoverPosition
+      );
+    const selfCompanyHoverText = stringifyHovers(selfCompanyHovers);
+    const leadingSelfCompanyHoverText = stringifyHovers(
+      selfCompanyHovers?.slice(0, 2)
+    );
+
+    assert.ok(
+      selfCompanyHoverText.includes('**self.company**: `Company` instance'),
+      `Expected self.company hover to resolve the annotated attribute receiver. Received: ${selfCompanyHoverText}`
+    );
+    assert.ok(
+      selfCompanyHoverText.includes('Model: `blog.Company`'),
+      `Expected self.company hover to mention the resolved Django model label. Received: ${selfCompanyHoverText}`
+    );
+    assert.ok(
+      selfCompanyHoverText.includes('Resolved symbol: `blog.models.Company`'),
+      `Expected self.company hover to mention the resolved Django class symbol. Received: ${selfCompanyHoverText}`
+    );
+    assert.ok(
+      selfCompanyHoverText.includes('Class category: `django`'),
+      `Expected self.company hover to mark the resolved class as django. Received: ${selfCompanyHoverText}`
+    );
+    assert.ok(
+      leadingSelfCompanyHoverText.includes('**self.company**: `Company` instance'),
+      `Expected the Django ORM extension hover to appear among the leading hover cards. Leading hovers: ${leadingSelfCompanyHoverText}`
+    );
+
+    const customRelatedManagerHoverPosition = positionInsideText(
+      document,
+      "typed_company.question_thread_set.create(ti='draft')",
+      'question_thread_set'
+    );
+    const customRelatedManagerHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        customRelatedManagerHoverPosition
+      );
+    const customRelatedManagerHoverText = stringifyHovers(
+      customRelatedManagerHovers
+    );
+
+    assert.ok(
+      customRelatedManagerHoverText.includes(
+        'Member kind: `reverse_relation`'
+      ),
+      `Expected custom related-manager hover to keep the reverse relation member context. Received: ${customRelatedManagerHoverText}`
+    );
+    assert.ok(
+      customRelatedManagerHoverText.includes(
+        'Return annotation: `QuestionThreadManager[QuestionThread]`'
+      ),
+      `Expected custom related-manager hover to mention the custom manager annotation. Received: ${customRelatedManagerHoverText}`
+    );
+    assert.ok(
+      customRelatedManagerHoverText.includes(
+        'Resolved return symbol: `blog.models.QuestionThreadManager`'
+      ),
+      `Expected custom related-manager hover to mention the manager class symbol. Received: ${customRelatedManagerHoverText}`
+    );
+    assert.ok(
+      customRelatedManagerHoverText.includes(
+        'Return annotation model: `blog.QuestionThread`'
+      ),
+      `Expected custom related-manager hover to mention the managed model from the annotation. Received: ${customRelatedManagerHoverText}`
+    );
+    assert.ok(
+      customRelatedManagerHoverText.includes('Return class kind: `manager`'),
+      `Expected custom related-manager hover to mark the manager class kind. Received: ${customRelatedManagerHoverText}`
+    );
+
+    const selfCustomRelatedManagerHoverPosition = positionInsideText(
+      document,
+      "self.company.question_thread_set.create(he='captain')",
+      'question_thread_set'
+    );
+    const selfCustomRelatedManagerHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        selfCustomRelatedManagerHoverPosition
+      );
+    const selfCustomRelatedManagerHoverText = stringifyHovers(
+      selfCustomRelatedManagerHovers
+    );
+
+    assert.ok(
+      selfCustomRelatedManagerHoverText.includes(
+        'Return annotation: `CaptainQuestionThreadManager`'
+      ),
+      `Expected self.company related-manager hover to mention the TYPE_CHECKING manager annotation. Received: ${selfCustomRelatedManagerHoverText}`
+    );
+    assert.ok(
+      selfCustomRelatedManagerHoverText.includes(
+        'Resolved return symbol: `blog.models.CaptainQuestionThreadManager`'
+      ),
+      `Expected self.company related-manager hover to mention the custom manager class. Received: ${selfCustomRelatedManagerHoverText}`
+    );
+    assert.ok(
+      selfCustomRelatedManagerHoverText.includes('Return class kind: `manager`'),
+      `Expected self.company related-manager hover to mark the custom manager class kind. Received: ${selfCustomRelatedManagerHoverText}`
+    );
+
+    const selfImportedRelatedManagerHoverPosition = positionInsideText(
+      document,
+      "self.company.imported_question_thread_set.create(he='captain_imported')",
+      'imported_question_thread_set'
+    );
+    const selfImportedRelatedManagerHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        selfImportedRelatedManagerHoverPosition
+      );
+    const selfImportedRelatedManagerHoverText = stringifyHovers(
+      selfImportedRelatedManagerHovers
+    );
+
+    assert.ok(
+      selfImportedRelatedManagerHoverText.includes(
+        'Return annotation: `CaptainImportedQuestionThreadManager`'
+      ),
+      `Expected imported related-manager hover to mention the TYPE_CHECKING manager annotation. Received: ${selfImportedRelatedManagerHoverText}`
+    );
+    assert.ok(
+      selfImportedRelatedManagerHoverText.includes(
+        'Resolved return symbol: `blog.captain_imported.CaptainImportedQuestionThreadManager`'
+      ),
+      `Expected imported related-manager hover to resolve a manager excluded from __all__. Received: ${selfImportedRelatedManagerHoverText}`
+    );
+    assert.ok(
+      selfImportedRelatedManagerHoverText.includes('Return class kind: `manager`'),
+      `Expected imported related-manager hover to mark the custom manager class kind. Received: ${selfImportedRelatedManagerHoverText}`
+    );
+
+    const assignedThreadHoverPosition = positionInsideText(
+      document,
+      "company_question_thread.message_set.create(con='multiline')",
+      'company_question_thread'
+    );
+    const assignedThreadHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        assignedThreadHoverPosition
+      );
+    const assignedThreadHoverText = stringifyHovers(assignedThreadHovers);
+    const leadingAssignedThreadHoverText = stringifyHovers(
+      assignedThreadHovers?.slice(0, 2)
+    );
+
+    assert.ok(
+      assignedThreadHoverText.includes(
+        '**company_question_thread**: `QuestionThread` instance'
+      ),
+      `Expected create()-assigned variable hover to resolve the created model instance. Received: ${assignedThreadHoverText}`
+    );
+    assert.ok(
+      assignedThreadHoverText.includes('Model: `blog.QuestionThread`'),
+      `Expected create()-assigned variable hover to mention the created model label. Received: ${assignedThreadHoverText}`
+    );
+    assert.ok(
+      leadingAssignedThreadHoverText.includes(
+        '**company_question_thread**: `QuestionThread` instance'
+      ),
+      `Expected the Django ORM extension hover to appear among the leading cards for create()-assigned variables. Leading hovers: ${leadingAssignedThreadHoverText}`
+    );
+
+    const captainAssignedThreadHoverPosition = positionInsideText(
+      document,
+      'return company_question_thread',
+      'company_question_thread'
+    );
+    const captainAssignedThreadHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        captainAssignedThreadHoverPosition
+      );
+    const captainAssignedThreadHoverText = stringifyHovers(
+      captainAssignedThreadHovers
+    );
+    const leadingCaptainAssignedThreadHoverText = stringifyHovers(
+      captainAssignedThreadHovers?.slice(0, 2)
+    );
+
+    assert.ok(
+      captainAssignedThreadHoverText.includes(
+        '**company_question_thread**: `CaptainQuestionThread` instance'
+      ),
+      `Expected Captain-style create()-assigned variable hover to resolve the created model instance. Received: ${captainAssignedThreadHoverText}`
+    );
+    assert.ok(
+      captainAssignedThreadHoverText.includes('Model: `blog.CaptainQuestionThread`'),
+      `Expected Captain-style create()-assigned variable hover to mention the created model label. Received: ${captainAssignedThreadHoverText}`
+    );
+    assert.ok(
+      leadingCaptainAssignedThreadHoverText.includes(
+        '**company_question_thread**: `CaptainQuestionThread` instance'
+      ),
+      `Expected the Django ORM extension hover to appear among the leading cards for Captain-style create()-assigned variables. Leading hovers: ${leadingCaptainAssignedThreadHoverText}`
+    );
+
+    const inheritedManagerAssignedThreadHoverPosition = positionInsideText(
+      document,
+      'return inherited_company_question_thread',
+      'inherited_company_question_thread'
+    );
+    const inheritedManagerAssignedThreadHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        inheritedManagerAssignedThreadHoverPosition
+      );
+    const inheritedManagerAssignedThreadHoverText = stringifyHovers(
+      inheritedManagerAssignedThreadHovers
+    );
+
+    assert.ok(
+      inheritedManagerAssignedThreadHoverText.includes(
+        '**inherited_company_question_thread**: `CompanyQuestionThread` instance'
+      ),
+      `Expected inherited-manager create()-assigned variable hover to resolve the concrete model instance instead of the generic base manager model. Received: ${inheritedManagerAssignedThreadHoverText}`
+    );
+    assert.ok(
+      inheritedManagerAssignedThreadHoverText.includes(
+        'Model: `blog.CompanyQuestionThread`'
+      ),
+      `Expected inherited-manager create()-assigned variable hover to mention the concrete related model label. Received: ${inheritedManagerAssignedThreadHoverText}`
+    );
+
+    const proxyManagerAssignedThreadHoverPosition = positionInsideText(
+      document,
+      'return proxy_company_question_thread',
+      'proxy_company_question_thread'
+    );
+    const proxyManagerAssignedThreadHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        proxyManagerAssignedThreadHoverPosition
+      );
+    const proxyManagerAssignedThreadHoverText = stringifyHovers(
+      proxyManagerAssignedThreadHovers
+    );
+
+    assert.ok(
+      proxyManagerAssignedThreadHoverText.includes(
+        '**proxy_company_question_thread**: `ProxyCompanyQuestionThread` instance'
+      ),
+      `Expected proxy-style create()-assigned variable hover to resolve the concrete related model instance instead of the proxy subclass. Received: ${proxyManagerAssignedThreadHoverText}`
+    );
+    assert.ok(
+      proxyManagerAssignedThreadHoverText.includes(
+        'Model: `blog.ProxyCompanyQuestionThread`'
+      ),
+      `Expected proxy-style create()-assigned variable hover to mention the concrete related model label. Received: ${proxyManagerAssignedThreadHoverText}`
+    );
+
+    const createMethodHoverPosition = positionInsideText(
+      document,
+      "typed_company.question_thread_set.create(ti='draft')",
+      'create'
+    );
+    const createMethodHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        createMethodHoverPosition
+      );
+    const createMethodHoverText = stringifyHovers(createMethodHovers);
+    const leadingCreateMethodHoverText = stringifyHovers(
+      createMethodHovers?.slice(0, 2)
+    );
+    const firstCreateMethodHoverText = stringifyHovers(
+      createMethodHovers?.slice(0, 1)
+    );
+
+    assert.ok(
+      createMethodHoverText.includes('**create**'),
+      `Expected create() hover to include the ORM member entry. Received: ${createMethodHoverText}`
+    );
+    assert.ok(
+      createMethodHoverText.includes('Receiver kind: `manager`'),
+      `Expected create() hover to resolve against the explicit manager annotation receiver. Received: ${createMethodHoverText}`
+    );
+    assert.ok(
+      createMethodHoverText.includes(
+        'Receiver class: `blog.models.QuestionThreadManager`'
+      ),
+      `Expected create() hover to mention the custom manager class. Received: ${createMethodHoverText}`
+    );
+    assert.ok(
+      createMethodHoverText.includes('Return model: `blog.QuestionThread`'),
+      `Expected create() hover to mention the created model. Received: ${createMethodHoverText}`
+    );
+    assert.ok(
+      leadingCreateMethodHoverText.includes('**create**'),
+      `Expected the Django ORM extension hover to appear among the leading cards for create(). Leading hovers: ${leadingCreateMethodHoverText}`
+    );
+    assert.ok(
+      firstCreateMethodHoverText.includes('**create**'),
+      `Expected the Django ORM extension hover to be the first hover card for create(). First hover: ${firstCreateMethodHoverText}`
+    );
+
+    const filterMethodHoverPosition = positionInsideText(
+      document,
+      "typed_company.question_thread_set.filter(ti='draft')",
+      'filter'
+    );
+    const filterMethodHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        filterMethodHoverPosition
+      );
+    const filterMethodHoverText = stringifyHovers(filterMethodHovers);
+    const firstFilterMethodHoverText = stringifyHovers(
+      filterMethodHovers?.slice(0, 1)
+    );
+
+    assert.ok(
+      filterMethodHoverText.includes('**filter**'),
+      `Expected filter() hover to include the ORM member entry. Received: ${filterMethodHoverText}`
+    );
+    assert.ok(
+      filterMethodHoverText.includes('Return model: `blog.QuestionThread`'),
+      `Expected filter() hover to mention the related queryset model. Received: ${filterMethodHoverText}`
+    );
+    assert.ok(
+      firstFilterMethodHoverText.includes('**filter**'),
+      `Expected the Django ORM extension hover to be the first hover card for filter(). First hover: ${firstFilterMethodHoverText}`
     );
   });
 
@@ -4601,14 +5460,21 @@ suite('Django ORM Intellisense UI', () => {
 
     assert.ok(
       (relatedManagerCreateCompletionItem?.sortText ?? '').startsWith(
-        '\u0000django-'
+        '\u0000\u0000django-'
       ),
       `Expected reverse related manager create() completion to carry high-priority Django sortText. Received: ${relatedManagerCreateCompletionItem?.sortText}`
     );
     assert.strictEqual(
+      completionItemLabelDetail(relatedManagerCreateCompletionItem!),
+      ' -> FulfillmentDetail',
+      `Expected reverse related manager create() completion to expose the inferred return model inline. Received: ${completionItemLabelDetail(
+        relatedManagerCreateCompletionItem!
+      )}`
+    );
+    assert.strictEqual(
       completionItemDescription(relatedManagerCreateCompletionItem!),
-      'Django',
-      `Expected reverse related manager create() completion to expose a Django description and avoid duplicate-label merging. Received: ${completionItemDescription(relatedManagerCreateCompletionItem!)}`
+      'FulfillmentDetail',
+      `Expected reverse related manager create() completion to expose the inferred model description and avoid duplicate-label merging. Received: ${completionItemDescription(relatedManagerCreateCompletionItem!)}`
     );
 
 
@@ -4843,6 +5709,28 @@ suite('Django ORM Intellisense UI', () => {
         .slice(0, 20)
         .join(', ')}`
     );
+    const contentCompletionItem = findCompletionItemByLabel(
+      functionAttributeCompletionList?.items,
+      'content'
+    );
+    assert.ok(
+      contentCompletionItem,
+      'Expected to resolve the general-class attribute completion item for `content`.'
+    );
+    assert.strictEqual(
+      completionItemLabelDetail(contentCompletionItem!),
+      ' (str)',
+      `Expected general-class attribute completion to expose the annotated type inline. Received: ${completionItemLabelDetail(
+        contentCompletionItem!
+      )}`
+    );
+    assert.strictEqual(
+      completionItemDescription(contentCompletionItem!),
+      'QuestionThreadMessage',
+      `Expected general-class attribute completion to expose the owner class inline. Received: ${completionItemDescription(
+        contentCompletionItem!
+      )}`
+    );
 
     const functionMethodCompletionPosition = positionAfterTextInContainer(
       document,
@@ -4859,6 +5747,28 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hasCompletionItemLabel(functionMethodCompletionList?.items, 'render_preview'),
       'Expected string general-class return annotations to propagate instance methods.'
+    );
+    const renderPreviewCompletionItem = findCompletionItemByLabel(
+      functionMethodCompletionList?.items,
+      'render_preview'
+    );
+    assert.ok(
+      renderPreviewCompletionItem,
+      'Expected to resolve the general-class method completion item for `render_preview`.'
+    );
+    assert.strictEqual(
+      completionItemLabelDetail(renderPreviewCompletionItem!),
+      ' -> str',
+      `Expected general-class method completion to expose the return annotation inline. Received: ${completionItemLabelDetail(
+        renderPreviewCompletionItem!
+      )}`
+    );
+    assert.strictEqual(
+      completionItemDescription(renderPreviewCompletionItem!),
+      'QuestionThreadMessage',
+      `Expected general-class method completion to expose the owner class inline. Received: ${completionItemDescription(
+        renderPreviewCompletionItem!
+      )}`
     );
 
     const methodAttributeCompletionPosition = positionAfterTextInContainer(
@@ -5247,9 +6157,14 @@ suite('Django ORM Intellisense UI', () => {
       'has_active_category'
     );
     assert.strictEqual(
-      completionItemDisplayLabel(existsItem!),
-      'has_active_category (BooleanField)',
-      'Expected Exists() annotated instance completions to expose a BooleanField kind inline.'
+      completionItemLabelDetail(existsItem!),
+      ' (BooleanField)',
+      'Expected Exists() annotated instance completions to expose a BooleanField kind inline in the suggestion list.'
+    );
+    assert.strictEqual(
+      completionItemDescription(existsItem!),
+      'Product',
+      'Expected Exists() annotated instance completions to expose the inferred receiver model inline in the suggestion list.'
     );
 
     const diagnostics = await waitForDiagnostics(
@@ -6768,14 +7683,14 @@ suite('Django ORM Intellisense UI', () => {
       'Expected partial completion inside the class-method if-clause to keep `fd` typed as FulfillmentDetail.'
     );
     assert.strictEqual(
-      completionItemDisplayLabel(detailCodeCompletionItem!),
-      'detail_code (CharField)',
-      'Expected the `if fd.de` completion probe to expose the FulfillmentDetail field kind inline.'
+      completionItemLabelDetail(detailCodeCompletionItem!),
+      ' (CharField)',
+      'Expected the `if fd.de` completion probe to expose the FulfillmentDetail field kind inline in the suggestion list.'
     );
     assert.strictEqual(
       completionItemDescription(detailCodeCompletionItem!),
-      'Django model',
-      'Expected the `if fd.de` completion probe to stay on Django model instance completion.'
+      'FulfillmentDetail',
+      'Expected the `if fd.de` completion probe to expose the inferred receiver model inline in the suggestion list.'
     );
     assert.ok(
       !hasCompletionItemLabel(methodReceiverProbeList?.items, 'reference'),
@@ -6805,14 +7720,14 @@ suite('Django ORM Intellisense UI', () => {
       'Expected partial completion after `if fd.fulfillment.` to switch to the Fulfillment receiver.'
     );
     assert.strictEqual(
-      completionItemDisplayLabel(referenceCompletionItem!),
-      'reference (CharField)',
-      'Expected the `if fd.fulfillment.re` completion probe to expose Fulfillment field kinds inline.'
+      completionItemLabelDetail(referenceCompletionItem!),
+      ' (CharField)',
+      'Expected the `if fd.fulfillment.re` completion probe to expose Fulfillment field kinds inline in the suggestion list.'
     );
     assert.strictEqual(
       completionItemDescription(referenceCompletionItem!),
-      'Django model',
-      'Expected the `if fd.fulfillment.re` completion probe to stay on Django model instance completion.'
+      'Fulfillment',
+      'Expected the `if fd.fulfillment.re` completion probe to expose the inferred receiver model inline in the suggestion list.'
     );
     assert.ok(
       !hasCompletionItemLabel(methodRelationProbeList?.items, 'detail_code'),
@@ -7193,6 +8108,40 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       djangoImportHoverText.includes('Class category: `django`'),
       `Expected imported django class hover to mark Product as django. Received: ${djangoImportHoverText}`
+    );
+
+    const typedManagerHoverPosition = positionInsideText(
+      queryExamplesDocument,
+      "typed_generic_catalog_manager.create(na='draft')",
+      'typed_generic_catalog_manager'
+    );
+    const typedManagerHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        queryExamplesDocument.uri,
+        typedManagerHoverPosition
+      );
+    const typedManagerHoverText = stringifyHovers(typedManagerHovers);
+
+    assert.ok(
+      typedManagerHoverText.includes(
+        '**typed_generic_catalog_manager**: `CatalogManager` manager'
+      ),
+      `Expected typed generic manager hover to resolve the custom manager receiver. Received: ${typedManagerHoverText}`
+    );
+    assert.ok(
+      typedManagerHoverText.includes('Model: `sales.Product`'),
+      `Expected typed generic manager hover to mention the managed model. Received: ${typedManagerHoverText}`
+    );
+    assert.ok(
+      typedManagerHoverText.includes(
+        'Resolved symbol: `sales.managers.CatalogManager`'
+      ),
+      `Expected typed generic manager hover to mention the manager class symbol. Received: ${typedManagerHoverText}`
+    );
+    assert.ok(
+      typedManagerHoverText.includes('Class kind: `manager`'),
+      `Expected typed generic manager hover to mark the receiver as a manager class. Received: ${typedManagerHoverText}`
     );
 
     const servicesDocument = await openFixtureDocument(
@@ -8486,6 +9435,32 @@ function stringifyHovers(hovers: vscode.Hover[] | undefined): string {
       })
     )
     .join('\n');
+}
+
+function activeSignatureParameterLabel(
+  signatureHelp: vscode.SignatureHelp | undefined
+): string | undefined {
+  if (!signatureHelp) {
+    return undefined;
+  }
+
+  const signature =
+    signatureHelp.signatures[signatureHelp.activeSignature ?? 0] ??
+    signatureHelp.signatures[0];
+  if (!signature) {
+    return undefined;
+  }
+
+  const parameter =
+    signature.parameters[signatureHelp.activeParameter ?? 0] ??
+    signature.parameters[0];
+  if (!parameter) {
+    return undefined;
+  }
+
+  return Array.isArray(parameter.label)
+    ? signature.label.slice(parameter.label[0], parameter.label[1])
+    : parameter.label;
 }
 
 function firstDefinition(
