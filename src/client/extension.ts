@@ -175,8 +175,39 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   let didPromoteProvidersAfterPylanceActivation = false;
   let lastDaemonReady = daemon.isReady();
+  let lastAppliedActivePythonProviderFingerprint: string | undefined;
 
-  const promotePythonProviders = (reason: string): void => {
+  const currentActivePythonProviderFingerprint = (): string | undefined => {
+    const activeDocument = vscode.window.activeTextEditor?.document;
+    if (
+      activeDocument?.languageId !== 'python' ||
+      activeDocument.uri.scheme !== 'file'
+    ) {
+      return undefined;
+    }
+    return activeDocument.uri.toString();
+  };
+
+  const promotePythonProviders = (
+    reason: string,
+    expectedActivePythonProviderFingerprint?: string
+  ): void => {
+    if (expectedActivePythonProviderFingerprint) {
+      const currentFingerprint = currentActivePythonProviderFingerprint();
+      if (
+        !currentFingerprint ||
+        currentFingerprint !== expectedActivePythonProviderFingerprint ||
+        lastAppliedActivePythonProviderFingerprint ===
+          expectedActivePythonProviderFingerprint
+      ) {
+        return;
+      }
+      lastAppliedActivePythonProviderFingerprint =
+        expectedActivePythonProviderFingerprint;
+    } else {
+      lastAppliedActivePythonProviderFingerprint = undefined;
+    }
+
     pythonProviderRegistration.dispose();
     pythonProviderRegistration = vscode.Disposable.from(
       ...registerPythonProviders(daemon)
@@ -188,11 +219,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const schedulePythonProviderPromotion = (
     reason: string,
-    delayMs = 75
+    delayMs = 75,
+    expectedActivePythonProviderFingerprint?: string
   ): void => {
     const timer = setTimeout(() => {
       providerPromotionTimers.delete(timer);
-      promotePythonProviders(reason);
+      promotePythonProviders(reason, expectedActivePythonProviderFingerprint);
     }, delayMs);
     providerPromotionTimers.add(timer);
   };
@@ -206,11 +238,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const schedulePythonProviderPromotionBurst = (
     reason: string,
-    delayMsList: number[]
+    delayMsList: number[],
+    expectedActivePythonProviderFingerprint?: string
   ): void => {
     clearProviderPromotionTimers();
     for (const delayMs of delayMsList) {
-      schedulePythonProviderPromotion(reason, delayMs);
+      schedulePythonProviderPromotion(
+        reason,
+        delayMs,
+        expectedActivePythonProviderFingerprint
+      );
     }
   };
 
@@ -262,11 +299,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (editor?.document.languageId !== 'python') {
         return;
       }
+      const activePythonProviderFingerprint = editor.document.uri.toString();
       schedulePythonProviderPromotionBurst('active-python-editor', [
         0,
         150,
         750,
-      ]);
+      ], activePythonProviderFingerprint);
     })
   );
 

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 import re
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -18,6 +20,7 @@ class _MemberSurfaceCache:
     static_index/runtime 인스턴스가 바뀌면 자동 무효화."""
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self._owner: tuple[int, int] = (0, 0)
         self._list_cache: dict[
             tuple[str, str, str | None], list[OrmMemberItem]
@@ -45,13 +48,15 @@ class _MemberSurfaceCache:
         receiver_kind: str,
         manager_name: str | None,
     ) -> list[OrmMemberItem]:
-        self._check_owner(static_index, runtime)
         key = (model_label, receiver_kind, manager_name)
-        cached = self._list_cache.get(key)
-        if cached is not None:
-            self._hits += 1
-            return cached
-        self._misses += 1
+        with self._lock:
+            self._check_owner(static_index, runtime)
+            cached = self._list_cache.get(key)
+            if cached is not None:
+                self._hits += 1
+                return cached
+            self._misses += 1
+
         surface = _member_surface(
             static_index=static_index,
             runtime=runtime,
@@ -59,18 +64,25 @@ class _MemberSurfaceCache:
             receiver_kind=receiver_kind,
             manager_name=manager_name,
         )
-        self._list_cache[key] = surface
-        self._dict_cache[key] = {item.name: item for item in surface}
-        return surface
+        with self._lock:
+            self._check_owner(static_index, runtime)
+            cached = self._list_cache.get(key)
+            if cached is not None:
+                self._hits += 1
+                return cached
+            self._list_cache[key] = surface
+            self._dict_cache[key] = {item.name: item for item in surface}
+            return surface
 
     def invalidate_model(self, model_label: str) -> None:
         """Invalidate cache entries for a specific model label."""
-        keys_to_remove = [
-            key for key in self._list_cache if key[0] == model_label
-        ]
-        for key in keys_to_remove:
-            self._list_cache.pop(key, None)
-            self._dict_cache.pop(key, None)
+        with self._lock:
+            keys_to_remove = [
+                key for key in self._list_cache if key[0] == model_label
+            ]
+            for key in keys_to_remove:
+                self._list_cache.pop(key, None)
+                self._dict_cache.pop(key, None)
 
     def force_owner(
         self, static_index: StaticIndex, runtime: RuntimeInspection
@@ -80,7 +92,8 @@ class _MemberSurfaceCache:
         Used when static_index is replaced but most cache entries are still
         valid (e.g. single-file reindex).
         """
-        self._owner = (id(static_index), id(runtime))
+        with self._lock:
+            self._owner = (id(static_index), id(runtime))
 
     def find(
         self,
@@ -91,20 +104,26 @@ class _MemberSurfaceCache:
         name: str,
         manager_name: str | None,
     ) -> OrmMemberItem | None:
-        self._check_owner(static_index, runtime)
         key = (model_label, receiver_kind, manager_name)
-        name_dict = self._dict_cache.get(key)
-        if name_dict is not None:
-            self._hits += 1
-            return name_dict.get(name)
-        self._misses += 1
+        with self._lock:
+            self._check_owner(static_index, runtime)
+            name_dict = self._dict_cache.get(key)
+            if name_dict is not None:
+                self._hits += 1
+                return name_dict.get(name)
+            self._misses += 1
+
         self.get_list(
             static_index, runtime, model_label, receiver_kind, manager_name
         )
-        return self._dict_cache[key].get(name)
+        with self._lock:
+            return self._dict_cache[key].get(name)
 
 
 _surface_cache = _MemberSurfaceCache()
+_workspace_files_cache_lock = threading.RLock()
+_workspace_files_cache_owner = 0
+_workspace_files_cache_value: set[str] | None = None
 
 BUILTIN_QUERYSET_METHODS: dict[str, tuple[str, str]] = {
     'all': ('Django queryset method', 'queryset'),
@@ -397,6 +416,20 @@ def resolve_orm_member(
     if not normalized_name:
         return {'resolved': False, 'reason': 'empty'}
 
+    direct_item = _direct_resolve_member_item(
+        static_index=static_index,
+        runtime=runtime,
+        model_label=model_label,
+        receiver_kind=receiver_kind,
+        name=normalized_name,
+        manager_name=manager_name,
+    )
+    if direct_item is not None:
+        return {
+            'resolved': True,
+            'item': direct_item.to_dict(),
+        }
+
     item = _surface_cache.find(
         static_index, runtime, model_label, receiver_kind,
         normalized_name, manager_name,
@@ -411,6 +444,99 @@ def resolve_orm_member(
         'resolved': True,
         'item': item.to_dict(),
     }
+
+
+def _direct_resolve_member_item(
+    *,
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+    model_label: str,
+    receiver_kind: str,
+    name: str,
+    manager_name: str | None,
+) -> OrmMemberItem | None:
+    if receiver_kind == 'instance':
+        field = static_index.find_field(model_label, name)
+        if field is not None:
+            return _field_member_item(field)
+
+        for item in _static_model_method_items(
+            static_index=static_index,
+            model_label=model_label,
+            receiver_kind='instance',
+        ):
+            if item.name == name:
+                return item
+        return None
+
+    if receiver_kind == 'model_class':
+        for item in _manager_name_items(static_index, runtime, model_label):
+            if item.name == name:
+                return item
+        for item in _static_model_method_items(
+            static_index=static_index,
+            model_label=model_label,
+            receiver_kind='model_class',
+        ):
+            if item.name == name:
+                return item
+        return None
+
+    if receiver_kind in {'manager', 'related_manager'}:
+        builtin = BUILTIN_MANAGER_METHODS.get(name)
+        if builtin is not None:
+            detail, return_kind = builtin
+            return OrmMemberItem(
+                name=name,
+                member_kind='method',
+                model_label=model_label,
+                receiver_kind=receiver_kind,
+                detail=detail,
+                source='builtin',
+                return_kind=return_kind,
+                return_model_label=(
+                    model_label if return_kind in {'instance', 'manager', 'queryset'} else None
+                ),
+                manager_name=manager_name,
+            )
+
+        for item in _static_manager_method_items(
+            static_index=static_index,
+            model_label=model_label,
+            manager_name=manager_name,
+        ):
+            if item.name == name:
+                return item
+        return None
+
+    if receiver_kind == 'queryset':
+        builtin = BUILTIN_QUERYSET_METHODS.get(name)
+        if builtin is not None:
+            detail, return_kind = builtin
+            return OrmMemberItem(
+                name=name,
+                member_kind='method',
+                model_label=model_label,
+                receiver_kind='queryset',
+                detail=detail,
+                source='builtin',
+                return_kind=return_kind,
+                return_model_label=(
+                    model_label if return_kind in {'instance', 'manager', 'queryset'} else None
+                ),
+                manager_name=manager_name,
+            )
+
+        for item in _static_queryset_method_items(
+            static_index=static_index,
+            model_label=model_label,
+            manager_name=manager_name,
+        ):
+            if item.name == name:
+                return item
+        return None
+
+    return None
 
 
 def _member_surface(
@@ -1334,10 +1460,20 @@ def _queryset_class_reference_from_manager(
 
 
 def _workspace_files(static_index: StaticIndex) -> set[str]:
-    return {
+    global _workspace_files_cache_owner, _workspace_files_cache_value
+    owner = id(static_index)
+    with _workspace_files_cache_lock:
+        if owner == _workspace_files_cache_owner and _workspace_files_cache_value is not None:
+            return _workspace_files_cache_value
+
+    files = {
         str(Path(module.file_path).resolve())
         for module in static_index.modules.values()
     }
+    with _workspace_files_cache_lock:
+        _workspace_files_cache_owner = owner
+        _workspace_files_cache_value = files
+    return files
 
 
 def _manager_names(
@@ -1553,6 +1689,19 @@ def _model_label_for_runtime_model(model_class: type[object]) -> str | None:
 
 
 def _parse_class_node(file_path: str, class_name: str) -> ast.ClassDef | None:
+    try:
+        mtime_ns = os.stat(file_path).st_mtime_ns
+    except OSError:
+        return None
+    return _parse_class_node_cached(file_path, class_name, mtime_ns)
+
+
+@lru_cache(maxsize=8192)
+def _parse_class_node_cached(
+    file_path: str,
+    class_name: str,
+    mtime_ns: int,
+) -> ast.ClassDef | None:
     try:
         parsed_module = ast.parse(Path(file_path).read_text(encoding='utf-8'))
     except (OSError, SyntaxError, UnicodeDecodeError):

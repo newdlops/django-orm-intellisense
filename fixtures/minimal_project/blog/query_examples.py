@@ -232,6 +232,20 @@ class CaptainCompanyQuestionServiceExamples:
             company_question_thread_id=1
         ).message_set.exclude(co='captain')
 
+    def update_company_question_thread(
+        self, *, company_question_thread_id: int, content: str
+    ) -> "CaptainQuestionThreadMessage":
+        company_question_thread = (
+            self.company.question_thread_set.get_queryset()
+            .exclude_deleted()
+            .get(id=company_question_thread_id)
+        )
+        company_question_thread.save(update_fields=["updated_at"])
+        message = company_question_thread.message_set.create(
+            content=content
+        )
+        return message
+
 
 from typing import TYPE_CHECKING
 

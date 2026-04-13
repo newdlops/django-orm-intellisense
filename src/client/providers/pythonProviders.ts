@@ -1513,13 +1513,35 @@ export function registerPythonProviders(
             return cancelledCompletionResult(token);
           }
           if (memberContext) {
+            const classSource =
+              memberContext.receiver.classSource ??
+              (memberContext.receiver.kind === 'instance'
+                ? await resolveClassDefinitionForExpression(
+                    daemon,
+                    document,
+                    memberContext.receiverExpression,
+                    document.offsetAt(position),
+                    new Set()
+                  )
+                : undefined);
+            const canUseLocalOrmMemberCompletions =
+              memberContext.receiver.kind !== 'instance' ||
+              (
+                !memberContext.prefix.trim() &&
+                (
+                  Boolean(memberContext.receiver.classSource) ||
+                  memberContext.receiverExpression.includes('.')
+                )
+              );
             const result =
-              daemon.listOrmMemberCompletionsLocal(
-                memberContext.receiver.modelLabel,
-                memberContext.receiver.kind,
-                memberContext.prefix,
-                memberContext.receiver.managerName
-              ) ??
+              (canUseLocalOrmMemberCompletions
+                ? daemon.listOrmMemberCompletionsLocal(
+                    memberContext.receiver.modelLabel,
+                    memberContext.receiver.kind,
+                    memberContext.prefix,
+                    memberContext.receiver.managerName
+                  )
+                : undefined) ??
               await daemon.listOrmMemberCompletions(
                 memberContext.receiver.modelLabel,
                 memberContext.receiver.kind,
@@ -1533,9 +1555,14 @@ export function registerPythonProviders(
               result.items,
               memberContext.receiver
             );
-            const sortedItems = prioritizeOrmMemberCompletionItems(
-              mergedItems,
+            const sortedItems = prioritizeDirectClassInstanceMemberItems(
+              prioritizeOrmMemberCompletionItems(
+                mergedItems,
+                memberContext.receiver,
+                memberContext.prefix
+              ),
               memberContext.receiver,
+              classSource,
               memberContext.prefix
             );
             const completions = sortedItems.map((item, index) => {
@@ -1569,19 +1596,24 @@ export function registerPythonProviders(
               return completion;
             });
 
-            const classSource = memberContext.receiver.classSource;
             if (!classSource) {
               return completions;
             }
 
-            const existingNames = new Set(sortedItems.map((item) => item.name));
+            const existingItemsByName = new Map(
+              sortedItems.map((item, index) => [item.name, { item, index }])
+            );
             const classItems = await listClassInstanceMemberItems(
               daemon,
               classSource
             );
             for (const [index, item] of classItems.entries()) {
+              const existing = existingItemsByName.get(item.name);
+              const shouldOverrideExisting =
+                item.kind === 'property' &&
+                existing?.item.memberKind !== 'property';
               if (
-                existingNames.has(item.name) ||
+                (!shouldOverrideExisting && existing) ||
                 (memberContext.prefix &&
                   !item.name.startsWith(memberContext.prefix))
               ) {
@@ -1606,6 +1638,10 @@ export function registerPythonProviders(
                 classSource,
                 item
               );
+              if (shouldOverrideExisting && existing) {
+                completions[existing.index] = completion;
+                continue;
+              }
               completions.push(completion);
             }
 
@@ -2746,6 +2782,54 @@ function prioritizeOrmMemberCompletionItems(
       }
 
       return left.item.name.localeCompare(right.item.name);
+    })
+    .map((entry) => entry.item);
+}
+
+function prioritizeDirectClassInstanceMemberItems(
+  items: OrmMemberItem[],
+  receiver: OrmReceiverInfo,
+  classSource: ClassDefinitionSource | undefined,
+  prefix = ''
+): OrmMemberItem[] {
+  if (receiver.kind !== 'instance' || !classSource || prefix.trim()) {
+    return items;
+  }
+
+  const directMemberRank = new Map<string, number>();
+  for (const [index, item] of directClassInstanceMemberItems(classSource).entries()) {
+    if (item.kind === 'method') {
+      continue;
+    }
+    if (!directMemberRank.has(item.name)) {
+      directMemberRank.set(item.name, index);
+    }
+  }
+
+  if (directMemberRank.size === 0) {
+    return items;
+  }
+
+  return [...items]
+    .map((item, index) => ({
+      item,
+      index,
+      directRank: directMemberRank.get(item.name),
+    }))
+    .sort((left, right) => {
+      if (left.directRank != null || right.directRank != null) {
+        if (left.directRank == null) {
+          return 1;
+        }
+        if (right.directRank == null) {
+          return -1;
+        }
+        if (left.directRank !== right.directRank) {
+          return left.directRank - right.directRank;
+        }
+      }
+
+      return left.index - right.index;
     })
     .map((entry) => entry.item);
 }
@@ -7087,57 +7171,15 @@ async function resolveOrmReceiverFromCallExpression(
     return undefined;
   }
 
-  // Fast path: try to resolve the full chain locally via surfaceIndex
-  const chain = collectOrmMemberChain(expression);
-  if (chain) {
-    const hasUnsafe = chain.members.some(
-      (m) => m === 'annotate' || m === 'alias'
-    );
-    const STANDARD_ORM_CHAIN_METHODS = new Set([
-      'objects', 'all', 'filter', 'exclude', 'get', 'aggregate',
-      'update', 'create', 'get_or_create', 'update_or_create',
-      'values', 'values_list', 'order_by', 'only', 'defer',
-      'select_related', 'prefetch_related', 'distinct', 'reverse',
-      'none', 'union', 'intersection', 'difference', 'using',
-      'first', 'last', 'earliest', 'latest', 'count', 'exists',
-      'bulk_create', 'bulk_update', 'in_bulk', 'iterator',
-      'delete', 'dates', 'datetimes', 'raw',
-    ]);
-    const allStandard = chain.members.every((m) => STANDARD_ORM_CHAIN_METHODS.has(m));
-    if (!hasUnsafe && allStandard) {
-      const baseLabel = daemon.modelLabelByName.get(chain.base);
-      if (baseLabel) {
-        const localResult = daemon.resolveOrmMemberChainLocal(
-          baseLabel,
-          'model_class',
-          chain.members
-        );
-        if (localResult.resolved && localResult.modelLabel && localResult.receiverKind) {
-          if (isOrmReceiverKind(localResult.receiverKind)) {
-            return {
-              kind: localResult.receiverKind,
-              modelLabel: localResult.modelLabel,
-              managerName: localResult.managerName,
-            };
-          }
-        }
-        // Fall back to daemon IPC if local resolution failed
-        const ipcResult = await daemon.resolveOrmMemberChain(
-          baseLabel,
-          'model_class',
-          chain.members
-        );
-        if (ipcResult.resolved && ipcResult.modelLabel && ipcResult.receiverKind) {
-          if (isOrmReceiverKind(ipcResult.receiverKind)) {
-            return {
-              kind: ipcResult.receiverKind,
-              modelLabel: ipcResult.modelLabel,
-              managerName: ipcResult.managerName,
-            };
-          }
-        }
-      }
-    }
+  const chainedReceiver = await resolveOrmReceiverFromCallChain(
+    daemon,
+    document,
+    expression,
+    beforeOffset,
+    visited
+  );
+  if (chainedReceiver) {
+    return chainedReceiver;
   }
 
   if (parsedCall.kind === 'function') {
@@ -7258,6 +7300,148 @@ async function resolveOrmReceiverFromCallExpression(
     parsedCall.memberName,
     visited
   );
+}
+
+async function resolveOrmReceiverFromCallChain(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  expression: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  const chain = collectOrmMemberChain(expression);
+  if (!chain) {
+    return undefined;
+  }
+
+  const hasUnsafe = chain.members.some(
+    (member) => member === 'annotate' || member === 'alias'
+  );
+  if (hasUnsafe) {
+    return undefined;
+  }
+
+  const SAFE_CHAIN_METHODS = new Set([
+    'objects',
+    'all',
+    'filter',
+    'exclude',
+    'get',
+    'aggregate',
+    'update',
+    'create',
+    'get_or_create',
+    'update_or_create',
+    'values',
+    'values_list',
+    'order_by',
+    'only',
+    'defer',
+    'select_related',
+    'prefetch_related',
+    'distinct',
+    'reverse',
+    'none',
+    'union',
+    'intersection',
+    'difference',
+    'using',
+    'first',
+    'last',
+    'earliest',
+    'latest',
+    'count',
+    'exists',
+    'bulk_create',
+    'bulk_update',
+    'in_bulk',
+    'iterator',
+    'delete',
+    'dates',
+    'datetimes',
+    'raw',
+    'get_queryset',
+    'exclude_deleted',
+  ]);
+  if (chain.members.some((member) => !SAFE_CHAIN_METHODS.has(member))) {
+    return undefined;
+  }
+
+  let baseReceiver: OrmReceiverInfo | undefined;
+  if (/^[A-Za-z_][\w]*$/.test(chain.baseExpression)) {
+    const baseLabel = daemon.modelLabelByName.get(chain.baseExpression);
+    if (baseLabel) {
+      baseReceiver = {
+        kind: 'model_class',
+        modelLabel: baseLabel,
+      };
+    }
+  }
+
+  if (!baseReceiver) {
+    const dynamicBaseReceiver = await resolveDynamicInstanceReceiverAtOffset(
+      daemon,
+      document,
+      chain.baseExpression,
+      beforeOffset,
+      new Set(visited)
+    );
+    const staticBaseReceiver = await resolveOrmReceiverAtOffset(
+      daemon,
+      document,
+      chain.baseExpression,
+      beforeOffset,
+      new Set(visited)
+    );
+    baseReceiver = preferMemberReceiver(
+      staticBaseReceiver,
+      dynamicBaseReceiver
+    );
+  }
+
+  if (!baseReceiver) {
+    return undefined;
+  }
+
+  const localResult = daemon.resolveOrmMemberChainLocal(
+    baseReceiver.modelLabel,
+    baseReceiver.kind,
+    chain.members,
+    baseReceiver.managerName
+  );
+  if (
+    localResult.resolved &&
+    localResult.modelLabel &&
+    localResult.receiverKind &&
+    isOrmReceiverKind(localResult.receiverKind)
+  ) {
+    return {
+      kind: localResult.receiverKind,
+      modelLabel: localResult.modelLabel,
+      managerName: localResult.managerName,
+    };
+  }
+
+  const ipcResult = await daemon.resolveOrmMemberChain(
+    baseReceiver.modelLabel,
+    baseReceiver.kind,
+    chain.members,
+    baseReceiver.managerName
+  );
+  if (
+    ipcResult.resolved &&
+    ipcResult.modelLabel &&
+    ipcResult.receiverKind &&
+    isOrmReceiverKind(ipcResult.receiverKind)
+  ) {
+    return {
+      kind: ipcResult.receiverKind,
+      modelLabel: ipcResult.modelLabel,
+      managerName: ipcResult.managerName,
+    };
+  }
+
+  return undefined;
 }
 
 async function resolveOrmReceiverFromFunctionSource(
@@ -8331,6 +8515,17 @@ async function resolveModelLabelFromCallExpression(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<string | undefined> {
+  const chainedReceiver = await resolveOrmReceiverFromCallChain(
+    daemon,
+    document,
+    expression,
+    beforeOffset,
+    visited
+  );
+  if (chainedReceiver) {
+    return chainedReceiver.modelLabel;
+  }
+
   const parsedCall = parseCalledExpression(expression);
   if (!parsedCall) {
     return undefined;
@@ -8388,6 +8583,48 @@ async function resolveModelLabelFromCallExpression(
       visited,
       new Set()
     );
+  }
+
+  const objectReceiver = await resolveOrmReceiverAtOffset(
+    daemon,
+    document,
+    parsedCall.objectExpression,
+    beforeOffset,
+    new Set(visited)
+  );
+  if (objectReceiver) {
+    const localResolution = daemon.resolveOrmMemberLocal(
+      objectReceiver.modelLabel,
+      objectReceiver.kind,
+      parsedCall.memberName
+    );
+    if (localResolution) {
+      const localReceiver = receiverFromOrmMemberResolution(
+        localResolution,
+        objectReceiver,
+        parsedCall.memberName,
+        expression
+      );
+      if (localReceiver) {
+        return localReceiver.modelLabel;
+      }
+    }
+
+    const resolution = await daemon.resolveOrmMember(
+      objectReceiver.modelLabel,
+      objectReceiver.kind,
+      parsedCall.memberName,
+      objectReceiver.managerName
+    );
+    const resolvedReceiver = receiverFromOrmMemberResolution(
+      resolution,
+      objectReceiver,
+      parsedCall.memberName,
+      expression
+    );
+    if (resolvedReceiver) {
+      return resolvedReceiver.modelLabel;
+    }
   }
 
   const objectResolvedLabel = await resolveBaseModelLabelForReceiverAtOffset(
@@ -10284,7 +10521,7 @@ function parseCalledExpression(expression: string): ParsedCallExpression | undef
 
 function collectOrmMemberChain(
   expression: string
-): { base: string; members: string[] } | undefined {
+): { baseExpression: string; members: string[] } | undefined {
   const members: string[] = [];
   let current = expression;
 
@@ -10307,13 +10544,12 @@ function collectOrmMemberChain(
     return undefined;
   }
 
-  // current should be a simple identifier (the model class name)
-  const base = current.trim();
-  if (!/^[A-Za-z_][\w]*$/.test(base)) {
+  const baseExpression = current.trim();
+  if (!baseExpression) {
     return undefined;
   }
 
-  return { base, members };
+  return { baseExpression, members };
 }
 
 function parseCallExpressionDetails(

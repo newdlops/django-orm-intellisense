@@ -635,8 +635,15 @@ export class AnalysisDaemon implements vscode.Disposable {
     prefix: string,
     managerName?: string
   ): OrmMemberCompletionsResult | undefined {
-    if (receiverKind === 'instance' || receiverKind === 'scalar' || receiverKind === 'unknown') {
+    if (receiverKind === 'scalar' || receiverKind === 'unknown') {
       return undefined;
+    }
+
+    if (receiverKind === 'instance') {
+      if (prefix.trim()) {
+        return undefined;
+      }
+      return this.listLocalInstanceOrmMemberCompletions(modelLabel, prefix);
     }
 
     const modelEntry = this.surfaceIndex[modelLabel];
@@ -691,6 +698,96 @@ export class AnalysisDaemon implements vscode.Disposable {
       receiverKind,
       modelLabel,
       managerName,
+    };
+  }
+
+  private listLocalInstanceOrmMemberCompletions(
+    modelLabel: string,
+    prefix: string,
+  ): OrmMemberCompletionsResult | undefined {
+    const model = this.localWorkspaceIndex.models.get(modelLabel);
+    if (!model) {
+      return undefined;
+    }
+
+    const normalizedPrefix = prefix.trim();
+    const itemsByName = new Map<string, OrmMemberItem>();
+    const addItem = (item: OrmMemberItem) => {
+      if (normalizedPrefix && !item.name.startsWith(normalizedPrefix)) {
+        return;
+      }
+      itemsByName.set(item.name, item);
+    };
+
+    for (const field of model.fields.values()) {
+      if (this.isHiddenLookupFieldName(field.name)) {
+        continue;
+      }
+
+      const relation =
+        model.relations.get(field.name) ?? model.reverseRelations.get(field.name);
+      const isReverseRelation = relation?.direction === 'reverse';
+      const isForwardRelation = relation?.direction === 'forward' || (
+        !relation && field.isRelation
+      );
+      let memberKind = 'field';
+      let returnKind: string | undefined = 'scalar';
+      let returnModelLabel: string | undefined;
+
+      if (isReverseRelation) {
+        memberKind = 'reverse_relation';
+        returnKind = 'related_manager';
+        returnModelLabel = relation?.targetModelLabel || undefined;
+      } else if (isForwardRelation) {
+        memberKind = 'relation';
+        returnKind =
+          field.fieldKind === 'ManyToManyField' ? 'related_manager' : 'instance';
+        returnModelLabel = relation?.targetModelLabel || undefined;
+      }
+
+      addItem({
+        name: field.name,
+        memberKind,
+        modelLabel,
+        receiverKind: 'instance',
+        detail: field.fieldKind,
+        source: 'local',
+        fieldKind: field.fieldKind,
+        isRelation: field.isRelation,
+        returnKind,
+        returnModelLabel,
+      });
+    }
+
+    const instanceEntry = this.surfaceIndex[modelLabel]?.instance;
+    if (instanceEntry) {
+      for (const [name, [returnKind, returnModelLabel]] of Object.entries(instanceEntry)) {
+        if (itemsByName.has(name)) {
+          continue;
+        }
+
+        addItem({
+          name,
+          memberKind: returnKind === 'manager' ? 'manager' : 'method',
+          modelLabel,
+          receiverKind: 'instance',
+          detail:
+            returnKind === 'manager'
+              ? 'Django manager'
+              : 'Django model instance method',
+          source: 'local',
+          isRelation: false,
+          returnKind,
+          returnModelLabel: returnModelLabel || undefined,
+        });
+      }
+    }
+
+    return {
+      resolved: true,
+      items: [...itemsByName.values()],
+      receiverKind: 'instance',
+      modelLabel,
     };
   }
 

@@ -3066,6 +3066,52 @@ suite('Django ORM Intellisense UI', () => {
       'Expected Captain-style create()-assigned variable member completion to include `message_set`.'
     );
 
+    const captainGetAssignedMessageCreateCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        `message = company_question_thread.message_set.create(
+            content=content
+        )`,
+        'content'
+      );
+    const captainGetAssignedMessageCreateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainGetAssignedMessageCreateCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        captainGetAssignedMessageCreateCompletionList?.items,
+        'content'
+      ),
+      'Expected Captain-style get()-assigned variable message_set create() field completion to include `content`.'
+    );
+
+    const captainGetAssignedVariableCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        `message = company_question_thread.message_set.create(
+            content=content
+        )`,
+        'company_question_thread.'
+      );
+    const captainGetAssignedVariableCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        captainGetAssignedVariableCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        captainGetAssignedVariableCompletionList?.items,
+        'message_set'
+      ),
+      'Expected Captain-style get()-assigned variable member completion to include `message_set`.'
+    );
+
     const inheritedManagerAssignedMessageCreateCompletionPosition =
       positionAfterTextInContainer(
         document,

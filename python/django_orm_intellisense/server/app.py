@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -238,7 +238,30 @@ class DaemonServer:
         # Save real stdout before any redirect so background process
         # callbacks always write to the correct fd.
         self._real_stdout = sys.stdout
+        sys.stdout = sys.stderr
         self._bg_pool: ProcessPoolExecutor | None = None
+        self._bg_pool_capacity = 0
+        self._fallback_bg_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix='fallback-bg',
+        )
+        self._bg_metrics_lock = threading.Lock()
+        self._bg_metrics: dict[str, dict[str, int]] = {
+            'pool': {
+                'submitted': 0,
+                'completed': 0,
+                'failed': 0,
+                'inflight': 0,
+                'peak': 0,
+            },
+            'fallback': {
+                'submitted': 0,
+                'completed': 0,
+                'failed': 0,
+                'inflight': 0,
+                'peak': 0,
+            },
+        }
         self._last_surface_index: dict[str, object] | None = None
         self._last_model_names: list[str] | None = None
         self._last_static_fallback: dict[str, dict[str, list[str]]] | None = None
@@ -262,9 +285,14 @@ class DaemonServer:
                 )
                 continue
 
-            if request.get('background') and self._bg_pool is not None:
-                # Background requests → separate OS processes (no GIL).
-                self._submit_bg(request)
+            if request.get('background'):
+                if self._bg_pool is not None:
+                    # Background requests → separate OS processes (no GIL).
+                    self._submit_bg(request)
+                else:
+                    # Keep foreground hover/completion responsive when process
+                    # pools are unavailable (e.g. OS semaphore/disk limits).
+                    self._submit_fallback_bg(request)
             else:
                 # Foreground (hover, completion, initialize, reindexFile)
                 # → main thread for immediate response.
@@ -272,6 +300,7 @@ class DaemonServer:
 
         if self._bg_pool is not None:
             self._bg_pool.shutdown(wait=False)
+        self._fallback_bg_pool.shutdown(wait=False)
 
     # ------------------------------------------------------------------
     # Background process pool
@@ -293,6 +322,7 @@ class DaemonServer:
             mg = self.model_graph
 
         if si is None or rt is None or mg is None:
+            self._bg_pool_capacity = 0
             return
 
         worker_count = min(os.cpu_count() or 4, 8)
@@ -302,6 +332,7 @@ class DaemonServer:
                 initializer=_init_bg_worker,
                 initargs=(si, rt, mg),
             )
+            self._bg_pool_capacity = worker_count
             print(
                 f'[pool] ProcessPoolExecutor created workers={worker_count}',
                 file=sys.stderr, flush=True,
@@ -309,10 +340,122 @@ class DaemonServer:
         except Exception as exc:  # pragma: no cover — pickle/fork failure
             print(
                 f'[pool] ProcessPoolExecutor failed ({exc}), '
-                f'background requests will run on main thread',
+                f'background requests will run on fallback thread',
                 file=sys.stderr, flush=True,
             )
             self._bg_pool = None
+            self._bg_pool_capacity = 0
+
+    def _bg_capacity(self, worker_kind: str) -> int:
+        if worker_kind == 'pool':
+            return self._bg_pool_capacity
+        if worker_kind == 'fallback':
+            return 1
+        return 0
+
+    def _record_bg_submit(
+        self,
+        worker_kind: str,
+        request_id: Any,
+        method: Any,
+        source: Any,
+    ) -> None:
+        with self._bg_metrics_lock:
+            stats = self._bg_metrics[worker_kind]
+            stats['submitted'] += 1
+            stats['inflight'] += 1
+            stats['peak'] = max(stats['peak'], stats['inflight'])
+            inflight = stats['inflight']
+            submitted = stats['submitted']
+            completed = stats['completed']
+            failed = stats['failed']
+            peak = stats['peak']
+            capacity = self._bg_capacity(worker_kind)
+            total_inflight = sum(
+                worker_stats['inflight']
+                for worker_stats in self._bg_metrics.values()
+            )
+        queued_est = max(inflight - capacity, 0)
+        running_est = inflight - queued_est
+        _log_bg_queue(
+            event='submit',
+            worker=worker_kind,
+            method=method,
+            request_id=request_id,
+            source=source,
+            inflight=inflight,
+            total_inflight=total_inflight,
+            running_est=running_est,
+            queued_est=queued_est,
+            submitted=submitted,
+            completed=completed,
+            failed=failed,
+            peak=peak,
+        )
+
+    def _record_bg_done(
+        self,
+        worker_kind: str,
+        request_id: Any,
+        method: Any,
+        source: Any,
+        *,
+        ok: bool | None,
+    ) -> None:
+        with self._bg_metrics_lock:
+            stats = self._bg_metrics[worker_kind]
+            stats['inflight'] = max(stats['inflight'] - 1, 0)
+            stats['completed'] += 1
+            if ok is False:
+                stats['failed'] += 1
+            inflight = stats['inflight']
+            submitted = stats['submitted']
+            completed = stats['completed']
+            failed = stats['failed']
+            peak = stats['peak']
+            capacity = self._bg_capacity(worker_kind)
+            total_inflight = sum(
+                worker_stats['inflight']
+                for worker_stats in self._bg_metrics.values()
+            )
+        queued_est = max(inflight - capacity, 0)
+        running_est = inflight - queued_est
+        _log_bg_queue(
+            event='done',
+            worker=worker_kind,
+            method=method,
+            request_id=request_id,
+            source=source,
+            inflight=inflight,
+            total_inflight=total_inflight,
+            running_est=running_est,
+            queued_est=queued_est,
+            submitted=submitted,
+            completed=completed,
+            failed=failed,
+            peak=peak,
+            ok=ok,
+        )
+
+    def _submit_fallback_bg(self, request: dict[str, Any]) -> None:
+        """Run background requests on a local thread when processes are unavailable."""
+        request_id = request.get('id')
+        method = request.get('method')
+        source = request.get('source') or 'unknown'
+
+        future = self._fallback_bg_pool.submit(self._handle_request, request)
+        self._record_bg_submit('fallback', request_id, method, source)
+
+        def _on_done(f: Any) -> None:
+            self._record_bg_done(
+                'fallback',
+                request_id,
+                method,
+                source,
+                ok=f.exception() is None,
+            )
+
+        future.add_done_callback(_on_done)
 
     def _submit_bg(self, request: dict[str, Any]) -> None:
         """Submit a request to the background process pool."""
@@ -324,9 +467,11 @@ class DaemonServer:
 
         assert self._bg_pool is not None
         future = self._bg_pool.submit(_bg_dispatch, method, params)
+        self._record_bg_submit('pool', request_id, method, source)
 
         def _on_done(f: Any) -> None:
             elapsed = time.perf_counter() - started
+            ok = True
             try:
                 result = f.result()
                 batch_size = result.get('_batch_size') if isinstance(result, dict) else None
@@ -342,6 +487,9 @@ class DaemonServer:
                     message=str(exc),
                     data={'traceback': traceback.format_exc(limit=8)},
                 )
+                ok = False
+            finally:
+                self._record_bg_done('pool', request_id, method, source, ok=ok)
 
         future.add_done_callback(_on_done)
 
@@ -1495,6 +1643,39 @@ def _log_ipc(
     print(
         f'[ipc:{tag}] [{thread}] {method}#{request_id}'
         f' source={source} {elapsed:.3f}s {status}{batch_info}',
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _log_bg_queue(
+    *,
+    event: str,
+    worker: str,
+    method: Any,
+    request_id: Any,
+    source: Any,
+    inflight: int,
+    total_inflight: int,
+    running_est: int,
+    queued_est: int,
+    submitted: int,
+    completed: int,
+    failed: int,
+    peak: int,
+    ok: bool | None = None,
+) -> None:
+    status = ''
+    if ok is True:
+        status = ' ok=1'
+    elif ok is False:
+        status = ' ok=0'
+    print(
+        f'[bg-queue] {event} worker={worker} {method}#{request_id}'
+        f' source={source} inflight={inflight} total_inflight={total_inflight}'
+        f' running_est={running_est} queued_est={queued_est}'
+        f' submitted={submitted} completed={completed}'
+        f' failed={failed} peak={peak}{status}',
         file=sys.stderr,
         flush=True,
     )
