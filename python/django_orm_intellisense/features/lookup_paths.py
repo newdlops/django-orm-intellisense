@@ -40,16 +40,11 @@ DEFAULT_LOOKUP_OPERATORS = (
     'second',
 )
 
-_ONE_HOP_DESCENDANT_CACHE_OWNER = 0
-_ONE_HOP_DESCENDANT_CACHE: dict[
+_DESCENDANT_CACHE_OWNER = 0
+_DESCENDANT_CACHE: dict[
     tuple[str, str, bool],
     tuple[dict[str, object], ...],
 ] = {}
-
-# Maximum number of items returned by lookupPathCompletions.
-# Keeps serialised JSON payloads small enough that they do not
-# block the stdout IPC pipe for hundreds of milliseconds.
-MAX_LOOKUP_PATH_ITEMS = 500
 
 
 def list_lookup_path_completions(
@@ -174,22 +169,11 @@ def list_lookup_path_completions(
             str(item['name']).lower(),
         )
     )
-    # When the user has traversed FK(s), results are more focused.
-    # Scale the limit based on depth — deeper traversal = more targeted.
-    if len(completed_segments) >= 2:
-        effective_limit = 10_000
-    elif len(completed_segments) >= 1:
-        effective_limit = MAX_LOOKUP_PATH_ITEMS * 3
-    else:
-        effective_limit = MAX_LOOKUP_PATH_ITEMS
-    truncated = len(items) > effective_limit
-    if truncated:
-        items = items[:effective_limit]
     return {
         'items': items,
         'resolved': True,
         'currentModelLabel': traversal.get('currentModelLabel'),
-        'truncated': truncated,
+        'truncated': False,
     }
 
 
@@ -527,7 +511,7 @@ def _lookup_descendant_completion_items(
     relation_only: bool,
     method: str,
 ) -> list[dict[str, object]]:
-    items = _one_hop_descendant_completion_items(
+    items = _descendant_completion_items(
         model_graph=model_graph,
         model_label=model_label,
         relation_only=relation_only,
@@ -540,26 +524,27 @@ def _lookup_descendant_completion_items(
     ]
 
 
-def _one_hop_descendant_completion_items(
+def _descendant_completion_items(
     *,
     model_graph: ModelGraph,
     model_label: str,
     relation_only: bool,
     method: str,
 ) -> tuple[dict[str, object], ...]:
-    global _ONE_HOP_DESCENDANT_CACHE_OWNER
+    global _DESCENDANT_CACHE_OWNER
 
     owner = id(model_graph)
-    if owner != _ONE_HOP_DESCENDANT_CACHE_OWNER:
-        _ONE_HOP_DESCENDANT_CACHE.clear()
-        _ONE_HOP_DESCENDANT_CACHE_OWNER = owner
+    if owner != _DESCENDANT_CACHE_OWNER:
+        _DESCENDANT_CACHE.clear()
+        _DESCENDANT_CACHE_OWNER = owner
 
     key = (model_label, method, relation_only)
-    cached = _ONE_HOP_DESCENDANT_CACHE.get(key)
+    cached = _DESCENDANT_CACHE.get(key)
     if cached is not None:
         return cached
 
     items_by_name: dict[str, dict[str, object]] = {}
+
     for relation_field in _lookup_fields_for_method(
         model_graph=model_graph,
         model_label=model_label,
@@ -586,7 +571,7 @@ def _one_hop_descendant_completion_items(
         cast(dict[str, object], items_by_name[name])
         for name in sorted(items_by_name)
     )
-    _ONE_HOP_DESCENDANT_CACHE[key] = cached_items
+    _DESCENDANT_CACHE[key] = cached_items
     return cached_items
 
 
