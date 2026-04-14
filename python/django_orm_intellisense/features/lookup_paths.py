@@ -80,7 +80,7 @@ def list_lookup_path_completions(
         method in FILTER_LOOKUP_METHODS
         and (bool(current_partial) or not completed_segments)
     )
-    include_eager_descendants = len(completed_segments) <= 1
+    include_eager_descendants = len(completed_segments) <= 2
 
     items: list[dict[str, object]]
     if traversal['completionMode'] == 'field':
@@ -174,9 +174,14 @@ def list_lookup_path_completions(
             str(item['name']).lower(),
         )
     )
-    # When the user has already traversed FK(s), results are more focused,
-    # so allow a larger item limit to include 1-hop descendants.
-    effective_limit = MAX_LOOKUP_PATH_ITEMS * 3 if completed_segments else MAX_LOOKUP_PATH_ITEMS
+    # When the user has traversed FK(s), results are more focused.
+    # Scale the limit based on depth — deeper traversal = more targeted.
+    if len(completed_segments) >= 2:
+        effective_limit = 10_000
+    elif len(completed_segments) >= 1:
+        effective_limit = MAX_LOOKUP_PATH_ITEMS * 3
+    else:
+        effective_limit = MAX_LOOKUP_PATH_ITEMS
     truncated = len(items) > effective_limit
     if truncated:
         items = items[:effective_limit]
