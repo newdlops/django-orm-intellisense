@@ -981,18 +981,37 @@ export function registerPythonProviders(
         if (isDiagnosticsCancelled()) break;
       }
       const context = _lookupContexts[i];
-      const ctx = context as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number; _isPrefetch?: boolean };
+      const ctx = context as LookupDiagnosticContext & {
+        _needsCallContextValidation?: boolean;
+        _absoluteStart?: number;
+        _absoluteEnd?: number;
+        _isPrefetch?: boolean;
+        _isDictKey?: boolean;
+        _isFExpression?: boolean;
+        _isExpressionPath?: boolean;
+      };
       if (ctx._needsCallContextValidation && ctx._absoluteStart !== undefined) {
-        const callContext = ctx._isPrefetch
-          ? prefetchLookupCallContext(_docTextForValidation, ctx._absoluteStart)
-          : querysetStringCallContext(_docTextForValidation, ctx._absoluteStart);
-        if (!callContext || (!ctx._isPrefetch && callContext.method !== context.method)) {
+        let callContext: { receiverExpression: string; method: string } | undefined;
+        if (ctx._isDictKey && ctx._absoluteEnd !== undefined) {
+          const dictCtx = unpackedLookupDictCallContext(_docTextForValidation, ctx._absoluteStart, ctx._absoluteEnd);
+          callContext = dictCtx ? { receiverExpression: dictCtx.receiverExpression, method: dictCtx.method } : undefined;
+        } else if (ctx._isFExpression) {
+          const fCtx = fExpressionCallContext(_docTextForValidation, ctx._absoluteStart);
+          callContext = fCtx ? { receiverExpression: fCtx.receiverExpression, method: F_EXPRESSION_METHOD } : undefined;
+        } else if (ctx._isExpressionPath && ctx._absoluteEnd !== undefined) {
+          const exprCtx = expressionStringArgumentCallContext(_docTextForValidation, ctx._absoluteStart, ctx._absoluteEnd);
+          callContext = exprCtx ? { receiverExpression: exprCtx.receiverExpression, method: expressionPathMethodName(exprCtx.expressionName) } : undefined;
+        } else if (ctx._isPrefetch) {
+          callContext = prefetchLookupCallContext(_docTextForValidation, ctx._absoluteStart) ?? undefined;
+        } else {
+          const lookupCtx = querysetStringCallContext(_docTextForValidation, ctx._absoluteStart);
+          callContext = lookupCtx && lookupCtx.method === context.method ? lookupCtx : undefined;
+        }
+        if (!callContext) {
           continue;
         }
         context.receiverExpression = callContext.receiverExpression;
-        if (ctx._isPrefetch) {
-          context.method = callContext.method;
-        }
+        context.method = callContext.method;
       }
       _validatedLookupContexts.push(context);
     }
@@ -6031,6 +6050,11 @@ function findLookupDiagnosticContexts(
 ): LookupDiagnosticContext[] {
   const contexts: LookupDiagnosticContext[] = [];
   const seen = new Set<string>();
+  // Cache document text once to avoid repeated getText() calls.
+  // Note: dict-key, F-expression, and expression-path contexts use
+  // deferred validation (same as lookup contexts) to avoid calling
+  // expensive backward-scanning functions during the synchronous scan.
+  const _cachedDocText = document.getText();
 
   for (let line = 0; line < document.lineCount; line += 1) {
     const lineText = document.lineAt(line).text;
@@ -6099,28 +6123,22 @@ function findLookupDiagnosticContexts(
         continue;
       }
 
-      const callContext = unpackedLookupDictCallContext(
-        document.getText(),
-        lineStartOffset + start,
-        lineStartOffset + end
-      );
-      if (!callContext) {
-        continue;
-      }
-
       const range = new vscode.Range(line, start, line, end);
-      const key = `${range.start.line}:${range.start.character}:${value}:${callContext.method}`;
-      if (seen.has(key)) {
+      const dictKey = `${range.start.line}:${range.start.character}:${value}:dict`;
+      if (seen.has(dictKey)) {
         continue;
       }
-      seen.add(key);
-
+      seen.add(dictKey);
       contexts.push({
-        receiverExpression: callContext.receiverExpression,
-        method: callContext.method,
+        receiverExpression: '',
+        method: '',
         value,
         range,
-      });
+        _needsCallContextValidation: true,
+        _absoluteStart: lineStartOffset + start,
+        _absoluteEnd: lineStartOffset + end,
+        _isDictKey: true,
+      } as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number; _absoluteEnd?: number; _isDictKey?: boolean });
     }
 
     for (const match of lineText.matchAll(F_EXPRESSION_HOVER_PATTERN)) {
@@ -6129,24 +6147,21 @@ function findLookupDiagnosticContexts(
       const localOffset = prefix.lastIndexOf(value);
       const start = (match.index ?? 0) + localOffset;
       const absoluteStart = lineStartOffset + start;
-      const callContext = fExpressionCallContext(document.getText(), absoluteStart);
-      if (!callContext) {
-        continue;
-      }
-
       const range = new vscode.Range(line, start, line, start + value.length);
-      const key = `${range.start.line}:${range.start.character}:${value}:${F_EXPRESSION_METHOD}`;
-      if (seen.has(key)) {
+      const fKey = `${range.start.line}:${range.start.character}:${value}:f_expr`;
+      if (seen.has(fKey)) {
         continue;
       }
-      seen.add(key);
-
+      seen.add(fKey);
       contexts.push({
-        receiverExpression: callContext.receiverExpression,
+        receiverExpression: '',
         method: F_EXPRESSION_METHOD,
         value,
         range,
-      });
+        _needsCallContextValidation: true,
+        _absoluteStart: absoluteStart,
+        _isFExpression: true,
+      } as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number; _isFExpression?: boolean });
     }
 
     for (const match of lineText.matchAll(EXPRESSION_STRING_HOVER_PATTERN)) {
@@ -6154,29 +6169,22 @@ function findLookupDiagnosticContexts(
       const start = (match.index ?? 0) + 1;
       const absoluteStart = lineStartOffset + start;
       const absoluteEnd = absoluteStart + value.length + 1;
-      const callContext = expressionStringArgumentCallContext(
-        document.getText(),
-        absoluteStart,
-        absoluteEnd
-      );
-      if (!callContext) {
-        continue;
-      }
-
-      const method = expressionPathMethodName(callContext.expressionName);
       const range = new vscode.Range(line, start, line, start + value.length);
-      const key = `${range.start.line}:${range.start.character}:${value}:${method}`;
-      if (seen.has(key)) {
+      const exprKey = `${range.start.line}:${range.start.character}:${value}:expr`;
+      if (seen.has(exprKey)) {
         continue;
       }
-      seen.add(key);
-
+      seen.add(exprKey);
       contexts.push({
-        receiverExpression: callContext.receiverExpression,
-        method,
+        receiverExpression: '',
+        method: '',
         value,
         range,
-      });
+        _needsCallContextValidation: true,
+        _absoluteStart: absoluteStart,
+        _absoluteEnd: absoluteEnd,
+        _isExpressionPath: true,
+      } as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number; _absoluteEnd?: number; _isExpressionPath?: boolean });
     }
 
     for (const match of lineText.matchAll(/[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/g)) {

@@ -80,7 +80,7 @@ def list_lookup_path_completions(
         method in FILTER_LOOKUP_METHODS
         and (bool(current_partial) or not completed_segments)
     )
-    include_eager_descendants = not completed_segments
+    include_eager_descendants = len(completed_segments) <= 2
 
     items: list[dict[str, object]]
     if traversal['completionMode'] == 'field':
