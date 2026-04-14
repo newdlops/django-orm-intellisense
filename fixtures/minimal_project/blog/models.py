@@ -441,3 +441,7 @@ class ProxyCompanyQuestionThreadMessage(models.Model):
     objects = ProxyCompanyQuestionThreadMessageManager.from_queryset(
         ProxyCompanyQuestionThreadMessageQuerySet
     )()
+
+
+# Ensure Django discovers models defined in separate modules within this app.
+from blog.schema_examples import SchemaExample as SchemaExample  # noqa: F401,E402

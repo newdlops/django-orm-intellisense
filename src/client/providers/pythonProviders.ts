@@ -166,7 +166,7 @@ const EXPRESSION_PATH_METHOD_PREFIX = 'expression_path:';
 const ANNOTATED_MEMBER_SOURCE = 'annotation_expression';
 const INITIAL_DIAGNOSTIC_REFRESH_DELAY_MS = 500;
 const DIAGNOSTIC_TIME_BUDGET_MS = 10_000;
-const DIAGNOSTIC_REQUEST_BUDGET = 200;
+const DIAGNOSTIC_REQUEST_BUDGET = 1000;
 const modelSubclassRelationCache = new Map<string, boolean>();
 const VIRTUAL_LOOKUP_OPERATORS = [
   'exact',
@@ -972,7 +972,7 @@ export function registerPythonProviders(
     // Pre-validate all lookup contexts in batches, yielding between
     // batches to avoid blocking the event loop.
     const _docTextForValidation = document.getText();
-    const VALIDATION_BATCH_SIZE = 5;
+    const VALIDATION_BATCH_SIZE = 15;
     const _validatedLookupContexts: LookupDiagnosticContext[] = [];
     for (let i = 0; i < _lookupContexts.length; i += 1) {
       if (isDiagnosticsCancelled()) break;
@@ -1290,7 +1290,10 @@ export function registerPythonProviders(
       }
     }
 
-    if (isDiagnosticsCancelled()) {
+    // Publish whatever diagnostics we have, even if the budget was exhausted.
+    // Returning early would discard all partial results, leaving the user
+    // with zero ORM diagnostics until the next document change.
+    if (diagnosticsDisposed || document.version !== documentVersion) {
       return;
     }
 
@@ -2590,7 +2593,46 @@ export function registerPythonProviders(
               'filter'
             );
             if (isDefCancelled()) { return undefined; }
-            return definitionLocationFromLookupResolution(resolution);
+            const location = definitionLocationFromLookupResolution(resolution);
+            if (location) {
+              return location;
+            }
+
+            // Fallback: if the daemon resolved the field but lacks source
+            // location info, search for the field assignment in the parent
+            // model class within the current document.
+            if (resolution.resolved) {
+              const metaClass = findEnclosingClassDefinition(
+                document,
+                document.offsetAt(position)
+              );
+              if (metaClass) {
+                const ownerClass = findEnclosingParentClassDefinition(
+                  document,
+                  metaClass
+                );
+                if (ownerClass) {
+                  const fieldPattern = new RegExp(
+                    `^(\\s+)${schemaFieldLiteral.value}\\s*=`
+                  );
+                  for (
+                    let line = ownerClass.line + 1;
+                    line < metaClass.line;
+                    line++
+                  ) {
+                    const lineText = document.lineAt(line).text;
+                    if (fieldPattern.test(lineText)) {
+                      const col = lineText.indexOf(schemaFieldLiteral.value);
+                      return new vscode.Location(
+                        document.uri,
+                        new vscode.Position(line, col)
+                      );
+                    }
+                  }
+                }
+              }
+            }
+            return undefined;
           } catch {
             return undefined;
           }
@@ -6056,10 +6098,12 @@ async function findLookupDiagnosticContexts(
   const contexts: LookupDiagnosticContext[] = [];
   const seen = new Set<string>();
   const SCAN_CHUNK_LINES = 50;
+  const isSmallFile = document.lineCount < 500;
 
   for (let line = 0; line < document.lineCount; line += 1) {
     // Yield every SCAN_CHUNK_LINES to keep event loop responsive
-    if (line > 0 && line % SCAN_CHUNK_LINES === 0) {
+    // Skip yielding for small files where synchronous scan is fast enough
+    if (!isSmallFile && line > 0 && line % SCAN_CHUNK_LINES === 0) {
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       if (isCancelled()) { return contexts; }
     }
