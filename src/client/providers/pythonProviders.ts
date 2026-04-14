@@ -934,7 +934,7 @@ export function registerPythonProviders(
     daemon.logDiagnostic(`[diagnostics:scan] starting sync scan for ${document.uri.fsPath.split('/').slice(-2).join('/')}`);
     const _scanStart = performance.now();
     const _relationContexts = findRelationDiagnosticContexts(document);
-    const _lookupContexts = findLookupDiagnosticContexts(document);
+    const _lookupContexts = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled);
     daemon.logDiagnostic(`[diagnostics:scan] complete ${(performance.now() - _scanStart).toFixed(0)}ms relations=${_relationContexts.length} lookups=${_lookupContexts.length}`);
 
     for (const context of _relationContexts) {
@@ -961,7 +961,7 @@ export function registerPythonProviders(
 
     // Pass 1: Resolve receivers and collect items needing daemon lookup
     const _lookupPending: Array<{
-      context: ReturnType<typeof findLookupDiagnosticContexts> extends Iterable<infer T> ? T : never;
+      context: LookupDiagnosticContext;
       receiver: OrmReceiverInfo;
       baseModelLabel: string;
       batchIdx: number;
@@ -6045,18 +6045,20 @@ function findRelationDiagnosticContexts(
   return contexts;
 }
 
-function findLookupDiagnosticContexts(
-  document: vscode.TextDocument
-): LookupDiagnosticContext[] {
+async function findLookupDiagnosticContexts(
+  document: vscode.TextDocument,
+  isCancelled: () => boolean
+): Promise<LookupDiagnosticContext[]> {
   const contexts: LookupDiagnosticContext[] = [];
   const seen = new Set<string>();
-  // Cache document text once to avoid repeated getText() calls.
-  // Note: dict-key, F-expression, and expression-path contexts use
-  // deferred validation (same as lookup contexts) to avoid calling
-  // expensive backward-scanning functions during the synchronous scan.
-  const _cachedDocText = document.getText();
+  const SCAN_CHUNK_LINES = 50;
 
   for (let line = 0; line < document.lineCount; line += 1) {
+    // Yield every SCAN_CHUNK_LINES to keep event loop responsive
+    if (line > 0 && line % SCAN_CHUNK_LINES === 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (isCancelled()) { return contexts; }
+    }
     const lineText = document.lineAt(line).text;
     const lineStartOffset = document.offsetAt(new vscode.Position(line, 0));
     const excludedWordRanges: Array<{ start: number; end: number }> = [];
