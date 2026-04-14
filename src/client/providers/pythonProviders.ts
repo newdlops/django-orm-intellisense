@@ -890,6 +890,14 @@ export function registerPythonProviders(
       return;
     }
 
+    // Yield to the event loop before starting the synchronous document scan.
+    // This ensures hover/definition/completion requests that arrived first
+    // can be processed without being blocked by diagnostic scanning.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    if (diagnosticsDisposed || document.version !== documentVersion) {
+      return;
+    }
+
     const diagnostics: vscode.Diagnostic[] = [];
     const seenRanges = new Set<string>();
     const diagnosticStartTime = Date.now();
@@ -922,7 +930,13 @@ export function registerPythonProviders(
     };
     const trackRequest = (): void => { diagnosticRequestCount++; };
 
-    for (const context of findRelationDiagnosticContexts(document)) {
+    daemon.logDiagnostic(`[diagnostics:scan] starting sync scan for ${document.uri.fsPath.split('/').slice(-2).join('/')}`);
+    const _scanStart = performance.now();
+    const _relationContexts = findRelationDiagnosticContexts(document);
+    const _lookupContexts = findLookupDiagnosticContexts(document);
+    daemon.logDiagnostic(`[diagnostics:scan] complete ${(performance.now() - _scanStart).toFixed(0)}ms relations=${_relationContexts.length} lookups=${_lookupContexts.length}`);
+
+    for (const context of _relationContexts) {
       if (isDiagnosticsCancelled()) break;
       try {
         const resolution = await daemon.resolveRelationTarget(context.value, /* background */ true);
@@ -954,9 +968,26 @@ export function registerPythonProviders(
     const _batchItems: Array<{ baseModelLabel: string; value: string; method: string }> = [];
     const _receiverCache = new Map<string, OrmReceiverInfo | null>();
 
-    for (const context of findLookupDiagnosticContexts(document)) {
+    for (const context of _lookupContexts) {
       if (isDiagnosticsCancelled()) break;
       try {
+        // Deferred call context validation: the synchronous scanner skips
+        // the expensive querysetStringCallContext to avoid blocking the
+        // event loop.  Perform the validation here in the async loop.
+        const ctx = context as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number; _isPrefetch?: boolean };
+        if (ctx._needsCallContextValidation && ctx._absoluteStart !== undefined) {
+          const docText = document.getText();
+          const callContext = ctx._isPrefetch
+            ? prefetchLookupCallContext(docText, ctx._absoluteStart)
+            : querysetStringCallContext(docText, ctx._absoluteStart);
+          if (!callContext || (!ctx._isPrefetch && callContext.method !== context.method)) {
+            continue;
+          }
+          context.receiverExpression = callContext.receiverExpression;
+          if (ctx._isPrefetch) {
+            context.method = callContext.method;
+          }
+        }
         const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
           daemon, document, context.receiverExpression, context.range.end
         );
@@ -1044,6 +1075,9 @@ export function registerPythonProviders(
       }
     }
 
+    // Yield before heavy synchronous scan to let hover/definition respond.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    if (isDiagnosticsCancelled()) { /* skip */ } else
     for (const context of findDirectFieldDiagnosticContexts(document)) {
       if (isDiagnosticsCancelled()) break;
       try {
@@ -1087,6 +1121,8 @@ export function registerPythonProviders(
       }
     }
 
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    if (isDiagnosticsCancelled()) { /* skip */ } else
     for (const context of findSchemaFieldDiagnosticContexts(document)) {
       if (isDiagnosticsCancelled()) break;
       try {
@@ -1129,6 +1165,8 @@ export function registerPythonProviders(
       }
     }
 
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    if (isDiagnosticsCancelled()) { /* skip */ } else
     for (const context of findMetaConstraintLookupDiagnosticContexts(document)) {
       if (isDiagnosticsCancelled()) break;
       try {
@@ -1176,6 +1214,8 @@ export function registerPythonProviders(
       }
     }
 
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    if (isDiagnosticsCancelled()) { /* skip */ } else
     for (const context of findBulkUpdateFieldDiagnosticContexts(document)) {
       if (isDiagnosticsCancelled()) break;
       try {
@@ -1231,6 +1271,7 @@ export function registerPythonProviders(
     pythonSelector,
     {
       async provideCompletionItems(document, position, token) {
+        daemon.logDiagnostic(`[completion:enter] ${document.uri.fsPath.split('/').slice(-2).join('/')}:${position.line}:${position.character}`);
         try {
         if (providersDisposed || token.isCancellationRequested) {
           return undefined;
@@ -1864,6 +1905,7 @@ export function registerPythonProviders(
     pythonSelector,
     {
       async provideHover(document, position, token) {
+        daemon.logDiagnostic(`[hover:enter] ${document.uri.fsPath.split('/').slice(-2).join('/')}:${position.line}:${position.character}`);
         try {
         if (providersDisposed || token.isCancellationRequested) {
           daemon.logDiagnostic(`[hover] skip disposed=${providersDisposed} cancelled=${token.isCancellationRequested}`);
@@ -2346,6 +2388,7 @@ export function registerPythonProviders(
     pythonSelector,
     {
       async provideDefinition(document, position, token) {
+        daemon.logDiagnostic(`[definition:enter] ${document.uri.fsPath.split('/').slice(-2).join('/')}:${position.line}:${position.character}`);
         try {
         if (providersDisposed || token.isCancellationRequested) {
           return undefined;
@@ -5987,11 +6030,6 @@ function findLookupDiagnosticContexts(
       const prefix = match[0];
       const localOffset = prefix.lastIndexOf(value);
       const start = (match.index ?? 0) + localOffset;
-      const absoluteStart = lineStartOffset + start;
-      const callContext = querysetStringCallContext(document.getText(), absoluteStart);
-      if (!callContext || callContext.method !== method) {
-        continue;
-      }
 
       const range = new vscode.Range(line, start, line, start + value.length);
       const key = `${range.start.line}:${range.start.character}:${value}:${method}`;
@@ -6000,12 +6038,17 @@ function findLookupDiagnosticContexts(
       }
       seen.add(key);
 
+      // Defer expensive querysetStringCallContext to the async processing
+      // loop.  The receiver expression is resolved lazily to avoid blocking
+      // the event loop during the synchronous document scan.
       contexts.push({
-        receiverExpression: callContext.receiverExpression,
+        receiverExpression: '',
         method,
         value,
         range,
-      });
+        _needsCallContextValidation: true,
+        _absoluteStart: lineStartOffset + start,
+      } as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number });
     }
 
     for (const match of lineText.matchAll(PREFETCH_LOOKUP_HOVER_PATTERN)) {
@@ -6013,25 +6056,23 @@ function findLookupDiagnosticContexts(
       const prefix = match[0];
       const localOffset = prefix.lastIndexOf(value);
       const start = (match.index ?? 0) + localOffset;
-      const absoluteStart = lineStartOffset + start;
-      const callContext = prefetchLookupCallContext(document.getText(), absoluteStart);
-      if (!callContext) {
-        continue;
-      }
 
       const range = new vscode.Range(line, start, line, start + value.length);
-      const key = `${range.start.line}:${range.start.character}:${value}:${callContext.method}`;
+      const key = `${range.start.line}:${range.start.character}:${value}:prefetch`;
       if (seen.has(key)) {
         continue;
       }
       seen.add(key);
 
       contexts.push({
-        receiverExpression: callContext.receiverExpression,
-        method: callContext.method,
+        receiverExpression: '',
+        method: 'prefetch',
         value,
         range,
-      });
+        _needsCallContextValidation: true,
+        _absoluteStart: lineStartOffset + start,
+        _isPrefetch: true,
+      } as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number; _isPrefetch?: boolean });
     }
 
     for (const match of lineText.matchAll(LOOKUP_DICT_KEY_HOVER_PATTERN)) {
@@ -6167,9 +6208,14 @@ function findDirectFieldDiagnosticContexts(
 ): DirectFieldDiagnosticContext[] {
   const contexts: DirectFieldDiagnosticContext[] = [];
   const seen = new Set<string>();
+  // Only scan lines that contain .create( or .update( to avoid O(words × filesize)
+  const DIRECT_CALL_LINE_PATTERN = /\.(?:create|update)\s*\(/;
 
   for (let line = 0; line < document.lineCount; line += 1) {
     const lineText = document.lineAt(line).text;
+    if (!DIRECT_CALL_LINE_PATTERN.test(lineText)) {
+      continue;
+    }
 
     for (const match of lineText.matchAll(/[A-Za-z_][\w]*/g)) {
       const start = match.index ?? 0;
