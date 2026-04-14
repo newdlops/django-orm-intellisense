@@ -12,6 +12,11 @@ from typing import Any, get_args, get_origin, get_type_hints
 
 from ..runtime.inspector import RuntimeInspection
 from ..static_index.indexer import FieldCandidate, ModelCandidate, ModuleIndex, StaticIndex
+from .django_builtins import (
+    INSTANCE_BUILTIN_METHODS as _INSTANCE_BUILTINS,
+    MANAGER_BUILTIN_METHODS as _MANAGER_BUILTINS,
+    QUERYSET_BUILTIN_METHODS as _QUERYSET_BUILTINS,
+)
 
 
 class _MemberSurfaceCache:
@@ -135,36 +140,28 @@ _workspace_files_cache_lock = threading.RLock()
 _workspace_files_cache_owner = 0
 _workspace_files_cache_value: set[str] | None = None
 
-BUILTIN_QUERYSET_METHODS: dict[str, tuple[str, str]] = {
-    'all': ('Django queryset method', 'queryset'),
-    'alias': ('Django queryset method', 'queryset'),
-    'annotate': ('Django queryset method', 'queryset'),
-    'count': ('Django queryset method', 'scalar'),
-    'create': ('Django queryset method', 'instance'),
-    'defer': ('Django queryset method', 'queryset'),
-    'distinct': ('Django queryset method', 'queryset'),
-    'exclude': ('Django queryset method', 'queryset'),
-    'exists': ('Django queryset method', 'scalar'),
-    'filter': ('Django queryset method', 'queryset'),
-    'first': ('Django queryset method', 'instance'),
-    'get': ('Django queryset method', 'instance'),
-    'last': ('Django queryset method', 'instance'),
-    'only': ('Django queryset method', 'queryset'),
-    'order_by': ('Django queryset method', 'queryset'),
-    'prefetch_related': ('Django queryset method', 'queryset'),
-    'select_related': ('Django queryset method', 'queryset'),
-    'update': ('Django queryset method', 'scalar'),
-    'values': ('Django queryset method', 'unknown'),
-    'values_list': ('Django queryset method', 'unknown'),
-}
+def _build_builtin_dict(
+    source: dict[str, object],
+) -> dict[str, tuple[str, str]]:
+    """Convert BuiltinMethodInfo dict to legacy (detail, return_kind) format."""
+    return {
+        name: (info.description, info.return_kind)
+        for name, info in source.items()
+    }
+
+
+BUILTIN_QUERYSET_METHODS: dict[str, tuple[str, str]] = _build_builtin_dict(
+    _QUERYSET_BUILTINS,
+)
 
 BUILTIN_MANAGER_METHODS: dict[str, tuple[str, str]] = {
     **BUILTIN_QUERYSET_METHODS,
-    'bulk_create': ('Django manager method', 'scalar'),
-    'get_queryset': ('Django manager method', 'queryset'),
-    'get_or_create': ('Django manager method', 'unknown'),
-    'update_or_create': ('Django manager method', 'unknown'),
+    **_build_builtin_dict(_MANAGER_BUILTINS),
 }
+
+BUILTIN_INSTANCE_METHODS: dict[str, tuple[str, str]] = _build_builtin_dict(
+    _INSTANCE_BUILTINS,
+)
 
 
 @dataclass(frozen=True)
@@ -183,9 +180,10 @@ class OrmMemberItem:
     column: int | None = None
     field_kind: str | None = None
     is_relation: bool = False
+    signature: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        d: dict[str, object] = {
             'name': self.name,
             'memberKind': self.member_kind,
             'modelLabel': self.model_label,
@@ -201,6 +199,9 @@ class OrmMemberItem:
             'fieldKind': self.field_kind,
             'isRelation': self.is_relation,
         }
+        if self.signature is not None:
+            d['signature'] = self.signature
+        return d
 
 
 def build_surface_index(
@@ -477,6 +478,24 @@ def _direct_resolve_member_item(
         ):
             if item.name == name:
                 return item
+
+        builtin = BUILTIN_INSTANCE_METHODS.get(name)
+        if builtin is not None:
+            detail, return_kind = builtin
+            info = _INSTANCE_BUILTINS.get(name)
+            return OrmMemberItem(
+                name=name,
+                member_kind='method',
+                model_label=model_label,
+                receiver_kind='instance',
+                detail=detail,
+                source='builtin',
+                return_kind=return_kind,
+                return_model_label=(
+                    model_label if return_kind == 'instance' else None
+                ),
+                signature=info.signature if info else None,
+            )
         return None
 
     if receiver_kind == 'model_class':
@@ -496,6 +515,8 @@ def _direct_resolve_member_item(
         builtin = BUILTIN_MANAGER_METHODS.get(name)
         if builtin is not None:
             detail, return_kind = builtin
+            _all_builtins = {**_QUERYSET_BUILTINS, **_MANAGER_BUILTINS}
+            info = _all_builtins.get(name)
             return OrmMemberItem(
                 name=name,
                 member_kind='method',
@@ -508,6 +529,7 @@ def _direct_resolve_member_item(
                     model_label if return_kind in {'instance', 'manager', 'queryset'} else None
                 ),
                 manager_name=manager_name,
+                signature=info.signature if info else None,
             )
 
         for item in _static_manager_method_items(
@@ -523,6 +545,7 @@ def _direct_resolve_member_item(
         builtin = BUILTIN_QUERYSET_METHODS.get(name)
         if builtin is not None:
             detail, return_kind = builtin
+            info = _QUERYSET_BUILTINS.get(name)
             return OrmMemberItem(
                 name=name,
                 member_kind='method',
@@ -535,6 +558,7 @@ def _direct_resolve_member_item(
                     model_label if return_kind in {'instance', 'manager', 'queryset'} else None
                 ),
                 manager_name=manager_name,
+                signature=info.signature if info else None,
             )
 
         for item in _static_queryset_method_items(
@@ -614,6 +638,12 @@ def _instance_surface(
         model_label=model_label,
         receiver_kind='instance',
     ):
+        if item.name in seen_names:
+            continue
+        items.append(item)
+        seen_names.add(item.name)
+
+    for item in _builtin_instance_method_items(model_label):
         if item.name in seen_names:
             continue
         items.append(item)
@@ -856,6 +886,8 @@ def _builtin_method_items(
     model_label: str,
     manager_name: str | None,
 ) -> list[OrmMemberItem]:
+    # Look up signature from the knowledge base
+    _all_builtins = {**_QUERYSET_BUILTINS, **_MANAGER_BUILTINS}
     return [
         OrmMemberItem(
             name=name,
@@ -867,8 +899,28 @@ def _builtin_method_items(
             return_kind=return_kind,
             return_model_label=model_label if return_kind in {'instance', 'manager', 'queryset'} else None,
             manager_name=manager_name,
+            signature=_all_builtins[name].signature if name in _all_builtins else None,
         )
         for name, (detail, return_kind) in sorted(definitions.items())
+    ]
+
+
+def _builtin_instance_method_items(
+    model_label: str,
+) -> list[OrmMemberItem]:
+    return [
+        OrmMemberItem(
+            name=name,
+            member_kind='method',
+            model_label=model_label,
+            receiver_kind='instance',
+            detail=detail,
+            source='builtin',
+            return_kind=return_kind,
+            return_model_label=model_label if return_kind == 'instance' else None,
+            signature=_INSTANCE_BUILTINS[name].signature if name in _INSTANCE_BUILTINS else None,
+        )
+        for name, (detail, return_kind) in sorted(BUILTIN_INSTANCE_METHODS.items())
     ]
 
 

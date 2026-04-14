@@ -143,6 +143,7 @@ export interface OrmMemberItem {
   column?: number;
   fieldKind?: string;
   isRelation: boolean;
+  signature?: string;
 }
 
 export interface OrmMemberCompletionsResult {

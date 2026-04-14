@@ -96,33 +96,84 @@ const ORM_FIELD_SIGNATURE_METHODS = new Set([
   ...DIRECT_FIELD_KEYWORD_METHODS,
 ]);
 const FAST_LOCAL_ORM_MEMBER_HOVER_NAMES = new Set([
+  // QuerySet / Manager methods
   'aggregate',
   'alias',
   'all',
   'annotate',
   'bulk_create',
   'bulk_update',
+  'contains',
   'count',
   'create',
+  'dates',
+  'datetimes',
   'defer',
   'delete',
+  'difference',
   'distinct',
+  'earliest',
   'exclude',
   'exists',
+  'explain',
+  'extra',
   'filter',
   'first',
   'get',
   'get_or_create',
   'get_queryset',
+  'in_bulk',
+  'intersection',
+  'iterator',
   'last',
+  'latest',
+  'none',
   'only',
   'order_by',
   'prefetch_related',
+  'raw',
+  'reverse',
+  'select_for_update',
   'select_related',
+  'union',
   'update',
   'update_or_create',
+  'using',
   'values',
   'values_list',
+  // Async QuerySet variants
+  'aaggregate',
+  'abulk_create',
+  'abulk_update',
+  'acontains',
+  'acount',
+  'acreate',
+  'adelete',
+  'aearliest',
+  'aexists',
+  'afirst',
+  'aget',
+  'aget_or_create',
+  'ain_bulk',
+  'aiterator',
+  'alast',
+  'alatest',
+  'aupdate',
+  'aupdate_or_create',
+  // Model instance methods
+  'save',
+  'full_clean',
+  'clean',
+  'clean_fields',
+  'validate_unique',
+  'validate_constraints',
+  'refresh_from_db',
+  'serializable_value',
+  'get_deferred_fields',
+  'asave',
+  'arefresh_from_db',
+  'aclean',
+  'afull_clean',
 ]);
 const BULK_UPDATE_FIELD_LIST_METHODS = new Set(['bulk_update']);
 const EXPRESSION_QUERYSET_METHODS = new Set([
@@ -5763,7 +5814,19 @@ function buildOrmMemberMarkdown(
   receiver: OrmReceiverInfo
 ): vscode.MarkdownString {
   const markdown = new vscode.MarkdownString(undefined, true);
-  markdown.appendMarkdown(`**${item.name}**\n\n`);
+
+  // Show signature as code block for builtin methods
+  if (item.signature && item.source === 'builtin') {
+    markdown.appendCodeblock(
+      `${item.name}${item.signature}`,
+      'python'
+    );
+    markdown.appendMarkdown(`${item.detail}\n\n`);
+    markdown.appendMarkdown(`---\n\n`);
+  } else {
+    markdown.appendMarkdown(`**${item.name}**\n\n`);
+  }
+
   markdown.appendMarkdown(`Receiver kind: \`${receiver.kind}\`\n\n`);
   markdown.appendMarkdown(`Receiver model: \`${receiver.modelLabel}\`\n\n`);
   if (receiver.classSource) {
