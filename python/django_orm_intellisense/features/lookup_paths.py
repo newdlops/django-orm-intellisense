@@ -80,7 +80,10 @@ def list_lookup_path_completions(
         method in FILTER_LOOKUP_METHODS
         and (bool(current_partial) or not completed_segments)
     )
-    include_eager_descendants = len(completed_segments) <= 2
+    # Include descendants only when user has traversed at least one FK
+    # (completed_segments >= 1).  For empty prefix, return direct fields
+    # only with isIncomplete=true — VS Code will re-request as user types.
+    include_eager_descendants = 1 <= len(completed_segments) <= 2
 
     items: list[dict[str, object]]
     if traversal['completionMode'] == 'field':

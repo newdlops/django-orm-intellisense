@@ -1448,7 +1448,11 @@ export function registerPythonProviders(
               return completion;
             });
 
-            return completions;
+            // Mark as incomplete when truncated or prefix is short — VS Code
+            // will re-request as the user types more, allowing FK descendant
+            // results to load incrementally.
+            const isIncomplete = Boolean(result.truncated) || !lookupContext.prefix.includes('__');
+            return new vscode.CompletionList(completions, isIncomplete);
           }
 
           if (directFieldContext) {
