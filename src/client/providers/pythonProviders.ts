@@ -863,7 +863,8 @@ export function registerPythonProviders(
 
   const refreshDiagnostics = async (
     document: vscode.TextDocument
-  ): Promise<void> => daemon.withRequestSource('diagnostic', async () => {
+  ): Promise<void> => daemon.withDeadline(performance.now() + DIAGNOSTIC_TIME_BUDGET_MS, () =>
+  daemon.withRequestSource('diagnostic', async () => {
     if (diagnosticsDisposed) {
       return;
     }
@@ -968,26 +969,37 @@ export function registerPythonProviders(
     const _batchItems: Array<{ baseModelLabel: string; value: string; method: string }> = [];
     const _receiverCache = new Map<string, OrmReceiverInfo | null>();
 
-    for (const context of _lookupContexts) {
+    // Pre-validate all lookup contexts in batches, yielding between
+    // batches to avoid blocking the event loop.
+    const _docTextForValidation = document.getText();
+    const VALIDATION_BATCH_SIZE = 5;
+    const _validatedLookupContexts: LookupDiagnosticContext[] = [];
+    for (let i = 0; i < _lookupContexts.length; i += 1) {
+      if (isDiagnosticsCancelled()) break;
+      if (i > 0 && i % VALIDATION_BATCH_SIZE === 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        if (isDiagnosticsCancelled()) break;
+      }
+      const context = _lookupContexts[i];
+      const ctx = context as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number; _isPrefetch?: boolean };
+      if (ctx._needsCallContextValidation && ctx._absoluteStart !== undefined) {
+        const callContext = ctx._isPrefetch
+          ? prefetchLookupCallContext(_docTextForValidation, ctx._absoluteStart)
+          : querysetStringCallContext(_docTextForValidation, ctx._absoluteStart);
+        if (!callContext || (!ctx._isPrefetch && callContext.method !== context.method)) {
+          continue;
+        }
+        context.receiverExpression = callContext.receiverExpression;
+        if (ctx._isPrefetch) {
+          context.method = callContext.method;
+        }
+      }
+      _validatedLookupContexts.push(context);
+    }
+
+    for (const context of _validatedLookupContexts) {
       if (isDiagnosticsCancelled()) break;
       try {
-        // Deferred call context validation: the synchronous scanner skips
-        // the expensive querysetStringCallContext to avoid blocking the
-        // event loop.  Perform the validation here in the async loop.
-        const ctx = context as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number; _isPrefetch?: boolean };
-        if (ctx._needsCallContextValidation && ctx._absoluteStart !== undefined) {
-          const docText = document.getText();
-          const callContext = ctx._isPrefetch
-            ? prefetchLookupCallContext(docText, ctx._absoluteStart)
-            : querysetStringCallContext(docText, ctx._absoluteStart);
-          if (!callContext || (!ctx._isPrefetch && callContext.method !== context.method)) {
-            continue;
-          }
-          context.receiverExpression = callContext.receiverExpression;
-          if (ctx._isPrefetch) {
-            context.method = callContext.method;
-          }
-        }
         const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
           daemon, document, context.receiverExpression, context.range.end
         );
@@ -1265,7 +1277,7 @@ export function registerPythonProviders(
 
     diagnosticCollection.set(document.uri, diagnostics);
     lastDiagnosedDocumentVersions.set(key, documentVersion);
-  });
+  }));
 
   const completionProvider = vscode.languages.registerCompletionItemProvider(
     pythonSelector,
