@@ -1559,6 +1559,12 @@ export class AnalysisDaemon implements vscode.Disposable {
     if (cached) {
       const age = Date.now() - cached.createdAt;
       if (age < RESPONSE_CACHE_TTL_MS) {
+        // Re-check abort even on cache hit: the caller may have been
+        // cancelled between the top-of-function check and this point
+        // (e.g. due to an intervening await in a loop).
+        if (this.isAborted()) {
+          return Promise.reject(new Error(`Aborted (cache hit): ${method}`));
+        }
         return cached.promise as Promise<T>;
       }
       // TTL expired — evict and re-request

@@ -1231,6 +1231,7 @@ export function registerPythonProviders(
     pythonSelector,
     {
       async provideCompletionItems(document, position, token) {
+        try {
         if (providersDisposed || token.isCancellationRequested) {
           return undefined;
         }
@@ -1778,6 +1779,10 @@ export function registerPythonProviders(
         compAbort.abort();
         clearTimeout(compTimeout);
         return compResult;
+        } catch (error) {
+          daemon.logDiagnostic(`[completion:error] ${error instanceof Error ? error.message : String(error)}`);
+          return undefined;
+        }
       },
     },
     "'",
@@ -1859,6 +1864,7 @@ export function registerPythonProviders(
     pythonSelector,
     {
       async provideHover(document, position, token) {
+        try {
         if (providersDisposed || token.isCancellationRequested) {
           daemon.logDiagnostic(`[hover] skip disposed=${providersDisposed} cancelled=${token.isCancellationRequested}`);
           return undefined;
@@ -2120,9 +2126,10 @@ export function registerPythonProviders(
           }
         }
 
-        if (isCancelled()) { logSlowPhases(); return undefined; }
+        if (isCancelled()) { daemon.logDiagnostic(`[hover:bail] cancelled-before-literals`); logSlowPhases(); return undefined; }
 
         markPhase('literals');
+        daemon.logDiagnostic(`[hover:stage] entering ormMemberCtx aborted=${daemon.isAborted()}`);
         try {
           await ensureStarted();
           if (isCancelled()) { logSlowPhases(); return undefined; }
@@ -2217,7 +2224,8 @@ export function registerPythonProviders(
         }
 
         markPhase('ormMember');
-        if (isCancelled()) { logSlowPhases(); return undefined; }
+        daemon.logDiagnostic(`[hover:stage] entering import aborted=${daemon.isAborted()}`);
+        if (isCancelled()) { daemon.logDiagnostic(`[hover:bail] cancelled-before-import`); logSlowPhases(); return undefined; }
 
         try {
           await ensureStarted();
@@ -2290,6 +2298,7 @@ export function registerPythonProviders(
         }
 
         markPhase('classHover');
+        daemon.logDiagnostic(`[hover:stage] entering instanceHover aborted=${daemon.isAborted()}`);
         if (!isCancelled()) {
           try {
             await ensureStarted();
@@ -2325,6 +2334,10 @@ export function registerPythonProviders(
         const shortPath = document.uri.fsPath.split('/').slice(-2).join('/');
         daemon.logDiagnostic(`[hover] ${shortPath}:${position.line}:${position.character} ${elapsed}ms result=${hoverResult ? 'hover' : 'none'} disposed=${providersDisposed}${timedOut ? ' TIMEOUT' : ''}`);
         return hoverResult;
+        } catch (error) {
+          daemon.logDiagnostic(`[hover:error] ${error instanceof Error ? error.message : String(error)}`);
+          return undefined;
+        }
       },
     }
   );
@@ -2333,6 +2346,7 @@ export function registerPythonProviders(
     pythonSelector,
     {
       async provideDefinition(document, position, token) {
+        try {
         if (providersDisposed || token.isCancellationRequested) {
           return undefined;
         }
@@ -2608,6 +2622,10 @@ export function registerPythonProviders(
         defAbort.abort();
         clearTimeout(defTimeout);
         return defResult;
+        } catch (error) {
+          daemon.logDiagnostic(`[definition:error] ${error instanceof Error ? error.message : String(error)}`);
+          return undefined;
+        }
       },
     }
   );
@@ -3515,6 +3533,7 @@ async function buildAnnotatedReceiverMemberHover(
   receiver: OrmReceiverInfo,
   memberName: string
 ): Promise<vscode.Hover | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const classSource = receiver.classSource;
   if (!classSource) {
     return undefined;
@@ -4553,6 +4572,7 @@ async function resolveImportReferenceAtPosition(
   document: vscode.TextDocument,
   position: vscode.Position
 ): Promise<ImportReference | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const directReference = importReferenceAtPosition(document, position);
   if (directReference) {
     return directReference;
@@ -4607,6 +4627,7 @@ async function resolveTypeHintHoverTargetAtPosition(
   document: vscode.TextDocument,
   position: vscode.Position
 ): Promise<TypeHintHoverTarget | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const annotationSegment = typeAnnotationSegmentAtPosition(document, position);
   if (!annotationSegment) {
     return undefined;
@@ -4669,6 +4690,7 @@ async function resolveClassHoverTargetAtPosition(
   document: vscode.TextDocument,
   position: vscode.Position
 ): Promise<ClassHoverTarget | undefined> {
+  if (daemon.isAborted()) { daemon.logDiagnostic(`[classHover:aborted] ${position.line}:${position.character}`); return undefined; }
   const classDefinition = classDefinitionAtPosition(document, position);
   const referenceText = classDefinition
     ? classDefinition.name
@@ -4711,6 +4733,7 @@ async function resolveImportedModuleMemberReference(
   bindings: ImportBindings,
   memberName: string
 ): Promise<ImportReference | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const lineText = document.lineAt(wordRange.start.line).text;
   if (
     wordRange.start.character === 0 ||
@@ -4763,6 +4786,7 @@ async function buildImportHover(
   daemon: AnalysisDaemon,
   reference: ImportReference
 ): Promise<vscode.Hover | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   if (reference.kind === 'module') {
     return buildModuleImportHover(
       reference.moduleName,
@@ -4868,6 +4892,7 @@ async function resolveReceiverInstanceHoverAtPosition(
   document: vscode.TextDocument,
   position: vscode.Position
 ): Promise<vscode.Hover | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const receiverExpression = receiverExpressionPrefixAtPosition(
     document,
     position
@@ -5054,6 +5079,7 @@ async function resolveImportedClassHoverTarget(
   daemon: AnalysisDaemon,
   resolution: ExportOriginResolution
 ): Promise<ClassHoverTarget | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   if (!resolution.originFilePath || !resolution.originSymbol) {
     return undefined;
   }
@@ -5520,6 +5546,7 @@ async function buildOrmMemberHover(
   receiver: OrmReceiverInfo,
   resolution: OrmMemberResolution
 ): Promise<vscode.Hover | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   if (!resolution.resolved || !resolution.item) {
     return undefined;
   }
@@ -5833,6 +5860,7 @@ async function resolveImportedSymbolOrModule(
   | { kind: 'module'; moduleName: string; resolution: ModuleResolution }
   | undefined
 > {
+  if (daemon.isAborted()) { return undefined; }
   const exportResolution = await daemon.resolveExportOrigin(moduleName, symbol);
   if (exportResolution.resolved) {
     return {
@@ -6421,6 +6449,7 @@ async function resolveOrmMemberCompletionContext(
   document: vscode.TextDocument,
   position: vscode.Position
 ): Promise<OrmMemberCompletionContext | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const prefixContext = ormMemberPrefixContext(document, position);
   if (!prefixContext) {
     return undefined;
@@ -6494,6 +6523,7 @@ async function resolveClassInstanceCompletionContext(
   document: vscode.TextDocument,
   position: vscode.Position
 ): Promise<ClassInstanceCompletionContext | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const prefixContext = ormMemberPrefixContext(document, position);
   if (!prefixContext) {
     return undefined;
@@ -6548,6 +6578,7 @@ async function resolveOrmMemberAccessContext(
   document: vscode.TextDocument,
   position: vscode.Position
 ): Promise<OrmMemberAccessContext | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const wordRange = document.getWordRangeAtPosition(position, /[A-Za-z_][\w]*/);
   if (!wordRange) {
     return undefined;
@@ -6959,6 +6990,7 @@ async function resolveOrmReceiverAtOffset(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedExpression = normalizeReceiverExpression(receiverExpression);
   if (!normalizedExpression) {
     return undefined;
@@ -6989,6 +7021,7 @@ async function resolveOrmReceiverAtOffsetCore(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedExpression = normalizeReceiverExpression(receiverExpression);
   if (!normalizedExpression) {
     return undefined;
@@ -7216,6 +7249,7 @@ async function preferAnnotatedMemberReceiver(
   annotatedReceiver: OrmReceiverInfo | undefined,
   objectReceiver: OrmReceiverInfo
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   if (!annotatedReceiver) {
     return resolvedReceiver;
   }
@@ -7258,6 +7292,7 @@ async function preferReceiverAnnotation(
   resolvedReceiver: OrmReceiverInfo | undefined,
   annotatedReceiver: OrmReceiverInfo | undefined
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   if (!annotatedReceiver) {
     return resolvedReceiver;
   }
@@ -7307,6 +7342,7 @@ async function resolvePreferredAnnotatedModelLabel(
   resolvedReceiver: OrmReceiverInfo,
   annotatedReceiver: OrmReceiverInfo
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   if (resolvedReceiver.modelLabel === annotatedReceiver.modelLabel) {
     return undefined;
   }
@@ -7354,6 +7390,7 @@ async function resolveDynamicInstanceReceiverAtOffset(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedExpression = normalizeReceiverExpression(receiverExpression);
   if (!normalizedExpression) {
     return undefined;
@@ -7736,6 +7773,7 @@ async function resolveOrmReceiverFromFunctionSource(
   functionSource: FunctionDefinitionSource,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const returnExpressions = collectReturnExpressions(
     functionSource.document,
     functionSource.functionDef
@@ -7768,6 +7806,7 @@ async function resolveOrmReceiverFromClassMethodSource(
   methodName: string,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const methodSource = await resolveMethodDefinitionInClassHierarchy(
     daemon,
     classSource,
@@ -7788,6 +7827,7 @@ async function resolveOrmReceiverFromBaseClasses(
   visited: Set<string>,
   visitedClasses: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const methodSource = await resolveMethodDefinitionFromBaseClasses(
     daemon,
     classSource,
@@ -7875,6 +7915,7 @@ async function resolveReceiverFromOrmMemberSource(
   item: OrmMemberItem | undefined,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   if (!item?.filePath || !item.line) {
     return undefined;
   }
@@ -8144,6 +8185,7 @@ async function resolveTupleAssignedReceiverAtOffset(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const assignment = findNearestTupleAssignedExpression(
     document,
     variableName,
@@ -8191,6 +8233,7 @@ async function resolveBulkCreateIterableElementReceiverAtOffset(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedExpression = normalizeReceiverExpression(expression);
   if (!normalizedExpression) {
     return undefined;
@@ -8254,6 +8297,7 @@ async function resolveOrmReceiverFromLoopTarget(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const iterableBinding = findNearestIterableBindingExpression(
     document,
     variableName,
@@ -8351,6 +8395,7 @@ async function resolveBaseModelLabelForReceiver(
   receiverExpression: string,
   position: vscode.Position
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   return resolveBaseModelLabelForReceiverAtOffset(
     daemon,
     document,
@@ -8366,6 +8411,7 @@ async function resolveLookupReceiverInfoForReceiver(
   receiverExpression: string,
   position: vscode.Position
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   return resolveLookupReceiverInfoForReceiverAtOffset(
     daemon,
     document,
@@ -8382,6 +8428,7 @@ async function resolveLookupReceiverInfoForReceiverAtOffset(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const resolvedReceiver = await resolveLookupReceiverAtOffset(
     daemon,
     document,
@@ -8518,6 +8565,7 @@ async function resolveLookupReceiverAtOffset(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedExpression = normalizeReceiverExpression(receiverExpression);
   if (!normalizedExpression) {
     return undefined;
@@ -8675,6 +8723,7 @@ async function resolveLookupReceiverFromCallExpression(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const parsedCall = parseCalledExpression(expression);
   if (!parsedCall) {
     return undefined;
@@ -8803,6 +8852,7 @@ async function resolveModelLabelFromCallExpression(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const chainedReceiver = await resolveOrmReceiverFromCallChain(
     daemon,
     document,
@@ -8951,6 +9001,7 @@ async function resolveModelLabelFromSymbol(
   symbol: string,
   beforeOffset: number
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const simpleName = symbol.includes('.') ? symbol.split('.').at(-1)! : symbol;
   const localLabel = daemon.modelLabelByName.get(simpleName);
   if (localLabel) {
@@ -8991,6 +9042,7 @@ async function resolveModelLabelFromImports(
   symbol: string,
   beforeOffset: number
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const bindings = collectImportBindings(document, beforeOffset);
   const directBinding = bindings.symbols.get(symbol);
   if (directBinding) {
@@ -9023,6 +9075,7 @@ async function resolveModelLabelFromImportedSymbol(
   moduleName: string,
   symbolName: string
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const exportResolution = await daemon.resolveExportOrigin(moduleName, symbolName);
   const originModule = exportResolution.originModule ?? moduleName;
   const originSymbol = exportResolution.originSymbol ?? symbolName;
@@ -9051,6 +9104,7 @@ async function resolveModelLabelFromFunctionSource(
   functionSource: FunctionDefinitionSource,
   visited: Set<string>
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const returnExpressions = collectReturnExpressions(
     functionSource.document,
     functionSource.functionDef
@@ -9082,6 +9136,7 @@ async function resolveModelLabelFromClassMethodSource(
   methodName: string,
   visited: Set<string>
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const methodSource = await resolveMethodDefinitionInClassHierarchy(
     daemon,
     classSource,
@@ -9101,6 +9156,7 @@ async function resolveMethodDefinitionInClassHierarchy(
   methodName: string,
   visitedClasses: Set<string>
 ): Promise<FunctionDefinitionSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const visitKey = `${classSource.document.uri.toString()}:${classSource.classDef.name}`;
   if (visitedClasses.has(visitKey)) {
     return undefined;
@@ -9136,6 +9192,7 @@ async function resolveMethodDefinitionFromBaseClasses(
   methodName: string,
   visitedClasses: Set<string>
 ): Promise<FunctionDefinitionSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   for (const baseExpression of classSource.classDef.baseExpressions) {
     const baseClassSource = await resolveClassDefinitionSource(
       daemon,
@@ -9169,6 +9226,7 @@ async function resolveModelLabelFromBaseClasses(
   visited: Set<string>,
   visitedClasses: Set<string>
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const methodSource = await resolveMethodDefinitionFromBaseClasses(
     daemon,
     classSource,
@@ -9386,6 +9444,7 @@ async function resolveClassDefinitionSource(
   symbol: string,
   beforeOffset: number
 ): Promise<ClassDefinitionSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const sameDocumentClass = findClassDefinition(document, symbol);
   if (sameDocumentClass) {
     return {
@@ -9429,6 +9488,7 @@ async function resolveSpecialClassKind(
   classSource: ClassDefinitionSource,
   visited: Set<string>
 ): Promise<SpecialClassKind | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const visitKey = `${classSource.document.uri.toString()}:${classSource.classDef.name}`;
   if (visited.has(visitKey)) {
     return undefined;
@@ -9480,6 +9540,7 @@ async function resolveClassDefinitionFromClassMethodSource(
   classSource: ClassDefinitionSource,
   methodName: string
 ): Promise<ClassDefinitionSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const methodSource = await resolveMethodDefinitionInClassHierarchy(
     daemon,
     classSource,
@@ -9497,6 +9558,7 @@ async function resolveClassDefinitionFromModelLabel(
   daemon: AnalysisDaemon,
   modelLabel: string
 ): Promise<ClassDefinitionSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const targets = await listAllRelationTargets(daemon);
   const target = targets.items.find((item) => item.label === modelLabel);
   if (!target?.filePath || !target.objectName) {
@@ -9617,6 +9679,7 @@ async function resolveClassDefinitionFromBaseClasses(
   methodName: string,
   visitedClasses: Set<string>
 ): Promise<ClassDefinitionSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const methodSource = await resolveMethodDefinitionFromBaseClasses(
     daemon,
     classSource,
@@ -9923,6 +9986,7 @@ async function resolveFunctionDefinitionSource(
   symbol: string,
   beforeOffset: number
 ): Promise<FunctionDefinitionSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const sameDocumentFunction = findTopLevelFunctionDefinition(document, symbol);
   if (sameDocumentFunction) {
     return {
@@ -9965,6 +10029,7 @@ async function resolveReceiverFromFunctionReturnAnnotation(
   daemon: AnalysisDaemon,
   functionSource: FunctionDefinitionSource
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const annotation = functionSource.functionDef.returnAnnotation;
   if (!annotation) {
     return undefined;
@@ -9982,6 +10047,7 @@ async function resolveModelLabelFromFunctionReturnAnnotation(
   daemon: AnalysisDaemon,
   functionSource: FunctionDefinitionSource
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const annotation = functionSource.functionDef.returnAnnotation;
   if (!annotation) {
     return undefined;
@@ -9999,6 +10065,7 @@ async function resolveClassDefinitionFromFunctionReturnAnnotation(
   daemon: AnalysisDaemon,
   functionSource: FunctionDefinitionSource
 ): Promise<ClassDefinitionSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const annotation = functionSource.functionDef.returnAnnotation;
   if (!annotation) {
     return undefined;
@@ -10018,6 +10085,7 @@ async function resolveImportedDefinitionDocument(
   symbol: string,
   beforeOffset: number
 ): Promise<{ document: vscode.TextDocument; symbolName: string } | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const bindings = collectImportBindings(document, beforeOffset);
   const directBinding = bindings.symbols.get(symbol);
   if (directBinding) {
@@ -10093,6 +10161,7 @@ async function resolveDirectModuleDefinitionDocument(
   moduleName: string,
   symbolName: string
 ): Promise<{ document: vscode.TextDocument; symbolName: string } | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const moduleResolution = await daemon.resolveModule(moduleName);
   if (!moduleResolution.resolved || !moduleResolution.filePath) {
     return undefined;
@@ -10111,6 +10180,7 @@ async function resolveImportedModelDefinitionDocument(
   moduleName: string,
   symbolName: string
 ): Promise<{ document: vscode.TextDocument; symbolName: string } | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const targets = await listAllRelationTargets(daemon);
   const sameNameTargets = targets.items.filter(
     (item) => item.objectName === symbolName
@@ -10275,6 +10345,7 @@ async function resolveMetaOwnerModelLabel(
   document: vscode.TextDocument,
   position: vscode.Position
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const metaClass = findEnclosingClassDefinition(document, document.offsetAt(position));
   if (!metaClass || metaClass.name !== 'Meta') {
     return undefined;
@@ -11340,6 +11411,7 @@ async function resolveTypeVarBoundAnnotation(
   beforeOffset: number,
   visitedTypeVars: Set<string>
 ): Promise<TypeAnnotationSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedTypeVarName = normalizeTypeAnnotation(typeVarName);
   if (!normalizedTypeVarName) {
     return undefined;
@@ -11775,6 +11847,7 @@ async function resolveAnnotatedReceiverForIdentifier(
   variableName: string,
   beforeOffset: number
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const typeAnnotation = findTypeAnnotationForIdentifier(
     document,
     variableName,
@@ -11827,6 +11900,7 @@ async function resolveAnnotatedReceiverForExpression(
   expression: string,
   beforeOffset: number
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedExpression = normalizeReceiverExpression(expression);
   if (!normalizedExpression) {
     return undefined;
@@ -11855,6 +11929,7 @@ async function resolveTypeAnnotationForMemberAccess(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<TypeAnnotationSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const classSource = await resolveClassDefinitionForExpression(
     daemon,
     document,
@@ -11880,6 +11955,7 @@ async function resolveClassAttributeTypeAnnotationSource(
   attributeName: string,
   visitedClasses: Set<string>
 ): Promise<TypeAnnotationSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const visitKey = `${classSource.document.uri.toString()}:${classSource.classDef.name}:${attributeName}`;
   if (visitedClasses.has(visitKey)) {
     return undefined;
@@ -11929,6 +12005,7 @@ async function resolveDirectReceiverFromTypeAnnotation(
   annotation: string,
   beforeOffset: number
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   for (const candidate of splitTopLevelTypeAlternatives(annotation)) {
     const resolvedReceiver = await resolveSingleDirectReceiverType(
       daemon,
@@ -11950,6 +12027,7 @@ async function resolveSingleDirectReceiverType(
   annotation: string,
   beforeOffset: number
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedAnnotation = normalizeTypeAnnotation(annotation);
   if (!normalizedAnnotation) {
     return undefined;
@@ -12080,6 +12158,7 @@ async function resolveIterableElementReceiverFromTypeAnnotation(
   annotation: string,
   beforeOffset: number
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   for (const candidate of splitTopLevelTypeAlternatives(annotation)) {
     const resolvedReceiver = await resolveSingleIterableElementType(
       daemon,
@@ -12101,6 +12180,7 @@ async function resolveSingleIterableElementType(
   annotation: string,
   beforeOffset: number
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedAnnotation = normalizeTypeAnnotation(annotation);
   if (!normalizedAnnotation) {
     return undefined;
@@ -12198,6 +12278,7 @@ async function resolveModelLabelFromTypeAnnotation(
   annotation: string,
   beforeOffset: number
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedAnnotation = normalizeTypeAnnotation(annotation);
   if (!normalizedAnnotation) {
     return undefined;
@@ -12299,6 +12380,7 @@ async function resolveReceiverFromSpecialClassTypeAnnotation(
   annotation: string,
   beforeOffset: number
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const classSource = await resolveClassDefinitionFromTypeAnnotation(
     daemon,
     document,
@@ -12342,6 +12424,7 @@ async function resolveReceiverFromSpecialClassGenericType(
   modelAnnotation: string | undefined,
   beforeOffset: number
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const classSource = await resolveClassDefinitionFromTypeAnnotation(
     daemon,
     document,
@@ -12393,6 +12476,7 @@ async function resolveModelLabelFromSpecialClassTypeAnnotation(
   annotation: string,
   beforeOffset: number
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const classSource = await resolveClassDefinitionFromTypeAnnotation(
     daemon,
     document,
@@ -12422,6 +12506,7 @@ async function resolveModelLabelFromSpecialClassGenericType(
   modelAnnotation: string | undefined,
   beforeOffset: number
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const specialReceiver = await resolveReceiverFromSpecialClassGenericType(
     daemon,
     document,
@@ -12437,6 +12522,7 @@ async function resolveModelLabelFromSpecialClassSource(
   classSource: ClassDefinitionSource,
   specialKind: SpecialClassKind
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const preferredCandidateLabel = await resolvePreferredSpecialClassCandidateModelLabel(
     daemon,
     classSource,
@@ -12515,6 +12601,7 @@ async function resolvePreferredSpecialClassCandidateModelLabel(
   classSource: ClassDefinitionSource,
   specialKind: SpecialClassKind
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const candidateModelNames = specialClassModelNameCandidates(
     classSource,
     specialKind
@@ -12561,6 +12648,7 @@ async function resolveDirectModelLabelFromSpecialClassBaseExpressions(
   classSource: ClassDefinitionSource,
   specialKind: SpecialClassKind
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   for (const baseExpression of classSource.classDef.baseExpressions) {
     const genericBaseLabel =
       await resolveModelLabelFromSpecialClassGenericBaseExpression(
@@ -12593,6 +12681,7 @@ async function resolveInheritedModelLabelFromSpecialClassBaseExpressions(
   specialKind: SpecialClassKind,
   visited: Set<string>
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const visitKey = `${classSource.document.uri.toString()}:${classSource.classDef.name}:${specialKind}`;
   if (visited.has(visitKey)) {
     return undefined;
@@ -12634,6 +12723,7 @@ async function resolveModelLabelFromSpecialClassGenericBaseExpression(
   baseExpression: string,
   specialKind: SpecialClassKind
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedExpression = stripWrappingParentheses(baseExpression.trim());
   if (!normalizedExpression) {
     return undefined;
@@ -12668,6 +12758,7 @@ async function resolveModelLabelFromFromQuerysetArgument(
   baseExpression: string,
   visited: Set<string>
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const details = parseCallExpressionDetails(baseExpression);
   if (
     !details ||
@@ -12775,6 +12866,7 @@ async function resolveClassDefinitionFromTypeAnnotation(
   annotation: string,
   beforeOffset: number
 ): Promise<ClassDefinitionSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedAnnotation = normalizeTypeAnnotation(annotation);
   if (!normalizedAnnotation) {
     return undefined;
@@ -12864,6 +12956,7 @@ async function resolveSpecialSiblingClassDefinitionSource(
   daemon: AnalysisDaemon,
   className: string
 ): Promise<ClassDefinitionSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const candidateName = className.trim().split('.').at(-1);
   if (!candidateName) {
     return undefined;
@@ -13211,6 +13304,7 @@ async function resolveImportedModuleAlias(
   bindings: ImportBindings,
   alias: string
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const directModule = bindings.modules.get(alias);
   if (directModule) {
     return directModule;
