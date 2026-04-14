@@ -165,8 +165,8 @@ const F_EXPRESSION_METHOD = 'f_expression';
 const EXPRESSION_PATH_METHOD_PREFIX = 'expression_path:';
 const ANNOTATED_MEMBER_SOURCE = 'annotation_expression';
 const INITIAL_DIAGNOSTIC_REFRESH_DELAY_MS = 500;
-const DIAGNOSTIC_TIME_BUDGET_MS = 4_000;
-const DIAGNOSTIC_REQUEST_BUDGET = 40;
+const DIAGNOSTIC_TIME_BUDGET_MS = 10_000;
+const DIAGNOSTIC_REQUEST_BUDGET = 200;
 const modelSubclassRelationCache = new Map<string, boolean>();
 const VIRTUAL_LOOKUP_OPERATORS = [
   'exact',
