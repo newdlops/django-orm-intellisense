@@ -48,6 +48,9 @@ import type {
 const REQUEST_TIMEOUT_MS = 8_000;
 const INITIALIZE_REQUEST_TIMEOUT_MS = 60_000;
 const RESPONSE_CACHE_LIMIT = 512;
+const RESPONSE_CACHE_TTL_MS = 30_000;
+const MAX_PENDING_REQUESTS = 64;
+const MAX_PAYLOAD_BYTES = 512 * 1024; // 512KB
 const LOCAL_LOOKUP_RELATION_ONLY_METHODS = new Set([
   'select_related',
   'prefetch_related',
@@ -171,7 +174,7 @@ function prependToPath(
 export class AnalysisDaemon implements vscode.Disposable {
   private readonly stateEmitter = new vscode.EventEmitter<HealthSnapshot>();
   private readonly pendingRequests = new Map<string, PendingRequest>();
-  private readonly responseCache = new Map<string, Promise<unknown>>();
+  private readonly responseCache = new Map<string, { promise: Promise<unknown>; createdAt: number }>();
   private readonly intentionalExitProcessIds = new Set<number>();
   private readonly requestSourceContext = new AsyncLocalStorage<IpcRequestSource>();
   private readonly output: vscode.OutputChannel;
@@ -640,9 +643,6 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
 
     if (receiverKind === 'instance') {
-      if (prefix.trim()) {
-        return undefined;
-      }
       return this.listLocalInstanceOrmMemberCompletions(modelLabel, prefix);
     }
 
@@ -706,7 +706,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     prefix: string,
   ): OrmMemberCompletionsResult | undefined {
     const model = this.localWorkspaceIndex.models.get(modelLabel);
-    if (!model) {
+    if (!model || model.fields.size === 0) {
       return undefined;
     }
 
@@ -1514,10 +1514,36 @@ export class AnalysisDaemon implements vscode.Disposable {
   ): Promise<T> {
     const source = this.currentRequestSource();
     const effectiveBackground = background || source === 'diagnostic';
-    const cacheKey = JSON.stringify({ method, params, background: effectiveBackground });
+
+    // Cache key ignores background flag so foreground (hover) and background
+    // (diagnostic) requests for the same method+params share a single IPC
+    // round-trip.  The daemon returns identical results regardless of queue.
+    const cacheKey = JSON.stringify({ method, params });
     const cached = this.responseCache.get(cacheKey);
     if (cached) {
-      return cached as Promise<T>;
+      const age = Date.now() - cached.createdAt;
+      if (age < RESPONSE_CACHE_TTL_MS) {
+        return cached.promise as Promise<T>;
+      }
+      // TTL expired — evict and re-request
+      this.responseCache.delete(cacheKey);
+    }
+
+    // Reject if pending queue is full to prevent backpressure freeze
+    if (this.pendingRequests.size >= MAX_PENDING_REQUESTS) {
+      this.output.appendLine(
+        `  [IPC] DROPPING ${method} (source=${source}): pending queue full (${this.pendingRequests.size}/${MAX_PENDING_REQUESTS})`
+      );
+      return Promise.reject(new Error(`Pending request queue full (${MAX_PENDING_REQUESTS}). Dropping ${method}.`));
+    }
+
+    // Reject oversized payloads before serialization stalls the event loop
+    const serializedParams = JSON.stringify(params);
+    if (serializedParams.length > MAX_PAYLOAD_BYTES) {
+      this.output.appendLine(
+        `  [IPC] DROPPING ${method} (source=${source}): payload too large (${(serializedParams.length / 1024).toFixed(1)}KB > ${MAX_PAYLOAD_BYTES / 1024}KB)`
+      );
+      return Promise.reject(new Error(`Payload too large for ${method}: ${(serializedParams.length / 1024).toFixed(1)}KB`));
     }
 
     const requestPromise = this.request<T>(
@@ -1527,10 +1553,10 @@ export class AnalysisDaemon implements vscode.Disposable {
       effectiveBackground,
       source
     );
-    this.responseCache.set(cacheKey, requestPromise);
+    this.responseCache.set(cacheKey, { promise: requestPromise, createdAt: Date.now() });
     this.evictOldestCachedResponse();
     requestPromise.catch(() => {
-      if (this.responseCache.get(cacheKey) === requestPromise) {
+      if (this.responseCache.get(cacheKey)?.promise === requestPromise) {
         this.responseCache.delete(cacheKey);
       }
     });
@@ -1553,6 +1579,13 @@ export class AnalysisDaemon implements vscode.Disposable {
     if ('event' in message) {
       this.handleServerNotification(message);
       return;
+    }
+
+    const payloadKb = trimmed.length / 1024;
+    if (payloadKb >= 10) {
+      this.output.appendLine(
+        `  [IPC:recv] ${message.id} payload=${payloadKb.toFixed(1)}KB`
+      );
     }
 
     const pending = this.pendingRequests.get(message.id);
@@ -1665,6 +1698,11 @@ export class AnalysisDaemon implements vscode.Disposable {
     );
   }
 
+  /** Write a diagnostic line to the output channel (always, regardless of logLevel). */
+  logDiagnostic(message: string): void {
+    this.output.appendLine(message);
+  }
+
   private log(level: 'info' | 'debug', message: string): void {
     const settings = getExtensionSettings();
     if (settings.logLevel === 'off') {
@@ -1683,6 +1721,14 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   private evictOldestCachedResponse(): void {
+    // Evict TTL-expired entries first
+    const now = Date.now();
+    for (const [key, entry] of this.responseCache) {
+      if (now - entry.createdAt >= RESPONSE_CACHE_TTL_MS) {
+        this.responseCache.delete(key);
+      }
+    }
+    // Then evict oldest if still over limit
     while (this.responseCache.size > RESPONSE_CACHE_LIMIT) {
       const oldestKey = this.responseCache.keys().next().value;
       if (!oldestKey) {

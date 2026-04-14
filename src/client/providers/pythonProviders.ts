@@ -165,6 +165,8 @@ const F_EXPRESSION_METHOD = 'f_expression';
 const EXPRESSION_PATH_METHOD_PREFIX = 'expression_path:';
 const ANNOTATED_MEMBER_SOURCE = 'annotation_expression';
 const INITIAL_DIAGNOSTIC_REFRESH_DELAY_MS = 500;
+const DIAGNOSTIC_TIME_BUDGET_MS = 10_000;
+const DIAGNOSTIC_REQUEST_BUDGET = 80;
 const modelSubclassRelationCache = new Map<string, boolean>();
 const VIRTUAL_LOOKUP_OPERATORS = [
   'exact',
@@ -759,7 +761,16 @@ export function registerPythonProviders(
     'djangoOrmIntellisense.orm'
   );
   const diagnosticsEnabled = isPylanceAvailable();
+  let providersDisposed = false;
   let diagnosticsDisposed = false;
+  // Disposal signal: rejects when providers are disposed, used with Promise.race
+  // to immediately abort in-flight hover/completion/definition/signature calls.
+  let fireDisposalSignal: (() => void) | undefined;
+  const disposalSignal = new Promise<never>((_, reject) => {
+    fireDisposalSignal = () => reject(new Error('providers disposed'));
+  });
+  // Suppress unhandled rejection from the signal promise itself
+  disposalSignal.catch(() => {});
   const diagnosticTimers = new Map<string, NodeJS.Timeout>();
   const lastDiagnosedDocumentVersions = new Map<string, number>();
   let fullDiagnosticsRefreshTimer: NodeJS.Timeout | undefined;
@@ -876,10 +887,42 @@ export function registerPythonProviders(
 
     const diagnostics: vscode.Diagnostic[] = [];
     const seenRanges = new Set<string>();
+    const diagnosticStartTime = Date.now();
+    let diagnosticRequestCount = 0;
+    let diagnosticBudgetLogged = false;
+    const isDiagnosticsCancelled = () => {
+      if (diagnosticsDisposed || document.version !== documentVersion) {
+        return true;
+      }
+      const elapsed = Date.now() - diagnosticStartTime;
+      if (elapsed > DIAGNOSTIC_TIME_BUDGET_MS) {
+        if (!diagnosticBudgetLogged) {
+          diagnosticBudgetLogged = true;
+          daemon.logDiagnostic(
+            `[diagnostics] time budget exhausted (${elapsed}ms > ${DIAGNOSTIC_TIME_BUDGET_MS}ms, ${diagnosticRequestCount} requests) for ${document.uri.fsPath}`
+          );
+        }
+        return true;
+      }
+      if (diagnosticRequestCount >= DIAGNOSTIC_REQUEST_BUDGET) {
+        if (!diagnosticBudgetLogged) {
+          diagnosticBudgetLogged = true;
+          daemon.logDiagnostic(
+            `[diagnostics] request budget exhausted (${diagnosticRequestCount}/${DIAGNOSTIC_REQUEST_BUDGET}) for ${document.uri.fsPath}`
+          );
+        }
+        return true;
+      }
+      return false;
+    };
+    const trackRequest = (): void => { diagnosticRequestCount++; };
 
     for (const context of findRelationDiagnosticContexts(document)) {
+      if (isDiagnosticsCancelled()) break;
       try {
         const resolution = await daemon.resolveRelationTarget(context.value, /* background */ true);
+        trackRequest();
+        if (isDiagnosticsCancelled()) break;
         const diagnostic = buildRelationDiagnostic(context, resolution);
         if (!diagnostic) {
           continue;
@@ -907,10 +950,13 @@ export function registerPythonProviders(
     const _receiverCache = new Map<string, OrmReceiverInfo | null>();
 
     for (const context of findLookupDiagnosticContexts(document)) {
+      if (isDiagnosticsCancelled()) break;
       try {
         const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
           daemon, document, context.receiverExpression, context.range.end
         );
+        trackRequest();
+        if (isDiagnosticsCancelled()) break;
         if (!lookupReceiver) continue;
 
         const virtualRes = resolveVirtualLookupPath(lookupReceiver, context.value, context.method);
@@ -936,6 +982,9 @@ export function registerPythonProviders(
     }
 
     // Pass 2: Batch resolve lookup paths
+    if (isDiagnosticsCancelled()) {
+      return;
+    }
     let _batchRes: import('../protocol').LookupPathResolution[] | undefined;
     // Only use batch when there are enough items to justify the overhead,
     // and batch size is manageable for the daemon's single-threaded processing.
@@ -945,6 +994,7 @@ export function registerPythonProviders(
     if (_batchItems.length >= BATCH_THRESHOLD) {
       try {
         _batchRes = await daemon.resolveLookupPathBatch(_batchItems);
+        trackRequest();
         if (!Array.isArray(_batchRes) || _batchRes.length !== _batchItems.length) {
           _batchRes = undefined;
         }
@@ -955,9 +1005,14 @@ export function registerPythonProviders(
 
     // Pass 3: Build diagnostics
     for (const { context, receiver, baseModelLabel, batchIdx } of _lookupPending) {
+      if (isDiagnosticsCancelled()) break;
       try {
-        const resolution = _batchRes?.[batchIdx]
-          ?? await daemon.resolveLookupPath(baseModelLabel, context.value, context.method, /* background */ true);
+        let resolution = _batchRes?.[batchIdx];
+        if (!resolution) {
+          resolution = await daemon.resolveLookupPath(baseModelLabel, context.value, context.method, /* background */ true);
+          trackRequest();
+        }
+        if (isDiagnosticsCancelled()) break;
         if (!resolution.resolved) {
           const partialCompletions = {
             items: mergeLookupCompletionItems(
@@ -985,6 +1040,7 @@ export function registerPythonProviders(
     }
 
     for (const context of findDirectFieldDiagnosticContexts(document)) {
+      if (isDiagnosticsCancelled()) break;
       try {
         const baseModelLabel = await resolveBaseModelLabelForReceiver(
           daemon,
@@ -992,6 +1048,8 @@ export function registerPythonProviders(
           context.receiverExpression,
           context.range.end
         );
+        trackRequest();
+        if (isDiagnosticsCancelled()) break;
         if (!baseModelLabel) {
           continue;
         }
@@ -1002,6 +1060,8 @@ export function registerPythonProviders(
           'filter',
           /* background */ true
         );
+        trackRequest();
+        if (isDiagnosticsCancelled()) break;
         const diagnostic = buildDirectFieldDiagnostic(
           context,
           baseModelLabel,
@@ -1023,12 +1083,15 @@ export function registerPythonProviders(
     }
 
     for (const context of findSchemaFieldDiagnosticContexts(document)) {
+      if (isDiagnosticsCancelled()) break;
       try {
         const baseModelLabel = await resolveMetaOwnerModelLabel(
           daemon,
           document,
           context.range.end
         );
+        trackRequest();
+        if (isDiagnosticsCancelled()) break;
         if (!baseModelLabel) {
           continue;
         }
@@ -1039,6 +1102,8 @@ export function registerPythonProviders(
           'filter',
           /* background */ true
         );
+        trackRequest();
+        if (isDiagnosticsCancelled()) break;
         const diagnostic = buildSchemaFieldDiagnostic(
           context,
           baseModelLabel,
@@ -1060,12 +1125,15 @@ export function registerPythonProviders(
     }
 
     for (const context of findMetaConstraintLookupDiagnosticContexts(document)) {
+      if (isDiagnosticsCancelled()) break;
       try {
         const baseModelLabel = await resolveMetaOwnerModelLabel(
           daemon,
           document,
           context.range.end
         );
+        trackRequest();
+        if (isDiagnosticsCancelled()) break;
         if (!baseModelLabel) {
           continue;
         }
@@ -1076,6 +1144,8 @@ export function registerPythonProviders(
           'filter',
           /* background */ true
         );
+        trackRequest();
+        if (isDiagnosticsCancelled()) break;
         const diagnostic = buildLookupDiagnostic(
           {
             receiverExpression: '',
@@ -1102,6 +1172,7 @@ export function registerPythonProviders(
     }
 
     for (const context of findBulkUpdateFieldDiagnosticContexts(document)) {
+      if (isDiagnosticsCancelled()) break;
       try {
         const baseModelLabel = await resolveBaseModelLabelForReceiver(
           daemon,
@@ -1109,6 +1180,8 @@ export function registerPythonProviders(
           context.receiverExpression,
           context.range.end
         );
+        trackRequest();
+        if (isDiagnosticsCancelled()) break;
         if (!baseModelLabel) {
           continue;
         }
@@ -1119,6 +1192,8 @@ export function registerPythonProviders(
           'filter',
           /* background */ true
         );
+        trackRequest();
+        if (isDiagnosticsCancelled()) break;
         const diagnostic = buildBulkUpdateFieldDiagnostic(
           context,
           baseModelLabel,
@@ -1139,11 +1214,7 @@ export function registerPythonProviders(
       }
     }
 
-    if (document.version !== documentVersion) {
-      return;
-    }
-
-    if (diagnosticsDisposed) {
+    if (isDiagnosticsCancelled()) {
       return;
     }
 
@@ -1155,7 +1226,14 @@ export function registerPythonProviders(
     pythonSelector,
     {
       async provideCompletionItems(document, position, token) {
-        return daemon.withRequestSource('completion', async () => {
+        if (providersDisposed || token.isCancellationRequested) {
+          return undefined;
+        }
+        const tokenAbort = new Promise<undefined>((resolve) => {
+          token.onCancellationRequested(() => resolve(undefined));
+        });
+        return Promise.race([
+        daemon.withRequestSource('completion', async () => {
         const relationContext = relationCompletionContext(document, position);
         if (relationContext) {
           try {
@@ -1526,13 +1604,8 @@ export function registerPythonProviders(
                 : undefined);
             const canUseLocalOrmMemberCompletions =
               memberContext.receiver.kind !== 'instance' ||
-              (
-                !memberContext.prefix.trim() &&
-                (
-                  Boolean(memberContext.receiver.classSource) ||
-                  memberContext.receiverExpression.includes('.')
-                )
-              );
+              Boolean(memberContext.receiver.classSource) ||
+              memberContext.receiverExpression.includes('.');
             const result =
               (canUseLocalOrmMemberCompletions
                 ? daemon.listOrmMemberCompletionsLocal(
@@ -1685,7 +1758,10 @@ export function registerPythonProviders(
         } catch {
           return undefined;
         }
-        });
+        }),
+        disposalSignal.catch(() => undefined),
+        tokenAbort,
+        ]);
       },
     },
     "'",
@@ -1700,7 +1776,14 @@ export function registerPythonProviders(
     pythonSelector,
     {
       async provideSignatureHelp(document, position, token) {
-        return daemon.withRequestSource('signature', async () => {
+        if (providersDisposed || token.isCancellationRequested) {
+          return undefined;
+        }
+        const sigTokenAbort = new Promise<undefined>((resolve) => {
+          token.onCancellationRequested(() => resolve(undefined));
+        });
+        return Promise.race([
+        daemon.withRequestSource('signature', async () => {
           const signatureContext = directFieldSignatureHelpContext(
             document,
             position
@@ -1744,7 +1827,10 @@ export function registerPythonProviders(
           } catch {
             return undefined;
           }
-        });
+        }),
+        disposalSignal.catch(() => undefined),
+        sigTokenAbort,
+        ]);
       },
     },
     {
@@ -1757,13 +1843,27 @@ export function registerPythonProviders(
     pythonSelector,
     {
       async provideHover(document, position, token) {
-        return daemon.withRequestSource('hover', async () => {
+        if (providersDisposed || token.isCancellationRequested) {
+          daemon.logDiagnostic(`[hover] skip disposed=${providersDisposed} cancelled=${token.isCancellationRequested}`);
+          return undefined;
+        }
+        const hoverStart = performance.now();
+        // Race hover body against disposal signal + token cancellation so that
+        // tab switches immediately abort in-flight daemon awaits.
+        const tokenAbort = new Promise<undefined>((resolve) => {
+          token.onCancellationRequested(() => resolve(undefined));
+        });
+        const hoverResult = await Promise.race([
+        daemon.withRequestSource('hover', async () => {
+        const isCancelled = () => providersDisposed || token.isCancellationRequested;
         const ensureStarted = createEnsureStartedOnce(daemon, document.uri);
         const relationLiteral = relationHoverLiteral(document, position);
         if (relationLiteral) {
           try {
             await ensureStarted();
+            if (isCancelled()) { return undefined; }
             const resolution = await daemon.resolveRelationTarget(relationLiteral.value);
+            if (isCancelled()) { return undefined; }
             const relationHover = buildRelationHover(relationLiteral.value, resolution);
             if (relationHover) {
               return relationHover;
@@ -1772,6 +1872,8 @@ export function registerPythonProviders(
             return undefined;
           }
         }
+
+        if (isCancelled()) { return undefined; }
 
         const lookupLiteral =
           lookupHoverLiteral(document, position) ??
@@ -1793,6 +1895,7 @@ export function registerPythonProviders(
         if (lookupLiteral) {
           try {
             await ensureStarted();
+            if (isCancelled()) { return undefined; }
             const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
               daemon,
               document,
@@ -1804,6 +1907,7 @@ export function registerPythonProviders(
             }
 
             const baseModelLabel = lookupReceiver.modelLabel;
+            if (isCancelled()) { return undefined; }
             const resolution =
               resolveVirtualLookupPath(
                 lookupReceiver,
@@ -1815,6 +1919,7 @@ export function registerPythonProviders(
                 lookupLiteral.value,
                 lookupLiteral.method
               ));
+            if (isCancelled()) { return undefined; }
             const lookupHover = buildLookupHover(
               lookupLiteral.value,
               lookupLiteral.method,
@@ -1832,12 +1937,14 @@ export function registerPythonProviders(
         if (directFieldLiteral) {
           try {
             await ensureStarted();
+            if (isCancelled()) { return undefined; }
             const baseModelLabel = await resolveBaseModelLabelForReceiver(
               daemon,
               document,
               directFieldLiteral.receiverExpression,
               position
             );
+            if (isCancelled()) { return undefined; }
             if (!baseModelLabel) {
               return undefined;
             }
@@ -1847,6 +1954,7 @@ export function registerPythonProviders(
               directFieldLiteral.value,
               'filter'
             );
+            if (isCancelled()) { return undefined; }
             return buildLookupHover(
               directFieldLiteral.value,
               directFieldLiteral.method,
@@ -1861,11 +1969,13 @@ export function registerPythonProviders(
         if (metaConstraintLookupLiteralAtPosition) {
           try {
             await ensureStarted();
+            if (isCancelled()) { return undefined; }
             const baseModelLabel = await resolveMetaOwnerModelLabel(
               daemon,
               document,
               position
             );
+            if (isCancelled()) { return undefined; }
             if (!baseModelLabel) {
               return undefined;
             }
@@ -1875,6 +1985,7 @@ export function registerPythonProviders(
               metaConstraintLookupLiteralAtPosition.value,
               'filter'
             );
+            if (isCancelled()) { return undefined; }
             return buildLookupHover(
               metaConstraintLookupLiteralAtPosition.value,
               'filter',
@@ -1889,11 +2000,13 @@ export function registerPythonProviders(
         if (schemaFieldLiteral) {
           try {
             await ensureStarted();
+            if (isCancelled()) { return undefined; }
             const baseModelLabel = await resolveMetaOwnerModelLabel(
               daemon,
               document,
               position
             );
+            if (isCancelled()) { return undefined; }
             if (!baseModelLabel) {
               return undefined;
             }
@@ -1903,6 +2016,7 @@ export function registerPythonProviders(
               schemaFieldLiteral.value,
               'filter'
             );
+            if (isCancelled()) { return undefined; }
             return buildLookupHover(
               schemaFieldLiteral.value,
               'filter',
@@ -1917,12 +2031,14 @@ export function registerPythonProviders(
         if (bulkUpdateFieldLiteral) {
           try {
             await ensureStarted();
+            if (isCancelled()) { return undefined; }
             const baseModelLabel = await resolveBaseModelLabelForReceiver(
               daemon,
               document,
               bulkUpdateFieldLiteral.receiverExpression,
               position
             );
+            if (isCancelled()) { return undefined; }
             if (!baseModelLabel) {
               return undefined;
             }
@@ -1932,6 +2048,7 @@ export function registerPythonProviders(
               bulkUpdateFieldLiteral.value,
               'filter'
             );
+            if (isCancelled()) { return undefined; }
             return buildLookupHover(
               bulkUpdateFieldLiteral.value,
               'filter',
@@ -1943,13 +2060,17 @@ export function registerPythonProviders(
           }
         }
 
+        if (isCancelled()) { return undefined; }
+
         try {
           await ensureStarted();
+          if (isCancelled()) { return undefined; }
           const memberContext = await resolveOrmMemberAccessContext(
             daemon,
             document,
             position
           );
+          if (isCancelled()) { return undefined; }
           if (memberContext) {
             const virtualResolution = resolveVirtualOrmMember(
               memberContext.receiver,
@@ -1995,12 +2116,14 @@ export function registerPythonProviders(
               }
             }
 
+            if (isCancelled()) { return undefined; }
             const resolution = await daemon.resolveOrmMember(
               memberContext.receiver.modelLabel,
               memberContext.receiver.kind,
               memberContext.memberName,
               memberContext.receiver.managerName
             );
+            if (isCancelled()) { return undefined; }
             const memberHover = await buildOrmMemberHover(
               daemon,
               document,
@@ -2014,6 +2137,7 @@ export function registerPythonProviders(
               return memberHover;
             }
 
+            if (isCancelled()) { return undefined; }
             const annotatedMemberHover = await buildAnnotatedReceiverMemberHover(
               daemon,
               document,
@@ -2029,14 +2153,18 @@ export function registerPythonProviders(
           return undefined;
         }
 
+        if (isCancelled()) { return undefined; }
+
         try {
           await ensureStarted();
+          if (isCancelled()) { return undefined; }
           const importReference = await resolveImportReferenceAtPosition(
             daemon,
             document,
             position
           );
           if (importReference) {
+            if (isCancelled()) { return undefined; }
             const importHover = await buildImportHover(
               daemon,
               importReference
@@ -2049,8 +2177,11 @@ export function registerPythonProviders(
           return undefined;
         }
 
+        if (isCancelled()) { return undefined; }
+
         try {
           await ensureStarted();
+          if (isCancelled()) { return undefined; }
           const typeHintHoverTarget = await resolveTypeHintHoverTargetAtPosition(
             daemon,
             document,
@@ -2066,8 +2197,11 @@ export function registerPythonProviders(
           return undefined;
         }
 
+        if (isCancelled()) { return undefined; }
+
         try {
           await ensureStarted();
+          if (isCancelled()) { return undefined; }
           const classHoverTarget =
             await resolveClassHoverTargetAtPosition(
               daemon,
@@ -2086,10 +2220,10 @@ export function registerPythonProviders(
           return undefined;
         }
 
-        if (!token.isCancellationRequested) {
+        if (!isCancelled()) {
           try {
             await ensureStarted();
-            if (!token.isCancellationRequested) {
+            if (!isCancelled()) {
               const ormInstanceHover = await resolveReceiverInstanceHoverAtPosition(
                 daemon,
                 document,
@@ -2105,7 +2239,13 @@ export function registerPythonProviders(
         }
 
         return undefined;
-        });
+        }),
+        disposalSignal.catch(() => undefined),
+        tokenAbort,
+        ]);
+        const elapsed = (performance.now() - hoverStart).toFixed(0);
+        daemon.logDiagnostic(`[hover] ${position.line}:${position.character} ${elapsed}ms result=${hoverResult ? 'hover' : 'none'} disposed=${providersDisposed}`);
+        return hoverResult;
       },
     }
   );
@@ -2114,13 +2254,20 @@ export function registerPythonProviders(
     pythonSelector,
     {
       async provideDefinition(document, position) {
-        return daemon.withRequestSource('definition', async () => {
+        if (providersDisposed) {
+          return undefined;
+        }
+        return Promise.race([
+        daemon.withRequestSource('definition', async () => {
+        const isDefCancelled = () => providersDisposed;
         const ensureStarted = createEnsureStartedOnce(daemon, document.uri);
         const relationLiteral = relationHoverLiteral(document, position);
         if (relationLiteral) {
           try {
             await ensureStarted();
+            if (isDefCancelled()) { return undefined; }
             const resolution = await daemon.resolveRelationTarget(relationLiteral.value);
+            if (isDefCancelled()) { return undefined; }
             const location = definitionLocationFromRelationResolution(resolution);
             if (location) {
               return location;
@@ -2129,6 +2276,8 @@ export function registerPythonProviders(
             return undefined;
           }
         }
+
+        if (isDefCancelled()) { return undefined; }
 
         const lookupLiteral =
           lookupHoverLiteral(document, position) ??
@@ -2150,12 +2299,14 @@ export function registerPythonProviders(
         if (lookupLiteral) {
           try {
             await ensureStarted();
+            if (isDefCancelled()) { return undefined; }
             const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
               daemon,
               document,
               lookupLiteral.receiverExpression,
               position
             );
+            if (isDefCancelled()) { return undefined; }
             if (!lookupReceiver) {
               return undefined;
             }
@@ -2172,6 +2323,7 @@ export function registerPythonProviders(
                 lookupLiteral.value,
                 lookupLiteral.method
               ));
+            if (isDefCancelled()) { return undefined; }
             const location = definitionLocationFromLookupResolution(resolution);
             if (location) {
               return location;
@@ -2181,15 +2333,19 @@ export function registerPythonProviders(
           }
         }
 
+        if (isDefCancelled()) { return undefined; }
+
         if (directFieldLiteral) {
           try {
             await ensureStarted();
+            if (isDefCancelled()) { return undefined; }
             const baseModelLabel = await resolveBaseModelLabelForReceiver(
               daemon,
               document,
               directFieldLiteral.receiverExpression,
               position
             );
+            if (isDefCancelled()) { return undefined; }
             if (!baseModelLabel) {
               return undefined;
             }
@@ -2199,20 +2355,25 @@ export function registerPythonProviders(
               directFieldLiteral.value,
               'filter'
             );
+            if (isDefCancelled()) { return undefined; }
             return definitionLocationFromLookupResolution(resolution);
           } catch {
             return undefined;
           }
         }
 
+        if (isDefCancelled()) { return undefined; }
+
         if (metaConstraintLookupLiteralAtPosition) {
           try {
             await ensureStarted();
+            if (isDefCancelled()) { return undefined; }
             const baseModelLabel = await resolveMetaOwnerModelLabel(
               daemon,
               document,
               position
             );
+            if (isDefCancelled()) { return undefined; }
             if (!baseModelLabel) {
               return undefined;
             }
@@ -2222,20 +2383,25 @@ export function registerPythonProviders(
               metaConstraintLookupLiteralAtPosition.value,
               'filter'
             );
+            if (isDefCancelled()) { return undefined; }
             return definitionLocationFromLookupResolution(resolution);
           } catch {
             return undefined;
           }
         }
 
+        if (isDefCancelled()) { return undefined; }
+
         if (schemaFieldLiteral) {
           try {
             await ensureStarted();
+            if (isDefCancelled()) { return undefined; }
             const baseModelLabel = await resolveMetaOwnerModelLabel(
               daemon,
               document,
               position
             );
+            if (isDefCancelled()) { return undefined; }
             if (!baseModelLabel) {
               return undefined;
             }
@@ -2245,21 +2411,26 @@ export function registerPythonProviders(
               schemaFieldLiteral.value,
               'filter'
             );
+            if (isDefCancelled()) { return undefined; }
             return definitionLocationFromLookupResolution(resolution);
           } catch {
             return undefined;
           }
         }
 
+        if (isDefCancelled()) { return undefined; }
+
         if (bulkUpdateFieldLiteral) {
           try {
             await ensureStarted();
+            if (isDefCancelled()) { return undefined; }
             const baseModelLabel = await resolveBaseModelLabelForReceiver(
               daemon,
               document,
               bulkUpdateFieldLiteral.receiverExpression,
               position
             );
+            if (isDefCancelled()) { return undefined; }
             if (!baseModelLabel) {
               return undefined;
             }
@@ -2269,19 +2440,24 @@ export function registerPythonProviders(
               bulkUpdateFieldLiteral.value,
               'filter'
             );
+            if (isDefCancelled()) { return undefined; }
             return definitionLocationFromLookupResolution(resolution);
           } catch {
             return undefined;
           }
         }
 
+        if (isDefCancelled()) { return undefined; }
+
         try {
           await ensureStarted();
+          if (isDefCancelled()) { return undefined; }
           const memberContext = await resolveOrmMemberAccessContext(
             daemon,
             document,
             position
           );
+          if (isDefCancelled()) { return undefined; }
           if (memberContext) {
             const virtualResolution = resolveVirtualOrmMember(
               memberContext.receiver,
@@ -2302,6 +2478,7 @@ export function registerPythonProviders(
               memberContext.memberName,
               memberContext.receiver.managerName
             );
+            if (isDefCancelled()) { return undefined; }
             const location = definitionLocationFromOrmMemberResolution(resolution);
             if (location) {
               return location;
@@ -2311,13 +2488,17 @@ export function registerPythonProviders(
           return undefined;
         }
 
+        if (isDefCancelled()) { return undefined; }
+
         try {
           await ensureStarted();
+          if (isDefCancelled()) { return undefined; }
           const importReference = await resolveImportReferenceAtPosition(
             daemon,
             document,
             position
           );
+          if (isDefCancelled()) { return undefined; }
           if (!importReference) {
             return undefined;
           }
@@ -2325,6 +2506,7 @@ export function registerPythonProviders(
             daemon,
             importReference
           );
+          if (isDefCancelled()) { return undefined; }
           if (location) {
             return location;
           }
@@ -2333,7 +2515,9 @@ export function registerPythonProviders(
         }
 
         return undefined;
-        });
+        }),
+        disposalSignal.catch(() => undefined),
+        ]);
       },
     }
   );
@@ -2422,7 +2606,9 @@ export function registerPythonProviders(
       scheduleTrackedDiagnosticsRefresh(0);
     }),
     new vscode.Disposable(() => {
+      providersDisposed = true;
       diagnosticsDisposed = true;
+      fireDisposalSignal?.();
       clearScheduledDiagnostics();
       lastDiagnosedDocumentVersions.clear();
       diagnosticCollection.dispose();

@@ -110,6 +110,12 @@ def _target_dict(
         else 'static'
     )
 
+    # Limit array sizes to keep the serialised payload small when returning
+    # all 1000+ models.  The client only displays the first 8 items anyway.
+    _LIST_PREVIEW_LIMIT = 8
+    relation_names = list(node.relation_names)
+    reverse_relation_names = list(node.reverse_relation_names)
+
     return {
         'appLabel': node.app_label,
         'objectName': node.object_name,
@@ -117,9 +123,9 @@ def _target_dict(
         'module': node.module,
         'importPath': node.import_path,
         'source': source,
-        'fieldNames': field_names,
-        'relationNames': list(node.relation_names),
-        'reverseRelationNames': list(node.reverse_relation_names),
+        'fieldNames': field_names[:_LIST_PREVIEW_LIMIT],
+        'relationNames': relation_names[:_LIST_PREVIEW_LIMIT],
+        'reverseRelationNames': reverse_relation_names[:_LIST_PREVIEW_LIMIT],
         'managerNames': list(node.manager_names),
         'filePath': node.file_path,
         'line': node.line,

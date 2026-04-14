@@ -475,7 +475,12 @@ class DaemonServer:
             try:
                 result = f.result()
                 batch_size = result.get('_batch_size') if isinstance(result, dict) else None
-                _log_ipc('bg', method, request_id, elapsed, True, source=source, batch_size=batch_size)
+                item_count = None
+                if isinstance(result, dict):
+                    items = result.get('items')
+                    if isinstance(items, list):
+                        item_count = len(items)
+                _log_ipc('bg', method, request_id, elapsed, True, source=source, batch_size=batch_size, item_count=item_count)
                 if batch_size is not None:
                     result.pop('_batch_size', None)
                 self._write_response(request_id, result)
@@ -547,7 +552,12 @@ class DaemonServer:
 
         elapsed = time.perf_counter() - started
         batch_size = result.get('_batch_size') if isinstance(result, dict) else None
-        _log_ipc(thread, method, request_id, elapsed, background, source=source, batch_size=batch_size)
+        item_count = None
+        if isinstance(result, dict):
+            items = result.get('items')
+            if isinstance(items, list):
+                item_count = len(items)
+        _log_ipc(thread, method, request_id, elapsed, background, source=source, batch_size=batch_size, item_count=item_count)
         if batch_size is not None:
             result.pop('_batch_size', None)
         self._write_response(request_id, result)
@@ -1614,7 +1624,16 @@ class DaemonServer:
 
     def _write_message(self, payload: dict[str, Any]) -> None:
         with self._write_lock:
-            self._real_stdout.write(json.dumps(payload, sort_keys=True) + '\n')
+            serialized = json.dumps(payload, sort_keys=True)
+            request_id = payload.get('id')
+            size_kb = len(serialized) / 1024
+            if size_kb >= 10:
+                print(
+                    f'[ipc:write] {request_id} payload={size_kb:.1f}KB',
+                    file=sys.stderr,
+                    flush=True,
+                )
+            self._real_stdout.write(serialized + '\n')
             self._real_stdout.flush()
 
 
@@ -1636,13 +1655,15 @@ def _log_ipc(
     source: Any = 'unknown',
     error: bool = False,
     batch_size: int | None = None,
+    item_count: int | None = None,
 ) -> None:
     tag = 'bg' if background else 'fg'
     status = 'ERR' if error else 'OK'
     batch_info = f' batch={batch_size}' if batch_size else ''
+    items_info = f' items={item_count}' if item_count is not None else ''
     print(
         f'[ipc:{tag}] [{thread}] {method}#{request_id}'
-        f' source={source} {elapsed:.3f}s {status}{batch_info}',
+        f' source={source} {elapsed:.3f}s {status}{batch_info}{items_info}',
         file=sys.stderr,
         flush=True,
     )

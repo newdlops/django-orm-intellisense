@@ -106,6 +106,7 @@ export interface LookupPathCompletionsResult {
   resolved: boolean;
   reason?: string;
   currentModelLabel?: string;
+  truncated?: boolean;
 }
 
 export interface LookupPathResolution {

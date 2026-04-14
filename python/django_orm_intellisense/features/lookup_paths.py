@@ -46,6 +46,11 @@ _ONE_HOP_DESCENDANT_CACHE: dict[
     tuple[dict[str, object], ...],
 ] = {}
 
+# Maximum number of items returned by lookupPathCompletions.
+# Keeps serialised JSON payloads small enough that they do not
+# block the stdout IPC pipe for hundreds of milliseconds.
+MAX_LOOKUP_PATH_ITEMS = 500
+
 
 def list_lookup_path_completions(
     *,
@@ -169,10 +174,14 @@ def list_lookup_path_completions(
             str(item['name']).lower(),
         )
     )
+    truncated = len(items) > MAX_LOOKUP_PATH_ITEMS
+    if truncated:
+        items = items[:MAX_LOOKUP_PATH_ITEMS]
     return {
         'items': items,
         'resolved': True,
         'currentModelLabel': traversal.get('currentModelLabel'),
+        'truncated': truncated,
     }
 
 

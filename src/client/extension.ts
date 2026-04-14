@@ -188,6 +188,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return activeDocument.uri.toString();
   };
 
+  let lastProviderRegistrationTime = 0;
+  const PROVIDER_REGISTRATION_MIN_INTERVAL_MS = 200;
+
   const promotePythonProviders = (
     reason: string,
     expectedActivePythonProviderFingerprint?: string
@@ -205,9 +208,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       lastAppliedActivePythonProviderFingerprint =
         expectedActivePythonProviderFingerprint;
     } else {
-      lastAppliedActivePythonProviderFingerprint = undefined;
+      // Non-fingerprinted events (pylance, language-client, daemon-ready):
+      // throttle to avoid excessive re-registrations during startup.
+      const now = Date.now();
+      if (now - lastProviderRegistrationTime < PROVIDER_REGISTRATION_MIN_INTERVAL_MS) {
+        return;
+      }
+      // Preserve lastAppliedActivePythonProviderFingerprint so subsequent
+      // tab-switch events for the same file are correctly deduplicated.
     }
 
+    lastProviderRegistrationTime = Date.now();
     pythonProviderRegistration.dispose();
     pythonProviderRegistration = vscode.Disposable.from(
       ...registerPythonProviders(daemon)
@@ -297,6 +308,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       if (editor?.document.languageId !== 'python') {
+        return;
+      }
+      // Only promote on the very first Python tab activation; subsequent tab
+      // switches reuse the already-registered providers so hover results are
+      // preserved and don't flicker back to "Loading…".
+      if (lastAppliedActivePythonProviderFingerprint !== undefined) {
         return;
       }
       const activePythonProviderFingerprint = editor.document.uri.toString();
@@ -426,11 +443,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   daemon.onDidChangeState(() => {
     const isReady = daemon.isReady();
     if (isReady && !lastDaemonReady) {
-      schedulePythonProviderPromotionBurst('daemon-ready', [
-        75,
-        350,
-        1200,
-      ]);
+      schedulePythonProviderPromotion('daemon-ready', 75);
     }
     lastDaemonReady = isReady;
   });

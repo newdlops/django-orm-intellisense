@@ -57,6 +57,8 @@ class _MemberSurfaceCache:
                 return cached
             self._misses += 1
 
+        import time as _time
+        _started = _time.perf_counter()
         surface = _member_surface(
             static_index=static_index,
             runtime=runtime,
@@ -64,6 +66,14 @@ class _MemberSurfaceCache:
             receiver_kind=receiver_kind,
             manager_name=manager_name,
         )
+        _elapsed = _time.perf_counter() - _started
+        if _elapsed >= 0.010:
+            print(
+                f'[surface:miss] {model_label}/{receiver_kind} '
+                f'{_elapsed:.3f}s items={len(surface)}',
+                file=__import__("sys").stderr,
+                flush=True,
+            )
         with self._lock:
             self._check_owner(static_index, runtime)
             cached = self._list_cache.get(key)
@@ -1125,6 +1135,16 @@ def _runtime_callable_member_items(
 ) -> list[OrmMemberItem]:
     items: list[OrmMemberItem] = []
     seen_names: set[str] = set()
+    resolved_path_cache: dict[str, str | None] = {}
+
+    def _resolve_source_path(source_file: str) -> str | None:
+        cached = resolved_path_cache.get(source_file)
+        if cached is not None:
+            return cached
+        resolved = str(Path(source_file).resolve())
+        result = resolved if resolved in workspace_files else None
+        resolved_path_cache[source_file] = result or ''
+        return result
 
     for owner_class in owner_classes:
         for class_in_mro in owner_class.mro():
@@ -1145,13 +1165,16 @@ def _runtime_callable_member_items(
                     source_file = inspect.getsourcefile(callable_member)
                 except (OSError, TypeError):
                     source_file = None
-                if source_file is None or str(Path(source_file).resolve()) not in workspace_files:
+                if source_file is None:
+                    continue
+                resolved_path = _resolve_source_path(source_file)
+                if resolved_path is None:
                     continue
 
-                try:
-                    _, line = inspect.getsourcelines(callable_member)
-                except (OSError, TypeError):
-                    line = None
+                # Use __code__.co_firstlineno for O(1) line lookup instead of
+                # inspect.getsourcelines which reads and parses the source file.
+                code = getattr(callable_member, '__code__', None)
+                line = getattr(code, 'co_firstlineno', None) if code is not None else None
 
                 return_kind, return_model_label = _runtime_return_semantics(
                     callable_member,
@@ -1169,7 +1192,7 @@ def _runtime_callable_member_items(
                         return_kind=return_kind,
                         return_model_label=return_model_label,
                         manager_name=manager_name,
-                        file_path=str(Path(source_file).resolve()),
+                        file_path=resolved_path,
                         line=line,
                         column=1,
                     )
