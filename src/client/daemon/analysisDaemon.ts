@@ -177,6 +177,8 @@ export class AnalysisDaemon implements vscode.Disposable {
   private readonly responseCache = new Map<string, { promise: Promise<unknown>; createdAt: number }>();
   private readonly intentionalExitProcessIds = new Set<number>();
   private readonly requestSourceContext = new AsyncLocalStorage<IpcRequestSource>();
+  private readonly abortSignalContext = new AsyncLocalStorage<AbortSignal>();
+  private readonly deadlineContext = new AsyncLocalStorage<number>();
   private readonly output: vscode.OutputChannel;
   private process?: ChildProcessWithoutNullStreams;
   private stdoutReader?: readline.Interface;
@@ -226,6 +228,30 @@ export class AnalysisDaemon implements vscode.Disposable {
 
   withRequestSource<T>(source: IpcRequestSource, callback: () => T): T {
     return this.requestSourceContext.run(source, callback);
+  }
+
+  withAbortSignal<T>(signal: AbortSignal, callback: () => T): T {
+    return this.abortSignalContext.run(signal, callback);
+  }
+
+  /** Run callback with a performance.now() deadline (ms since epoch). */
+  withDeadline<T>(deadlineMs: number, callback: () => T): T {
+    return this.deadlineContext.run(deadlineMs, callback);
+  }
+
+  /**
+   * Check if the current async context should abort.
+   * Works even when the event loop is blocked (performance.now() is synchronous).
+   */
+  isAborted(): boolean {
+    if (this.abortSignalContext.getStore()?.aborted === true) {
+      return true;
+    }
+    const deadline = this.deadlineContext.getStore();
+    if (deadline !== undefined && performance.now() >= deadline) {
+      return true;
+    }
+    return false;
   }
 
   private rebuildLocalWorkspaceIndex(): void {
@@ -1512,6 +1538,16 @@ export class AnalysisDaemon implements vscode.Disposable {
     params: Record<string, unknown>,
     background: boolean = false
   ): Promise<T> {
+    // Fast-reject if the caller's abort signal has already fired.
+    // This prevents orphaned hover resolution bodies from issuing new IPC
+    // calls after the hover has been cancelled / timed out.
+    if (this.isAborted()) {
+      this.output.appendLine(
+        `  [IPC:abort] ${method} rejected (aborted) pending=${this.pendingRequests.size}`
+      );
+      return Promise.reject(new Error(`Aborted: ${method}`));
+    }
+
     const source = this.currentRequestSource();
     const effectiveBackground = background || source === 'diagnostic';
 
@@ -1544,6 +1580,15 @@ export class AnalysisDaemon implements vscode.Disposable {
         `  [IPC] DROPPING ${method} (source=${source}): payload too large (${(serializedParams.length / 1024).toFixed(1)}KB > ${MAX_PAYLOAD_BYTES / 1024}KB)`
       );
       return Promise.reject(new Error(`Payload too large for ${method}: ${(serializedParams.length / 1024).toFixed(1)}KB`));
+    }
+
+    // Log queue state when it grows beyond a threshold
+    const queueSize = this.pendingRequests.size;
+    if (queueSize >= 5 && queueSize % 5 === 0) {
+      const pending = [...this.pendingRequests.keys()].join(', ');
+      this.output.appendLine(
+        `  [IPC:queue] pending=${queueSize} adding=${method}(source=${source}) ids=[${pending}]`
+      );
     }
 
     const requestPromise = this.request<T>(

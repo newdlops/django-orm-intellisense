@@ -165,8 +165,8 @@ const F_EXPRESSION_METHOD = 'f_expression';
 const EXPRESSION_PATH_METHOD_PREFIX = 'expression_path:';
 const ANNOTATED_MEMBER_SOURCE = 'annotation_expression';
 const INITIAL_DIAGNOSTIC_REFRESH_DELAY_MS = 500;
-const DIAGNOSTIC_TIME_BUDGET_MS = 10_000;
-const DIAGNOSTIC_REQUEST_BUDGET = 80;
+const DIAGNOSTIC_TIME_BUDGET_MS = 4_000;
+const DIAGNOSTIC_REQUEST_BUDGET = 40;
 const modelSubclassRelationCache = new Map<string, boolean>();
 const VIRTUAL_LOOKUP_OPERATORS = [
   'exact',
@@ -831,6 +831,10 @@ export function registerPythonProviders(
     if (diagnosticsDisposed) {
       return;
     }
+    // Stagger diagnostic refreshes across visible documents to avoid
+    // flooding the event loop with concurrent IPC calls.
+    let staggerDelay = 0;
+    const STAGGER_INCREMENT_MS = 200;
     for (const document of collectDiagnosticRefreshDocuments()) {
       if (!shouldAnalyzeDocument(document, daemon.getState().workspaceRoot)) {
         if (!diagnosticsDisposed) {
@@ -839,7 +843,8 @@ export function registerPythonProviders(
         continue;
       }
 
-      scheduleDiagnosticsRefresh(document, 0);
+      scheduleDiagnosticsRefresh(document, staggerDelay);
+      staggerDelay += STAGGER_INCREMENT_MS;
     }
   };
 
@@ -1229,10 +1234,17 @@ export function registerPythonProviders(
         if (providersDisposed || token.isCancellationRequested) {
           return undefined;
         }
+        const compStart = performance.now();
+        const COMP_TIMEOUT_MS = 3_000;
+        const compAbort = new AbortController();
+        token.onCancellationRequested(() => compAbort.abort());
+        const compTimeout = setTimeout(() => compAbort.abort(), COMP_TIMEOUT_MS);
         const tokenAbort = new Promise<undefined>((resolve) => {
           token.onCancellationRequested(() => resolve(undefined));
         });
-        return Promise.race([
+        const compResult = await Promise.race([
+        daemon.withDeadline(compStart + COMP_TIMEOUT_MS, () =>
+        daemon.withAbortSignal(compAbort.signal, () =>
         daemon.withRequestSource('completion', async () => {
         const relationContext = relationCompletionContext(document, position);
         if (relationContext) {
@@ -1758,10 +1770,14 @@ export function registerPythonProviders(
         } catch {
           return undefined;
         }
-        }),
+        }))),
         disposalSignal.catch(() => undefined),
         tokenAbort,
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), COMP_TIMEOUT_MS)),
         ]);
+        compAbort.abort();
+        clearTimeout(compTimeout);
+        return compResult;
       },
     },
     "'",
@@ -1853,27 +1869,71 @@ export function registerPythonProviders(
         const tokenAbort = new Promise<undefined>((resolve) => {
           token.onCancellationRequested(() => resolve(undefined));
         });
+        // Hard timeout: if all resolution paths haven't completed within this
+        // budget, bail out.  Most successful hovers complete in <200ms; the
+        // timeout protects against event-loop starvation when many concurrent
+        // hovers / diagnostics contend for CPU.
+        const HOVER_HARD_TIMEOUT_MS = 3_000;
+        const hoverTimeout = new Promise<undefined>((resolve) => {
+          setTimeout(() => resolve(undefined), HOVER_HARD_TIMEOUT_MS);
+        });
+        // AbortController: when the hover is cancelled (token, timeout, or
+        // disposal), abort the signal.  This propagates into cachedRequest()
+        // via AsyncLocalStorage so orphaned resolution bodies immediately
+        // stop issuing new IPC calls.
+        const hoverAbort = new AbortController();
+        token.onCancellationRequested(() => hoverAbort.abort());
+        const abortOnTimeout = setTimeout(() => hoverAbort.abort(), HOVER_HARD_TIMEOUT_MS);
+        const hoverDeadline = hoverStart + HOVER_HARD_TIMEOUT_MS;
         const hoverResult = await Promise.race([
+        daemon.withDeadline(hoverDeadline, () =>
+        daemon.withAbortSignal(hoverAbort.signal, () =>
         daemon.withRequestSource('hover', async () => {
-        const isCancelled = () => providersDisposed || token.isCancellationRequested;
+        const isCancelled = () =>
+          providersDisposed ||
+          token.isCancellationRequested ||
+          hoverAbort.signal.aborted ||
+          (performance.now() - hoverStart) >= HOVER_HARD_TIMEOUT_MS;
         const ensureStarted = createEnsureStartedOnce(daemon, document.uri);
+        // Slow-hover phase tracking: only logs when total elapsed > 200ms
+        const phaseTimings: Array<[string, number]> = [];
+        let lastPhaseTime = performance.now();
+        const markPhase = (name: string): void => {
+          const now = performance.now();
+          phaseTimings.push([name, now - lastPhaseTime]);
+          lastPhaseTime = now;
+        };
+        const logSlowPhases = (): void => {
+          const totalElapsed = performance.now() - hoverStart;
+          if (totalElapsed < 200) return;
+          const parts = phaseTimings
+            .filter(([, ms]) => ms >= 5)
+            .map(([name, ms]) => `${name}=${ms.toFixed(0)}ms`);
+          if (parts.length > 0) {
+            const shortPath = document.uri.fsPath.split('/').slice(-2).join('/');
+            daemon.logDiagnostic(`[hover:slow] ${shortPath}:${position.line}:${position.character} phases: ${parts.join(', ')}`);
+          }
+        };
         const relationLiteral = relationHoverLiteral(document, position);
         if (relationLiteral) {
           try {
             await ensureStarted();
-            if (isCancelled()) { return undefined; }
+            if (isCancelled()) { logSlowPhases(); return undefined; }
             const resolution = await daemon.resolveRelationTarget(relationLiteral.value);
-            if (isCancelled()) { return undefined; }
+            if (isCancelled()) { logSlowPhases(); return undefined; }
+            markPhase('relation');
             const relationHover = buildRelationHover(relationLiteral.value, resolution);
             if (relationHover) {
+              logSlowPhases();
               return relationHover;
             }
           } catch {
+            logSlowPhases();
             return undefined;
           }
         }
 
-        if (isCancelled()) { return undefined; }
+        if (isCancelled()) { logSlowPhases(); return undefined; }
 
         const lookupLiteral =
           lookupHoverLiteral(document, position) ??
@@ -2060,17 +2120,19 @@ export function registerPythonProviders(
           }
         }
 
-        if (isCancelled()) { return undefined; }
+        if (isCancelled()) { logSlowPhases(); return undefined; }
 
+        markPhase('literals');
         try {
           await ensureStarted();
-          if (isCancelled()) { return undefined; }
+          if (isCancelled()) { logSlowPhases(); return undefined; }
           const memberContext = await resolveOrmMemberAccessContext(
             daemon,
             document,
             position
           );
-          if (isCancelled()) { return undefined; }
+          markPhase('ormMemberCtx');
+          if (isCancelled()) { logSlowPhases(); return undefined; }
           if (memberContext) {
             const virtualResolution = resolveVirtualOrmMember(
               memberContext.receiver,
@@ -2150,14 +2212,16 @@ export function registerPythonProviders(
             }
           }
         } catch {
+          logSlowPhases();
           return undefined;
         }
 
-        if (isCancelled()) { return undefined; }
+        markPhase('ormMember');
+        if (isCancelled()) { logSlowPhases(); return undefined; }
 
         try {
           await ensureStarted();
-          if (isCancelled()) { return undefined; }
+          if (isCancelled()) { logSlowPhases(); return undefined; }
           const importReference = await resolveImportReferenceAtPosition(
             daemon,
             document,
@@ -2174,14 +2238,16 @@ export function registerPythonProviders(
             }
           }
         } catch {
+          logSlowPhases();
           return undefined;
         }
 
-        if (isCancelled()) { return undefined; }
+        markPhase('import');
+        if (isCancelled()) { logSlowPhases(); return undefined; }
 
         try {
           await ensureStarted();
-          if (isCancelled()) { return undefined; }
+          if (isCancelled()) { logSlowPhases(); return undefined; }
           const typeHintHoverTarget = await resolveTypeHintHoverTargetAtPosition(
             daemon,
             document,
@@ -2194,14 +2260,16 @@ export function registerPythonProviders(
             }
           }
         } catch {
+          logSlowPhases();
           return undefined;
         }
 
-        if (isCancelled()) { return undefined; }
+        markPhase('typeHint');
+        if (isCancelled()) { logSlowPhases(); return undefined; }
 
         try {
           await ensureStarted();
-          if (isCancelled()) { return undefined; }
+          if (isCancelled()) { logSlowPhases(); return undefined; }
           const classHoverTarget =
             await resolveClassHoverTargetAtPosition(
               daemon,
@@ -2217,9 +2285,11 @@ export function registerPythonProviders(
             }
           }
         } catch {
+          logSlowPhases();
           return undefined;
         }
 
+        markPhase('classHover');
         if (!isCancelled()) {
           try {
             await ensureStarted();
@@ -2230,21 +2300,30 @@ export function registerPythonProviders(
                 position
               );
               if (ormInstanceHover) {
+                logSlowPhases();
                 return ormInstanceHover;
               }
             }
           } catch {
+            logSlowPhases();
             return undefined;
           }
         }
 
+        markPhase('instanceHover');
+        logSlowPhases();
         return undefined;
-        }),
+        }))),
         disposalSignal.catch(() => undefined),
         tokenAbort,
+        hoverTimeout,
         ]);
+        hoverAbort.abort();
+        clearTimeout(abortOnTimeout);
         const elapsed = (performance.now() - hoverStart).toFixed(0);
-        daemon.logDiagnostic(`[hover] ${position.line}:${position.character} ${elapsed}ms result=${hoverResult ? 'hover' : 'none'} disposed=${providersDisposed}`);
+        const timedOut = !hoverResult && Number(elapsed) >= HOVER_HARD_TIMEOUT_MS;
+        const shortPath = document.uri.fsPath.split('/').slice(-2).join('/');
+        daemon.logDiagnostic(`[hover] ${shortPath}:${position.line}:${position.character} ${elapsed}ms result=${hoverResult ? 'hover' : 'none'} disposed=${providersDisposed}${timedOut ? ' TIMEOUT' : ''}`);
         return hoverResult;
       },
     }
@@ -2253,13 +2332,20 @@ export function registerPythonProviders(
   const definitionProvider = vscode.languages.registerDefinitionProvider(
     pythonSelector,
     {
-      async provideDefinition(document, position) {
-        if (providersDisposed) {
+      async provideDefinition(document, position, token) {
+        if (providersDisposed || token.isCancellationRequested) {
           return undefined;
         }
-        return Promise.race([
+        const defStart = performance.now();
+        const DEF_TIMEOUT_MS = 3_000;
+        const defAbort = new AbortController();
+        token.onCancellationRequested(() => defAbort.abort());
+        const defTimeout = setTimeout(() => defAbort.abort(), DEF_TIMEOUT_MS);
+        const defResult = await Promise.race([
+        daemon.withDeadline(defStart + DEF_TIMEOUT_MS, () =>
+        daemon.withAbortSignal(defAbort.signal, () =>
         daemon.withRequestSource('definition', async () => {
-        const isDefCancelled = () => providersDisposed;
+        const isDefCancelled = () => providersDisposed || token.isCancellationRequested || defAbort.signal.aborted || (performance.now() - defStart) >= DEF_TIMEOUT_MS;
         const ensureStarted = createEnsureStartedOnce(daemon, document.uri);
         const relationLiteral = relationHoverLiteral(document, position);
         if (relationLiteral) {
@@ -2515,9 +2601,13 @@ export function registerPythonProviders(
         }
 
         return undefined;
-        }),
+        }))),
         disposalSignal.catch(() => undefined),
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), DEF_TIMEOUT_MS)),
         ]);
+        defAbort.abort();
+        clearTimeout(defTimeout);
+        return defResult;
       },
     }
   );
@@ -2562,7 +2652,9 @@ export function registerPythonProviders(
       if (!diagnosticsEnabled) {
         return;
       }
-      scheduleTrackedDiagnosticsRefresh(0);
+      // Delay diagnostics refresh on tab switch to let hover requests
+      // settle first and avoid flooding the event loop.
+      scheduleTrackedDiagnosticsRefresh(500);
     }),
     vscode.workspace.onDidCloseTextDocument((document) => {
       if (!diagnosticsDisposed) {
@@ -6353,19 +6445,20 @@ async function resolveOrmMemberCompletionContext(
       return undefined;
     }
 
+    const candidateVisited = new Set<string>();
     const dynamicReceiver = await resolveDynamicInstanceReceiverAtOffset(
       daemon,
       document,
       parsedAccess.receiverExpression,
       endOffset,
-      new Set()
+      candidateVisited
     );
     const staticReceiver = await resolveOrmReceiverAtOffset(
       daemon,
       document,
       parsedAccess.receiverExpression,
       endOffset,
-      new Set()
+      candidateVisited
     );
     const annotatedReceiver = await resolveAnnotatedReceiverForExpression(
       daemon,
@@ -6478,6 +6571,7 @@ async function resolveOrmMemberAccessContext(
   );
   let sawScopedCandidate = false;
   for (const candidate of candidates) {
+    if (daemon.isAborted()) { return undefined; }
     const parsedAccess = parseTrailingMemberAccessCandidate(
       candidate.text,
       memberName
@@ -6489,19 +6583,20 @@ async function resolveOrmMemberAccessContext(
       return undefined;
     }
 
+    const candidateVisited = new Set<string>();
     const dynamicReceiver = await resolveDynamicInstanceReceiverAtOffset(
       daemon,
       document,
       parsedAccess.receiverExpression,
       endOffset,
-      new Set()
+      candidateVisited
     );
     const staticReceiver = await resolveOrmReceiverAtOffset(
       daemon,
       document,
       parsedAccess.receiverExpression,
       endOffset,
-      new Set()
+      candidateVisited
     );
     const annotatedReceiver = await resolveAnnotatedReceiverForExpression(
       daemon,
@@ -6899,6 +6994,8 @@ async function resolveOrmReceiverAtOffsetCore(
     return undefined;
   }
 
+  if (daemon.isAborted()) { return undefined; }
+
   const visitKey = `${document.uri.toString()}:orm:${normalizedExpression}@${beforeOffset}`;
   if (visited.has(visitKey) || visited.size > 12) {
     return undefined;
@@ -6913,7 +7010,7 @@ async function resolveOrmReceiverAtOffsetCore(
       document,
       memberAccess.objectExpression,
       beforeOffset,
-      new Set()
+      visited
     );
     const staticObjectReceiver = await resolveOrmReceiverAtOffset(
       daemon,
@@ -6932,7 +7029,7 @@ async function resolveOrmReceiverAtOffsetCore(
       memberAccess.objectExpression,
       memberAccess.memberName,
       beforeOffset,
-      new Set()
+      visited
     );
     if (objectReceiver) {
       const virtualResolution = resolveVirtualOrmMember(
@@ -7262,6 +7359,8 @@ async function resolveDynamicInstanceReceiverAtOffset(
     return undefined;
   }
 
+  if (daemon.isAborted()) { return undefined; }
+
   const visitKey = `${document.uri.toString()}:dynamic-instance:${normalizedExpression}@${beforeOffset}`;
   if (visited.has(visitKey) || visited.size > 12) {
     return undefined;
@@ -7282,7 +7381,7 @@ async function resolveDynamicInstanceReceiverAtOffset(
       document,
       memberAccess.objectExpression,
       beforeOffset,
-      new Set()
+      visited
     );
     const objectReceiver = preferMemberReceiver(
       staticObjectReceiver,
@@ -7352,6 +7451,7 @@ async function resolveOrmReceiverFromCallExpression(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const parsedCall = parseCalledExpression(expression);
   if (!parsedCall) {
     return undefined;
@@ -7495,6 +7595,7 @@ async function resolveOrmReceiverFromCallChain(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const chain = collectOrmMemberChain(expression);
   if (!chain) {
     return undefined;
@@ -8316,6 +8417,7 @@ async function resolveBaseModelLabelForReceiverAtOffset(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedExpression = normalizeReceiverExpression(receiverExpression);
   if (!normalizedExpression) {
     return undefined;
@@ -9087,6 +9189,7 @@ async function resolveClassDefinitionForExpression(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<ClassDefinitionSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const normalizedExpression = stripWrappingParentheses(expression.trim());
   if (!normalizedExpression) {
     return undefined;
@@ -9770,6 +9873,7 @@ async function resolveClassHoverCategory(
   classSource: ClassDefinitionSource,
   visited: Set<string>
 ): Promise<ClassHoverCategory> {
+  if (daemon.isAborted()) { return 'general'; }
   const visitKey = `${classSource.document.uri.toString()}:${classSource.classDef.name}`;
   if (visited.has(visitKey)) {
     return 'general';
@@ -11696,6 +11800,7 @@ async function resolveAnnotatedReceiverForMemberAccess(
   beforeOffset: number,
   visited: Set<string>
 ): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
   const typeAnnotation = await resolveTypeAnnotationForMemberAccess(
     daemon,
     document,

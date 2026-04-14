@@ -195,6 +195,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     reason: string,
     expectedActivePythonProviderFingerprint?: string
   ): void => {
+    // Throttle all re-registrations (fingerprinted or not) to avoid
+    // disposing in-flight hover/completion requests too aggressively.
+    const now = Date.now();
+    if (now - lastProviderRegistrationTime < PROVIDER_REGISTRATION_MIN_INTERVAL_MS) {
+      return;
+    }
+
     if (expectedActivePythonProviderFingerprint) {
       const currentFingerprint = currentActivePythonProviderFingerprint();
       if (
@@ -208,12 +215,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       lastAppliedActivePythonProviderFingerprint =
         expectedActivePythonProviderFingerprint;
     } else {
-      // Non-fingerprinted events (pylance, language-client, daemon-ready):
-      // throttle to avoid excessive re-registrations during startup.
-      const now = Date.now();
-      if (now - lastProviderRegistrationTime < PROVIDER_REGISTRATION_MIN_INTERVAL_MS) {
-        return;
-      }
       // Preserve lastAppliedActivePythonProviderFingerprint so subsequent
       // tab-switch events for the same file are correctly deduplicated.
     }
@@ -314,6 +315,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // switches reuse the already-registered providers so hover results are
       // preserved and don't flicker back to "Loading…".
       if (lastAppliedActivePythonProviderFingerprint !== undefined) {
+        return;
+      }
+      // If daemon-ready already registered providers, skip the burst to avoid
+      // disposing in-flight hover/completion requests.
+      if (lastDaemonReady) {
         return;
       }
       const activePythonProviderFingerprint = editor.document.uri.toString();
