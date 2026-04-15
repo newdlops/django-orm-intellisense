@@ -6,7 +6,8 @@
       "Bash(git stash:*)",
       "Bash(npm run:*)",
       "Bash(npx tsc:*)",
-      "Bash(npx vscode-test:*)"
+      "Bash(npx vscode-test:*)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d.get\\(''''scripts'''',{}\\), indent=2\\)\\)\")"
     ]
   }
 }

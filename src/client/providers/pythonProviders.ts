@@ -216,6 +216,7 @@ const F_EXPRESSION_METHOD = 'f_expression';
 const EXPRESSION_PATH_METHOD_PREFIX = 'expression_path:';
 const ANNOTATED_MEMBER_SOURCE = 'annotation_expression';
 const INITIAL_DIAGNOSTIC_REFRESH_DELAY_MS = 500;
+const EDIT_DIAGNOSTIC_DEBOUNCE_MS = 1000;
 const DIAGNOSTIC_TIME_BUDGET_MS = 10_000;
 const DIAGNOSTIC_REQUEST_BUDGET = 1000;
 const modelSubclassRelationCache = new Map<string, boolean>();
@@ -824,6 +825,15 @@ export function registerPythonProviders(
   disposalSignal.catch(() => {});
   const diagnosticTimers = new Map<string, NodeJS.Timeout>();
   const lastDiagnosedDocumentVersions = new Map<string, number>();
+  /** Tracks partial diagnostic results from budget-exhausted scans so the
+   *  next scan of the same version can reuse them instead of restarting. */
+  const partialDiagnosticResults = new Map<string, {
+    version: number;
+    diagnostics: vscode.Diagnostic[];
+    seenRanges: Set<string>;
+    budgetExhausted: boolean;
+  }>();
+  const activeDiagnosticScans = new Set<string>();
   let fullDiagnosticsRefreshTimer: NodeJS.Timeout | undefined;
 
   const isVisibleDocument = (document: vscode.TextDocument): boolean =>
@@ -894,6 +904,14 @@ export function registerPythonProviders(
         continue;
       }
 
+      // Do not overwrite an existing per-document timer (e.g. from an edit
+      // debounce) — the edit-triggered timer is more specific and should
+      // take priority over the blanket tracked refresh.
+      const docKey = document.uri.toString();
+      if (diagnosticTimers.has(docKey) || activeDiagnosticScans.has(docKey)) {
+        continue;
+      }
+
       scheduleDiagnosticsRefresh(document, staggerDelay);
       staggerDelay += STAGGER_INCREMENT_MS;
     }
@@ -920,6 +938,12 @@ export function registerPythonProviders(
       return;
     }
     const key = document.uri.toString();
+
+    // Prevent overlapping scans of the same document from concurrent triggers
+    if (activeDiagnosticScans.has(key)) {
+      return;
+    }
+
     const documentVersion = document.version;
     if (lastDiagnosedDocumentVersions.get(key) === documentVersion) {
       return;
@@ -933,9 +957,11 @@ export function registerPythonProviders(
       return;
     }
 
+    activeDiagnosticScans.add(key);
     try {
       await daemon.ensureStarted(document.uri);
     } catch {
+      activeDiagnosticScans.delete(key);
       if (!diagnosticsDisposed) {
         diagnosticCollection.delete(document.uri);
       }
@@ -947,11 +973,18 @@ export function registerPythonProviders(
     // can be processed without being blocked by diagnostic scanning.
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (diagnosticsDisposed || document.version !== documentVersion) {
+      activeDiagnosticScans.delete(key);
       return;
     }
 
-    const diagnostics: vscode.Diagnostic[] = [];
-    const seenRanges = new Set<string>();
+    // Restore partial results from a previous budget-exhausted scan of the
+    // same document version, so we start with existing diagnostics instead
+    // of re-resolving from scratch.
+    const priorPartial = partialDiagnosticResults.get(key);
+    const diagnostics: vscode.Diagnostic[] =
+      priorPartial?.version === documentVersion ? [...priorPartial.diagnostics] : [];
+    const seenRanges: Set<string> =
+      priorPartial?.version === documentVersion ? new Set(priorPartial.seenRanges) : new Set();
     const diagnosticStartTime = Date.now();
     let diagnosticRequestCount = 0;
     let diagnosticBudgetLogged = false;
@@ -982,16 +1015,38 @@ export function registerPythonProviders(
     };
     const trackRequest = (): void => { diagnosticRequestCount++; };
 
-    daemon.logDiagnostic(`[diagnostics:scan] starting sync scan for ${document.uri.fsPath.split('/').slice(-2).join('/')}`);
+    // Determine visible range for prioritized scanning on large files
+    const VISIBLE_RANGE_SCAN_THRESHOLD = 500; // lines
+    const visibleEditor = vscode.window.visibleTextEditors.find(
+      (e) => e.document.uri.toString() === document.uri.toString()
+    );
+    const visibleRange = visibleEditor?.visibleRanges[0];
+    const useVisibleRangeScan = document.lineCount >= VISIBLE_RANGE_SCAN_THRESHOLD && visibleRange != null;
+    // Expand visible range by a margin to catch surrounding context
+    const VISIBLE_MARGIN = 50;
+    const visStartLine = useVisibleRangeScan ? Math.max(0, visibleRange!.start.line - VISIBLE_MARGIN) : 0;
+    const visEndLine = useVisibleRangeScan ? Math.min(document.lineCount, visibleRange!.end.line + VISIBLE_MARGIN) : document.lineCount;
+
+    daemon.logDiagnostic(`[diagnostics:scan] starting sync scan for ${document.uri.fsPath.split('/').slice(-2).join('/')}${useVisibleRangeScan ? ` (visible-first: lines ${visStartLine}-${visEndLine})` : ''}`);
     const _scanStart = performance.now();
-    const _relationContexts = findRelationDiagnosticContexts(document);
-    const _lookupContexts = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled);
+
+    // Phase 1: scan visible range (or full doc for small files)
+    const _relationContexts = findRelationDiagnosticContexts(document, visStartLine, visEndLine);
+    const _lookupContexts = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, visStartLine, visEndLine);
     daemon.logDiagnostic(`[diagnostics:scan] complete ${(performance.now() - _scanStart).toFixed(0)}ms relations=${_relationContexts.length} lookups=${_lookupContexts.length}`);
 
+    // Deduplicate relation target resolution within a single scan.
+    // The same model string (e.g. "User") may appear in many ForeignKey
+    // declarations — resolve each unique value only once.
+    const _relationResolutionCache = new Map<string, RelationTargetResolution>();
     for (const context of _relationContexts) {
       if (isDiagnosticsCancelled()) break;
       try {
-        const resolution = await daemon.resolveRelationTarget(context.value, /* background */ true);
+        let resolution = _relationResolutionCache.get(context.value);
+        if (!resolution) {
+          resolution = await daemon.resolveRelationTarget(context.value, /* background */ true);
+          _relationResolutionCache.set(context.value, resolution);
+        }
         trackRequest();
         if (isDiagnosticsCancelled()) break;
         const diagnostic = buildRelationDiagnostic(context, resolution);
@@ -1154,6 +1209,115 @@ export function registerPythonProviders(
         diagnostics.push(diagnostic);
       } catch {
         continue;
+      }
+    }
+
+    // Phase 2: If we used visible-range scanning, publish partial results
+    // immediately for responsiveness, then scan the remaining lines.
+    if (useVisibleRangeScan && !isDiagnosticsCancelled()) {
+      if (!diagnosticsDisposed && document.version === documentVersion) {
+        diagnosticCollection.set(document.uri, [...diagnostics]);
+      }
+
+      // Scan remaining lines (before and after visible range)
+      const remainingRanges: Array<[number, number]> = [];
+      if (visStartLine > 0) remainingRanges.push([0, visStartLine]);
+      if (visEndLine < document.lineCount) remainingRanges.push([visEndLine, document.lineCount]);
+
+      for (const [rStart, rEnd] of remainingRanges) {
+        if (isDiagnosticsCancelled()) break;
+
+        const extraRelations = findRelationDiagnosticContexts(document, rStart, rEnd);
+        const extraLookups = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, rStart, rEnd);
+
+        for (const context of extraRelations) {
+          if (isDiagnosticsCancelled()) break;
+          try {
+            let resolution = _relationResolutionCache.get(context.value);
+            if (!resolution) {
+              resolution = await daemon.resolveRelationTarget(context.value, true);
+              _relationResolutionCache.set(context.value, resolution);
+            }
+            trackRequest();
+            if (isDiagnosticsCancelled()) break;
+            const diagnostic = buildRelationDiagnostic(context, resolution);
+            if (!diagnostic) continue;
+            const dKey = diagnostic.range.start.toString() + diagnostic.message;
+            if (seenRanges.has(dKey)) continue;
+            seenRanges.add(dKey);
+            diagnostics.push(diagnostic);
+          } catch { continue; }
+        }
+
+        // Process extra lookup contexts through the same pipeline
+        const extraDocText = document.getText();
+        const extraValidated: LookupDiagnosticContext[] = [];
+        for (let i = 0; i < extraLookups.length; i += 1) {
+          if (isDiagnosticsCancelled()) break;
+          const ctx = extraLookups[i] as LookupDiagnosticContext & {
+            _needsCallContextValidation?: boolean;
+            _absoluteStart?: number;
+            _absoluteEnd?: number;
+            _isPrefetch?: boolean;
+            _isDictKey?: boolean;
+            _isFExpression?: boolean;
+            _isExpressionPath?: boolean;
+          };
+          if (ctx._needsCallContextValidation && ctx._absoluteStart !== undefined) {
+            let callContext: { receiverExpression: string; method: string } | undefined;
+            if (ctx._isDictKey && ctx._absoluteEnd !== undefined) {
+              callContext = unpackedLookupDictCallContext(extraDocText, ctx._absoluteStart, ctx._absoluteEnd) as typeof callContext;
+            } else if (ctx._isFExpression) {
+              const fCtx = fExpressionCallContext(extraDocText, ctx._absoluteStart);
+              callContext = fCtx ? { receiverExpression: fCtx.receiverExpression, method: F_EXPRESSION_METHOD } : undefined;
+            } else if (ctx._isExpressionPath && ctx._absoluteEnd !== undefined) {
+              const exprCtx = expressionStringArgumentCallContext(extraDocText, ctx._absoluteStart, ctx._absoluteEnd);
+              callContext = exprCtx ? { receiverExpression: exprCtx.receiverExpression, method: expressionPathMethodName(exprCtx.expressionName) } : undefined;
+            } else if (ctx._isPrefetch) {
+              callContext = prefetchLookupCallContext(extraDocText, ctx._absoluteStart) ?? undefined;
+            } else {
+              const lookupCtx = querysetStringCallContext(extraDocText, ctx._absoluteStart);
+              callContext = lookupCtx && lookupCtx.method === extraLookups[i].method ? lookupCtx : undefined;
+            }
+            if (!callContext) continue;
+            extraLookups[i].receiverExpression = callContext.receiverExpression;
+            extraLookups[i].method = callContext.method;
+          }
+          extraValidated.push(extraLookups[i]);
+        }
+
+        for (const context of extraValidated) {
+          if (isDiagnosticsCancelled()) break;
+          try {
+            const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
+              daemon, document, context.receiverExpression, context.range.end
+            );
+            trackRequest();
+            if (isDiagnosticsCancelled()) break;
+            if (!lookupReceiver) continue;
+            const virtualRes = resolveVirtualLookupPath(lookupReceiver, context.value, context.method);
+            if (virtualRes?.resolved) continue;
+            const resolution = await daemon.resolveLookupPath(lookupReceiver.modelLabel, context.value, context.method, true);
+            trackRequest();
+            if (isDiagnosticsCancelled()) break;
+            if (!resolution.resolved) {
+              const partialCompletions = {
+                items: mergeLookupCompletionItems(
+                  (await listLookupPathCompletionsFast(daemon, lookupReceiver.modelLabel, context.value, context.method)).items,
+                  virtualLookupCompletionItems(lookupReceiver, context.value, context.method)
+                ),
+                resolved: true,
+              };
+              if (partialCompletions.items.length > 0) continue;
+            }
+            const diagnostic = buildLookupDiagnostic(context, lookupReceiver.modelLabel, resolution);
+            if (!diagnostic) continue;
+            const dKey = diagnostic.range.start.toString() + diagnostic.message;
+            if (seenRanges.has(dKey)) continue;
+            seenRanges.add(dKey);
+            diagnostics.push(diagnostic);
+          } catch { continue; }
+        }
       }
     }
 
@@ -1345,11 +1509,28 @@ export function registerPythonProviders(
     // Returning early would discard all partial results, leaving the user
     // with zero ORM diagnostics until the next document change.
     if (diagnosticsDisposed || document.version !== documentVersion) {
+      activeDiagnosticScans.delete(key);
       return;
     }
 
     diagnosticCollection.set(document.uri, diagnostics);
-    lastDiagnosedDocumentVersions.set(key, documentVersion);
+
+    if (diagnosticBudgetLogged) {
+      // Budget was exhausted — save partial results so the next scan of
+      // the same version can reuse them instead of re-resolving everything.
+      partialDiagnosticResults.set(key, {
+        version: documentVersion,
+        diagnostics: [...diagnostics],
+        seenRanges: new Set(seenRanges),
+        budgetExhausted: true,
+      });
+      // Do NOT set lastDiagnosedDocumentVersions — allow re-scanning
+      // when triggered again (e.g., after a tab switch or scroll).
+    } else {
+      lastDiagnosedDocumentVersions.set(key, documentVersion);
+      partialDiagnosticResults.delete(key);
+    }
+    activeDiagnosticScans.delete(key);
   }));
 
   const completionProvider = vscode.languages.registerCompletionItemProvider(
@@ -2832,7 +3013,7 @@ export function registerPythonProviders(
       if (!isVisibleDocument(event.document)) {
         return;
       }
-      scheduleDiagnosticsRefresh(event.document);
+      scheduleDiagnosticsRefresh(event.document, EDIT_DIAGNOSTIC_DEBOUNCE_MS);
     }),
     vscode.window.onDidChangeVisibleTextEditors(() => {
       if (diagnosticsDisposed) {
@@ -2851,6 +3032,7 @@ export function registerPythonProviders(
       }
       const key = document.uri.toString();
       lastDiagnosedDocumentVersions.delete(key);
+      partialDiagnosticResults.delete(key);
       const timer = diagnosticTimers.get(key);
       if (timer) {
         clearTimeout(timer);
@@ -2881,6 +3063,7 @@ export function registerPythonProviders(
         clearScheduledDiagnostics();
         diagnosticCollection.clear();
         lastDiagnosedDocumentVersions.clear();
+        partialDiagnosticResults.clear();
         return;
       }
 
@@ -2892,6 +3075,8 @@ export function registerPythonProviders(
       fireDisposalSignal?.();
       clearScheduledDiagnostics();
       lastDiagnosedDocumentVersions.clear();
+      partialDiagnosticResults.clear();
+      activeDiagnosticScans.clear();
       diagnosticCollection.dispose();
     }),
   ];
@@ -6133,11 +6318,13 @@ function shouldAnalyzeDocument(
 }
 
 function findRelationDiagnosticContexts(
-  document: vscode.TextDocument
+  document: vscode.TextDocument,
+  startLine = 0,
+  endLine = document.lineCount
 ): RelationDiagnosticContext[] {
   const contexts: RelationDiagnosticContext[] = [];
 
-  for (let line = 0; line < document.lineCount; line += 1) {
+  for (let line = startLine; line < endLine; line += 1) {
     const lineText = document.lineAt(line).text;
     for (const match of lineText.matchAll(RELATION_HOVER_PATTERN)) {
       const value = match[2];
@@ -6156,14 +6343,17 @@ function findRelationDiagnosticContexts(
 
 async function findLookupDiagnosticContexts(
   document: vscode.TextDocument,
-  isCancelled: () => boolean
+  isCancelled: () => boolean,
+  startLine = 0,
+  endLine = document.lineCount
 ): Promise<LookupDiagnosticContext[]> {
   const contexts: LookupDiagnosticContext[] = [];
   const seen = new Set<string>();
   const SCAN_CHUNK_LINES = 50;
-  const isSmallFile = document.lineCount < 500;
+  const lineCount = endLine - startLine;
+  const isSmallFile = lineCount < 500;
 
-  for (let line = 0; line < document.lineCount; line += 1) {
+  for (let line = startLine; line < endLine; line += 1) {
     // Yield every SCAN_CHUNK_LINES to keep event loop responsive
     // Skip yielding for small files where synchronous scan is fast enough
     if (!isSmallFile && line > 0 && line % SCAN_CHUNK_LINES === 0) {
@@ -6337,14 +6527,16 @@ async function findLookupDiagnosticContexts(
 }
 
 function findDirectFieldDiagnosticContexts(
-  document: vscode.TextDocument
+  document: vscode.TextDocument,
+  startLine = 0,
+  endLine = document.lineCount
 ): DirectFieldDiagnosticContext[] {
   const contexts: DirectFieldDiagnosticContext[] = [];
   const seen = new Set<string>();
   // Only scan lines that contain .create( or .update( to avoid O(words × filesize)
   const DIRECT_CALL_LINE_PATTERN = /\.(?:create|update)\s*\(/;
 
-  for (let line = 0; line < document.lineCount; line += 1) {
+  for (let line = startLine; line < endLine; line += 1) {
     const lineText = document.lineAt(line).text;
     if (!DIRECT_CALL_LINE_PATTERN.test(lineText)) {
       continue;
@@ -6379,12 +6571,14 @@ function findDirectFieldDiagnosticContexts(
 }
 
 function findSchemaFieldDiagnosticContexts(
-  document: vscode.TextDocument
+  document: vscode.TextDocument,
+  startLine = 0,
+  endLine = document.lineCount
 ): SchemaFieldDiagnosticContext[] {
   const contexts: SchemaFieldDiagnosticContext[] = [];
   const seen = new Set<string>();
 
-  for (let line = 0; line < document.lineCount; line += 1) {
+  for (let line = startLine; line < endLine; line += 1) {
     const lineText = document.lineAt(line).text;
     for (const match of lineText.matchAll(/[-A-Za-z_][\w-]*/g)) {
       const value = match[0];
@@ -6413,12 +6607,14 @@ function findSchemaFieldDiagnosticContexts(
 }
 
 function findMetaConstraintLookupDiagnosticContexts(
-  document: vscode.TextDocument
+  document: vscode.TextDocument,
+  startLine = 0,
+  endLine = document.lineCount
 ): MetaConstraintLookupDiagnosticContext[] {
   const contexts: MetaConstraintLookupDiagnosticContext[] = [];
   const seen = new Set<string>();
 
-  for (let line = 0; line < document.lineCount; line += 1) {
+  for (let line = startLine; line < endLine; line += 1) {
     const lineText = document.lineAt(line).text;
     for (const match of lineText.matchAll(/[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/g)) {
       const value = match[0];
@@ -6447,12 +6643,14 @@ function findMetaConstraintLookupDiagnosticContexts(
 }
 
 function findBulkUpdateFieldDiagnosticContexts(
-  document: vscode.TextDocument
+  document: vscode.TextDocument,
+  startLine = 0,
+  endLine = document.lineCount
 ): BulkUpdateFieldListDiagnosticContext[] {
   const contexts: BulkUpdateFieldListDiagnosticContext[] = [];
   const seen = new Set<string>();
 
-  for (let line = 0; line < document.lineCount; line += 1) {
+  for (let line = startLine; line < endLine; line += 1) {
     const lineText = document.lineAt(line).text;
     for (const match of lineText.matchAll(/[-A-Za-z_][\w-]*/g)) {
       const value = match[0];

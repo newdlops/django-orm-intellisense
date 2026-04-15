@@ -1111,18 +1111,19 @@ class DaemonServer:
         )
 
         affected_labels = old_labels | new_labels
-        if not affected_labels and new_static_index is static_index:
-            # No changes (e.g. syntax error, no model changes)
+        if not affected_labels:
+            # No model changes — static index structure may be rebuilt but
+            # model surfaces are identical. Skip the expensive surface rebuild
+            # and return unchanged to avoid sending the 18MB+ payload.
+            if new_static_index is not static_index:
+                with self._state_lock:
+                    self.static_index = new_static_index
             elapsed = time.perf_counter() - started
             print(
                 f'[PERF] reindexFile: no changes {elapsed:.3f}s',
                 file=sys.stderr,
             )
-            return {
-                'surfaceIndex': self._last_surface_index or {},
-                'modelNames': self._last_model_names or [],
-                'staticFallback': self._last_static_fallback,
-            }
+            return {'unchanged': True}
 
         # Also invalidate reverse-relation targets: models that reference
         # affected models may have changed reverse relations.
@@ -1201,6 +1202,7 @@ class DaemonServer:
             'surfaceIndex': surface_index,
             'modelNames': model_names,
             'staticFallback': static_fallback if static_fallback else None,
+            'changedLabels': sorted(affected_labels),
         }
 
     def _health(self) -> dict[str, Any]:

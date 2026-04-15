@@ -47,8 +47,9 @@ import type {
 
 const REQUEST_TIMEOUT_MS = 8_000;
 const INITIALIZE_REQUEST_TIMEOUT_MS = 60_000;
-const RESPONSE_CACHE_LIMIT = 512;
+const RESPONSE_CACHE_LIMIT = 2048;
 const RESPONSE_CACHE_TTL_MS = 30_000;
+const DIAGNOSTIC_CACHE_TTL_MS = 120_000;
 const MAX_PENDING_REQUESTS = 64;
 const MAX_PAYLOAD_BYTES = 512 * 1024; // 512KB
 const LOCAL_LOOKUP_RELATION_ONLY_METHODS = new Set([
@@ -174,7 +175,7 @@ function prependToPath(
 export class AnalysisDaemon implements vscode.Disposable {
   private readonly stateEmitter = new vscode.EventEmitter<HealthSnapshot>();
   private readonly pendingRequests = new Map<string, PendingRequest>();
-  private readonly responseCache = new Map<string, { promise: Promise<unknown>; createdAt: number }>();
+  private readonly responseCache = new Map<string, { promise: Promise<unknown>; createdAt: number; source?: IpcRequestSource }>();
   private readonly intentionalExitProcessIds = new Set<number>();
   private readonly requestSourceContext = new AsyncLocalStorage<IpcRequestSource>();
   private readonly abortSignalContext = new AsyncLocalStorage<AbortSignal>();
@@ -486,6 +487,12 @@ export class AnalysisDaemon implements vscode.Disposable {
       false,
       'reindex'
     );
+
+    // Fast path: no model changes detected — skip all processing
+    if (result.unchanged) {
+      return result;
+    }
+
     const nextSurfaceIndex = result.surfaceIndex ?? {};
     const nextModelNames = new Set(result.modelNames ?? []);
     const nextStaticFallback = result.staticFallback ?? null;
@@ -1558,7 +1565,10 @@ export class AnalysisDaemon implements vscode.Disposable {
     const cached = this.responseCache.get(cacheKey);
     if (cached) {
       const age = Date.now() - cached.createdAt;
-      if (age < RESPONSE_CACHE_TTL_MS) {
+      const effectiveTtl = source === 'diagnostic' || cached.source === 'diagnostic'
+        ? DIAGNOSTIC_CACHE_TTL_MS
+        : RESPONSE_CACHE_TTL_MS;
+      if (age < effectiveTtl) {
         // Re-check abort even on cache hit: the caller may have been
         // cancelled between the top-of-function check and this point
         // (e.g. due to an intervening await in a loop).
@@ -1604,7 +1614,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       effectiveBackground,
       source
     );
-    this.responseCache.set(cacheKey, { promise: requestPromise, createdAt: Date.now() });
+    this.responseCache.set(cacheKey, { promise: requestPromise, createdAt: Date.now(), source });
     this.evictOldestCachedResponse();
     requestPromise.catch(() => {
       if (this.responseCache.get(cacheKey)?.promise === requestPromise) {
@@ -1775,7 +1785,8 @@ export class AnalysisDaemon implements vscode.Disposable {
     // Evict TTL-expired entries first
     const now = Date.now();
     for (const [key, entry] of this.responseCache) {
-      if (now - entry.createdAt >= RESPONSE_CACHE_TTL_MS) {
+      const ttl = entry.source === 'diagnostic' ? DIAGNOSTIC_CACHE_TTL_MS : RESPONSE_CACHE_TTL_MS;
+      if (now - entry.createdAt >= ttl) {
         this.responseCache.delete(key);
       }
     }

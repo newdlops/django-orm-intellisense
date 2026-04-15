@@ -201,6 +201,10 @@ export interface ReindexFileResult {
   surfaceIndex: Record<string, Record<string, Record<string, [string, string | null]>>>;
   modelNames: string[];
   staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
+  /** When true, no model changes were detected — surfaceIndex/modelNames are omitted. */
+  unchanged?: boolean;
+  /** When present, only these labels changed (delta update). */
+  changedLabels?: string[];
 }
 
 export interface RequestMessage {
