@@ -1,8 +1,8 @@
 {
   "name": "django-orm-intellisense",
   "displayName": "Django ORM Intellisense",
-  "description": "VS Code extension scaffold for Django ORM development assistance.",
-  "version": "0.0.1",
+  "description": "Framework-aware autocomplete, hover, go-to-definition, and diagnostics for Django ORM lookup paths, relation strings, and queryset chains.",
+  "version": "0.1.1",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -18,8 +18,14 @@
   },
   "categories": [
     "Programming Languages",
+    "Linters",
     "Other"
   ],
+  "icon": "images/icon.png",
+  "galleryBanner": {
+    "color": "#0c4b33",
+    "theme": "dark"
+  },
   "activationEvents": [
     "onLanguage:python",
     "onCommand:djangoOrmIntellisense.showStatus",
@@ -58,25 +64,25 @@
         "djangoOrmIntellisense.autoStart": {
           "type": "boolean",
           "default": true,
-          "description": "Python 파일을 열 때 분석 데몬을 자동으로 시작합니다. false로 설정하면 수동으로 Restart Daemon 명령을 실행해야 합니다."
+          "description": "Automatically start the analysis daemon when a Python file is opened. Set to false to require manual restart."
         },
         "djangoOrmIntellisense.pythonInterpreter": {
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "분석 데몬이 사용할 Python 인터프리터 경로. .venv 디렉토리 또는 python 실행 파일 경로를 지정합니다. 비어 있으면 python3을 사용합니다. Cmd+Shift+P → 'Django ORM: Select Python Interpreter'로 선택 가능."
+          "description": "Path to the Python interpreter for the analysis daemon. Accepts a virtualenv directory (.venv) or a Python executable path. Falls back to python3 if empty. Use Cmd+Shift+P → 'Django ORM: Select Python Interpreter' to browse."
         },
         "djangoOrmIntellisense.settingsModule": {
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "DJANGO_SETTINGS_MODULE 값. 비어 있으면 manage.py에서 자동 감지합니다. 여러 settings 파일이 있는 프로젝트에서 명시적으로 지정합니다."
+          "description": "DJANGO_SETTINGS_MODULE value. Auto-detected from manage.py if empty. Set explicitly for projects with multiple settings files."
         },
         "djangoOrmIntellisense.workspaceRoot": {
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "Django 프로젝트 루트 경로. VS Code 워크스페이스가 모노레포인 경우 Django 프로젝트가 위치한 하위 디렉토리를 지정합니다."
+          "description": "Django project root path. Use this when your VS Code workspace is a monorepo and the Django project lives in a subdirectory."
         },
         "djangoOrmIntellisense.logLevel": {
           "type": "string",
@@ -96,7 +102,11 @@
     "django",
     "orm",
     "python",
-    "intellisense"
+    "intellisense",
+    "autocomplete",
+    "queryset",
+    "filter",
+    "lookup"
   ],
   "scripts": {
     "vscode:prepublish": "npm run compile",

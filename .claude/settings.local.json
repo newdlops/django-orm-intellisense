@@ -5,7 +5,8 @@
       "Bash(grep:*)",
       "Bash(git stash:*)",
       "Bash(npm run:*)",
-      "Bash(npx tsc:*)"
+      "Bash(npx tsc:*)",
+      "Bash(npx vscode-test:*)"
     ]
   }
 }
