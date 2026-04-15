@@ -3684,6 +3684,87 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
+  test('infers multiline parenthesized assignment receivers', async function () {
+    this.timeout(60_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    // Test: multiline parenthesized assignment with chained methods
+    // company_question_thread = (
+    //     self.company.question_thread_set.get_queryset()
+    //     .exclude_deleted()
+    //     .get(id=company_question_thread_id)
+    // )
+    // company_question_thread.me  ← should complete to message_set
+    const multilineParenCompletionPosition = positionAfterTextInContainer(
+      document,
+      'def multiline_paren_assignment_examples(\n        self, *, company_question_thread_id: int\n    ):\n        company_question_thread = (\n            self.company.question_thread_set.get_queryset()\n            .exclude_deleted()\n            .get(id=company_question_thread_id)\n        )\n        company_question_thread.me',
+      '.me'
+    );
+    const multilineParenCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        multilineParenCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(multilineParenCompletionList?.items, 'message_set'),
+      'Expected multiline parenthesized assignment to resolve as CaptainQuestionThread instance with message_set.'
+    );
+
+    // Test: simple multiline parenthesized assignment
+    // simple_result = (
+    //     Post.objects.get(id=1)
+    // )
+    // simple_result.au  ← should complete to author
+    const simpleParenPosition = positionAfterTextInContainer(
+      document,
+      'simple_result = (\n        Post.objects.get(id=1)\n    )\n    simple_result.au',
+      '.au'
+    );
+    const simpleParenCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        simpleParenPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(simpleParenCompletionList?.items, 'author'),
+      'Expected simple multiline parenthesized assignment with get() to resolve as Post instance.'
+    );
+
+    // Test: chained multiline parenthesized assignment
+    // chained_result = (
+    //     Post.objects.filter(published=True)
+    //     .first()
+    // )
+    // chained_result.au  ← should complete to author
+    const chainedParenPosition = positionAfterTextInContainer(
+      document,
+      'chained_result = (\n        Post.objects.filter(published=True)\n        .first()\n    )\n    chained_result.au',
+      '.au'
+    );
+    const chainedParenCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        chainedParenPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(chainedParenCompletionList?.items, 'author'),
+      'Expected chained multiline parenthesized assignment with first() to resolve as Post instance.'
+    );
+  });
+
   test('resolves package model re-exports when a sibling models.py file exists', async function () {
     this.timeout(20_000);
 
@@ -8235,6 +8316,300 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       djangoDefinitionHoverText.includes('Class category: `django`'),
       `Expected Product definition hover to mark the class as django. Received: ${djangoDefinitionHoverText}`
+    );
+  });
+
+  test('shows hover for Django builtin instance and queryset methods', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    // --- Instance builtin method: save() ---
+    const saveHoverPosition = positionInsideText(
+      document,
+      'post.save()',
+      'save'
+    );
+    const saveHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      saveHoverPosition
+    );
+    const saveHoverText = stringifyHovers(saveHovers);
+
+    assert.ok(
+      saveHoverText.includes('save'),
+      `Expected builtin instance method hover to mention save. Received: ${saveHoverText}`
+    );
+    assert.ok(
+      saveHoverText.includes('Receiver kind: `instance`'),
+      `Expected builtin instance method hover to show instance receiver. Received: ${saveHoverText}`
+    );
+
+    // --- Instance builtin method: full_clean() ---
+    const fullCleanHoverPosition = positionInsideText(
+      document,
+      'post.full_clean()',
+      'full_clean'
+    );
+    const fullCleanHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        fullCleanHoverPosition
+      );
+    const fullCleanHoverText = stringifyHovers(fullCleanHovers);
+
+    assert.ok(
+      fullCleanHoverText.includes('full_clean'),
+      `Expected full_clean hover to show method name. Received: ${fullCleanHoverText}`
+    );
+    assert.ok(
+      fullCleanHoverText.includes('Receiver kind: `instance`'),
+      `Expected full_clean hover to show instance receiver. Received: ${fullCleanHoverText}`
+    );
+
+    // --- Instance builtin method: refresh_from_db() ---
+    const refreshHoverPosition = positionInsideText(
+      document,
+      'post.refresh_from_db()',
+      'refresh_from_db'
+    );
+    const refreshHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      refreshHoverPosition
+    );
+    const refreshHoverText = stringifyHovers(refreshHovers);
+
+    assert.ok(
+      refreshHoverText.includes('refresh_from_db'),
+      `Expected refresh_from_db hover to show method name. Received: ${refreshHoverText}`
+    );
+    assert.ok(
+      refreshHoverText.includes('Receiver kind: `instance`'),
+      `Expected refresh_from_db hover to show instance receiver. Received: ${refreshHoverText}`
+    );
+
+    // --- QuerySet builtin method: union() ---
+    const unionHoverPosition = positionInsideText(
+      document,
+      'qs.union(Post.objects.none())',
+      'union'
+    );
+    const unionHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      unionHoverPosition
+    );
+    const unionHoverText = stringifyHovers(unionHovers);
+
+    assert.ok(
+      unionHoverText.includes('union'),
+      `Expected queryset builtin union hover to show method name. Received: ${unionHoverText}`
+    );
+    assert.ok(
+      unionHoverText.includes('Return kind: `queryset`'),
+      `Expected queryset builtin union hover to show queryset return. Received: ${unionHoverText}`
+    );
+    assert.ok(
+      unionHoverText.includes('Receiver kind: `queryset`'),
+      `Expected queryset builtin union hover to show queryset receiver. Received: ${unionHoverText}`
+    );
+
+    // --- QuerySet builtin method: explain() ---
+    const explainHoverPosition = positionInsideText(
+      document,
+      'qs.explain()',
+      'explain'
+    );
+    const explainHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      explainHoverPosition
+    );
+    const explainHoverText = stringifyHovers(explainHovers);
+
+    assert.ok(
+      explainHoverText.includes('explain'),
+      `Expected queryset builtin explain hover to show method name. Received: ${explainHoverText}`
+    );
+    assert.ok(
+      explainHoverText.includes('Receiver kind: `queryset`'),
+      `Expected queryset builtin explain hover to show queryset receiver. Received: ${explainHoverText}`
+    );
+
+    // --- Completion: instance builtins appear ---
+    const instanceCompletionPosition = positionAfterText(
+      document,
+      'post.save'
+    );
+    const instanceCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        instanceCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(instanceCompletionList?.items ?? [], 'save'),
+      'Expected instance builtin completion to include save.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(
+        instanceCompletionList?.items ?? [],
+        'full_clean'
+      ),
+      'Expected instance builtin completion to include full_clean.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(
+        instanceCompletionList?.items ?? [],
+        'refresh_from_db'
+      ),
+      'Expected instance builtin completion to include refresh_from_db.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(instanceCompletionList?.items ?? [], 'delete'),
+      'Expected instance builtin completion to include delete.'
+    );
+
+    // --- Completion: queryset builtins appear ---
+    const qsCompletionPosition = positionAfterText(
+      document,
+      'qs.select_for_update'
+    );
+    const qsCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        qsCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        qsCompletionList?.items ?? [],
+        'select_for_update'
+      ),
+      'Expected queryset builtin completion to include select_for_update.'
+    );
+  });
+
+  test('resolves lookup paths inside deeply nested multiline Q/When/Case expressions', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    // --- Q() keyword inside When() inside Case() inside annotate() ---
+    const nestedQHoverPosition = positionInsideText(
+      document,
+      'Q(question_thread_set__is_open=True)',
+      'question_thread_set__is_open'
+    );
+    const nestedQHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        nestedQHoverPosition
+      );
+    const nestedQHoverText = stringifyHovers(nestedQHovers);
+
+    assert.ok(
+      nestedQHoverText.includes('Owner model:') ||
+        nestedQHoverText.includes('Field kind:'),
+      `Expected nested Q() lookup hover to resolve the field path. Received: ${nestedQHoverText}`
+    );
+
+    // --- Bare keyword inside When() inside Case() inside annotate() ---
+    const bareWhenHoverPosition = positionInsideText(
+      document,
+      'question_thread_set__title="test"',
+      'question_thread_set__title'
+    );
+    const bareWhenHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        bareWhenHoverPosition
+      );
+    const bareWhenHoverText = stringifyHovers(bareWhenHovers);
+
+    assert.ok(
+      bareWhenHoverText.includes('Owner model:') ||
+        bareWhenHoverText.includes('Field kind:'),
+      `Expected bare When() keyword lookup hover to resolve the field path. Received: ${bareWhenHoverText}`
+    );
+
+    // --- Multi-line Q() with | combinator inside filter() ---
+    const filterQHoverPosition = positionInsideText(
+      document,
+      'Q(question_thread_set__title__icontains="test")',
+      'question_thread_set__title__icontains'
+    );
+    const filterQHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        filterQHoverPosition
+      );
+    const filterQHoverText = stringifyHovers(filterQHovers);
+
+    assert.ok(
+      filterQHoverText.includes('Owner model:') ||
+        filterQHoverText.includes('Field kind:'),
+      `Expected multi-line filter Q() lookup hover to resolve the field path. Received: ${filterQHoverText}`
+    );
+
+    // --- Bare keyword in multi-line filter() ---
+    const filterBareHoverPosition = positionInsideText(
+      document,
+      'name__icontains="corp"',
+      'name__icontains'
+    );
+    const filterBareHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        filterBareHoverPosition
+      );
+    const filterBareHoverText = stringifyHovers(filterBareHovers);
+
+    assert.ok(
+      filterBareHoverText.includes('Owner model:') ||
+        filterBareHoverText.includes('Field kind:'),
+      `Expected multi-line filter bare keyword hover to resolve the field path. Received: ${filterBareHoverText}`
+    );
+
+    // --- Completion inside nested Q() ---
+    const nestedQCompletionPosition = positionAfterText(
+      document,
+      'Q(question_thread_set__is_open'
+    );
+    const nestedQCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        nestedQCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        nestedQCompletionList?.items ?? [],
+        'is_open'
+      ),
+      `Expected nested Q() completion to include is_open. Got: ${(nestedQCompletionList?.items ?? []).map(completionItemLabel).join(', ')}`
     );
   });
 

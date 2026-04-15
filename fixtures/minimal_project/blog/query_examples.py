@@ -246,6 +246,16 @@ class CaptainCompanyQuestionServiceExamples:
         )
         return message
 
+    def multiline_paren_assignment_examples(
+        self, *, company_question_thread_id: int
+    ):
+        company_question_thread = (
+            self.company.question_thread_set.get_queryset()
+            .exclude_deleted()
+            .get(id=company_question_thread_id)
+        )
+        company_question_thread.me
+
 
 from typing import TYPE_CHECKING
 
@@ -301,3 +311,52 @@ class ProxyManagerCompanyQuestionServiceExamples:
         )
         proxy_company_question_thread.message_set.create(content=content)
         return proxy_company_question_thread
+
+
+def builtin_method_examples():
+    post = Post.objects.first()
+    post.save()
+    post.full_clean()
+    post.refresh_from_db()
+
+    qs = Post.objects.filter(published=True)
+    qs.union(Post.objects.none())
+    qs.difference(Post.objects.all())
+    qs.select_for_update()
+    qs.explain()
+
+
+def multiline_nested_expression_examples():
+    from django.db.models import Case, Value as V, When
+
+    Company.objects.annotate(
+        _label=Case(
+            When(
+                Q(question_thread_set__is_open=True),
+                then=V("open"),
+            ),
+            When(
+                question_thread_set__title="test",
+                then=V("test"),
+            ),
+            default=V("closed"),
+        )
+    )
+    Company.objects.filter(
+        Q(question_thread_set__is_open=True)
+        | Q(question_thread_set__title__icontains="test"),
+        name__icontains="corp",
+    )
+
+
+def multiline_paren_assignment_examples():
+    simple_result = (
+        Post.objects.get(id=1)
+    )
+    simple_result.au
+
+    chained_result = (
+        Post.objects.filter(published=True)
+        .first()
+    )
+    chained_result.au
