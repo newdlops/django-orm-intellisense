@@ -2,7 +2,7 @@
   "name": "django-orm-intellisense",
   "displayName": "Django ORM Intellisense",
   "description": "Framework-aware autocomplete, hover, go-to-definition, and diagnostics for Django ORM lookup paths, relation strings, and queryset chains.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {

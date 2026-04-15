@@ -88,16 +88,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const files = [...pendingReindexFiles];
     pendingReindexFiles.clear();
 
+    let anyChanged = false;
     for (const filePath of files) {
       try {
         output.appendLine(`[ls] reindexing file: ${filePath}`);
-        await daemon.reindexFile(filePath);
+        const result = await daemon.reindexFile(filePath);
+        if (!result.unchanged) {
+          anyChanged = true;
+        }
       } catch (error) {
         output.appendLine(`[ls] reindex failed: ${String(error)}`);
       }
     }
 
-    if (Object.keys(daemon.surfaceIndex).length === 0) {
+    if (!anyChanged || Object.keys(daemon.surfaceIndex).length === 0) {
       return;
     }
 

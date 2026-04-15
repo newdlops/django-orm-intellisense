@@ -815,6 +815,7 @@ export function registerPythonProviders(
   const diagnosticsEnabled = isPylanceAvailable();
   let providersDisposed = false;
   let diagnosticsDisposed = false;
+  let activeCompletionCount = 0;
   // Disposal signal: rejects when providers are disposed, used with Promise.race
   // to immediately abort in-flight hover/completion/definition/signature calls.
   let fireDisposalSignal: (() => void) | undefined;
@@ -853,12 +854,19 @@ export function registerPythonProviders(
     diagnosticTimers.clear();
   };
 
+  const COMPLETION_DIAGNOSTIC_DEFER_MS = 3_000;
   const scheduleDiagnosticsRefresh = (
     document: vscode.TextDocument,
     delayMs = 200
   ): void => {
     if (!shouldAnalyzeDocument(document, daemon.getState().workspaceRoot)) {
       return;
+    }
+
+    // Defer diagnostics while completions are in-flight to avoid flooding
+    // the event loop with concurrent IPC calls and redundant scans.
+    if (activeCompletionCount > 0) {
+      delayMs = Math.max(delayMs, COMPLETION_DIAGNOSTIC_DEFER_MS);
     }
 
     const key = document.uri.toString();
@@ -1080,46 +1088,14 @@ export function registerPythonProviders(
     const _docTextForValidation = document.getText();
     const VALIDATION_BATCH_SIZE = 15;
     const _validatedLookupContexts: LookupDiagnosticContext[] = [];
-    for (let i = 0; i < _lookupContexts.length; i += 1) {
+    for (let batchStart = 0; batchStart < _lookupContexts.length; batchStart += VALIDATION_BATCH_SIZE) {
       if (isDiagnosticsCancelled()) break;
-      if (i > 0 && i % VALIDATION_BATCH_SIZE === 0) {
+      if (batchStart > 0) {
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
         if (isDiagnosticsCancelled()) break;
       }
-      const context = _lookupContexts[i];
-      const ctx = context as LookupDiagnosticContext & {
-        _needsCallContextValidation?: boolean;
-        _absoluteStart?: number;
-        _absoluteEnd?: number;
-        _isPrefetch?: boolean;
-        _isDictKey?: boolean;
-        _isFExpression?: boolean;
-        _isExpressionPath?: boolean;
-      };
-      if (ctx._needsCallContextValidation && ctx._absoluteStart !== undefined) {
-        let callContext: { receiverExpression: string; method: string } | undefined;
-        if (ctx._isDictKey && ctx._absoluteEnd !== undefined) {
-          const dictCtx = unpackedLookupDictCallContext(_docTextForValidation, ctx._absoluteStart, ctx._absoluteEnd);
-          callContext = dictCtx ? { receiverExpression: dictCtx.receiverExpression, method: dictCtx.method } : undefined;
-        } else if (ctx._isFExpression) {
-          const fCtx = fExpressionCallContext(_docTextForValidation, ctx._absoluteStart);
-          callContext = fCtx ? { receiverExpression: fCtx.receiverExpression, method: F_EXPRESSION_METHOD } : undefined;
-        } else if (ctx._isExpressionPath && ctx._absoluteEnd !== undefined) {
-          const exprCtx = expressionStringArgumentCallContext(_docTextForValidation, ctx._absoluteStart, ctx._absoluteEnd);
-          callContext = exprCtx ? { receiverExpression: exprCtx.receiverExpression, method: expressionPathMethodName(exprCtx.expressionName) } : undefined;
-        } else if (ctx._isPrefetch) {
-          callContext = prefetchLookupCallContext(_docTextForValidation, ctx._absoluteStart) ?? undefined;
-        } else {
-          const lookupCtx = querysetStringCallContext(_docTextForValidation, ctx._absoluteStart);
-          callContext = lookupCtx && lookupCtx.method === context.method ? lookupCtx : undefined;
-        }
-        if (!callContext) {
-          continue;
-        }
-        context.receiverExpression = callContext.receiverExpression;
-        context.method = callContext.method;
-      }
-      _validatedLookupContexts.push(context);
+      const batch = _lookupContexts.slice(batchStart, batchStart + VALIDATION_BATCH_SIZE);
+      _validatedLookupContexts.push(...validateLookupContexts(batch, _docTextForValidation, isDiagnosticsCancelled));
     }
 
     for (const context of _validatedLookupContexts) {
@@ -1219,6 +1195,19 @@ export function registerPythonProviders(
         diagnosticCollection.set(document.uri, [...diagnostics]);
       }
 
+      // Incrementally publish diagnostics every N new items so the user
+      // sees results trickle in rather than waiting for the full scan.
+      const INCREMENTAL_PUBLISH_INTERVAL = 50;
+      let phase2NewDiagCount = 0;
+      const incrementalPublish = () => {
+        phase2NewDiagCount++;
+        if (phase2NewDiagCount % INCREMENTAL_PUBLISH_INTERVAL === 0) {
+          if (!diagnosticsDisposed && document.version === documentVersion) {
+            diagnosticCollection.set(document.uri, [...diagnostics]);
+          }
+        }
+      };
+
       // Scan remaining lines (before and after visible range)
       const remainingRanges: Array<[number, number]> = [];
       if (visStartLine > 0) remainingRanges.push([0, visStartLine]);
@@ -1246,45 +1235,13 @@ export function registerPythonProviders(
             if (seenRanges.has(dKey)) continue;
             seenRanges.add(dKey);
             diagnostics.push(diagnostic);
+            incrementalPublish();
           } catch { continue; }
         }
 
         // Process extra lookup contexts through the same pipeline
         const extraDocText = document.getText();
-        const extraValidated: LookupDiagnosticContext[] = [];
-        for (let i = 0; i < extraLookups.length; i += 1) {
-          if (isDiagnosticsCancelled()) break;
-          const ctx = extraLookups[i] as LookupDiagnosticContext & {
-            _needsCallContextValidation?: boolean;
-            _absoluteStart?: number;
-            _absoluteEnd?: number;
-            _isPrefetch?: boolean;
-            _isDictKey?: boolean;
-            _isFExpression?: boolean;
-            _isExpressionPath?: boolean;
-          };
-          if (ctx._needsCallContextValidation && ctx._absoluteStart !== undefined) {
-            let callContext: { receiverExpression: string; method: string } | undefined;
-            if (ctx._isDictKey && ctx._absoluteEnd !== undefined) {
-              callContext = unpackedLookupDictCallContext(extraDocText, ctx._absoluteStart, ctx._absoluteEnd) as typeof callContext;
-            } else if (ctx._isFExpression) {
-              const fCtx = fExpressionCallContext(extraDocText, ctx._absoluteStart);
-              callContext = fCtx ? { receiverExpression: fCtx.receiverExpression, method: F_EXPRESSION_METHOD } : undefined;
-            } else if (ctx._isExpressionPath && ctx._absoluteEnd !== undefined) {
-              const exprCtx = expressionStringArgumentCallContext(extraDocText, ctx._absoluteStart, ctx._absoluteEnd);
-              callContext = exprCtx ? { receiverExpression: exprCtx.receiverExpression, method: expressionPathMethodName(exprCtx.expressionName) } : undefined;
-            } else if (ctx._isPrefetch) {
-              callContext = prefetchLookupCallContext(extraDocText, ctx._absoluteStart) ?? undefined;
-            } else {
-              const lookupCtx = querysetStringCallContext(extraDocText, ctx._absoluteStart);
-              callContext = lookupCtx && lookupCtx.method === extraLookups[i].method ? lookupCtx : undefined;
-            }
-            if (!callContext) continue;
-            extraLookups[i].receiverExpression = callContext.receiverExpression;
-            extraLookups[i].method = callContext.method;
-          }
-          extraValidated.push(extraLookups[i]);
-        }
+        const extraValidated = validateLookupContexts(extraLookups, extraDocText, isDiagnosticsCancelled);
 
         for (const context of extraValidated) {
           if (isDiagnosticsCancelled()) break;
@@ -1316,6 +1273,7 @@ export function registerPythonProviders(
             if (seenRanges.has(dKey)) continue;
             seenRanges.add(dKey);
             diagnostics.push(diagnostic);
+            incrementalPublish();
           } catch { continue; }
         }
       }
@@ -1324,7 +1282,7 @@ export function registerPythonProviders(
     // Yield before heavy synchronous scan to let hover/definition respond.
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (isDiagnosticsCancelled()) { /* skip */ } else
-    for (const context of findDirectFieldDiagnosticContexts(document)) {
+    for (const context of findDirectFieldDiagnosticContexts(document, visStartLine, visEndLine)) {
       if (isDiagnosticsCancelled()) break;
       try {
         const baseModelLabel = await resolveBaseModelLabelForReceiver(
@@ -1369,7 +1327,7 @@ export function registerPythonProviders(
 
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (isDiagnosticsCancelled()) { /* skip */ } else
-    for (const context of findSchemaFieldDiagnosticContexts(document)) {
+    for (const context of findSchemaFieldDiagnosticContexts(document, visStartLine, visEndLine)) {
       if (isDiagnosticsCancelled()) break;
       try {
         const baseModelLabel = await resolveMetaOwnerModelLabel(
@@ -1413,7 +1371,7 @@ export function registerPythonProviders(
 
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (isDiagnosticsCancelled()) { /* skip */ } else
-    for (const context of findMetaConstraintLookupDiagnosticContexts(document)) {
+    for (const context of findMetaConstraintLookupDiagnosticContexts(document, visStartLine, visEndLine)) {
       if (isDiagnosticsCancelled()) break;
       try {
         const baseModelLabel = await resolveMetaOwnerModelLabel(
@@ -1462,7 +1420,7 @@ export function registerPythonProviders(
 
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (isDiagnosticsCancelled()) { /* skip */ } else
-    for (const context of findBulkUpdateFieldDiagnosticContexts(document)) {
+    for (const context of findBulkUpdateFieldDiagnosticContexts(document, visStartLine, visEndLine)) {
       if (isDiagnosticsCancelled()) break;
       try {
         const baseModelLabel = await resolveBaseModelLabelForReceiver(
@@ -1538,6 +1496,7 @@ export function registerPythonProviders(
     {
       async provideCompletionItems(document, position, token) {
         daemon.logDiagnostic(`[completion:enter] ${document.uri.fsPath.split('/').slice(-2).join('/')}:${position.line}:${position.character}`);
+        activeCompletionCount++;
         try {
         if (providersDisposed || token.isCancellationRequested) {
           return undefined;
@@ -2093,6 +2052,8 @@ export function registerPythonProviders(
         } catch (error) {
           daemon.logDiagnostic(`[completion:error] ${error instanceof Error ? error.message : String(error)}`);
           return undefined;
+        } finally {
+          activeCompletionCount--;
         }
       },
     },
@@ -6315,6 +6276,54 @@ function shouldAnalyzeDocument(
     relativePath.length === 0 ||
     (!relativePath.startsWith('..') && !path.isAbsolute(relativePath))
   );
+}
+
+/**
+ * Validate raw lookup contexts by resolving their call-context (receiver
+ * expression + method).  Contexts that fail validation are filtered out.
+ * This is shared between Phase 1 and Phase 2 diagnostic scanning.
+ */
+function validateLookupContexts(
+  contexts: LookupDiagnosticContext[],
+  docText: string,
+  isCancelled: () => boolean,
+): LookupDiagnosticContext[] {
+  const validated: LookupDiagnosticContext[] = [];
+  for (const context of contexts) {
+    if (isCancelled()) break;
+    const ctx = context as LookupDiagnosticContext & {
+      _needsCallContextValidation?: boolean;
+      _absoluteStart?: number;
+      _absoluteEnd?: number;
+      _isPrefetch?: boolean;
+      _isDictKey?: boolean;
+      _isFExpression?: boolean;
+      _isExpressionPath?: boolean;
+    };
+    if (ctx._needsCallContextValidation && ctx._absoluteStart !== undefined) {
+      let callContext: { receiverExpression: string; method: string } | undefined;
+      if (ctx._isDictKey && ctx._absoluteEnd !== undefined) {
+        const dictCtx = unpackedLookupDictCallContext(docText, ctx._absoluteStart, ctx._absoluteEnd);
+        callContext = dictCtx ? { receiverExpression: dictCtx.receiverExpression, method: dictCtx.method } : undefined;
+      } else if (ctx._isFExpression) {
+        const fCtx = fExpressionCallContext(docText, ctx._absoluteStart);
+        callContext = fCtx ? { receiverExpression: fCtx.receiverExpression, method: F_EXPRESSION_METHOD } : undefined;
+      } else if (ctx._isExpressionPath && ctx._absoluteEnd !== undefined) {
+        const exprCtx = expressionStringArgumentCallContext(docText, ctx._absoluteStart, ctx._absoluteEnd);
+        callContext = exprCtx ? { receiverExpression: exprCtx.receiverExpression, method: expressionPathMethodName(exprCtx.expressionName) } : undefined;
+      } else if (ctx._isPrefetch) {
+        callContext = prefetchLookupCallContext(docText, ctx._absoluteStart) ?? undefined;
+      } else {
+        const lookupCtx = querysetStringCallContext(docText, ctx._absoluteStart);
+        callContext = lookupCtx && lookupCtx.method === context.method ? lookupCtx : undefined;
+      }
+      if (!callContext) continue;
+      context.receiverExpression = callContext.receiverExpression;
+      context.method = callContext.method;
+    }
+    validated.push(context);
+  }
+  return validated;
 }
 
 function findRelationDiagnosticContexts(

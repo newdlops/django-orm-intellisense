@@ -242,7 +242,7 @@ class DaemonServer:
         self._bg_pool: ProcessPoolExecutor | None = None
         self._bg_pool_capacity = 0
         self._fallback_bg_pool = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=min(os.cpu_count() or 2, 3),
             thread_name_prefix='fallback-bg',
         )
         self._bg_metrics_lock = threading.Lock()
