@@ -10,7 +10,8 @@
       "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d.get\\(''''scripts'''',{}\\), indent=2\\)\\)\")",
       "Bash(wc -l /Users/lky/project/django-orm-intellisense/src/server/*.ts /Users/lky/project/django-orm-intellisense/python/django_orm_intellisense/features/*.py)",
       "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d.get\\('scripts',{}\\), indent=2\\)\\)\")",
-      "Bash(pkill -f \"Visual Studio Code\")"
+      "Bash(pkill -f \"Visual Studio Code\")",
+      "Bash(env)"
     ]
   }
 }

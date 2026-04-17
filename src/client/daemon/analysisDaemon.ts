@@ -1575,6 +1575,11 @@ export class AnalysisDaemon implements vscode.Disposable {
         if (this.isAborted()) {
           return Promise.reject(new Error(`Aborted (cache hit): ${method}`));
         }
+        // Promote to most-recently-used: delete + reinsert moves this
+        // entry to the end of Map's insertion order, turning FIFO eviction
+        // at .keys().next() into true LRU.
+        this.responseCache.delete(cacheKey);
+        this.responseCache.set(cacheKey, cached);
         return cached.promise as Promise<T>;
       }
       // TTL expired — evict and re-request
@@ -1782,15 +1787,26 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   private evictOldestCachedResponse(): void {
-    // Evict TTL-expired entries first
+    // Fast path: nothing to do when under the size limit. TTL-expired
+    // entries are cleaned lazily on access (see cachedRequest), so a
+    // full-Map sweep on every insert is wasted work — it was O(n) per
+    // insert and dominated CPU under bursty completion loads.
+    if (this.responseCache.size <= RESPONSE_CACHE_LIMIT) {
+      return;
+    }
+    // When over capacity: drop TTL-expired entries first (cheap win),
+    // then evict least-recently-used (Map insertion order, which
+    // cachedRequest maintains as access order).
     const now = Date.now();
     for (const [key, entry] of this.responseCache) {
       const ttl = entry.source === 'diagnostic' ? DIAGNOSTIC_CACHE_TTL_MS : RESPONSE_CACHE_TTL_MS;
       if (now - entry.createdAt >= ttl) {
         this.responseCache.delete(key);
       }
+      if (this.responseCache.size <= RESPONSE_CACHE_LIMIT) {
+        return;
+      }
     }
-    // Then evict oldest if still over limit
     while (this.responseCache.size > RESPONSE_CACHE_LIMIT) {
       const oldestKey = this.responseCache.keys().next().value;
       if (!oldestKey) {

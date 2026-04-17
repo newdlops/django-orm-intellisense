@@ -730,6 +730,25 @@ const parsedImportStatementCache = new WeakMap<
   vscode.TextDocument,
   CachedParsedImportStatements
 >();
+const documentTextCache = new WeakMap<
+  vscode.TextDocument,
+  { version: number; text: string }
+>();
+
+// document.getText() memoized by (document, version). Repeated calls in a
+// single provider invocation — especially the context-matcher suite in
+// provideCompletionItems — used to copy the full source buffer per call.
+// Large Python files (10k+ lines) turn that into real latency on keystroke.
+function getDocumentText(document: vscode.TextDocument): string {
+  const cached = documentTextCache.get(document);
+  if (cached && cached.version === document.version) {
+    return cached.text;
+  }
+  const text = document['getText']();
+  documentTextCache.set(document, { version: document.version, text });
+  return text;
+}
+
 const documentDefinitionsCache = new WeakMap<
   vscode.TextDocument,
   CachedDocumentDefinitions
@@ -1085,7 +1104,7 @@ export function registerPythonProviders(
 
     // Pre-validate all lookup contexts in batches, yielding between
     // batches to avoid blocking the event loop.
-    const _docTextForValidation = document.getText();
+    const _docTextForValidation = getDocumentText(document);
     const VALIDATION_BATCH_SIZE = 15;
     const _validatedLookupContexts: LookupDiagnosticContext[] = [];
     for (let batchStart = 0; batchStart < _lookupContexts.length; batchStart += VALIDATION_BATCH_SIZE) {
@@ -1240,7 +1259,7 @@ export function registerPythonProviders(
         }
 
         // Process extra lookup contexts through the same pipeline
-        const extraDocText = document.getText();
+        const extraDocText = getDocumentText(document);
         const extraValidated = validateLookupContexts(extraLookups, extraDocText, isDiagnosticsCancelled);
 
         for (const context of extraValidated) {
@@ -2806,7 +2825,7 @@ export function registerPythonProviders(
                 );
                 if (ownerClass) {
                   const fieldPattern = new RegExp(
-                    `^(\\s+)${schemaFieldLiteral.value}\\s*=`
+                    String.raw`^(\s+)${escapeRegExp(schemaFieldLiteral.value)}\s*=`
                   );
                   for (
                     let line = ownerClass.line + 1;
@@ -2994,6 +3013,7 @@ export function registerPythonProviders(
       const key = document.uri.toString();
       lastDiagnosedDocumentVersions.delete(key);
       partialDiagnosticResults.delete(key);
+      _ormReceiverCacheByDocument.delete(key);
       const timer = diagnosticTimers.get(key);
       if (timer) {
         clearTimeout(timer);
@@ -3921,7 +3941,7 @@ function lookupCompletionContext(
 
   const [, method, , currentValue] = match;
   const callContext = querysetStringCallContext(
-    document.getText(),
+    getDocumentText(document),
     document.offsetAt(position)
   );
   if (!callContext || callContext.method !== method) {
@@ -3958,7 +3978,7 @@ function prefetchLookupCompletionContext(
 
   const currentValue = match[2] ?? '';
   const callContext = prefetchLookupCallContext(
-    document.getText(),
+    getDocumentText(document),
     document.offsetAt(position)
   );
   if (!callContext) {
@@ -4010,7 +4030,7 @@ function lookupDictKeyCompletionContext(
     new vscode.Position(position.line, match.startCharacter)
   );
   const callContext = unpackedLookupDictCallContext(
-    document.getText(),
+    getDocumentText(document),
     startOffset,
     document.offsetAt(position)
   );
@@ -4045,7 +4065,7 @@ function fExpressionCompletionContext(
 
   const currentValue = match[2] ?? '';
   const callContext = fExpressionCallContext(
-    document.getText(),
+    getDocumentText(document),
     document.offsetAt(position)
   );
   if (!callContext) {
@@ -4083,11 +4103,11 @@ function expressionPathCompletionContext(
   const cursorOffset = document.offsetAt(position);
   const tokenStartOffset = cursorOffset - currentValue.length;
   const tokenEndOffset = expressionStringTokenEndOffset(
-    document.getText(),
+    getDocumentText(document),
     cursorOffset
   );
   const callContext = expressionStringArgumentCallContext(
-    document.getText(),
+    getDocumentText(document),
     tokenStartOffset,
     tokenEndOffset
   );
@@ -4119,7 +4139,7 @@ function keywordLookupCompletionContext(
     return undefined;
   }
 
-  const fullText = document.getText();
+  const fullText = getDocumentText(document);
   const cursorOffset = document.offsetAt(position);
   const prefixText = fullText.slice(0, cursorOffset);
   const tokenStartOffset = scanKeywordTokenStart(prefixText);
@@ -4149,7 +4169,7 @@ function directFieldKeywordCompletionContext(
   document: vscode.TextDocument,
   position: vscode.Position
 ): DirectFieldKeywordContext | undefined {
-  const fullText = document.getText();
+  const fullText = getDocumentText(document);
   const cursorOffset = document.offsetAt(position);
   const prefixText = fullText.slice(0, cursorOffset);
   const tokenStartOffset = scanKeywordTokenStart(prefixText);
@@ -4188,7 +4208,7 @@ function directFieldSignatureHelpContext(
       activeKeywordText?: string;
     }
   | undefined {
-  const text = document.getText();
+  const text = getDocumentText(document);
   const cursorOffset = document.offsetAt(position);
   const openParenOffset = findEnclosingCallOpenParenOffset(text, cursorOffset);
   if (openParenOffset === undefined) {
@@ -4281,7 +4301,7 @@ function metaConstraintLookupCompletionContext(
     return undefined;
   }
 
-  const fullText = document.getText();
+  const fullText = getDocumentText(document);
   const cursorOffset = document.offsetAt(position);
   const prefixText = fullText.slice(0, cursorOffset);
   const tokenStartOffset = scanKeywordTokenStart(prefixText);
@@ -4319,7 +4339,7 @@ function bulkUpdateFieldListCompletionContext(
   }
 
   const callContext = bulkUpdateFieldListCallContext(
-    document.getText(),
+    getDocumentText(document),
     document.offsetAt(position)
   );
   if (!callContext) {
@@ -4355,7 +4375,7 @@ function lookupHoverLiteral(
 
     if (position.character >= start && position.character <= end) {
       const callContext = querysetStringCallContext(
-        document.getText(),
+        getDocumentText(document),
         lineStartOffset + start
       );
       if (!callContext || callContext.method !== method) {
@@ -4392,7 +4412,7 @@ function prefetchLookupLiteral(
     }
 
     const callContext = prefetchLookupCallContext(
-      document.getText(),
+      getDocumentText(document),
       lineStartOffset + start
     );
     if (!callContext) {
@@ -4452,7 +4472,7 @@ function lookupDictKeyHoverLiteral(
   );
   const endOffset = document.offsetAt(new vscode.Position(position.line, match.end));
   const callContext = unpackedLookupDictCallContext(
-    document.getText(),
+    getDocumentText(document),
     startOffset,
     endOffset
   );
@@ -4486,7 +4506,7 @@ function fExpressionHoverLiteral(
     }
 
     const callContext = fExpressionCallContext(
-      document.getText(),
+      getDocumentText(document),
       lineStartOffset + start
     );
     if (!callContext) {
@@ -4520,7 +4540,7 @@ function expressionPathHoverLiteral(
     }
 
     const callContext = expressionStringArgumentCallContext(
-      document.getText(),
+      getDocumentText(document),
       lineStartOffset + start,
       lineStartOffset + end + 1
     );
@@ -4546,7 +4566,7 @@ function keywordLookupLiteral(
     return undefined;
   }
 
-  const fullText = document.getText();
+  const fullText = getDocumentText(document);
   const wordRange = document.getWordRangeAtPosition(
     position,
     /[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/
@@ -4607,7 +4627,7 @@ function directFieldKeywordLiteral(
   document: vscode.TextDocument,
   position: vscode.Position
 ): DirectFieldKeywordLiteral | undefined {
-  const fullText = document.getText();
+  const fullText = getDocumentText(document);
   const wordRange = document.getWordRangeAtPosition(position, /[A-Za-z_][\w]*/);
   if (!wordRange) {
     return undefined;
@@ -4692,7 +4712,7 @@ function metaConstraintLookupLiteral(
     return undefined;
   }
 
-  const fullText = document.getText();
+  const fullText = getDocumentText(document);
   const wordRange = document.getWordRangeAtPosition(
     position,
     /[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/
@@ -4761,7 +4781,7 @@ function bulkUpdateFieldListHoverLiteral(
     }
 
     const callContext = bulkUpdateFieldListCallContext(
-      document.getText(),
+      getDocumentText(document),
       lineStartOffset + start
     );
     if (!callContext) {
@@ -5621,6 +5641,7 @@ function cancelledCompletionResult(
 
 function resetProviderResolutionCaches(): void {
   allRelationTargetsCache = new WeakMap<AnalysisDaemon, Promise<RelationTargetsResult>>();
+  modelSubclassRelationCache.clear();
 }
 
 async function listAllRelationTargets(
@@ -11670,7 +11691,7 @@ function findNearestComprehensionIterableExpression(
   variableName: string,
   beforeOffset: number
 ): { expression: string; offset: number } | undefined {
-  const fullText = document.getText();
+  const fullText = getDocumentText(document);
 
   for (let index = beforeOffset - 1; index >= 0; index -= 1) {
     const openingDelimiter = fullText[index];
