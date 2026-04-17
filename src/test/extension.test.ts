@@ -9289,6 +9289,72 @@ suite('Django ORM Intellisense UI', () => {
       fs.rmSync(tempWorkspace, { recursive: true, force: true });
     }
   });
+
+  test('resolves snake_case variable names to PascalCase model names as fallback', async function () {
+    this.timeout(20_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    // snake_case variable "company" from unresolvable source → Company model fallback
+    const companyFilterPosition = positionAfterTextInContainer(
+      document,
+      "company.question_thread_set.filter(ti='fallback')",
+      'ti'
+    );
+    const companyFilterCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        companyFilterPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(companyFilterCompletionList?.items, 'title'),
+      'Expected snake_case fallback to resolve "company" → Company and complete reverse relation keyword lookup with `title`.'
+    );
+
+    // snake_case variable "question_thread" from unresolvable source → QuestionThread model fallback
+    const questionThreadFilterPosition = positionAfterTextInContainer(
+      document,
+      "question_thread.message_set.filter(co='fallback')",
+      'co'
+    );
+    const questionThreadFilterCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        questionThreadFilterPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(questionThreadFilterCompletionList?.items, 'content'),
+      'Expected snake_case fallback to resolve "question_thread" → QuestionThread and complete reverse relation keyword lookup with `content`.'
+    );
+
+    // Chained resolution: snake_case fallback → reverse relation → .get() → reverse relation
+    const chainFilterPosition = positionAfterTextInContainer(
+      document,
+      "qt.message_set.filter(co='chain')",
+      'co'
+    );
+    const chainFilterCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        chainFilterPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(chainFilterCompletionList?.items, 'content'),
+      'Expected chained snake_case fallback resolution to complete `content` through company → question_thread_set.get() → message_set.filter().'
+    );
+  });
 });
 
 async function setWorkspaceRoot(rootPath: string): Promise<void> {

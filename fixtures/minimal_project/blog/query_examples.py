@@ -360,3 +360,19 @@ def multiline_paren_assignment_examples():
         .first()
     )
     chained_result.au
+
+
+def snake_case_variable_name_fallback_examples(context):
+    # Variable assigned from unresolvable source — snake_case name matches Company model
+    company = context.get_company()
+    company.question_thread_set.filter(ti='fallback')
+    company.question_thread_set.create(ti='fallback')
+
+    # Multi-word snake_case variable matching QuestionThread model
+    question_thread = context.get_thread()
+    question_thread.message_set.filter(co='fallback')
+
+    # Reverse relation chain through snake_case fallback
+    company_for_chain = context.get_company()
+    qt = company_for_chain.question_thread_set.get(id=1)
+    qt.message_set.filter(co='chain')

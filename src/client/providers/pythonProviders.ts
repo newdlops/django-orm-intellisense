@@ -7579,16 +7579,33 @@ async function resolveOrmReceiverAtOffsetCore(
     beforeOffset
   );
   if (!assignment) {
+    // Fallback: snake_case variable name → PascalCase model name convention
+    const pascalName = snakeToPascalCase(rootIdentifier);
+    const fallbackLabel = daemon.modelLabelByName.get(pascalName);
+    if (fallbackLabel) {
+      return { kind: 'instance', modelLabel: fallbackLabel };
+    }
     return undefined;
   }
 
-  return resolveOrmReceiverAtOffset(
+  const assignmentReceiver = await resolveOrmReceiverAtOffset(
     daemon,
     document,
     assignment.expression,
     assignment.offset,
     visited
   );
+  if (assignmentReceiver) {
+    return assignmentReceiver;
+  }
+
+  // Fallback: assignment resolution failed, try snake_case → PascalCase
+  const pascalName = snakeToPascalCase(rootIdentifier);
+  const fallbackLabel = daemon.modelLabelByName.get(pascalName);
+  if (fallbackLabel) {
+    return { kind: 'instance', modelLabel: fallbackLabel };
+  }
+  return undefined;
 }
 
 function preferMemberReceiver(
@@ -11582,6 +11599,14 @@ function directModelSymbolCandidates(receiverExpression: string): string[] {
   }
 
   return [...new Set(candidates.filter(Boolean))];
+}
+
+function snakeToPascalCase(snake: string): string {
+  return snake
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join('');
 }
 
 function receiverRootIdentifier(receiverExpression: string): string | undefined {
