@@ -116,6 +116,25 @@ pub struct PendingFieldCandidate {
     pub related_query_name: Option<String>,
 }
 
+/// Project-defined method on a model class (regular `def`, async `def`,
+/// classmethod, staticmethod, or property). Extracted statically from
+/// the class body — used to surface hover/completion details without a
+/// Python round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectMethod {
+    pub model_label: String,
+    pub name: String,
+    pub file_path: String,
+    pub line: u32,
+    pub column: u32,
+    /// "method" | "classmethod" | "staticmethod" | "property" |
+    /// "cached_property" | "async_method"
+    pub kind: String,
+    #[serde(default)]
+    pub return_annotation: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FieldCandidate {
@@ -166,6 +185,8 @@ pub struct ModuleIndex {
     pub field_class_names: Vec<String>,
     #[serde(default)]
     pub field_aliases: Vec<(String, String)>,
+    #[serde(default)]
+    pub methods: Vec<ProjectMethod>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -174,4 +195,6 @@ pub struct StaticIndex {
     pub model_candidates: Vec<ModelCandidate>,
     pub fields: Vec<FieldCandidate>,
     pub modules: Vec<ModuleIndex>,
+    #[serde(default)]
+    pub methods: Vec<ProjectMethod>,
 }

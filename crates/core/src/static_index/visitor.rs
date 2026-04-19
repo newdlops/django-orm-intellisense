@@ -8,7 +8,7 @@ use rustpython_parser::source_code::{LineIndex, OneIndexed, SourceCode};
 
 use super::types::{
     is_django_field_class, is_relation_field_kind, DefinitionLocation, ImportBinding,
-    ModelCandidate, ModuleIndex, PendingFieldCandidate,
+    ModelCandidate, ModuleIndex, PendingFieldCandidate, ProjectMethod,
 };
 
 /// Walk the module AST, populating `ModuleIndex`. `module_name` is the
@@ -43,6 +43,7 @@ struct Visitor<'a> {
     class_base_refs: Vec<(String, Vec<String>)>,
     field_class_names: Vec<String>,
     field_aliases: Vec<(String, String)>,
+    methods: Vec<ProjectMethod>,
 }
 
 impl<'a> Visitor<'a> {
@@ -66,6 +67,7 @@ impl<'a> Visitor<'a> {
             class_base_refs: Vec::new(),
             field_class_names: Vec::new(),
             field_aliases: Vec::new(),
+            methods: Vec::new(),
         }
     }
 
@@ -85,6 +87,7 @@ impl<'a> Visitor<'a> {
             class_base_refs: self.class_base_refs,
             field_class_names: self.field_class_names,
             field_aliases: self.field_aliases,
+            methods: self.methods,
         }
     }
 
@@ -119,8 +122,18 @@ impl<'a> Visitor<'a> {
                 }
             }
             Stmt::ImportFrom(i) => {
-                let module = i.module.as_ref().map(|m| m.as_str().to_string());
-                if let Some(module) = module {
+                let raw_module = i.module.as_ref().map(|m| m.as_str().to_string());
+                let level = i
+                    .level
+                    .map(|l| l.to_u32() as usize)
+                    .unwrap_or(0);
+                let resolved = resolve_relative_import(
+                    &self.module_name,
+                    raw_module.as_deref(),
+                    level,
+                    self.is_package_init,
+                );
+                if let Some(module) = resolved {
                     for alias in &i.names {
                         if alias.name.as_str() == "*" {
                             self.import_bindings.push(ImportBinding {
@@ -183,6 +196,7 @@ impl<'a> Visitor<'a> {
                     };
 
                     self.extract_fields(&c.body, &label, &app_label);
+                    self.extract_methods(&c.body, &label);
                     self.model_candidates.push(candidate);
                 }
 
@@ -323,6 +337,85 @@ impl<'a> Visitor<'a> {
                 related_query_name,
             });
         }
+    }
+
+    /// Scan a model class body for `def`/`async def` members and
+    /// decorator-annotated properties / classmethods / staticmethods.
+    /// Nested class definitions are not recursed — callers already
+    /// handle that via `visit_stmts`.
+    fn extract_methods(&mut self, body: &[Stmt], model_label: &str) {
+        for stmt in body {
+            match stmt {
+                Stmt::FunctionDef(f) => {
+                    let (line, column) = self.location_of(stmt.range());
+                    let name = f.name.as_str().to_string();
+                    if name == "Meta" {
+                        continue;
+                    }
+                    let kind = classify_decorators(&f.decorator_list, false);
+                    let return_annotation = f
+                        .returns
+                        .as_deref()
+                        .map(dotted_name)
+                        .filter(|s| !s.is_empty());
+                    self.methods.push(ProjectMethod {
+                        model_label: model_label.to_string(),
+                        name,
+                        file_path: self.file_path.clone(),
+                        line,
+                        column,
+                        kind,
+                        return_annotation,
+                    });
+                }
+                Stmt::AsyncFunctionDef(f) => {
+                    let (line, column) = self.location_of(stmt.range());
+                    let name = f.name.as_str().to_string();
+                    let kind = classify_decorators(&f.decorator_list, true);
+                    let return_annotation = f
+                        .returns
+                        .as_deref()
+                        .map(dotted_name)
+                        .filter(|s| !s.is_empty());
+                    self.methods.push(ProjectMethod {
+                        model_label: model_label.to_string(),
+                        name,
+                        file_path: self.file_path.clone(),
+                        line,
+                        column,
+                        kind,
+                        return_annotation,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Map decorator list → method kind. Checks for `@property`,
+/// `@classmethod`, `@staticmethod`, and `@functools.cached_property` /
+/// `@cached_property` by name. Unknown decorators leave the method as
+/// a regular `method` (or `async_method` when async).
+fn classify_decorators(decorators: &[Expr], is_async: bool) -> String {
+    for d in decorators {
+        let name = dotted_name(d);
+        if name.is_empty() {
+            continue;
+        }
+        let tail = name.rsplit('.').next().unwrap_or(name.as_str());
+        match tail {
+            "property" => return "property".into(),
+            "classmethod" => return "classmethod".into(),
+            "staticmethod" => return "staticmethod".into(),
+            "cached_property" => return "cached_property".into(),
+            _ => {}
+        }
+    }
+    if is_async {
+        "async_method".into()
+    } else {
+        "method".into()
     }
 }
 
@@ -484,4 +577,57 @@ fn extract_keyword_expr<'a>(call: &'a ast::ExprCall, name: &str) -> Option<&'a E
         }
     }
     None
+}
+
+/// Resolve the absolute module name of a `from X import ...` statement.
+/// Mirrors Python's `_resolve_imported_module`:
+///   - level=0 → absolute (return `imported` as-is)
+///   - level≥1 → strip `level-1` trailing segments from the current
+///     package and prepend them to `imported`
+/// For `__init__.py` files, the "current package" equals the module
+/// name; for regular `.py` files, it is the module name minus the
+/// final segment.
+fn resolve_relative_import(
+    current_module: &str,
+    imported: Option<&str>,
+    level: usize,
+    is_package_init: bool,
+) -> Option<String> {
+    if level == 0 {
+        return imported.map(|s| s.to_string());
+    }
+
+    let base_parts: Vec<&str> = current_module.split('.').filter(|s| !s.is_empty()).collect();
+    let mut package_parts: Vec<&str> = if is_package_init {
+        base_parts.clone()
+    } else {
+        let len = base_parts.len();
+        if len == 0 {
+            Vec::new()
+        } else {
+            base_parts[..len - 1].to_vec()
+        }
+    };
+
+    if level > 1 {
+        let drop = level - 1;
+        if drop > package_parts.len() {
+            return None;
+        }
+        let keep = package_parts.len() - drop;
+        package_parts.truncate(keep);
+    }
+
+    let suffix_parts: Vec<&str> = imported
+        .map(|s| s.split('.').filter(|p| !p.is_empty()).collect::<Vec<&str>>())
+        .unwrap_or_default();
+
+    let mut full: Vec<&str> = Vec::with_capacity(package_parts.len() + suffix_parts.len());
+    full.extend(package_parts);
+    full.extend(suffix_parts);
+    if full.is_empty() {
+        None
+    } else {
+        Some(full.join("."))
+    }
 }

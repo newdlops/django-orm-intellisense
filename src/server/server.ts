@@ -43,6 +43,11 @@ import type { CompletionItem } from 'vscode-languageserver/node';
 import * as fs from 'fs';
 import * as path from 'path';
 
+type CompletionLabelDetails = {
+  detail?: string;
+  description?: string;
+};
+
 // ---------------------------------------------------------------------------
 // Connection & document manager
 // ---------------------------------------------------------------------------
@@ -631,7 +636,7 @@ connection.onCompletion((params: CompletionParams) => {
   // Cache lookup (includes model version + partial segment for correctness)
   const modelVer = modelVersions.get(context.currentModel) ?? 0;
   const resolvedKey = context.parsedLookup.segments.slice(0, -1).join('__');
-  const cacheKey = `${context.currentModel}@${modelVer}::${resolvedKey}::${context.partialSegment}`;
+  const cacheKey = `${context.currentModel}@${modelVer}::${resolvedKey}::${context.partialSegment}::${context.method ?? ''}`;
   const cached = completionCache.get(cacheKey);
   if (cached) {
     const _totalMs = performance.now() - _t0;
@@ -656,6 +661,7 @@ connection.onCompletion((params: CompletionParams) => {
       context.parsedLookup,
       context.partialSegment,
       workspaceIndex,
+      context.method,
       usageFrequency,
     );
     items = candidates.map((c, i) => {
@@ -665,12 +671,30 @@ connection.onCompletion((params: CompletionParams) => {
         detail: c.detail,
         sortText: String(i).padStart(4, '0'),
       };
+      if (c.kind === 'relation') {
+        const labelDetails = relationCompletionLabelDetails(c.detail);
+        if (labelDetails) {
+          (item as CompletionItem & { labelDetails?: CompletionLabelDetails }).labelDetails = labelDetails;
+        }
+      }
+      const canContinue =
+        c.kind === 'relation' ||
+        c.kind === 'transform' ||
+        (c.kind === 'field' && LOOKUP_CONTINUATION_METHODS.has(context.method ?? ''));
+      if (canContinue) {
+        item.insertText = c.name.endsWith('__') ? c.name : `${c.name}__`;
+        item.command = {
+          title: 'Continue Django ORM lookup',
+          command: 'editor.action.triggerSuggest',
+        };
+      }
       if (c.isFuzzyMatch) {
         // Typo correction: show with visual distinction
         item.detail = `\u26A0 did you mean '${c.name}'?`;
         item.sortText = `z_${String(i).padStart(4, '0')}`;
         item.filterText = c.name;
         item.insertText = c.name;
+        item.command = undefined;
       }
       return item;
     });
@@ -710,6 +734,24 @@ function candidateKindToLsp(kind: string): CompletionItemKind {
     case 'transform': return CompletionItemKind.Function;
     default: return CompletionItemKind.Variable;
   }
+}
+
+function relationCompletionLabelDetails(
+  detail: string | undefined
+): CompletionLabelDetails | undefined {
+  if (!detail) {
+    return undefined;
+  }
+
+  const [fieldKind, description] = detail.split(' · ');
+  if (!fieldKind || !description) {
+    return undefined;
+  }
+
+  return {
+    detail: ` (${fieldKind})`,
+    description,
+  };
 }
 
 /**
@@ -770,7 +812,13 @@ function extractCompletionContext(
     currentModel,
     parsedLookup,
     partialSegment,
+    method: detectCompletionMethod(lineText),
   };
+}
+
+function detectCompletionMethod(lineText: string): string | undefined {
+  const match = lineText.match(/\.([A-Za-z_][\w]*)\([^()]*$/);
+  return match?.[1];
 }
 
 // Django queryset methods that accept field lookups as keyword arguments
@@ -781,6 +829,7 @@ const QUERYSET_LOOKUP_METHODS = new Set([
   'select_related', 'prefetch_related',
   'annotate', 'aggregate', 'alias',
 ]);
+const LOOKUP_CONTINUATION_METHODS = new Set(['filter', 'exclude', 'get']);
 
 /**
  * Detect the Django model from the line text before the cursor.

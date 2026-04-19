@@ -224,7 +224,7 @@ const kindMap: Record<PrefixCandidate['kind'], CompletionItemKind> = {
 };
 
 function toCompletionItem(candidate: PrefixCandidate): CompletionItem {
-  return {
+  const item: CompletionItem = {
     label: candidate.name,
     kind: kindMap[candidate.kind],
     detail: candidate.detail,
@@ -235,4 +235,14 @@ function toCompletionItem(candidate: PrefixCandidate): CompletionItem {
       candidateKind: candidate.kind,
     },
   };
+  if (candidate.kind === 'relation' || candidate.kind === 'transform') {
+    item.insertText = candidate.name.endsWith('__')
+      ? candidate.name
+      : `${candidate.name}__`;
+    item.command = {
+      title: 'Continue Django ORM lookup',
+      command: 'editor.action.triggerSuggest',
+    };
+  }
+  return item;
 }

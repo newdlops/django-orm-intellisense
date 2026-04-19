@@ -6,15 +6,15 @@
  * Maps Django field class names to their applicable lookup expressions.
  */
 export const FIELD_LOOKUPS: Record<string, string[]> = {
-  // String fields
-  'CharField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'regex', 'iregex', 'isnull'],
-  'TextField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'regex', 'iregex', 'isnull'],
-  'SlugField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'regex', 'iregex', 'isnull'],
-  'URLField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'regex', 'iregex', 'isnull'],
-  'EmailField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'regex', 'iregex', 'isnull'],
-  'FilePathField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'regex', 'iregex', 'isnull'],
+  // String fields — Django allows lexicographic ordering via gt/gte/lt/lte
+  'CharField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'gt', 'gte', 'lt', 'lte', 'range', 'regex', 'iregex', 'isnull'],
+  'TextField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'gt', 'gte', 'lt', 'lte', 'range', 'regex', 'iregex', 'isnull'],
+  'SlugField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'gt', 'gte', 'lt', 'lte', 'range', 'regex', 'iregex', 'isnull'],
+  'URLField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'gt', 'gte', 'lt', 'lte', 'range', 'regex', 'iregex', 'isnull'],
+  'EmailField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'gt', 'gte', 'lt', 'lte', 'range', 'regex', 'iregex', 'isnull'],
+  'FilePathField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'gt', 'gte', 'lt', 'lte', 'range', 'regex', 'iregex', 'isnull'],
   'UUIDField': ['exact', 'in', 'isnull'],
-  'GenericIPAddressField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'isnull'],
+  'GenericIPAddressField': ['exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith', 'endswith', 'iendswith', 'in', 'gt', 'gte', 'lt', 'lte', 'isnull'],
 
   // Numeric fields
   'IntegerField': ['exact', 'gt', 'gte', 'lt', 'lte', 'in', 'range', 'isnull'],

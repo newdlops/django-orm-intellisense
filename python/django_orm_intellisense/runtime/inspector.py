@@ -397,6 +397,7 @@ def _collect_custom_lookups() -> dict[str, list[str]]:
     lookup names that are registered beyond the Django defaults.
     """
     try:
+        from django.apps import apps  # type: ignore
         from django.db import models  # type: ignore
     except ImportError:
         return {}
@@ -414,7 +415,7 @@ def _collect_custom_lookups() -> dict[str, list[str]]:
     }
 
     result: dict[str, list[str]] = {}
-    field_classes = [
+    field_classes: set[type[object]] = {
         models.CharField, models.TextField, models.IntegerField,
         models.FloatField, models.DecimalField, models.BooleanField,
         models.DateField, models.DateTimeField, models.TimeField,
@@ -422,9 +423,15 @@ def _collect_custom_lookups() -> dict[str, list[str]]:
         models.JSONField, models.UUIDField, models.BinaryField,
         models.FileField, models.ImageField, models.DurationField,
         models.AutoField, models.BigAutoField,
-    ]
+    }
 
-    for field_cls in field_classes:
+    for model in apps.get_models():
+        for field in model._meta.get_fields():
+            field_cls = getattr(field, '__class__', None)
+            if isinstance(field_cls, type):
+                field_classes.add(field_cls)
+
+    for field_cls in sorted(field_classes, key=lambda candidate: candidate.__name__):
         try:
             registered = field_cls.get_lookups()
         except (AttributeError, Exception):

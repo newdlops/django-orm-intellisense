@@ -16,7 +16,24 @@
       "Bash(tee /Users/lky/project/django-orm-intellisense/bench/baseline-ts.json)",
       "Bash(node /Users/lky/project/django-orm-intellisense/out/test/benchmark.js --full --json)",
       "Bash(/Users/lky/project/django-orm-intellisense/.e2e-django5/bin/python -m benchmarks.bench_reindex --json)",
-      "Bash(tee /Users/lky/project/django-orm-intellisense/bench/baseline-python.json)"
+      "Bash(tee /Users/lky/project/django-orm-intellisense/bench/baseline-python.json)",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(bash scripts/build-native.sh)",
+      "Bash(node out/client/native/fastpath.test.js)",
+      "Bash(python3 -c \"from python.django_orm_intellisense.features.orm_members import resolve_orm_member, build_surface_index, prebuild_member_surface_cache, rebuild_surface_for_models, fingerprint_surface_index, fingerprint_json_payload, resolve_orm_member_chain; print\\('orm_members imports OK'\\)\")",
+      "Bash(python3 -c \"from python.django_orm_intellisense.features.lookup_paths import resolve_lookup_path, FILTER_LOOKUP_METHODS, DEFAULT_LOOKUP_OPERATORS; print\\('lookup_paths imports OK'\\)\")",
+      "Bash(python3 -c \"from python.django_orm_intellisense.server import app; print\\('server/app imports OK'\\)\")",
+      "Bash(node out/bench/compare.js bench/baseline-ts.json /tmp/bench_current.json)",
+      "Bash(node out/test/benchmark.js --full --json)",
+      "Bash(/Users/lky/project/django-orm-intellisense/.e2e-system/bin/python --version)",
+      "Bash(DJLS_E2E_BASE_PYTHON=/Users/lky/project/django-orm-intellisense/.e2e-system/bin/python npm test)",
+      "Bash(DJLS_E2E_BASE_PYTHON=/Users/lky/project/django-orm-intellisense/.e2e-homebrew313/bin/python npm test)",
+      "Bash(awk '/^  1\\\\\\) Django/,/^  2\\\\\\)/' /tmp/e2e_after_fixes.txt)",
+      "Bash(DJLS_E2E_DEBUG=1 DJLS_E2E_BASE_PYTHON=/Users/lky/project/django-orm-intellisense/.e2e-homebrew313/bin/python npm test)",
+      "Bash(awk '/^\\\\s+[0-9]+\\\\\\) Django ORM Intellisense UI/{getline; print}' /tmp/e2e_round2.txt)",
+      "Bash(awk '/^\\\\s+[0-9]+\\\\\\)/{print}' /tmp/e2e_round2.txt)",
+      "Bash(awk '/^\\\\s+12\\\\\\) Django/,/^\\\\s+13\\\\\\) /' /tmp/e2e_pk.txt)"
     ]
   }
 }

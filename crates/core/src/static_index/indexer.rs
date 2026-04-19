@@ -51,6 +51,7 @@ pub fn build_static_index(root: &Path, files: &[PathBuf]) -> StaticIndex {
     let mut idx = StaticIndex::default();
     for module in &modules {
         idx.model_candidates.extend(module.model_candidates.clone());
+        idx.methods.extend(module.methods.clone());
     }
     idx.modules = modules;
     idx
@@ -191,5 +192,102 @@ mod tests {
         }
         let idx = build_static_index(root, &files);
         assert_eq!(idx.model_candidates.len(), 20);
+    }
+
+    #[test]
+    fn extracts_project_methods_with_decorator_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_tree(
+            root,
+            &[(
+                "shop/models.py",
+                r#"from django.db import models
+from functools import cached_property
+
+class Order(models.Model):
+    total = models.IntegerField()
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+
+    async def send_email(self) -> None:
+        pass
+
+    @property
+    def formatted_total(self) -> str:
+        return f'${self.total}'
+
+    @cached_property
+    def line_count(self) -> int:
+        return 0
+
+    @classmethod
+    def from_json(cls, payload):
+        return cls()
+
+    @staticmethod
+    def default_label():
+        return 'Order'
+"#,
+            )],
+        );
+
+        let idx = build_static_index(root, &[root.join("shop/models.py")]);
+        let methods: Vec<&super::super::types::ProjectMethod> = idx
+            .methods
+            .iter()
+            .filter(|m| m.model_label == "shop.Order")
+            .collect();
+        let names: Vec<&str> = methods.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"save"));
+        assert!(names.contains(&"send_email"));
+        assert!(names.contains(&"formatted_total"));
+        assert!(names.contains(&"line_count"));
+        assert!(names.contains(&"from_json"));
+        assert!(names.contains(&"default_label"));
+
+        let kind_of = |name: &str| -> String {
+            methods
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| m.kind.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(kind_of("save"), "method");
+        assert_eq!(kind_of("send_email"), "async_method");
+        assert_eq!(kind_of("formatted_total"), "property");
+        assert_eq!(kind_of("line_count"), "cached_property");
+        assert_eq!(kind_of("from_json"), "classmethod");
+        assert_eq!(kind_of("default_label"), "staticmethod");
+
+        // Return annotations captured when present.
+        let formatted = methods
+            .iter()
+            .find(|m| m.name == "formatted_total")
+            .unwrap();
+        assert_eq!(formatted.return_annotation.as_deref(), Some("str"));
+    }
+
+    #[test]
+    fn skips_meta_inner_class_from_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_tree(
+            root,
+            &[(
+                "shop/models.py",
+                "from django.db import models\n\nclass Order(models.Model):\n    class Meta:\n        ordering = ['id']\n    def nothing(self):\n        pass\n",
+            )],
+        );
+        let idx = build_static_index(root, &[root.join("shop/models.py")]);
+        let methods: Vec<&str> = idx
+            .methods
+            .iter()
+            .filter(|m| m.model_label == "shop.Order")
+            .map(|m| m.name.as_str())
+            .collect();
+        assert!(methods.contains(&"nothing"));
+        assert!(!methods.contains(&"Meta"));
     }
 }

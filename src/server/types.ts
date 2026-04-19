@@ -138,6 +138,7 @@ export interface CompletionContext {
   currentModel: string;
   parsedLookup: ParsedLookup;
   partialSegment: string;
+  method?: string;
 }
 
 export interface PrefixCandidate {

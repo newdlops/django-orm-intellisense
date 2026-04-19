@@ -1,0 +1,129 @@
+--- P12: resolveOrmMember 프로젝트 메서드 커버 + 풀 eager prewarm ---
+
+Motivation: Post-P11 real-project session on `captain` still hit
+the diagnostics budget 4× (10s window) and logged a 1784ms hover.
+Root causes:
+
+  1. `resolveOrmMember` for project-defined `def` / @property /
+     @classmethod still fell through to the Python daemon because
+     Rust only knew declared fields and Django builtins.
+  2. The Python ProcessPoolExecutor prewarm submitted noop tasks
+     sequentially, so spawning 2 workers meant 2 × 2.7s of Python
+     cold-start time before the pool could accept real work.
+
+## Scope
+
+### A. Project-method coverage in Rust (Tasks 9, 10)
+
+1. `static_index::types::ProjectMethod` — new struct carrying
+   `{model_label, name, file, line, column, kind, return_annotation}`.
+   `kind` is one of: `method`, `async_method`, `property`,
+   `cached_property`, `classmethod`, `staticmethod`.
+
+2. `ModuleIndex.methods: Vec<ProjectMethod>` and
+   `StaticIndex.methods: Vec<ProjectMethod>` — aggregate across
+   modules during `build_static_index`.
+
+3. `static_index::visitor::extract_methods` — walks a model
+   `class` body, extracts direct `FunctionDef` / `AsyncFunctionDef`
+   members, classifies decorator by tail name (`property`,
+   `classmethod`, `staticmethod`, `cached_property`). `Meta`
+   inner class is skipped.
+
+4. `features::orm_members`:
+   - `project_method_item(method, receiver_kind)` (now `pub`) —
+     converts `ProjectMethod` to `OrmMemberItem` with source
+     provenance (`source="project"`, `filePath`/`line`/`column`
+     preserved, `signature` synthesised from return annotation).
+   - `instance_surface_with_fields` now threads an optional
+     `&StaticIndex` so project methods appear before Django
+     built-ins. Project overrides of `save()` / `delete()` surface
+     with their own source location.
+   - `model_class_surface` emits project `@classmethod` /
+     `@staticmethod` alongside `objects`.
+
+5. `crates/node/src/lib.rs`:
+   - `resolve_member_from_state` consults `static_index.methods`
+     for both instance (non-classmethod / non-staticmethod) and
+     model_class (classmethod / staticmethod) lookups before
+     falling back to Django builtins.
+   - `native_ensure_ast_modules` now also updates
+     `state.static_index.methods`.
+   - `native_init_from_surface` initialises `methods` as empty
+     (populated on the subsequent AST ensure call).
+
+### B. ProcessPoolExecutor eager prewarm (Task 8)
+
+`server/app.py::_start_bg_pool_prewarm` now submits all `_bg_noop`
+tasks at once instead of sequentially:
+
+Before:
+    for _ in range(worker_count):
+        future = pool.submit(_bg_noop)
+        future.result()                  # blocks per-worker
+
+After:
+    futures = [pool.submit(_bg_noop) for _ in range(worker_count)]
+    for future in futures:
+        future.result()                  # all workers spawn in parallel
+
+Expected impact on the `captain` workspace where single worker
+cold-start is ~2.7s: 2-worker prewarm drops from ~5.4s to ~2.7s.
+
+## Fast-path cost (darwin-arm64, release, smoke test)
+
+    native_resolve_orm_member (project method): <0.05 ms
+    native_list_orm_member_completions          0.017 ms
+    native_resolve_export_origin                0.012 ms
+
+## Rust tests
+
+    61 → 64 passing (+3).
+    New:
+      static_index::indexer::tests::
+        extracts_project_methods_with_decorator_kinds
+        skips_meta_inner_class_from_methods
+      features::orm_members::tests::
+        project_methods_surface_on_instance_and_model_class
+
+## napi E2E (fastpath.test.js)
+
+Extended: writes a models.py with @property, @classmethod,
+@staticmethod, and async def — asserts each resolves with correct
+`memberKind` and `source="project"`. Bulk completion lists check
+that both instance (regular def + property) and model_class
+(classmethod + staticmethod) surfaces contain the new items.
+
+## Regression check (TS bench, 3 runs clean)
+
+    run 1: OK at 3k / 15k / 30k
+    run 2: OK at 3k / 15k / 30k
+    run 3: OK at 3k / 15k / 30k
+
+## Expected production impact (captain workspace)
+
+Based on the session log patterns:
+
+    Pool prewarm:              ~5.48s → ~2.7s   (-50%)
+    resolveOrmMember (project
+      def methods) cold-path:  20-300ms → <0.05ms
+    Diagnostics budget
+      exhaustion:              4× per open → expected 0-1×
+    1.8s hover stalls:         should disappear — they were
+                               queued behind resolveOrmMember
+                               Python calls
+
+The only remaining cold-window IPC calls should be runtime-only
+queries (`register_lookup` custom lookups, dynamic managers),
+which genuinely need the Python process.
+
+## Not covered
+
+- Method return-type inference (return_annotation is stored but
+  not yet mapped to a concrete `returnModelLabel` — would
+  require resolving annotation strings against imports, similar
+  to the FK relation target resolver).
+- Decorators expressed as `@some_factory(...)` calls
+  (`functools.wraps(x)` etc) — `dotted_name` returns empty for
+  `Expr::Call`, so we treat them as plain methods. Rare in
+  practice.

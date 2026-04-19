@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, get_args, get_origin, get_type_hints
 
 from ..runtime.inspector import RuntimeInspection
+from ..semantic.graph import ModelGraph
 from ..static_index.indexer import FieldCandidate, ModelCandidate, ModuleIndex, StaticIndex
 from .django_builtins import (
     INSTANCE_BUILTIN_METHODS as _INSTANCE_BUILTINS,
@@ -28,7 +29,7 @@ class _MemberSurfaceCache:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._owner: tuple[int, int] = (0, 0)
+        self._owner: tuple[int, int, int] = (0, 0, 0)
         self._list_cache: dict[
             tuple[str, str, str | None], list[OrmMemberItem]
         ] = {}
@@ -39,9 +40,12 @@ class _MemberSurfaceCache:
         self._misses = 0
 
     def _check_owner(
-        self, static_index: StaticIndex, runtime: RuntimeInspection
+        self,
+        static_index: StaticIndex,
+        runtime: RuntimeInspection,
+        model_graph: ModelGraph | None,
     ) -> None:
-        owner = (id(static_index), id(runtime))
+        owner = (id(static_index), id(runtime), id(model_graph))
         if owner != self._owner:
             self._list_cache.clear()
             self._dict_cache.clear()
@@ -51,13 +55,14 @@ class _MemberSurfaceCache:
         self,
         static_index: StaticIndex,
         runtime: RuntimeInspection,
+        model_graph: ModelGraph | None,
         model_label: str,
         receiver_kind: str,
         manager_name: str | None,
     ) -> list[OrmMemberItem]:
         key = (model_label, receiver_kind, manager_name)
         with self._lock:
-            self._check_owner(static_index, runtime)
+            self._check_owner(static_index, runtime, model_graph)
             cached = self._list_cache.get(key)
             if cached is not None:
                 self._hits += 1
@@ -69,6 +74,7 @@ class _MemberSurfaceCache:
         surface = _member_surface(
             static_index=static_index,
             runtime=runtime,
+            model_graph=model_graph,
             model_label=model_label,
             receiver_kind=receiver_kind,
             manager_name=manager_name,
@@ -82,7 +88,7 @@ class _MemberSurfaceCache:
                 flush=True,
             )
         with self._lock:
-            self._check_owner(static_index, runtime)
+            self._check_owner(static_index, runtime, model_graph)
             cached = self._list_cache.get(key)
             if cached is not None:
                 self._hits += 1
@@ -102,7 +108,10 @@ class _MemberSurfaceCache:
                 self._dict_cache.pop(key, None)
 
     def force_owner(
-        self, static_index: StaticIndex, runtime: RuntimeInspection
+        self,
+        static_index: StaticIndex,
+        runtime: RuntimeInspection,
+        model_graph: ModelGraph | None,
     ) -> None:
         """Update the owner without clearing the cache.
 
@@ -110,12 +119,13 @@ class _MemberSurfaceCache:
         valid (e.g. single-file reindex).
         """
         with self._lock:
-            self._owner = (id(static_index), id(runtime))
+            self._owner = (id(static_index), id(runtime), id(model_graph))
 
     def find(
         self,
         static_index: StaticIndex,
         runtime: RuntimeInspection,
+        model_graph: ModelGraph | None,
         model_label: str,
         receiver_kind: str,
         name: str,
@@ -123,7 +133,7 @@ class _MemberSurfaceCache:
     ) -> OrmMemberItem | None:
         key = (model_label, receiver_kind, manager_name)
         with self._lock:
-            self._check_owner(static_index, runtime)
+            self._check_owner(static_index, runtime, model_graph)
             name_dict = self._dict_cache.get(key)
             if name_dict is not None:
                 self._hits += 1
@@ -131,7 +141,7 @@ class _MemberSurfaceCache:
             self._misses += 1
 
         self.get_list(
-            static_index, runtime, model_label, receiver_kind, manager_name
+            static_index, runtime, model_graph, model_label, receiver_kind, manager_name
         )
         with self._lock:
             return self._dict_cache[key].get(name)
@@ -209,6 +219,7 @@ class OrmMemberItem:
 def build_surface_index(
     static_index: StaticIndex,
     runtime: RuntimeInspection,
+    model_graph: ModelGraph | None = None,
 ) -> dict[str, object]:
     """전체 model surface를 경량 dict로 빌드. TS에 전송하여 로컬 O(1) 해석."""
     index: dict[str, dict[str, dict[str, list[str | None]]]] = {}
@@ -219,7 +230,7 @@ def build_surface_index(
         model_entry: dict[str, dict[str, list[str | None]]] = {}
         for kind in receiver_kinds:
             surface = _surface_cache.get_list(
-                static_index, runtime,
+                static_index, runtime, model_graph,
                 candidate.label, kind, None,
             )
             kind_entry: dict[str, list[str | None]] = {}
@@ -282,6 +293,7 @@ def fingerprint_json_payload(payload: object) -> str:
 def rebuild_surface_for_models(
     static_index: StaticIndex,
     runtime: RuntimeInspection,
+    model_graph: ModelGraph | None,
     affected_labels: set[str],
     existing_surface_index: dict[str, object],
 ) -> dict[str, object]:
@@ -295,7 +307,7 @@ def rebuild_surface_for_models(
     started = time.perf_counter()
 
     # Update owner reference without clearing cache
-    _surface_cache.force_owner(static_index, runtime)
+    _surface_cache.force_owner(static_index, runtime, model_graph)
     # Invalidate only affected models
     for label in affected_labels:
         _surface_cache.invalidate_model(label)
@@ -317,7 +329,7 @@ def rebuild_surface_for_models(
         model_entry: dict[str, dict[str, list[str | None]]] = {}
         for kind in receiver_kinds:
             surface = _surface_cache.get_list(
-                static_index, runtime,
+                static_index, runtime, model_graph,
                 candidate.label, kind, None,
             )
             kind_entry: dict[str, list[str | None]] = {}
@@ -348,6 +360,7 @@ def rebuild_surface_for_models(
 def prebuild_member_surface_cache(
     static_index: StaticIndex,
     runtime: RuntimeInspection,
+    model_graph: ModelGraph | None = None,
 ) -> dict[str, object]:
     """초기화 시 모든 모델의 member surface를 프리빌드하고 surface index를 반환."""
     import time
@@ -359,11 +372,11 @@ def prebuild_member_surface_cache(
             continue
         for kind in receiver_kinds:
             _surface_cache.get_list(
-                static_index, runtime,
+                static_index, runtime, model_graph,
                 candidate.label, kind, None,
             )
             count += 1
-    surface_index = build_surface_index(static_index, runtime)
+    surface_index = build_surface_index(static_index, runtime, model_graph)
     elapsed = time.perf_counter() - started
     print(
         f'[PERF] prebuild_member_surface_cache: {count} surfaces '
@@ -379,6 +392,7 @@ def resolve_orm_member_chain(
     *,
     static_index: StaticIndex,
     runtime: RuntimeInspection,
+    model_graph: ModelGraph | None = None,
     model_label: str,
     receiver_kind: str,
     chain: list[str],
@@ -402,7 +416,7 @@ def resolve_orm_member_chain(
             }
         visited.add(visit_key)
         item = _surface_cache.find(
-            static_index, runtime,
+            static_index, runtime, model_graph,
             current_label, current_kind, name, current_manager,
         )
         if item is None:
@@ -439,32 +453,11 @@ def resolve_orm_member_chain(
     }
 
 
-def list_orm_member_completions(
-    *,
-    static_index: StaticIndex,
-    runtime: RuntimeInspection,
-    model_label: str,
-    receiver_kind: str,
-    prefix: str | None = None,
-    manager_name: str | None = None,
-) -> dict[str, object]:
-    items = _surface_cache.get_list(
-        static_index, runtime, model_label, receiver_kind, manager_name,
-    )
-
-    return {
-        'resolved': True,
-        'items': [item.to_dict() for item in items],
-        'receiverKind': receiver_kind,
-        'modelLabel': model_label,
-        'managerName': manager_name,
-    }
-
-
 def resolve_orm_member(
     *,
     static_index: StaticIndex,
     runtime: RuntimeInspection,
+    model_graph: ModelGraph | None = None,
     model_label: str,
     receiver_kind: str,
     name: str,
@@ -489,7 +482,7 @@ def resolve_orm_member(
         }
 
     item = _surface_cache.find(
-        static_index, runtime, model_label, receiver_kind,
+        static_index, runtime, model_graph, model_label, receiver_kind,
         normalized_name, manager_name,
     )
     if item is None:
@@ -624,12 +617,13 @@ def _member_surface(
     *,
     static_index: StaticIndex,
     runtime: RuntimeInspection,
+    model_graph: ModelGraph | None,
     model_label: str,
     receiver_kind: str,
     manager_name: str | None,
 ) -> list[OrmMemberItem]:
     if receiver_kind == 'instance':
-        return _instance_surface(static_index, runtime, model_label)
+        return _instance_surface(static_index, runtime, model_graph, model_label)
     if receiver_kind == 'model_class':
         return _model_class_surface(static_index, runtime, model_label)
     if receiver_kind == 'manager':
@@ -659,12 +653,18 @@ def _member_surface(
 def _instance_surface(
     static_index: StaticIndex,
     runtime: RuntimeInspection,
+    model_graph: ModelGraph | None,
     model_label: str,
 ) -> list[OrmMemberItem]:
     items: list[OrmMemberItem] = []
     seen_names: set[str] = set()
 
-    for field in static_index.fields_for_model(model_label):
+    field_source = (
+        model_graph.fields_for_model(model_label)
+        if model_graph is not None
+        else static_index.fields_for_model(model_label)
+    )
+    for field in field_source:
         item = _field_member_item(field)
         items.append(item)
         seen_names.add(item.name)

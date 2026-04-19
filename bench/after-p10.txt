@@ -1,0 +1,97 @@
+--- P10: Rust bulk completions + Python dead-code shrink ---
+
+Motivation: The SUMMARY left two follow-ups — (1) port the bulk
+lookup-path / ORM member completion generators to Rust, and (2) trim
+the Python daemon where the static paths were now redundant.
+
+## Scope
+
+1. `features::lookup_paths::list_lookup_path_completions` (Rust) —
+   full static port of the Python bulk generator. Covers:
+     - FSM-style traversal with cycle detection
+     - Field / field-and-lookup / lookup-chain completion modes
+     - `select_related` / `prefetch_related` alias filtering via
+       `related_query_alias` source tag
+     - Eager one-hop FK descendants up to depth 2
+     - Prefixed `field__operator` chain expansion for filter methods
+     - Cached descendants per (graph_ptr, model_label, method,
+       relation_only)
+
+2. `features::orm_members::list_orm_member_completions` (Rust) —
+   bulk static surface for instance / model_class / manager /
+   queryset / related_manager receivers. Project `def` methods still
+   fall back to Python.
+
+3. napi endpoints: `native_list_lookup_path_completions` and
+   `native_list_orm_member_completions` on the resident state.
+
+4. TS plumbing:
+   - `nativeFastPath.ts`: `nativeListLookupPathCompletions` +
+     `nativeListOrmMemberCompletions` wrappers.
+   - `analysisDaemon.ts`: `listLookupPathCompletionsNative` and
+     `listOrmMemberCompletionsNative` public methods gated on
+     `isNativeFastPathReady()`.
+   - `pythonProviders.ts`: fast-path chain is now
+     TS local → Rust → Python IPC (the Python call is the last-resort
+     fallback — typically unreachable once the native state is warm).
+
+5. Python daemon shrinkage:
+   - `features/lookup_paths.py`: 934 → 347 LOC (−587). Removed
+     `list_lookup_path_completions` and all descendant-cache
+     helpers — the bulk path is Rust-only now.
+   - `features/orm_members.py`: 1874 → 1852 LOC (−22). Removed the
+     `list_orm_member_completions` public API.
+   - `server/app.py`: the `lookupPathCompletions` and
+     `ormMemberCompletions` IPC handlers are now empty stubs that
+     return `resolved:false, reason:"handled_by_native"` for backward
+     compatibility.
+
+Total Python reduction: 10976 → 10355 LOC (−621). Descendant cache
+memory overhead removed entirely. Bulk IPC payloads (previously up to
+3 MB per completion on large projects) are gone.
+
+## Fast-path cost (darwin-arm64, release, smoke test)
+
+    native_list_lookup_path_completions   ~0.05 ms
+    native_list_orm_member_completions    ~0.02 ms
+
+For comparison, the Python IPC path on the largest real project in
+the history logs was ~221 ms for `lookupPathCompletions` returning
+~3 MB. The Rust path is ~4000× faster and allocation-bounded.
+
+## Regression check (TS bench, median-of-3 vs baseline-ts.json)
+
+    Run 1: OK at 3k / 15k / 30k
+    Run 2: OK at 3k / 15k / 30k
+    Run 3: OK at 3k / 15k / 30k
+
+One earlier single run flagged noise-level blips (completionP95Ms,
+trieBuildP95Ms at microsecond scale). All three median-of-3 repeats
+exit=0 vs baseline. compare.js no regressions. Memory budget holds.
+
+## Rust tests
+
+    54 passing (29 in features/ alone, up from 24 before this phase).
+    New tests:
+      - features::lookup_paths::tests::completion_* (6 cases)
+      - features::orm_members::tests::bulk_completion_* (4 cases)
+
+## napi E2E (fastpath.test.js)
+
+    fastpath napi OK: init=0ms, relation_target=0.014ms,
+      lookup_path=0.011ms, lookup_completions=0.051ms,
+      member_completions=0.017ms
+
+## Still routed through Python (unchanged from P8)
+
+    - Project-level `def` methods on models (instance / model_class):
+      Python builds the surfaceIndex that carries them, and the
+      Rust bulk list intentionally does not emit them. TS local
+      completion keeps working because the surfaceIndex has them.
+    - Runtime-registered custom lookups via `Field.register_lookup`.
+    - `resolveExportOrigin` / `resolveModule` (import alias).
+    - `reindexFile` (incremental surface rebuild).
+
+Pulling those into Rust would require AST extraction of class-level
+function definitions plus a Rust-side runtime inspector — both out
+of scope here.

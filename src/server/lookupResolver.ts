@@ -639,6 +639,14 @@ function getTransformsForKind(fieldKind: string, index: WorkspaceIndex): string[
     .map(({ payload }) => payload.name);
 }
 
+function shortModelLabel(modelLabel: string): string {
+  return modelLabel.split('.').at(-1) ?? modelLabel;
+}
+
+function displayRelationFieldKind(fieldKind: string): string {
+  return fieldKind.replace(/^reverse_/, '');
+}
+
 // ---------------------------------------------------------------------------
 // Public: getCompletionCandidates
 // ---------------------------------------------------------------------------
@@ -656,6 +664,7 @@ export function getCompletionCandidates(
   parsed: ParsedLookup,
   partialSegment: string,
   index: WorkspaceIndex,
+  method?: string,
   usageFrequency?: Map<string, number>,
 ): PrefixCandidate[] {
   const _t0 = performance.now();
@@ -716,12 +725,18 @@ export function getCompletionCandidates(
 
     // Reverse relations.
     for (const [name, rel] of model.reverseRelations) {
+      if (
+        isRelationOnlyCompletionMethod(method) &&
+        isLikelyRelatedQueryAlias(model, name, rel)
+      ) {
+        continue;
+      }
       if (matchesPrefix(name, lowerPartial)) {
         hasPrefixMatch = true;
         candidates.push({
           name,
           kind: 'relation',
-          detail: `reverse ${rel.fieldKind} from ${rel.targetModelLabel}`,
+          detail: `${displayRelationFieldKind(rel.fieldKind)} · ${shortModelLabel(model.label)} -> ${shortModelLabel(rel.targetModelLabel)}`,
           source: 'workspace',
           sortPriority: 3,
         });
@@ -828,6 +843,32 @@ export function getCompletionCandidates(
 function matchesPrefix(name: string, lowerPartial: string): boolean {
   if (lowerPartial === '') return true;
   return name.toLowerCase().startsWith(lowerPartial);
+}
+
+function isRelationOnlyCompletionMethod(method: string | undefined): boolean {
+  return method === 'select_related' || method === 'prefetch_related';
+}
+
+function isLikelyRelatedQueryAlias(
+  model: ModelInfo,
+  relationName: string,
+  relation: RelationInfo,
+): boolean {
+  if (relationName.endsWith('_set')) {
+    return false;
+  }
+
+  for (const [candidateName, candidateRelation] of model.reverseRelations) {
+    if (
+      candidateName !== relationName &&
+      candidateName.endsWith('_set') &&
+      candidateRelation.targetModelLabel === relation.targetModelLabel
+    ) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**

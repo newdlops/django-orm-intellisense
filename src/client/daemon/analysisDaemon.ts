@@ -9,10 +9,15 @@ import {
   hydrateNativeFastPathFromSurface,
   isNativeFastPathReady,
   dropNativeFastPath,
+  ensureNativeAstModules,
   nativeResolveRelationTarget,
   nativeListRelationTargets,
   nativeResolveLookupPath,
   nativeResolveOrmMember,
+  nativeListLookupPathCompletions,
+  nativeListOrmMemberCompletions,
+  nativeResolveExportOrigin,
+  nativeResolveModule,
 } from './nativeFastPath';
 import {
   resolvePythonInterpreter,
@@ -379,6 +384,16 @@ export class AnalysisDaemon implements vscode.Disposable {
       log: (level, message) => {
         this.log(level === 'info' ? 'info' : 'info', message);
       },
+    }).then((ok) => {
+      if (!ok) return;
+      // Populate `modules` in the resident Rust state so that
+      // `resolveExportOrigin` / `resolveModule` are answered natively.
+      // Runs on the JS task queue; callers observe stale
+      // (Python-fallback) answers until it completes, then microsecond
+      // ones. 1.1k-module workspaces come in under ~300ms.
+      void ensureNativeAstModules(workspaceRoot, (level, message) => {
+        this.log(level === 'info' ? 'info' : 'info', message);
+      });
     });
   }
 
@@ -539,16 +554,23 @@ export class AnalysisDaemon implements vscode.Disposable {
     value: string,
     background: boolean = false
   ): Promise<RelationTargetResolution> {
+    const source = this.currentRequestSource();
+    const allowLocationlessNative = background || source === 'diagnostic';
     // Native fast-path: static graph lookup completes in microseconds.
     // Python daemon was measured at 950-3084ms for this call on real
-    // projects. A static `resolved: true` is authoritative; a
-    // `not_found` is also authoritative for the static graph, so we
-    // return it directly. Only route through Python when the native
-    // state is not yet initialised.
+    // projects. Foreground definition/hover still needs source locations,
+    // but diagnostics only need the resolution outcome.
     const native = isNativeFastPathReady()
       ? nativeResolveRelationTarget(value)
       : undefined;
-    if (native) {
+    if (
+      native?.resolved &&
+      native.target &&
+      (native.target.filePath || allowLocationlessNative)
+    ) {
+      return native;
+    }
+    if (native && allowLocationlessNative && !native.resolved) {
       return native;
     }
     return this.cachedRequest<RelationTargetResolution>('resolveRelationTarget', {
@@ -560,6 +582,25 @@ export class AnalysisDaemon implements vscode.Disposable {
     moduleName: string,
     symbol: string
   ): Promise<ExportOriginResolution> {
+    const source = this.currentRequestSource();
+    const allowLocationlessNative = source === 'diagnostic';
+    // Native fast-path: recursive re-export walk on the resident static
+    // index. Python daemon cold-start (ProcessPoolExecutor spawn) can
+    // push this to 4-6s on the first diagnostic burst; the Rust path
+    // runs in microseconds. `modules` is populated on a background
+    // `ensureNativeAstModules` after surface hydrate, so we only hit
+    // the fast path once that completes — before then, `native` returns
+    // `undefined` and we fall through to Python.
+    const native = nativeResolveExportOrigin(moduleName, symbol);
+    if (
+      native?.resolved &&
+      (native.originFilePath || allowLocationlessNative)
+    ) {
+      return native;
+    }
+    if (native && allowLocationlessNative && !native.resolved) {
+      return native;
+    }
     return this.cachedRequest<ExportOriginResolution>('resolveExportOrigin', {
       module: moduleName,
       symbol,
@@ -567,6 +608,15 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   async resolveModule(moduleName: string): Promise<ModuleResolution> {
+    const source = this.currentRequestSource();
+    const allowLocationlessNative = source === 'diagnostic';
+    const native = nativeResolveModule(moduleName);
+    if (native?.resolved && (native.filePath || allowLocationlessNative)) {
+      return native;
+    }
+    if (native && allowLocationlessNative && !native.resolved) {
+      return native;
+    }
     return this.cachedRequest<ModuleResolution>('resolveModule', {
       module: moduleName,
     });
@@ -648,6 +698,21 @@ export class AnalysisDaemon implements vscode.Disposable {
       prefix,
       method,
     });
+  }
+
+  /**
+   * Native Rust bulk lookup-path completion. Returns `undefined` when the
+   * resident state is not ready (caller should fall back to Python IPC).
+   * Covers static fields, relations, descendants, and built-in lookup
+   * operators — custom runtime lookups still require the Python path.
+   */
+  listLookupPathCompletionsNative(
+    baseModelLabel: string,
+    prefix: string,
+    method: string
+  ): LookupPathCompletionsResult | undefined {
+    if (!isNativeFastPathReady()) return undefined;
+    return nativeListLookupPathCompletions(baseModelLabel, prefix, method);
   }
 
   /**
@@ -769,6 +834,8 @@ export class AnalysisDaemon implements vscode.Disposable {
     method: string,
     background: boolean = false
   ): Promise<LookupPathResolution> {
+    const source = this.currentRequestSource();
+    const allowLocationlessNative = background || source === 'diagnostic';
     // Native fast-path: static FSM walk on the resident model graph.
     // Python daemon was measured at up to 2.6s for one `title__startswith`
     // resolve. Only defer to Python when native can't answer (e.g.
@@ -776,10 +843,15 @@ export class AnalysisDaemon implements vscode.Disposable {
     if (isNativeFastPathReady()) {
       const native = nativeResolveLookupPath(baseModelLabel, value, method);
       if (native) {
-        // A static `resolved: true` is authoritative. For `resolved: false`
-        // with reason `unknown_lookup` we fall through to Python, which
-        // has access to runtime-registered lookups.
-        if (native.resolved || native.reason !== 'unknown_lookup') {
+        // Foreground hover/definition still need precise source locations.
+        // Diagnostics only need the boolean resolution outcome, so do not
+        // send static lookup-operator hits like `title__startswith` back to
+        // Python just because the native target is location-less.
+        if (
+          native.resolved &&
+          native.target &&
+          (native.target.filePath || allowLocationlessNative)
+        ) {
           return native;
         }
       }
@@ -803,6 +875,22 @@ export class AnalysisDaemon implements vscode.Disposable {
       prefix,
       managerName,
     });
+  }
+
+  /**
+   * Native Rust bulk ORM member completion. Returns `undefined` when the
+   * resident state is not ready. Covers the static surface — fields,
+   * reverse relations, Django built-in methods, default manager. Project
+   * `def` methods and dynamic managers still need the Python path.
+   */
+  listOrmMemberCompletionsNative(
+    modelLabel: string,
+    receiverKind: OrmReceiverKind,
+    prefix: string,
+    managerName?: string
+  ): OrmMemberCompletionsResult | undefined {
+    if (!isNativeFastPathReady()) return undefined;
+    return nativeListOrmMemberCompletions(modelLabel, receiverKind, prefix, managerName);
   }
 
   /**
@@ -988,7 +1076,14 @@ export class AnalysisDaemon implements vscode.Disposable {
     // project-defined methods and runtime managers.
     if (isNativeFastPathReady()) {
       const native = nativeResolveOrmMember(modelLabel, receiverKind, name, managerName);
-      if (native) {
+      if (
+        native &&
+        (
+          native.item?.filePath ||
+          native.item?.source === 'builtin' ||
+          native.item?.memberKind === 'method'
+        )
+      ) {
         return native;
       }
     }
@@ -1016,14 +1111,51 @@ export class AnalysisDaemon implements vscode.Disposable {
   async resolveLookupPathBatch(
     items: Array<{ baseModelLabel: string; value: string; method: string }>
   ): Promise<LookupPathResolution[]> {
+    const results: Array<LookupPathResolution | undefined> = new Array(items.length);
+    const fallbackItems: Array<{ baseModelLabel: string; value: string; method: string }> = [];
+    const fallbackIndexes: number[] = [];
+
+    if (isNativeFastPathReady()) {
+      for (const [index, item] of items.entries()) {
+        const native = nativeResolveLookupPath(
+          item.baseModelLabel,
+          item.value,
+          item.method,
+        );
+        if (native?.resolved && native.target) {
+          results[index] = native;
+          continue;
+        }
+        fallbackIndexes.push(index);
+        fallbackItems.push(item);
+      }
+    } else {
+      for (const [index, item] of items.entries()) {
+        fallbackIndexes.push(index);
+        fallbackItems.push(item);
+      }
+    }
+
+    if (fallbackItems.length === 0) {
+      return results.map(
+        (result) => result ?? { resolved: false, reason: 'missing_result' }
+      );
+    }
+
     const result = await this.request<{ results: LookupPathResolution[] }>(
       'resolveLookupPathBatch',
-      { items },
+      { items: fallbackItems },
       INITIALIZE_REQUEST_TIMEOUT_MS,
       true,  // always background
       this.currentRequestSource()
     );
-    return result.results;
+    for (const [fallbackResultIndex, itemIndex] of fallbackIndexes.entries()) {
+      results[itemIndex] = result.results[fallbackResultIndex];
+    }
+
+    return results.map(
+      (resolved) => resolved ?? { resolved: false, reason: 'missing_result' }
+    );
   }
 
   /**

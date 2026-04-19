@@ -458,8 +458,14 @@ function buildModelInfo(
 
     if (isRelation) {
       const targetModelLabel = extractTargetModel(returnKind, returnModelLabel) ?? '';
+      // Reverse OneToOne has returnKind='instance' but memberKind='reverse_relation'.
+      // memberKind is authoritative — relying on returnKind alone silently
+      // marks reverse OneToOne as forward, which breaks graph traversal
+      // (`Author.profile` reverse relation → Profile).
       const direction: 'forward' | 'reverse' =
-        returnKind === 'related_manager' ? 'reverse' : 'forward';
+        memberKind === 'reverse_relation' || returnKind === 'related_manager'
+          ? 'reverse'
+          : 'forward';
 
       const relationInfo: RelationInfo = {
         name: memberName,
@@ -472,8 +478,58 @@ function buildModelInfo(
         reverseRelations.set(memberName, relationInfo);
       } else {
         relations.set(memberName, relationInfo);
+        // Synthesize the FK `<name>_id` attname alias so lookup /
+        // keyword completions can offer it (Django auto-generates it
+        // at the ORM layer). Only for forward FK / OneToOne relations
+        // where the column lives on this model's table.
+        if (
+          (effectiveFieldKind === 'ForeignKey' ||
+            effectiveFieldKind === 'OneToOneField' ||
+            effectiveFieldKind === 'ParentalKey') &&
+          !fields.has(`${memberName}_id`)
+        ) {
+          const attnameField: FieldInfo = {
+            name: `${memberName}_id`,
+            fieldKind: 'IntegerField',
+            isRelation: false,
+            lookups: getLookupsForField('IntegerField'),
+            transforms: getTransformsForField('IntegerField'),
+          };
+          fields.set(attnameField.name, attnameField);
+        }
       }
     }
+  }
+
+  // Synthesize the `pk` primary-key alias so lookup completions /
+  // diagnostics can treat it as a valid field identifier. Django
+  // exposes `pk` on every concrete model as a shortcut to whatever
+  // field is declared `primary_key=True` (or the auto-created
+  // BigAutoField since Django 3.2).
+  if (!fields.has('pk')) {
+    const pkField: FieldInfo = {
+      name: 'pk',
+      fieldKind: 'BigAutoField',
+      isRelation: false,
+      lookups: getLookupsForField('BigAutoField'),
+      transforms: getTransformsForField('BigAutoField'),
+    };
+    fields.set('pk', pkField);
+  }
+
+  // Synthesize an `id` field when absent. Django auto-creates a
+  // BigAutoField primary key named `id` unless the model declares
+  // its own primary_key field. The surface may omit it when runtime
+  // inspection is unavailable.
+  if (!fields.has('id')) {
+    const idField: FieldInfo = {
+      name: 'id',
+      fieldKind: 'BigAutoField',
+      isRelation: false,
+      lookups: getLookupsForField('BigAutoField'),
+      transforms: getTransformsForField('BigAutoField'),
+    };
+    fields.set('id', idField);
   }
 
   return {

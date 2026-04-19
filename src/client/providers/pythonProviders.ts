@@ -219,6 +219,7 @@ const INITIAL_DIAGNOSTIC_REFRESH_DELAY_MS = 500;
 const EDIT_DIAGNOSTIC_DEBOUNCE_MS = 1000;
 const DIAGNOSTIC_TIME_BUDGET_MS = 10_000;
 const DIAGNOSTIC_REQUEST_BUDGET = 1000;
+const DIAGNOSTIC_LOOKUP_PARALLELISM = 4;
 const modelSubclassRelationCache = new Map<string, boolean>();
 const VIRTUAL_LOOKUP_OPERATORS = [
   'exact',
@@ -1015,6 +1016,22 @@ export function registerPythonProviders(
     const diagnosticStartTime = Date.now();
     let diagnosticRequestCount = 0;
     let diagnosticBudgetLogged = false;
+    let diagnosticPhase = 'setup';
+    const beginDiagnosticPhase = (phase: string): number => {
+      diagnosticPhase = phase;
+      return performance.now();
+    };
+    const logDiagnosticPhase = (
+      phase: string,
+      startedAt: number,
+      detail = ''
+    ): void => {
+      const phaseMs = performance.now() - startedAt;
+      const totalMs = Date.now() - diagnosticStartTime;
+      daemon.logDiagnostic(
+        `[diagnostics:phase] ${phase} ${phaseMs.toFixed(0)}ms total=${totalMs}ms requests=${diagnosticRequestCount}${detail ? ` ${detail}` : ''}`
+      );
+    };
     const isDiagnosticsCancelled = () => {
       if (diagnosticsDisposed || document.version !== documentVersion) {
         return true;
@@ -1024,7 +1041,7 @@ export function registerPythonProviders(
         if (!diagnosticBudgetLogged) {
           diagnosticBudgetLogged = true;
           daemon.logDiagnostic(
-            `[diagnostics] time budget exhausted (${elapsed}ms > ${DIAGNOSTIC_TIME_BUDGET_MS}ms, ${diagnosticRequestCount} requests) for ${document.uri.fsPath}`
+            `[diagnostics] time budget exhausted (${elapsed}ms > ${DIAGNOSTIC_TIME_BUDGET_MS}ms, ${diagnosticRequestCount} requests, phase=${diagnosticPhase}) for ${document.uri.fsPath}`
           );
         }
         return true;
@@ -1033,7 +1050,7 @@ export function registerPythonProviders(
         if (!diagnosticBudgetLogged) {
           diagnosticBudgetLogged = true;
           daemon.logDiagnostic(
-            `[diagnostics] request budget exhausted (${diagnosticRequestCount}/${DIAGNOSTIC_REQUEST_BUDGET}) for ${document.uri.fsPath}`
+            `[diagnostics] request budget exhausted (${diagnosticRequestCount}/${DIAGNOSTIC_REQUEST_BUDGET}, phase=${diagnosticPhase}) for ${document.uri.fsPath}`
           );
         }
         return true;
@@ -1055,16 +1072,19 @@ export function registerPythonProviders(
     const visEndLine = useVisibleRangeScan ? Math.min(document.lineCount, visibleRange!.end.line + VISIBLE_MARGIN) : document.lineCount;
 
     daemon.logDiagnostic(`[diagnostics:scan] starting sync scan for ${document.uri.fsPath.split('/').slice(-2).join('/')}${useVisibleRangeScan ? ` (visible-first: lines ${visStartLine}-${visEndLine})` : ''}`);
-    const _scanStart = performance.now();
+    const _scanStart = beginDiagnosticPhase('scan-visible');
 
     // Phase 1: scan visible range (or full doc for small files)
     const _relationContexts = findRelationDiagnosticContexts(document, visStartLine, visEndLine);
     const _lookupContexts = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, visStartLine, visEndLine);
     daemon.logDiagnostic(`[diagnostics:scan] complete ${(performance.now() - _scanStart).toFixed(0)}ms relations=${_relationContexts.length} lookups=${_lookupContexts.length}`);
+    logDiagnosticPhase('scan-visible', _scanStart, `relations=${_relationContexts.length} lookups=${_lookupContexts.length}`);
 
     // Deduplicate relation target resolution within a single scan.
     // The same model string (e.g. "User") may appear in many ForeignKey
     // declarations — resolve each unique value only once.
+    const _relationResolveStart = beginDiagnosticPhase('relations-visible');
+    let _relationDiagnosticsAdded = 0;
     const _relationResolutionCache = new Map<string, RelationTargetResolution>();
     for (const context of _relationContexts) {
       if (isDiagnosticsCancelled()) break;
@@ -1087,10 +1107,16 @@ export function registerPythonProviders(
         }
         seenRanges.add(key);
         diagnostics.push(diagnostic);
+        _relationDiagnosticsAdded++;
       } catch {
         continue;
       }
     }
+    logDiagnosticPhase(
+      'relations-visible',
+      _relationResolveStart,
+      `contexts=${_relationContexts.length} unique=${_relationResolutionCache.size} added=${_relationDiagnosticsAdded}`
+    );
 
     // Pass 1: Resolve receivers and collect items needing daemon lookup
     const _lookupPending: Array<{
@@ -1100,10 +1126,74 @@ export function registerPythonProviders(
       batchIdx: number;
     }> = [];
     const _batchItems: Array<{ baseModelLabel: string; value: string; method: string }> = [];
-    const _receiverCache = new Map<string, OrmReceiverInfo | null>();
+    const _receiverCache = new Map<string, Promise<OrmReceiverInfo | null>>();
+    const _lookupResolutionCache = new Map<string, Promise<LookupPathResolution>>();
+    const resolveCachedLookupReceiverInfo = (
+      context: LookupDiagnosticContext
+    ): Promise<OrmReceiverInfo | null> => {
+      const receiverCacheKey = context.receiverExpression;
+      const cached = _receiverCache.get(receiverCacheKey);
+      if (cached) {
+        return cached;
+      }
+
+      let request!: Promise<OrmReceiverInfo | null>;
+      request = resolveLookupReceiverInfoForReceiver(
+        daemon,
+        document,
+        context.receiverExpression,
+        context.range.end
+      )
+        .then((receiver) => receiver ?? null)
+        .catch((error) => {
+          if (_receiverCache.get(receiverCacheKey) === request) {
+            _receiverCache.delete(receiverCacheKey);
+          }
+          throw error;
+        });
+      _receiverCache.set(receiverCacheKey, request);
+      trackRequest();
+      return request;
+    };
+    const resolveCachedDiagnosticLookupPath = (
+      baseModelLabel: string,
+      value: string,
+      method: string
+    ): Promise<LookupPathResolution> => {
+      const resolutionCacheKey = `${baseModelLabel}\u0000${method}\u0000${value}`;
+      const cached = _lookupResolutionCache.get(resolutionCacheKey);
+      if (cached) {
+        return cached;
+      }
+
+      let request!: Promise<LookupPathResolution>;
+      request = daemon.resolveLookupPath(baseModelLabel, value, method, true)
+        .catch((error) => {
+          if (_lookupResolutionCache.get(resolutionCacheKey) === request) {
+            _lookupResolutionCache.delete(resolutionCacheKey);
+          }
+          throw error;
+        });
+      _lookupResolutionCache.set(resolutionCacheKey, request);
+      trackRequest();
+      return request;
+    };
+    const addDiagnosticIfNew = (diagnostic: vscode.Diagnostic | undefined): boolean => {
+      if (!diagnostic) {
+        return false;
+      }
+      const key = diagnostic.range.start.toString() + diagnostic.message;
+      if (seenRanges.has(key)) {
+        return false;
+      }
+      seenRanges.add(key);
+      diagnostics.push(diagnostic);
+      return true;
+    };
 
     // Pre-validate all lookup contexts in batches, yielding between
     // batches to avoid blocking the event loop.
+    const _validationStart = beginDiagnosticPhase('validate-lookups-visible');
     const _docTextForValidation = getDocumentText(document);
     const VALIDATION_BATCH_SIZE = 15;
     const _validatedLookupContexts: LookupDiagnosticContext[] = [];
@@ -1116,20 +1206,29 @@ export function registerPythonProviders(
       const batch = _lookupContexts.slice(batchStart, batchStart + VALIDATION_BATCH_SIZE);
       _validatedLookupContexts.push(...validateLookupContexts(batch, _docTextForValidation, isDiagnosticsCancelled));
     }
+    logDiagnosticPhase(
+      'validate-lookups-visible',
+      _validationStart,
+      `input=${_lookupContexts.length} valid=${_validatedLookupContexts.length}`
+    );
 
+    const _receiverResolveStart = beginDiagnosticPhase('receivers-visible');
+    let _receiverMisses = 0;
+    let _virtualResolved = 0;
     for (const context of _validatedLookupContexts) {
       if (isDiagnosticsCancelled()) break;
       try {
-        const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
-          daemon, document, context.receiverExpression, context.range.end
-        );
-        trackRequest();
+        const lookupReceiver = await resolveCachedLookupReceiverInfo(context);
         if (isDiagnosticsCancelled()) break;
-        if (!lookupReceiver) continue;
+        if (!lookupReceiver) {
+          _receiverMisses++;
+          continue;
+        }
 
         const virtualRes = resolveVirtualLookupPath(lookupReceiver, context.value, context.method);
         if (virtualRes?.resolved) {
           // Virtual lookup resolved successfully — skip daemon
+          _virtualResolved++;
           continue;
         }
         // virtualRes is null or { resolved: false } — need daemon resolution
@@ -1148,39 +1247,74 @@ export function registerPythonProviders(
         continue;
       }
     }
+    logDiagnosticPhase(
+      'receivers-visible',
+      _receiverResolveStart,
+      `validated=${_validatedLookupContexts.length} pending=${_lookupPending.length} batchItems=${_batchItems.length} receivers=${_receiverCache.size} missing=${_receiverMisses} virtual=${_virtualResolved}`
+    );
 
     // Pass 2: Batch resolve lookup paths
     if (isDiagnosticsCancelled()) {
+      logDiagnosticPhase('cancelled-before-batch', performance.now(), `diagnostics=${diagnostics.length}`);
       return;
     }
+    const _batchResolveStart = beginDiagnosticPhase('batch-lookups-visible');
     let _batchRes: import('../protocol').LookupPathResolution[] | undefined;
+    let _batchMode = 'below-threshold';
     // Only use batch when there are enough items to justify the overhead,
     // and batch size is manageable for the daemon's single-threaded processing.
     // Batch only when enough items exist — small files use individual calls
     // which return results incrementally (important for waitForDiagnostics timeout)
-    const BATCH_THRESHOLD = 200;
+    const BATCH_THRESHOLD = 50;
     if (_batchItems.length >= BATCH_THRESHOLD) {
+      _batchMode = 'fallback';
       try {
         _batchRes = await daemon.resolveLookupPathBatch(_batchItems);
         trackRequest();
         if (!Array.isArray(_batchRes) || _batchRes.length !== _batchItems.length) {
           _batchRes = undefined;
         }
+        if (_batchRes) {
+          for (const [index, item] of _batchItems.entries()) {
+            const resolutionCacheKey = `${item.baseModelLabel}\u0000${item.method}\u0000${item.value}`;
+            _lookupResolutionCache.set(
+              resolutionCacheKey,
+              Promise.resolve(_batchRes[index])
+            );
+          }
+          _batchMode = 'batch';
+        }
       } catch {
         // fall back to individual
+        _batchMode = 'error-fallback';
       }
     }
+    logDiagnosticPhase(
+      'batch-lookups-visible',
+      _batchResolveStart,
+      `items=${_batchItems.length} threshold=${BATCH_THRESHOLD} mode=${_batchMode}`
+    );
 
     // Pass 3: Build diagnostics
-    for (const { context, receiver, baseModelLabel, batchIdx } of _lookupPending) {
-      if (isDiagnosticsCancelled()) break;
+    const _buildLookupStart = beginDiagnosticPhase('build-lookups-visible');
+    const _lookupDiagnosticsBefore = diagnostics.length;
+    await runWithConcurrency(_lookupPending, DIAGNOSTIC_LOOKUP_PARALLELISM, isDiagnosticsCancelled, async ({
+      context,
+      receiver,
+      baseModelLabel,
+      batchIdx,
+    }) => {
+      if (isDiagnosticsCancelled()) return;
       try {
         let resolution = _batchRes?.[batchIdx];
         if (!resolution) {
-          resolution = await daemon.resolveLookupPath(baseModelLabel, context.value, context.method, /* background */ true);
-          trackRequest();
+          resolution = await resolveCachedDiagnosticLookupPath(
+            baseModelLabel,
+            context.value,
+            context.method
+          );
         }
-        if (isDiagnosticsCancelled()) break;
+        if (isDiagnosticsCancelled()) return;
         if (!resolution.resolved) {
           const partialCompletions = {
             items: mergeLookupCompletionItems(
@@ -1194,22 +1328,30 @@ export function registerPythonProviders(
             ),
             resolved: true,
           };
-          if (partialCompletions.items.length > 0) continue;
+          if (
+            hasSuppressingPartialLookupCompletion(
+              context.value,
+              partialCompletions.items
+            )
+          ) return;
         }
         const diagnostic = buildLookupDiagnostic(context, baseModelLabel, resolution);
-        if (!diagnostic) continue;
-        const key = diagnostic.range.start.toString() + diagnostic.message;
-        if (seenRanges.has(key)) continue;
-        seenRanges.add(key);
-        diagnostics.push(diagnostic);
+        addDiagnosticIfNew(diagnostic);
       } catch {
-        continue;
+        return;
       }
-    }
+    });
+    logDiagnosticPhase(
+      'build-lookups-visible',
+      _buildLookupStart,
+      `pending=${_lookupPending.length} added=${diagnostics.length - _lookupDiagnosticsBefore} cache=${_lookupResolutionCache.size}`
+    );
 
     // Phase 2: If we used visible-range scanning, publish partial results
     // immediately for responsiveness, then scan the remaining lines.
     if (useVisibleRangeScan && !isDiagnosticsCancelled()) {
+      const _phase2Start = beginDiagnosticPhase('phase2-remaining');
+      const _phase2DiagnosticsBefore = diagnostics.length;
       if (!diagnosticsDisposed && document.version === documentVersion) {
         diagnosticCollection.set(document.uri, [...diagnostics]);
       }
@@ -1235,9 +1377,17 @@ export function registerPythonProviders(
       for (const [rStart, rEnd] of remainingRanges) {
         if (isDiagnosticsCancelled()) break;
 
+        const _phase2ScanStart = beginDiagnosticPhase(`phase2-scan:${rStart}-${rEnd}`);
         const extraRelations = findRelationDiagnosticContexts(document, rStart, rEnd);
         const extraLookups = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, rStart, rEnd);
+        logDiagnosticPhase(
+          `phase2-scan:${rStart}-${rEnd}`,
+          _phase2ScanStart,
+          `relations=${extraRelations.length} lookups=${extraLookups.length}`
+        );
 
+        const _phase2RelationStart = beginDiagnosticPhase(`phase2-relations:${rStart}-${rEnd}`);
+        let _phase2RelationAdded = 0;
         for (const context of extraRelations) {
           if (isDiagnosticsCancelled()) break;
           try {
@@ -1249,33 +1399,38 @@ export function registerPythonProviders(
             trackRequest();
             if (isDiagnosticsCancelled()) break;
             const diagnostic = buildRelationDiagnostic(context, resolution);
-            if (!diagnostic) continue;
-            const dKey = diagnostic.range.start.toString() + diagnostic.message;
-            if (seenRanges.has(dKey)) continue;
-            seenRanges.add(dKey);
-            diagnostics.push(diagnostic);
-            incrementalPublish();
+            if (addDiagnosticIfNew(diagnostic)) {
+              _phase2RelationAdded++;
+              incrementalPublish();
+            }
           } catch { continue; }
         }
+        logDiagnosticPhase(
+          `phase2-relations:${rStart}-${rEnd}`,
+          _phase2RelationStart,
+          `contexts=${extraRelations.length} added=${_phase2RelationAdded} unique=${_relationResolutionCache.size}`
+        );
 
         // Process extra lookup contexts through the same pipeline
+        const _phase2LookupStart = beginDiagnosticPhase(`phase2-lookups:${rStart}-${rEnd}`);
         const extraDocText = getDocumentText(document);
         const extraValidated = validateLookupContexts(extraLookups, extraDocText, isDiagnosticsCancelled);
+        let _phase2LookupAdded = 0;
 
-        for (const context of extraValidated) {
-          if (isDiagnosticsCancelled()) break;
+        await runWithConcurrency(extraValidated, DIAGNOSTIC_LOOKUP_PARALLELISM, isDiagnosticsCancelled, async (context) => {
+          if (isDiagnosticsCancelled()) return;
           try {
-            const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
-              daemon, document, context.receiverExpression, context.range.end
-            );
-            trackRequest();
-            if (isDiagnosticsCancelled()) break;
-            if (!lookupReceiver) continue;
+            const lookupReceiver = await resolveCachedLookupReceiverInfo(context);
+            if (isDiagnosticsCancelled()) return;
+            if (!lookupReceiver) return;
             const virtualRes = resolveVirtualLookupPath(lookupReceiver, context.value, context.method);
-            if (virtualRes?.resolved) continue;
-            const resolution = await daemon.resolveLookupPath(lookupReceiver.modelLabel, context.value, context.method, true);
-            trackRequest();
-            if (isDiagnosticsCancelled()) break;
+            if (virtualRes?.resolved) return;
+            const resolution = await resolveCachedDiagnosticLookupPath(
+              lookupReceiver.modelLabel,
+              context.value,
+              context.method
+            );
+            if (isDiagnosticsCancelled()) return;
             if (!resolution.resolved) {
               const partialCompletions = {
                 items: mergeLookupCompletionItems(
@@ -1284,213 +1439,248 @@ export function registerPythonProviders(
                 ),
                 resolved: true,
               };
-              if (partialCompletions.items.length > 0) continue;
+              if (
+                hasSuppressingPartialLookupCompletion(
+                  context.value,
+                  partialCompletions.items
+                )
+              ) return;
             }
             const diagnostic = buildLookupDiagnostic(context, lookupReceiver.modelLabel, resolution);
-            if (!diagnostic) continue;
-            const dKey = diagnostic.range.start.toString() + diagnostic.message;
-            if (seenRanges.has(dKey)) continue;
-            seenRanges.add(dKey);
-            diagnostics.push(diagnostic);
-            incrementalPublish();
-          } catch { continue; }
-        }
+            if (addDiagnosticIfNew(diagnostic)) {
+              _phase2LookupAdded++;
+              incrementalPublish();
+            }
+          } catch { return; }
+        });
+        logDiagnosticPhase(
+          `phase2-lookups:${rStart}-${rEnd}`,
+          _phase2LookupStart,
+          `input=${extraLookups.length} valid=${extraValidated.length} added=${_phase2LookupAdded}`
+        );
       }
+      logDiagnosticPhase(
+        'phase2-remaining',
+        _phase2Start,
+        `ranges=${remainingRanges.length} added=${diagnostics.length - _phase2DiagnosticsBefore} published=${phase2NewDiagCount}`
+      );
     }
 
     // Yield before heavy synchronous scan to let hover/definition respond.
+    const _directFieldStart = beginDiagnosticPhase('direct-fields-visible');
+    let _directFieldContextCount = 0;
+    let _directFieldAdded = 0;
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    if (isDiagnosticsCancelled()) { /* skip */ } else
-    for (const context of findDirectFieldDiagnosticContexts(document, visStartLine, visEndLine)) {
-      if (isDiagnosticsCancelled()) break;
-      try {
-        const baseModelLabel = await resolveBaseModelLabelForReceiver(
-          daemon,
-          document,
-          context.receiverExpression,
-          context.range.end
-        );
-        trackRequest();
+    if (!isDiagnosticsCancelled()) {
+      const directFieldContexts = findDirectFieldDiagnosticContexts(document, visStartLine, visEndLine);
+      _directFieldContextCount = directFieldContexts.length;
+      for (const context of directFieldContexts) {
         if (isDiagnosticsCancelled()) break;
-        if (!baseModelLabel) {
-          continue;
-        }
+        try {
+          const baseModelLabel = await resolveBaseModelLabelForReceiver(
+            daemon,
+            document,
+            context.receiverExpression,
+            context.range.end
+          );
+          trackRequest();
+          if (isDiagnosticsCancelled()) break;
+          if (!baseModelLabel) {
+            continue;
+          }
 
-        const resolution = await daemon.resolveLookupPath(
-          baseModelLabel,
-          context.value,
-          'filter',
-          /* background */ true
-        );
-        trackRequest();
-        if (isDiagnosticsCancelled()) break;
-        const diagnostic = buildDirectFieldDiagnostic(
-          context,
-          baseModelLabel,
-          resolution
-        );
-        if (!diagnostic) {
+          const resolution = await daemon.resolveLookupPath(
+            baseModelLabel,
+            context.value,
+            'filter',
+            /* background */ true
+          );
+          trackRequest();
+          if (isDiagnosticsCancelled()) break;
+          const diagnostic = buildDirectFieldDiagnostic(
+            context,
+            baseModelLabel,
+            resolution
+          );
+          if (addDiagnosticIfNew(diagnostic)) {
+            _directFieldAdded++;
+          }
+        } catch {
           continue;
         }
-
-        const key = diagnostic.range.start.toString() + diagnostic.message;
-        if (seenRanges.has(key)) {
-          continue;
-        }
-        seenRanges.add(key);
-        diagnostics.push(diagnostic);
-      } catch {
-        continue;
       }
     }
+    logDiagnosticPhase(
+      'direct-fields-visible',
+      _directFieldStart,
+      `contexts=${_directFieldContextCount} added=${_directFieldAdded}`
+    );
 
+    const _schemaFieldStart = beginDiagnosticPhase('schema-fields-visible');
+    let _schemaFieldContextCount = 0;
+    let _schemaFieldAdded = 0;
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    if (isDiagnosticsCancelled()) { /* skip */ } else
-    for (const context of findSchemaFieldDiagnosticContexts(document, visStartLine, visEndLine)) {
-      if (isDiagnosticsCancelled()) break;
-      try {
-        const baseModelLabel = await resolveMetaOwnerModelLabel(
-          daemon,
-          document,
-          context.range.end
-        );
-        trackRequest();
+    if (!isDiagnosticsCancelled()) {
+      const schemaFieldContexts = findSchemaFieldDiagnosticContexts(document, visStartLine, visEndLine);
+      _schemaFieldContextCount = schemaFieldContexts.length;
+      for (const context of schemaFieldContexts) {
         if (isDiagnosticsCancelled()) break;
-        if (!baseModelLabel) {
-          continue;
-        }
+        try {
+          const baseModelLabel = await resolveMetaOwnerModelLabel(
+            daemon,
+            document,
+            context.range.end
+          );
+          trackRequest();
+          if (isDiagnosticsCancelled()) break;
+          if (!baseModelLabel) {
+            continue;
+          }
 
-        const resolution = await daemon.resolveLookupPath(
-          baseModelLabel,
-          context.value,
-          'filter',
-          /* background */ true
-        );
-        trackRequest();
-        if (isDiagnosticsCancelled()) break;
-        const diagnostic = buildSchemaFieldDiagnostic(
-          context,
-          baseModelLabel,
-          resolution
-        );
-        if (!diagnostic) {
+          const resolution = await daemon.resolveLookupPath(
+            baseModelLabel,
+            context.value,
+            'filter',
+            /* background */ true
+          );
+          trackRequest();
+          if (isDiagnosticsCancelled()) break;
+          const diagnostic = buildSchemaFieldDiagnostic(
+            context,
+            baseModelLabel,
+            resolution
+          );
+          if (addDiagnosticIfNew(diagnostic)) {
+            _schemaFieldAdded++;
+          }
+        } catch {
           continue;
         }
-
-        const key = diagnostic.range.start.toString() + diagnostic.message;
-        if (seenRanges.has(key)) {
-          continue;
-        }
-        seenRanges.add(key);
-        diagnostics.push(diagnostic);
-      } catch {
-        continue;
       }
     }
+    logDiagnosticPhase(
+      'schema-fields-visible',
+      _schemaFieldStart,
+      `contexts=${_schemaFieldContextCount} added=${_schemaFieldAdded}`
+    );
 
+    const _metaConstraintStart = beginDiagnosticPhase('meta-constraints-visible');
+    let _metaConstraintContextCount = 0;
+    let _metaConstraintAdded = 0;
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    if (isDiagnosticsCancelled()) { /* skip */ } else
-    for (const context of findMetaConstraintLookupDiagnosticContexts(document, visStartLine, visEndLine)) {
-      if (isDiagnosticsCancelled()) break;
-      try {
-        const baseModelLabel = await resolveMetaOwnerModelLabel(
-          daemon,
-          document,
-          context.range.end
-        );
-        trackRequest();
+    if (!isDiagnosticsCancelled()) {
+      const metaConstraintContexts = findMetaConstraintLookupDiagnosticContexts(document, visStartLine, visEndLine);
+      _metaConstraintContextCount = metaConstraintContexts.length;
+      for (const context of metaConstraintContexts) {
         if (isDiagnosticsCancelled()) break;
-        if (!baseModelLabel) {
-          continue;
-        }
+        try {
+          const baseModelLabel = await resolveMetaOwnerModelLabel(
+            daemon,
+            document,
+            context.range.end
+          );
+          trackRequest();
+          if (isDiagnosticsCancelled()) break;
+          if (!baseModelLabel) {
+            continue;
+          }
 
-        const resolution = await daemon.resolveLookupPath(
-          baseModelLabel,
-          context.value,
-          'filter',
-          /* background */ true
-        );
-        trackRequest();
-        if (isDiagnosticsCancelled()) break;
-        const diagnostic = buildLookupDiagnostic(
-          {
-            receiverExpression: '',
-            method: 'filter',
-            value: context.value,
-            range: context.range,
-          },
-          baseModelLabel,
-          resolution
-        );
-        if (!diagnostic) {
+          const resolution = await daemon.resolveLookupPath(
+            baseModelLabel,
+            context.value,
+            'filter',
+            /* background */ true
+          );
+          trackRequest();
+          if (isDiagnosticsCancelled()) break;
+          const diagnostic = buildLookupDiagnostic(
+            {
+              receiverExpression: '',
+              method: 'filter',
+              value: context.value,
+              range: context.range,
+            },
+            baseModelLabel,
+            resolution
+          );
+          if (addDiagnosticIfNew(diagnostic)) {
+            _metaConstraintAdded++;
+          }
+        } catch {
           continue;
         }
-
-        const key = diagnostic.range.start.toString() + diagnostic.message;
-        if (seenRanges.has(key)) {
-          continue;
-        }
-        seenRanges.add(key);
-        diagnostics.push(diagnostic);
-      } catch {
-        continue;
       }
     }
+    logDiagnosticPhase(
+      'meta-constraints-visible',
+      _metaConstraintStart,
+      `contexts=${_metaConstraintContextCount} added=${_metaConstraintAdded}`
+    );
 
+    const _bulkUpdateStart = beginDiagnosticPhase('bulk-update-visible');
+    let _bulkUpdateContextCount = 0;
+    let _bulkUpdateAdded = 0;
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    if (isDiagnosticsCancelled()) { /* skip */ } else
-    for (const context of findBulkUpdateFieldDiagnosticContexts(document, visStartLine, visEndLine)) {
-      if (isDiagnosticsCancelled()) break;
-      try {
-        const baseModelLabel = await resolveBaseModelLabelForReceiver(
-          daemon,
-          document,
-          context.receiverExpression,
-          context.range.end
-        );
-        trackRequest();
+    if (!isDiagnosticsCancelled()) {
+      const bulkUpdateContexts = findBulkUpdateFieldDiagnosticContexts(document, visStartLine, visEndLine);
+      _bulkUpdateContextCount = bulkUpdateContexts.length;
+      for (const context of bulkUpdateContexts) {
         if (isDiagnosticsCancelled()) break;
-        if (!baseModelLabel) {
-          continue;
-        }
+        try {
+          const baseModelLabel = await resolveBaseModelLabelForReceiver(
+            daemon,
+            document,
+            context.receiverExpression,
+            context.range.end
+          );
+          trackRequest();
+          if (isDiagnosticsCancelled()) break;
+          if (!baseModelLabel) {
+            continue;
+          }
 
-        const resolution = await daemon.resolveLookupPath(
-          baseModelLabel,
-          context.value,
-          'filter',
-          /* background */ true
-        );
-        trackRequest();
-        if (isDiagnosticsCancelled()) break;
-        const diagnostic = buildBulkUpdateFieldDiagnostic(
-          context,
-          baseModelLabel,
-          resolution
-        );
-        if (!diagnostic) {
+          const resolution = await daemon.resolveLookupPath(
+            baseModelLabel,
+            context.value,
+            'filter',
+            /* background */ true
+          );
+          trackRequest();
+          if (isDiagnosticsCancelled()) break;
+          const diagnostic = buildBulkUpdateFieldDiagnostic(
+            context,
+            baseModelLabel,
+            resolution
+          );
+          if (addDiagnosticIfNew(diagnostic)) {
+            _bulkUpdateAdded++;
+          }
+        } catch {
           continue;
         }
-
-        const key = diagnostic.range.start.toString() + diagnostic.message;
-        if (seenRanges.has(key)) {
-          continue;
-        }
-        seenRanges.add(key);
-        diagnostics.push(diagnostic);
-      } catch {
-        continue;
       }
     }
+    logDiagnosticPhase(
+      'bulk-update-visible',
+      _bulkUpdateStart,
+      `contexts=${_bulkUpdateContextCount} added=${_bulkUpdateAdded}`
+    );
 
     // Publish whatever diagnostics we have, even if the budget was exhausted.
     // Returning early would discard all partial results, leaving the user
     // with zero ORM diagnostics until the next document change.
+    const _publishStart = beginDiagnosticPhase('publish');
     if (diagnosticsDisposed || document.version !== documentVersion) {
       activeDiagnosticScans.delete(key);
       return;
     }
 
     diagnosticCollection.set(document.uri, diagnostics);
+    logDiagnosticPhase(
+      'publish',
+      _publishStart,
+      `diagnostics=${diagnostics.length} partial=${diagnosticBudgetLogged}`
+    );
 
     if (diagnosticBudgetLogged) {
       // Budget was exhausted — save partial results so the next scan of
@@ -1903,24 +2093,36 @@ export function registerPythonProviders(
                     document.offsetAt(position),
                     new Set()
                   )
+                : undefined) ??
+              (memberContext.receiver.kind === 'instance'
+                ? await resolveClassDefinitionForModelLabel(
+                    daemon,
+                    memberContext.receiver.modelLabel
+                  )
                 : undefined);
             const canUseLocalOrmMemberCompletions =
               memberContext.receiver.kind !== 'instance' ||
-              Boolean(memberContext.receiver.classSource) ||
+              Boolean(classSource) ||
               memberContext.receiverExpression.includes('.');
             const result =
               (canUseLocalOrmMemberCompletions
                 ? daemon.listOrmMemberCompletionsLocal(
                     memberContext.receiver.modelLabel,
                     memberContext.receiver.kind,
-                    memberContext.prefix,
+                    '',
                     memberContext.receiver.managerName
                   )
                 : undefined) ??
+              daemon.listOrmMemberCompletionsNative(
+                memberContext.receiver.modelLabel,
+                memberContext.receiver.kind,
+                '',
+                memberContext.receiver.managerName
+              ) ??
               await daemon.listOrmMemberCompletions(
                 memberContext.receiver.modelLabel,
                 memberContext.receiver.kind,
-                memberContext.prefix,
+                '',
                 memberContext.receiver.managerName
               );
             if (token.isCancellationRequested) {
@@ -2661,7 +2863,11 @@ export function registerPythonProviders(
             if (isDefCancelled()) { return undefined; }
             const resolution = await daemon.resolveRelationTarget(relationLiteral.value);
             if (isDefCancelled()) { return undefined; }
-            const location = definitionLocationFromRelationResolution(resolution);
+            const location =
+              await definitionLocationFromRelationResolutionWithFallback(
+                daemon,
+                resolution
+              );
             if (location) {
               return location;
             }
@@ -2717,7 +2923,10 @@ export function registerPythonProviders(
                 lookupLiteral.method
               ));
             if (isDefCancelled()) { return undefined; }
-            const location = definitionLocationFromLookupResolution(resolution);
+            const location = await definitionLocationFromLookupResolutionWithFallback(
+              daemon,
+              resolution
+            );
             if (location) {
               return location;
             }
@@ -2749,7 +2958,10 @@ export function registerPythonProviders(
               'filter'
             );
             if (isDefCancelled()) { return undefined; }
-            return definitionLocationFromLookupResolution(resolution);
+            return definitionLocationFromLookupResolutionWithFallback(
+              daemon,
+              resolution
+            );
           } catch {
             return undefined;
           }
@@ -2777,7 +2989,10 @@ export function registerPythonProviders(
               'filter'
             );
             if (isDefCancelled()) { return undefined; }
-            return definitionLocationFromLookupResolution(resolution);
+            return definitionLocationFromLookupResolutionWithFallback(
+              daemon,
+              resolution
+            );
           } catch {
             return undefined;
           }
@@ -2805,7 +3020,10 @@ export function registerPythonProviders(
               'filter'
             );
             if (isDefCancelled()) { return undefined; }
-            const location = definitionLocationFromLookupResolution(resolution);
+            const location = await definitionLocationFromLookupResolutionWithFallback(
+              daemon,
+              resolution
+            );
             if (location) {
               return location;
             }
@@ -2873,7 +3091,10 @@ export function registerPythonProviders(
               'filter'
             );
             if (isDefCancelled()) { return undefined; }
-            return definitionLocationFromLookupResolution(resolution);
+            return definitionLocationFromLookupResolutionWithFallback(
+              daemon,
+              resolution
+            );
           } catch {
             return undefined;
           }
@@ -3300,7 +3521,11 @@ function lookupCompletionCanContinue(
     return true;
   }
 
-  return item.isRelation || DJANGO_FIELD_PRIORITY_METHODS.has(method);
+  return (
+    item.isRelation ||
+    Boolean(item.relatedModelLabel) ||
+    DJANGO_FIELD_PRIORITY_METHODS.has(method)
+  );
 }
 
 function prioritizeLookupCompletionItems(
@@ -3492,16 +3717,22 @@ function ormMemberCompletionPriority(
   receiver: OrmReceiverInfo
 ): number {
   if (receiver.kind === 'instance') {
+    if (
+      (item.memberKind === 'field' || item.memberKind === 'relation') &&
+      (item.name === 'id' || item.name === 'pk')
+    ) {
+      return 1;
+    }
     if (item.memberKind === 'field' || item.memberKind === 'relation') {
       return 0;
     }
     if (item.memberKind === 'reverse_relation') {
-      return 1;
-    }
-    if (item.memberKind === 'manager') {
       return 2;
     }
-    return 3;
+    if (item.memberKind === 'manager') {
+      return 3;
+    }
+    return 4;
   }
 
   if (item.memberKind === 'method') {
@@ -5172,7 +5403,7 @@ function buildTypeHintClassHover(
 
   const moduleName = moduleNameForDocument(target.source.document);
   if (moduleName) {
-    markdown.appendMarkdown(`Defined in \`${moduleName}\`.`);
+    markdown.appendMarkdown(`defined in \`${moduleName}\`.`);
   }
 
   markdown.appendMarkdown(
@@ -5639,6 +5870,26 @@ function cancelledCompletionResult(
   return undefined;
 }
 
+async function runWithConcurrency<T>(
+  items: readonly T[],
+  limit: number,
+  isCancelled: () => boolean,
+  worker: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  let nextIndex = 0;
+  const workerCount = Math.min(limit, items.length);
+  const runners = Array.from({ length: workerCount }, async () => {
+    while (!isCancelled()) {
+      const index = nextIndex++;
+      if (index >= items.length) {
+        return;
+      }
+      await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+}
+
 function resetProviderResolutionCaches(): void {
   allRelationTargetsCache = new WeakMap<AnalysisDaemon, Promise<RelationTargetsResult>>();
   modelSubclassRelationCache.clear();
@@ -5664,16 +5915,41 @@ async function listAllRelationTargets(
   }
 }
 
+async function resolveClassDefinitionForModelLabel(
+  daemon: AnalysisDaemon,
+  modelLabel: string
+): Promise<ClassDefinitionSource | undefined> {
+  if (daemon.isAborted()) { return undefined; }
+  const targets = await listAllRelationTargets(daemon);
+  const target = targets.items.find((item) => item.label === modelLabel);
+  if (!target?.filePath) {
+    return undefined;
+  }
+
+  const document = await vscode.workspace.openTextDocument(target.filePath);
+  const classDef = findClassDefinition(document, target.objectName);
+  if (!classDef) {
+    return undefined;
+  }
+
+  return {
+    document,
+    classDef,
+    beforeOffset: document.offsetAt(new vscode.Position(classDef.line, 0)),
+  };
+}
+
 async function listLookupPathCompletionsFast(
   daemon: AnalysisDaemon,
   baseModelLabel: string,
   prefix: string,
   method: string
 ): Promise<LookupPathCompletionsResult> {
-  return (
-    daemon.listLookupPathCompletionsLocal(baseModelLabel, prefix, method) ??
-    await daemon.listLookupPathCompletions(baseModelLabel, prefix, method)
-  );
+  const local = daemon.listLookupPathCompletionsLocal(baseModelLabel, prefix, method);
+  if (local) return local;
+  const native = daemon.listLookupPathCompletionsNative(baseModelLabel, prefix, method);
+  if (native) return native;
+  return daemon.listLookupPathCompletions(baseModelLabel, prefix, method);
 }
 
 function mergeLookupCompletionItems(
@@ -5698,6 +5974,34 @@ function mergeLookupCompletionItems(
   }
 
   return merged;
+}
+
+function hasSuppressingPartialLookupCompletion(
+  value: string,
+  items: LookupPathItem[]
+): boolean {
+  const trimmedValue = value.trim();
+  if (!trimmedValue) {
+    return items.length > 0;
+  }
+
+  const currentSegment =
+    trimmedValue.split('__').filter(Boolean).at(-1)?.toLowerCase() ??
+    trimmedValue.toLowerCase();
+  if (!currentSegment) {
+    return items.length > 0;
+  }
+
+  return items.some((item) => {
+    const itemName = item.name.toLowerCase();
+    const fieldSegment =
+      item.fieldPath?.split('__').filter(Boolean).at(-1)?.toLowerCase() ??
+      itemName;
+    return (
+      itemName.startsWith(currentSegment) ||
+      fieldSegment.startsWith(currentSegment)
+    );
+  });
 }
 
 function virtualLookupCompletionItems(
@@ -6145,6 +6449,33 @@ function definitionLocationFromRelationResolution(
   );
 }
 
+async function definitionLocationFromRelationResolutionWithFallback(
+  daemon: AnalysisDaemon,
+  resolution: RelationTargetResolution
+): Promise<vscode.Location | undefined> {
+  const directLocation = definitionLocationFromRelationResolution(resolution);
+  if (directLocation) {
+    return directLocation;
+  }
+
+  if (!resolution.resolved || !resolution.target?.label) {
+    return undefined;
+  }
+
+  const classSource = await resolveClassDefinitionForModelLabel(
+    daemon,
+    resolution.target.label
+  );
+  if (!classSource) {
+    return undefined;
+  }
+
+  return new vscode.Location(
+    classSource.document.uri,
+    new vscode.Position(classSource.classDef.line, 0)
+  );
+}
+
 function definitionLocationFromExportResolution(
   resolution: ExportOriginResolution
 ): vscode.Location | undefined {
@@ -6239,6 +6570,51 @@ function definitionLocationFromLookupResolution(
     resolution.target.filePath,
     resolution.target.line,
     resolution.target.column
+  );
+}
+
+async function definitionLocationFromLookupResolutionWithFallback(
+  daemon: AnalysisDaemon,
+  resolution: LookupPathResolution
+): Promise<vscode.Location | undefined> {
+  const directLocation = definitionLocationFromLookupResolution(resolution);
+  if (directLocation) {
+    return directLocation;
+  }
+
+  if (!resolution.resolved || !resolution.target?.modelLabel) {
+    return undefined;
+  }
+
+  const classSource = await resolveClassDefinitionForModelLabel(
+    daemon,
+    resolution.target.modelLabel
+  );
+  if (!classSource) {
+    return undefined;
+  }
+
+  const fallbackFieldNames = [resolution.target.name];
+  if (resolution.target.name === 'pk') {
+    fallbackFieldNames.push('id');
+  } else if (resolution.target.name.endsWith('_id')) {
+    fallbackFieldNames.push(resolution.target.name.slice(0, -3));
+  }
+
+  for (const fieldName of fallbackFieldNames) {
+    const fieldLocation = findClassAttributeAssignment(
+      classSource.document,
+      classSource.classDef,
+      fieldName
+    );
+    if (fieldLocation) {
+      return fieldLocation;
+    }
+  }
+
+  return new vscode.Location(
+    classSource.document.uri,
+    new vscode.Position(classSource.classDef.line, 0)
   );
 }
 
@@ -10895,6 +11271,40 @@ function findMethodDefinition(
     }
 
     return functionDef;
+  }
+
+  return undefined;
+}
+
+function findClassAttributeAssignment(
+  document: vscode.TextDocument,
+  classDef: PythonClassDefinition,
+  attributeName: string
+): vscode.Location | undefined {
+  const assignmentPattern = new RegExp(
+    String.raw`^(\s+)${escapeRegExp(attributeName)}\s*=`
+  );
+
+  for (let line = classDef.line + 1; line <= classDef.endLine; line += 1) {
+    const lineText = document.lineAt(line).text;
+    const match = lineText.match(assignmentPattern);
+    if (!match) {
+      continue;
+    }
+
+    if (match[1].length <= classDef.indent) {
+      continue;
+    }
+
+    const column = lineText.indexOf(attributeName);
+    if (column < 0) {
+      continue;
+    }
+
+    return new vscode.Location(
+      document.uri,
+      new vscode.Position(line, column)
+    );
   }
 
   return undefined;

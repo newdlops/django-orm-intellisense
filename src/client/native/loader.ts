@@ -77,6 +77,23 @@ export interface NativeBindings {
     name: string,
     managerName?: string | null,
   ): Buffer | null;
+  nativeListLookupPathCompletions(
+    baseModelLabel: string,
+    prefix: string,
+    method: string,
+  ): Buffer | null;
+  nativeListOrmMemberCompletions(
+    modelLabel: string,
+    receiverKind: string,
+    prefix?: string | null,
+    managerName?: string | null,
+  ): Buffer | null;
+  nativeResolveExportOrigin(
+    moduleName: string,
+    symbol: string,
+  ): Buffer | null;
+  nativeResolveModule(moduleName: string): Buffer | null;
+  nativeEnsureAstModules(root: string): boolean;
 }
 
 let cached: NativeBindings | undefined;

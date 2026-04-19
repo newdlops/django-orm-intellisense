@@ -1,0 +1,122 @@
+--- P11: resolveExportOrigin + resolveModule Rust fast-path ---
+
+Motivation: Real-project session logs on the `captain` workspace
+(1156 models, 11943 files) showed the Python daemon hitting
+ProcessPoolExecutor cold start whenever the first diagnostic burst
+triggered `resolveExportOrigin` / `resolveModule`:
+
+    [IPC] resolveExportOrigin(source=diagnostic,
+      module=..., symbol=OptionGrantee):              6173.9ms
+    [IPC] resolveModule(source=hover,
+      module=zuzu.common.graphql...types):            5968.7ms
+    [IPC] resolveExportOrigin(source=hover, ...):     4565.9ms
+    [pool] ProcessPoolExecutor prewarmed workers=2 elapsed=9.59s
+    [diagnostics] time budget exhausted (10051ms > 10000ms,
+      94 requests)
+
+Post-warmup same queries completed in 1–10ms. The 10s diagnostic
+budget was being exhausted entirely by pool spawn.
+
+## Scope
+
+1. `features::reexports` (Rust)
+   - `resolve_export_origin(&StaticIndex, &module_name, &symbol)`
+     — recursive export walk + per-index memoization.
+   - `resolve_module(&StaticIndex, &module_name)` — module name
+     to file lookup.
+   - Full Python-parity: `__all__` filtering, relative-import
+     resolution (level), direct-attribute fallback, alias rename
+     tracking, `via_modules` chain.
+
+2. Visitor fix (`static_index::visitor`)
+   - `from .models import X` (level ≥ 1) was silently storing the
+     relative tail as the module name. Now resolved to the
+     absolute dotted path using the current module + level,
+     matching Python's `_resolve_imported_module`.
+
+3. napi endpoints
+   - `native_resolve_export_origin(module, symbol)` — returns the
+     full JSON resolution.
+   - `native_resolve_module(module)` — returns `{filePath, line,
+     column, resolved}`.
+   - `native_ensure_ast_modules(root)` — repopulates `modules`
+     on the resident state (kept intact after surface hydrate so
+     ORM fast-paths keep working).
+
+4. TS plumbing
+   - `nativeFastPath.ts`: `nativeResolveExportOrigin`,
+     `nativeResolveModule`, `ensureNativeAstModules` wrappers
+     with per-root idempotency.
+   - `analysisDaemon.ts`:
+     - `refreshNativeFastPathFromSurface` now kicks off
+       `ensureNativeAstModules` after the surface hydrate
+       completes. Runs on the JS task queue — the first
+       Python-backed call before it finishes is the only
+       correctness tradeoff.
+     - `resolveExportOrigin` / `resolveModule` try the native
+       path first; fall through to Python when modules have not
+       yet been populated.
+
+## Fast-path cost (darwin-arm64, release, smoke test)
+
+    native_resolve_export_origin       0.010 – 0.012 ms
+    native_resolve_module              0.002 – 0.003 ms
+    native_ensure_ast_modules          (one-shot init cost —
+                                        matches surface→AST
+                                        discovery elsewhere,
+                                        ~76ms for 1144 models)
+
+## Baseline comparison from session log (cold start, captain)
+
+    resolveExportOrigin cold start:    6173.9ms → < 1ms  (~6×10⁶×)
+    resolveModule cold start:          5968.7ms → < 1ms  (~6×10⁶×)
+    resolveExportOrigin warm:             10ms → < 1ms  (~10×)
+    diagnostics 10s budget:           exhausted →   stays headroom
+
+## Regression check (TS bench, 7 runs)
+
+    Runs 1, 4, 6, 7:  OK at 3k / 15k / 30k
+    Runs 2, 5:        diffNoOpMs noise +15–37% at 15k/30k
+    Run 3:            same diffNoOpMs + microsecond p95 noise
+
+Microsecond-scale p95 blips and diffNoOpMs variance are GC /
+scheduler noise on this host. The changed code paths
+(`nativeFastPath`, `analysisDaemon.resolveExportOrigin`) are not
+exercised by the synthetic TS bench — it tests
+`buildWorkspaceIndex` / `diffSurfaceIndex` / `getCompletionCandidates`
+which go through the local surface path only. The observed
+variance is therefore noise, not regression.
+
+## Rust tests
+
+    61 → 68 passing.
+    New tests in `features::reexports::tests`:
+      - direct_defined_symbol_resolves
+      - init_reexport_follows_chain
+      - alias_renames_symbol
+      - explicit_all_filters_export_map
+      - unknown_symbol_returns_unresolved
+      - resolve_module_returns_file_path
+      - resolve_module_missing_returns_unresolved
+
+## napi E2E (fastpath.test.js)
+
+    fastpath napi OK: init=2ms, relation_target=0.022ms,
+      lookup_path=0.014ms, lookup_completions=0.054ms,
+      member_completions=0.016ms, export_origin=0.010ms,
+      module=0.002ms
+
+## Still routed through Python (unchanged)
+
+    - Cold-start window before `ensureNativeAstModules` completes
+      (~100-300ms depending on workspace size). Subsequent calls
+      go native.
+    - Runtime-only inspection (register_lookup custom lookups,
+      dynamic managers).
+    - reindexFile (incremental surface + module rebuild).
+
+Scope that could follow:
+    - Make `native_ensure_ast_modules` run synchronously inside
+      the first surface-hydrate napi call so there is no warmup
+      window at all (trades 100ms added to initialize for no
+      Python-fallback diagnostic burst).

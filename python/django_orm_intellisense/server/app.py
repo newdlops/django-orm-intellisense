@@ -37,13 +37,11 @@ from ..discovery.workspace import (
 )
 from ..features.health import build_health_snapshot
 from ..features.lookup_paths import (
-    list_lookup_path_completions,
     resolve_lookup_path,
 )
 from ..features.orm_members import (
     fingerprint_json_payload,
     fingerprint_surface_index,
-    list_orm_member_completions,
     prebuild_member_surface_cache,
     rebuild_surface_for_models,
     resolve_orm_member,
@@ -160,7 +158,15 @@ def _bg_dispatch(method: str, params: dict[str, Any]) -> dict[str, Any]:
         mn = _clean_optional_string(params.get('managerName'))
         if ml is None or rk is None or nm is None:
             raise ValueError('missing params for resolveOrmMember')
-        return resolve_orm_member(static_index=si, runtime=rt, model_label=ml, receiver_kind=rk, name=nm, manager_name=mn)
+        return resolve_orm_member(
+            static_index=si,
+            runtime=rt,
+            model_graph=mg,
+            model_label=ml,
+            receiver_kind=rk,
+            name=nm,
+            manager_name=mn,
+        )
 
     if method == 'resolveOrmMemberBatch':
         items = params.get('items', [])
@@ -174,7 +180,17 @@ def _bg_dispatch(method: str, params: dict[str, Any]) -> dict[str, Any]:
                 if ml is None or rk is None or nm is None:
                     results.append({'resolved': False, 'reason': 'missing_params'})
                     continue
-                results.append(resolve_orm_member(static_index=si, runtime=rt, model_label=ml, receiver_kind=rk, name=nm, manager_name=mn))
+                results.append(
+                    resolve_orm_member(
+                        static_index=si,
+                        runtime=rt,
+                        model_graph=mg,
+                        model_label=ml,
+                        receiver_kind=rk,
+                        name=nm,
+                        manager_name=mn,
+                    )
+                )
             except Exception:
                 results.append({'resolved': False, 'reason': 'error'})
         return {'results': results, '_batch_size': len(items)}
@@ -202,24 +218,36 @@ def _bg_dispatch(method: str, params: dict[str, Any]) -> dict[str, Any]:
         mn = _clean_optional_string(params.get('managerName'))
         if ml is None or rk is None or not isinstance(chain, list):
             raise ValueError('missing params for resolveOrmMemberChain')
-        return resolve_orm_member_chain(static_index=si, runtime=rt, model_label=ml, receiver_kind=rk, chain=[str(n) for n in chain], manager_name=mn)
+        return resolve_orm_member_chain(
+            static_index=si,
+            runtime=rt,
+            model_graph=mg,
+            model_label=ml,
+            receiver_kind=rk,
+            chain=[str(n) for n in chain],
+            manager_name=mn,
+        )
 
+    # lookupPathCompletions / ormMemberCompletions are now served by the
+    # Rust fast-path + TS local fallback. The Python daemon no longer
+    # generates bulk completion lists. Any IPC that reaches here means
+    # neither local nor native path could answer — return an empty,
+    # non-resolved result so the caller falls through to a no-op.
     if method == 'lookupPathCompletions':
-        base = _clean_optional_string(params.get('baseModelLabel'))
-        prefix = _clean_optional_string(params.get('prefix')) or ''
-        mth = _clean_optional_string(params.get('method'))
-        if base is None or mth is None:
-            raise ValueError('missing params for lookupPathCompletions')
-        return list_lookup_path_completions(model_graph=mg, runtime=rt, base_model_label=base, prefix=prefix, method=mth)
+        return {'items': [], 'resolved': False, 'reason': 'handled_by_native'}
 
     if method == 'ormMemberCompletions':
-        ml = _clean_optional_string(params.get('modelLabel'))
-        rk = _clean_optional_string(params.get('receiverKind'))
-        prefix = _clean_optional_string(params.get('prefix')) or ''
+        ml = _clean_optional_string(params.get('modelLabel')) or ''
+        rk = _clean_optional_string(params.get('receiverKind')) or ''
         mn = _clean_optional_string(params.get('managerName'))
-        if ml is None or rk is None:
-            raise ValueError('missing params for ormMemberCompletions')
-        return list_orm_member_completions(static_index=si, runtime=rt, model_label=ml, receiver_kind=rk, prefix=prefix, manager_name=mn)
+        return {
+            'items': [],
+            'resolved': False,
+            'reason': 'handled_by_native',
+            'modelLabel': ml,
+            'receiverKind': rk,
+            'managerName': mn,
+        }
 
     if method == 'relationTargets':
         prefix = _clean_optional_string(params.get('prefix'))
@@ -232,9 +260,10 @@ def _bg_prebuild_surface_index() -> dict[str, object]:
     """Build the full surface index inside a background worker process."""
     si = _worker_static_index
     rt = _worker_runtime
+    mg = _worker_model_graph
     if si is None or rt is None:
         raise RuntimeError('Background worker not initialized')
-    return prebuild_member_surface_cache(si, rt)
+    return prebuild_member_surface_cache(si, rt, mg)
 
 
 def _bg_noop() -> None:
@@ -411,11 +440,15 @@ class DaemonServer:
         def worker() -> None:
             started_at = time.perf_counter()
             try:
-                for _ in range(worker_count):
-                    with self._state_lock:
-                        if self._bg_pool is not pool or self._bg_pool_prewarm_token != token:
-                            return
-                    future = pool.submit(_bg_noop)
+                with self._state_lock:
+                    if self._bg_pool is not pool or self._bg_pool_prewarm_token != token:
+                        return
+                # Submit all no-op tasks at once so ProcessPoolExecutor
+                # spawns workers in parallel. Sequential submission
+                # serialises the Python cold-start cost per worker
+                # (observed ~2.7s × N on the captain workspace).
+                futures = [pool.submit(_bg_noop) for _ in range(worker_count)]
+                for future in futures:
                     future.result()
                 print(
                     f'[pool] ProcessPoolExecutor prewarmed workers={worker_count} '
@@ -901,7 +934,11 @@ class DaemonServer:
         should_prebuild_surface_index = False
         if surface_index is None:
             if static_index.model_candidate_count <= INITIAL_SYNC_SURFACE_INDEX_MODEL_LIMIT:
-                surface_index = prebuild_member_surface_cache(static_index, runtime)
+                surface_index = prebuild_member_surface_cache(
+                    static_index,
+                    runtime,
+                    model_graph,
+                )
                 save_surface_index(
                     workspace_root,
                     source_fingerprint=source_snapshot.fingerprint,
@@ -1144,7 +1181,11 @@ class DaemonServer:
 
         def _fallback_worker() -> None:
             try:
-                surface_index = prebuild_member_surface_cache(static_index, runtime)
+                surface_index = prebuild_member_surface_cache(
+                    static_index,
+                    runtime,
+                    model_graph,
+                )
                 _apply_surface_index(surface_index)
             except Exception:
                 _log_failure()
@@ -1328,7 +1369,7 @@ class DaemonServer:
             runtime = create_pending_runtime_inspection()
 
         surface_index = rebuild_surface_for_models(
-            new_static_index, runtime, affected_labels, existing_surface,
+            new_static_index, runtime, model_graph, affected_labels, existing_surface,
         )
         removed_labels = sorted(
             label for label in affected_labels if label not in surface_index
@@ -1469,22 +1510,11 @@ class DaemonServer:
         return static_index.resolve_module(module_name).to_dict()
 
     def _lookup_path_completions(self, params: dict[str, Any]) -> dict[str, Any]:
-        _static_index, runtime, model_graph = self._require_graph_feature_state()
-        base_model_label = _clean_optional_string(params.get('baseModelLabel'))
-        prefix = _clean_optional_string(params.get('prefix')) or ''
-        method = _clean_optional_string(params.get('method'))
-        if base_model_label is None or method is None:
-            raise ValueError(
-                '`baseModelLabel` and `method` are required for lookupPathCompletions.'
-            )
-
-        return list_lookup_path_completions(
-            model_graph=model_graph,
-            runtime=runtime,
-            base_model_label=base_model_label,
-            prefix=prefix,
-            method=method,
-        )
+        # Rust fast-path + TS local index are authoritative. This Python
+        # stub exists only so the IPC surface stays backward-compatible;
+        # it returns an empty result so the caller shows no completions.
+        del params
+        return {'items': [], 'resolved': False, 'reason': 'handled_by_native'}
 
     def _resolve_lookup_path(self, params: dict[str, Any]) -> dict[str, Any]:
         _static_index, runtime, model_graph = self._require_graph_feature_state()
@@ -1505,27 +1535,24 @@ class DaemonServer:
         )
 
     def _orm_member_completions(self, params: dict[str, Any]) -> dict[str, Any]:
-        static_index, runtime = self._require_feature_state()
-        model_label = _clean_optional_string(params.get('modelLabel'))
-        receiver_kind = _clean_optional_string(params.get('receiverKind'))
-        prefix = _clean_optional_string(params.get('prefix')) or ''
+        # Rust fast-path + TS local index are authoritative. This Python
+        # stub returns an empty result for backward compatibility — the
+        # IPC path exists so older clients don't crash, but completions
+        # come from the local surfaceIndex or the native addon.
+        model_label = _clean_optional_string(params.get('modelLabel')) or ''
+        receiver_kind = _clean_optional_string(params.get('receiverKind')) or ''
         manager_name = _clean_optional_string(params.get('managerName'))
-        if model_label is None or receiver_kind is None:
-            raise ValueError(
-                '`modelLabel` and `receiverKind` are required for ormMemberCompletions.'
-            )
-
-        return list_orm_member_completions(
-            static_index=static_index,
-            runtime=runtime,
-            model_label=model_label,
-            receiver_kind=receiver_kind,
-            prefix=prefix,
-            manager_name=manager_name,
-        )
+        return {
+            'items': [],
+            'resolved': False,
+            'reason': 'handled_by_native',
+            'modelLabel': model_label,
+            'receiverKind': receiver_kind,
+            'managerName': manager_name,
+        }
 
     def _resolve_orm_member(self, params: dict[str, Any]) -> dict[str, Any]:
-        static_index, runtime = self._require_feature_state()
+        static_index, runtime, model_graph = self._require_graph_feature_state()
         model_label = _clean_optional_string(params.get('modelLabel'))
         receiver_kind = _clean_optional_string(params.get('receiverKind'))
         name = _clean_optional_string(params.get('name'))
@@ -1538,6 +1565,7 @@ class DaemonServer:
         return resolve_orm_member(
             static_index=static_index,
             runtime=runtime,
+            model_graph=model_graph,
             model_label=model_label,
             receiver_kind=receiver_kind,
             name=name,
@@ -1546,7 +1574,7 @@ class DaemonServer:
 
     def _resolve_orm_member_batch(self, params: dict[str, Any]) -> dict[str, Any]:
         """Batch resolve multiple ORM members in a single IPC call."""
-        static_index, runtime = self._require_feature_state()
+        static_index, runtime, model_graph = self._require_graph_feature_state()
         items = params.get('items', [])
         started = time.perf_counter()
         results = []
@@ -1562,6 +1590,7 @@ class DaemonServer:
                 result = resolve_orm_member(
                     static_index=static_index,
                     runtime=runtime,
+                    model_graph=model_graph,
                     model_label=model_label,
                     receiver_kind=receiver_kind,
                     name=name,
@@ -1598,7 +1627,7 @@ class DaemonServer:
         return {'results': results, '_batch_size': len(items)}
 
     def _resolve_orm_member_chain(self, params: dict[str, Any]) -> dict[str, Any]:
-        static_index, runtime = self._require_feature_state()
+        static_index, runtime, model_graph = self._require_graph_feature_state()
         model_label = _clean_optional_string(params.get('modelLabel'))
         receiver_kind = _clean_optional_string(params.get('receiverKind'))
         chain = params.get('chain')
@@ -1611,6 +1640,7 @@ class DaemonServer:
         return resolve_orm_member_chain(
             static_index=static_index,
             runtime=runtime,
+            model_graph=model_graph,
             model_label=model_label,
             receiver_kind=receiver_kind,
             chain=[str(name) for name in chain],

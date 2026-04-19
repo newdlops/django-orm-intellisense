@@ -19,10 +19,14 @@
 import { tryLoadNative, type NativeBindings } from '../native/loader';
 import type { SurfaceIndex } from '../../server/workspaceIndexer';
 import type {
+  ExportOriginResolution,
+  ModuleResolution,
   RelationTargetResolution,
   RelationTargetsResult,
   LookupPathResolution,
+  LookupPathCompletionsResult,
   OrmMemberResolution,
+  OrmMemberCompletionsResult,
   OrmMemberItem,
   OrmReceiverKind,
 } from '../protocol';
@@ -100,6 +104,9 @@ export async function ensureNativeFastPath(
       initialized = true;
       currentRoot = options.workspaceRoot;
       stateSource = 'ast';
+      // AST init populates modules directly, so downstream export
+      // queries can run without a separate ensure call.
+      astModulesEnsured = true;
       options.log?.(
         'info',
         `[fastpath] nativeInit ${formatInitStats(res)}`,
@@ -137,6 +144,8 @@ export function dropNativeFastPath(): void {
   currentRoot = null;
   stateSource = null;
   initInProgress = null;
+  astModulesEnsured = false;
+  astModulesEnsuring = null;
 }
 
 /**
@@ -172,6 +181,10 @@ export async function hydrateNativeFastPathFromSurface(
       initialized = true;
       currentRoot = options.workspaceRoot;
       stateSource = 'surface';
+      // Surface hydrate leaves `modules` empty. A follow-up
+      // `ensureNativeAstModules` call has to run before export-origin
+      // queries can be answered natively.
+      astModulesEnsured = false;
       options.log?.(
         'info',
         `[fastpath] nativeInitFromSurface reason=${options.reason ?? 'unknown'} ` +
@@ -284,4 +297,153 @@ export function nativeResolveOrmMember(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Try bulk `listLookupPathCompletions` on the resident state. Returns
+ * `undefined` when the native path is unavailable; otherwise a full
+ * completion list (may be empty when `resolved=false`).
+ */
+export function nativeListLookupPathCompletions(
+  baseModelLabel: string,
+  prefix: string,
+  method: string,
+): LookupPathCompletionsResult | undefined {
+  if (!initialized || disabled) return undefined;
+  const n = getNative();
+  if (!n) return undefined;
+  try {
+    const buf = n.nativeListLookupPathCompletions(baseModelLabel, prefix, method);
+    return tryParse<LookupPathCompletionsResult>(buf);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Try bulk `listOrmMemberCompletions` on the resident state. Returns the
+ * static complement — project `def` methods and dynamic managers remain
+ * served by Python. Callers should fall back to Python for the richer
+ * member surface when the receiver is instance without a local class
+ * source, etc.
+ */
+export function nativeListOrmMemberCompletions(
+  modelLabel: string,
+  receiverKind: OrmReceiverKind,
+  prefix: string,
+  managerName?: string,
+): OrmMemberCompletionsResult | undefined {
+  if (!initialized || disabled) return undefined;
+  const n = getNative();
+  if (!n) return undefined;
+  try {
+    const buf = n.nativeListOrmMemberCompletions(
+      modelLabel,
+      receiverKind,
+      prefix || null,
+      managerName ?? null,
+    );
+    return tryParse<OrmMemberCompletionsResult>(buf);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Try `resolveExportOrigin` on the resident static index. Returns
+ * `undefined` when either the native state is missing or the modules
+ * data has not been populated yet — caller should fall back to Python.
+ * When `resolution.resolved === false`, the caller can still use that
+ * result (Python would return the same). Callers that want a definitive
+ * hit before falling back should check `resolved` before returning.
+ */
+export function nativeResolveExportOrigin(
+  moduleName: string,
+  symbol: string,
+): ExportOriginResolution | undefined {
+  if (!initialized || disabled) return undefined;
+  const n = getNative();
+  if (!n) return undefined;
+  try {
+    const buf = n.nativeResolveExportOrigin(moduleName, symbol);
+    if (!buf) return undefined;
+    const parsed = tryParse<ExportOriginResolution | null>(buf);
+    return parsed ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Try `resolveModule` on the resident static index. Returns `undefined`
+ * when the native state is missing or modules are not populated.
+ */
+export function nativeResolveModule(
+  moduleName: string,
+): ModuleResolution | undefined {
+  if (!initialized || disabled) return undefined;
+  const n = getNative();
+  if (!n) return undefined;
+  try {
+    const buf = n.nativeResolveModule(moduleName);
+    if (!buf) return undefined;
+    const parsed = tryParse<ModuleResolution | null>(buf);
+    return parsed ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+let astModulesEnsured = false;
+let astModulesEnsuring: Promise<boolean> | null = null;
+
+/**
+ * Populate `modules` on the resident Rust state by running the AST
+ * indexer in the background. Call once after the surface hydrate so
+ * subsequent `resolveExportOrigin` / `resolveModule` queries can be
+ * answered natively.
+ */
+export function ensureNativeAstModules(
+  workspaceRoot: string,
+  log?: Logger,
+): Promise<boolean> {
+  if (disabled) return Promise.resolve(false);
+  if (astModulesEnsured && currentRoot === workspaceRoot) {
+    return Promise.resolve(true);
+  }
+  if (astModulesEnsuring) return astModulesEnsuring;
+  const n = getNative();
+  if (!n) return Promise.resolve(false);
+
+  astModulesEnsuring = new Promise<boolean>((resolve) => {
+    setImmediate(() => {
+      const started = performance.now();
+      try {
+        const ok = n.nativeEnsureAstModules(workspaceRoot);
+        const elapsedMs = performance.now() - started;
+        astModulesEnsured = ok;
+        log?.(
+          'info',
+          `[fastpath] nativeEnsureAstModules ok=${ok} elapsed=${elapsedMs.toFixed(1)}ms`,
+        );
+        resolve(ok);
+      } catch (err) {
+        log?.(
+          'warn',
+          `[fastpath] nativeEnsureAstModules failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        astModulesEnsured = false;
+        resolve(false);
+      } finally {
+        astModulesEnsuring = null;
+      }
+    });
+  });
+  return astModulesEnsuring;
+}
+
+/** Reset the AST-modules ensure flag. Call when workspace root changes. */
+export function resetNativeAstModulesFlag(): void {
+  astModulesEnsured = false;
+  astModulesEnsuring = null;
 }
