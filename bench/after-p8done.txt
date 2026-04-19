@@ -1,0 +1,37 @@
+--- P8 complete: analysisDaemon Rust fast-path wired in ---
+
+Fast-path napi measured cost (darwin-arm64, release):
+  native_init (2 synthetic models):          1-3ms  (scales linearly — 1500 ~20-30ms)
+  native_resolve_relation_target:            0.017-0.028ms
+  native_resolve_lookup_path:                0.010-0.012ms
+  native_resolve_orm_member:                 ~0.01ms (O(field_count) linear scan)
+
+Paths replaced in analysisDaemon.ts:
+  listRelationTargets            -> nativeListRelationTargets  fallback: Python
+  resolveRelationTarget          -> nativeResolveRelationTarget fallback: Python
+  resolveLookupPath              -> nativeResolveLookupPath     fallback: Python when reason=unknown_lookup (custom runtime lookups)
+  resolveOrmMember               -> nativeResolveOrmMember      fallback: Python for non-static members
+
+Observed Python baseline vs this phase (from real-project session log):
+  resolveRelationTarget value='int':       3084ms  ->  0.02ms        ~150,000x
+  resolveRelationTarget value='Starting':   953ms  ->  0.02ms         ~48,000x
+  resolveLookupPath 'title__startswith':   2623ms  ->  0.01ms        ~260,000x
+  resolveOrmMember db.Company instance:     288ms  ->  0.01ms         ~29,000x
+  [hover:slow] ormMemberCtx TIMEOUT@3s  ->  non-TIMEOUT (<1ms hover)  qualitative fix
+  [diagnostics] 10s budget exhaust @ 90 requests  ->  microsecond-per-request
+
+Initialization overhead (added cost):
+  nativeInit kicked off after the first Python daemon handshake.
+  Rebuilds once per workspace open or file-tree change.
+  Runs in parallel with Python daemon; does not block anything.
+
+Still routed through Python (intentional):
+  - lookupPathCompletions, ormMemberCompletions
+    (bulk completion lists — large payloads, per-model caching in Python is already fast enough)
+  - resolveExportOrigin, resolveModule
+    (module-resolution logic depends on import alias tables we haven't fully ported)
+  - reindexFile, resolveOrmMemberBatch, resolveLookupPathBatch
+  - Any runtime-dependent query (custom lookups via register_lookup, dynamic managers)
+
+Regression check (TS bench, median-of-5):
+  all three scales (3k / 15k / 30k) PASSED vs baseline-ts.json. compare.js exit=0.

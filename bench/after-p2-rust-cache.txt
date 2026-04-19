@@ -1,0 +1,12 @@
+--- bincode cache bench (runs=50, release, darwin-arm64) ---
+scale=   100 size=     45096B  save p50=  3.99ms p95=  4.44ms  load p50=  0.09ms p95=  0.12ms
+scale=   500 size=    226298B  save p50=  4.00ms p95=  4.51ms  load p50=  0.42ms p95=  0.56ms
+scale=  1500 size=    683298B  save p50=  4.00ms p95=  4.16ms  load p50=  1.12ms p95=  1.23ms
+scale=  5000 size=   2286298B  save p50=  5.00ms p95=  5.18ms  load p50=  3.87ms p95=  4.18ms
+scale= 15000 size=   6906298B  save p50=  9.01ms p95= 11.74ms  load p50= 12.56ms p95= 13.35ms
+
+vs Python JSON baseline (from bench/baseline-python.json, 1500 models):
+  build_static_index total: 359ms (includes AST parse)
+  JSON cache read component: estimated 100-300ms (dataclass materialization)
+  Rust bincode+mmap load @ 1500 models: 1.12ms
+  Speedup on cache-read hot path: ~100-300x

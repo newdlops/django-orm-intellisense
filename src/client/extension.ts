@@ -8,6 +8,7 @@ import { registerSelectPythonInterpreterCommand } from './commands/selectPythonI
 import { registerShowStatusCommand } from './commands/showStatus';
 import { isRelevantConfigurationChange, getExtensionSettings } from './config/settings';
 import { AnalysisDaemon } from './daemon/analysisDaemon';
+import type { ReindexFileResult } from './protocol';
 import { HealthDiagnostics } from './diagnostics/healthDiagnostics';
 import { registerPythonProviders } from './providers/pythonProviders';
 import { excludeDjangoStubsFromPylance } from './pylance/excludeDjangoStubs';
@@ -89,12 +90,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     pendingReindexFiles.clear();
 
     let anyChanged = false;
+    const surfaceIndexDelta: Record<string, unknown> = {};
+    const surfaceFingerprints: Record<string, string> = {};
+    const addedLabels = new Set<string>();
+    const changedLabels = new Set<string>();
+    const removedLabels = new Set<string>();
+    let latestStaticFallback: ReindexFileResult['staticFallback'];
+    let latestStaticFallbackFingerprint: ReindexFileResult['staticFallbackFingerprint'];
     for (const filePath of files) {
       try {
         output.appendLine(`[ls] reindexing file: ${filePath}`);
         const result = await daemon.reindexFile(filePath);
         if (!result.unchanged) {
           anyChanged = true;
+          mergeReindexDelta(
+            result,
+            surfaceIndexDelta,
+            surfaceFingerprints,
+            addedLabels,
+            changedLabels,
+            removedLabels,
+          );
+          if (result.staticFallback !== undefined) {
+            latestStaticFallback = result.staticFallback;
+            latestStaticFallbackFingerprint = result.staticFallbackFingerprint;
+          }
         }
       } catch (error) {
         output.appendLine(`[ls] reindex failed: ${String(error)}`);
@@ -106,13 +126,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
 
     output.appendLine(
-      `[ls] re-sending surfaceIndex after reindex: ${Object.keys(daemon.surfaceIndex).length} models`
+      `[ls] sending surfaceIndex delta after reindex: +${addedLabels.size} ~${changedLabels.size} -${removedLabels.size}`
     );
-    void languageClient.sendNotification('django/updateSurfaceIndex', {
-      surfaceIndex: daemon.surfaceIndex,
-      modelNames: Array.from(daemon.modelNames),
-      customLookups: daemon.customLookups,
-      staticFallback: daemon.staticFallback,
+    void languageClient.sendNotification('django/updateSurfaceIndexDelta', {
+      surfaceIndexDelta,
+      surfaceFingerprints,
+      addedLabels: [...addedLabels],
+      changedLabels: [...changedLabels],
+      removedLabels: [...removedLabels],
+      staticFallback: latestStaticFallback,
+      staticFallbackFingerprint: latestStaticFallbackFingerprint,
     });
   };
 
@@ -478,8 +501,11 @@ function feedSurfaceIndexToServer(
     void languageClient.sendNotification('django/updateSurfaceIndex', {
       surfaceIndex: daemon.surfaceIndex,
       modelNames,
+      surfaceFingerprints: daemon.surfaceFingerprints,
       customLookups: daemon.customLookups,
+      customLookupsFingerprint: daemon.customLookupsFingerprint,
       staticFallback: daemon.staticFallback,
+      staticFallbackFingerprint: daemon.staticFallbackFingerprint,
     });
   };
 
@@ -490,6 +516,42 @@ function feedSurfaceIndexToServer(
   daemon.onDidChangeState(() => {
     trySend();
   });
+}
+
+function mergeReindexDelta(
+  result: ReindexFileResult,
+  surfaceIndexDelta: Record<string, unknown>,
+  surfaceFingerprints: Record<string, string>,
+  addedLabels: Set<string>,
+  changedLabels: Set<string>,
+  removedLabels: Set<string>,
+): void {
+  const delta = result.surfaceIndexDelta ?? {};
+  for (const [label, value] of Object.entries(delta)) {
+    surfaceIndexDelta[label] = value;
+  }
+  for (const [label, fingerprint] of Object.entries(result.surfaceFingerprints ?? {})) {
+    surfaceFingerprints[label] = fingerprint;
+  }
+  for (const label of result.removedLabels ?? []) {
+    removedLabels.add(label);
+    addedLabels.delete(label);
+    changedLabels.delete(label);
+    delete surfaceIndexDelta[label];
+    delete surfaceFingerprints[label];
+  }
+  for (const label of result.addedLabels ?? []) {
+    removedLabels.delete(label);
+    changedLabels.delete(label);
+    addedLabels.add(label);
+  }
+  for (const label of result.changedLabels ?? []) {
+    if (addedLabels.has(label)) {
+      continue;
+    }
+    removedLabels.delete(label);
+    changedLabels.add(label);
+  }
 }
 
 export async function deactivate(): Promise<void> {

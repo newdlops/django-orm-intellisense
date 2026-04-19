@@ -16,10 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from ..cache import (
+    load_cached_model_graph,
     load_cached_source_snapshot,
     load_cached_runtime_inspection,
     load_cached_static_index,
     load_cached_surface_index,
+    save_model_graph,
     save_source_snapshot,
     save_runtime_inspection,
     save_static_index,
@@ -39,6 +41,8 @@ from ..features.lookup_paths import (
     resolve_lookup_path,
 )
 from ..features.orm_members import (
+    fingerprint_json_payload,
+    fingerprint_surface_index,
     list_orm_member_completions,
     prebuild_member_surface_cache,
     rebuild_surface_for_models,
@@ -61,6 +65,7 @@ from ..semantic.graph import (
     SemanticGraphSummary,
     build_model_graph,
     build_semantic_graph,
+    rebuild_model_graph_for_labels,
 )
 from ..static_index.indexer import StaticIndex, build_static_index, reindex_single_file
 
@@ -90,8 +95,11 @@ class _InitializedState:
     health_snapshot: dict[str, Any]
     model_names: list[str]
     surface_index: dict[str, object]
+    surface_fingerprints: dict[str, str]
     custom_lookups: dict[str, list[str]]
+    custom_lookups_fingerprint: str
     static_fallback: dict[str, dict[str, list[str]]] | None
+    static_fallback_fingerprint: str | None
 
 
 def _init_bg_worker(
@@ -220,6 +228,20 @@ def _bg_dispatch(method: str, params: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f'Unsupported background method: {method}')
 
 
+def _bg_prebuild_surface_index() -> dict[str, object]:
+    """Build the full surface index inside a background worker process."""
+    si = _worker_static_index
+    rt = _worker_runtime
+    if si is None or rt is None:
+        raise RuntimeError('Background worker not initialized')
+    return prebuild_member_surface_cache(si, rt)
+
+
+def _bg_noop() -> None:
+    """Warm a worker process so the first real BG request avoids spawn cost."""
+    return None
+
+
 class DaemonServer:
     def __init__(self, workspace_root: Path):
         self.workspace_root = workspace_root
@@ -240,6 +262,8 @@ class DaemonServer:
         self._real_stdout = sys.stdout
         sys.stdout = sys.stderr
         self._bg_pool: ProcessPoolExecutor | None = None
+        self._bg_pool_state_key: tuple[int, int, int] | None = None
+        self._bg_pool_prewarm_token = 0
         self._bg_pool_capacity = 0
         self._fallback_bg_pool = ThreadPoolExecutor(
             max_workers=min(os.cpu_count() or 2, 3),
@@ -263,8 +287,12 @@ class DaemonServer:
             },
         }
         self._last_surface_index: dict[str, object] | None = None
+        self._last_surface_fingerprints: dict[str, str] | None = None
         self._last_model_names: list[str] | None = None
         self._last_static_fallback: dict[str, dict[str, list[str]]] | None = None
+        self._last_static_fallback_fingerprint: str | None = None
+        self._last_custom_lookups_fingerprint: str | None = None
+        self._surface_prebuild_future: Any | None = None
 
     def run_stdio(self) -> None:
         threading.current_thread().name = 'main'
@@ -311,19 +339,35 @@ class DaemonServer:
 
         Called after initialize and reindexFile so workers get fresh data.
         """
-        old = self._bg_pool
-        self._bg_pool = None
-        if old is not None:
-            old.shutdown(wait=False)
-
         with self._state_lock:
             si = self.static_index
             rt = self.runtime_inspection
             mg = self.model_graph
 
         if si is None or rt is None or mg is None:
+            old = self._bg_pool
+            self._bg_pool = None
+            self._bg_pool_state_key = None
+            self._bg_pool_prewarm_token += 1
+            if old is not None:
+                old.shutdown(wait=False)
             self._bg_pool_capacity = 0
             return
+
+        state_key = (id(si), id(rt), id(mg))
+        if self._bg_pool is not None and self._bg_pool_state_key == state_key:
+            print(
+                '[pool] ProcessPoolExecutor reused existing state',
+                file=sys.stderr, flush=True,
+            )
+            return
+
+        old = self._bg_pool
+        self._bg_pool = None
+        self._bg_pool_state_key = None
+        self._bg_pool_prewarm_token += 1
+        if old is not None:
+            old.shutdown(wait=False)
 
         worker_count = min(os.cpu_count() or 4, 8)
         try:
@@ -332,11 +376,20 @@ class DaemonServer:
                 initializer=_init_bg_worker,
                 initargs=(si, rt, mg),
             )
+            self._bg_pool_state_key = state_key
             self._bg_pool_capacity = worker_count
             print(
                 f'[pool] ProcessPoolExecutor created workers={worker_count}',
                 file=sys.stderr, flush=True,
             )
+            warm_count = min(worker_count, 2)
+            if warm_count > 0:
+                self._bg_pool_prewarm_token += 1
+                self._start_bg_pool_prewarm(
+                    pool=self._bg_pool,
+                    token=self._bg_pool_prewarm_token,
+                    worker_count=warm_count,
+                )
         except Exception as exc:  # pragma: no cover — pickle/fork failure
             print(
                 f'[pool] ProcessPoolExecutor failed ({exc}), '
@@ -344,7 +397,44 @@ class DaemonServer:
                 file=sys.stderr, flush=True,
             )
             self._bg_pool = None
+            self._bg_pool_state_key = None
+            self._bg_pool_prewarm_token += 1
             self._bg_pool_capacity = 0
+
+    def _start_bg_pool_prewarm(
+        self,
+        *,
+        pool: ProcessPoolExecutor,
+        token: int,
+        worker_count: int,
+    ) -> None:
+        def worker() -> None:
+            started_at = time.perf_counter()
+            try:
+                for _ in range(worker_count):
+                    with self._state_lock:
+                        if self._bg_pool is not pool or self._bg_pool_prewarm_token != token:
+                            return
+                    future = pool.submit(_bg_noop)
+                    future.result()
+                print(
+                    f'[pool] ProcessPoolExecutor prewarmed workers={worker_count} '
+                    f'elapsed={time.perf_counter() - started_at:.2f}s',
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f'[pool] ProcessPoolExecutor prewarm skipped ({exc})',
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        threading.Thread(
+            target=worker,
+            name='bg-pool-prewarm',
+            daemon=True,
+        ).start()
 
     def _bg_capacity(self, worker_kind: str) -> int:
         if worker_kind == 'pool':
@@ -774,19 +864,34 @@ class DaemonServer:
             semantic_graph=semantic_graph,
             initialized_at=initialized_at,
         )
-        model_graph = build_model_graph(static_index, runtime)
+        runtime_cache_fingerprint = _runtime_cache_fingerprint(runtime)
+        model_graph = load_cached_model_graph(
+            workspace_root,
+            source_fingerprint=source_snapshot.fingerprint,
+            runtime_fingerprint=runtime_cache_fingerprint,
+        )
+        if model_graph is None:
+            model_graph = build_model_graph(static_index, runtime)
+            save_model_graph(
+                workspace_root,
+                source_fingerprint=source_snapshot.fingerprint,
+                runtime_fingerprint=runtime_cache_fingerprint,
+                model_graph=model_graph,
+            )
+            model_graph_status = 'build_model_graph'
+        else:
+            model_graph_status = 'load_cached_model_graph'
         edge_count = sum(
             len(edges)
             for edges in model_graph.edges_by_source_label.values()
         )
         _log_initialize_step(
-            'build_model_graph '
+            f'{model_graph_status} '
             f'models={len(model_graph.nodes_by_label)} '
             f'edges={edge_count} '
             f'elapsed={time.perf_counter() - started_at:.2f}s'
         )
 
-        runtime_cache_fingerprint = _runtime_cache_fingerprint(runtime)
         surface_index = load_cached_surface_index(
             workspace_root,
             source_fingerprint=source_snapshot.fingerprint,
@@ -828,14 +933,25 @@ class DaemonServer:
         )
 
         model_names = self._build_model_names(model_graph)
+        surface_fingerprints = fingerprint_surface_index(surface_index)
         static_fallback = self._build_static_fallback(
             model_graph=model_graph,
             surface_index=surface_index,
         )
+        static_fallback_fingerprint = (
+            fingerprint_json_payload(static_fallback)
+            if static_fallback
+            else None
+        )
+        custom_lookups = runtime.custom_lookups if runtime else {}
+        custom_lookups_fingerprint = fingerprint_json_payload(custom_lookups)
 
         self._last_surface_index = surface_index
+        self._last_surface_fingerprints = surface_fingerprints
         self._last_model_names = model_names
         self._last_static_fallback = static_fallback
+        self._last_static_fallback_fingerprint = static_fallback_fingerprint
+        self._last_custom_lookups_fingerprint = custom_lookups_fingerprint
         self._rebuild_bg_pool()
         if should_prebuild_surface_index:
             self._start_surface_index_prebuild(
@@ -864,8 +980,11 @@ class DaemonServer:
             health_snapshot=health_snapshot,
             model_names=model_names,
             surface_index=surface_index,
-            custom_lookups=runtime.custom_lookups if runtime else {},
+            surface_fingerprints=surface_fingerprints,
+            custom_lookups=custom_lookups,
+            custom_lookups_fingerprint=custom_lookups_fingerprint,
             static_fallback=static_fallback,
+            static_fallback_fingerprint=static_fallback_fingerprint,
         )
 
     def _initialize_response(
@@ -880,9 +999,12 @@ class DaemonServer:
             'health': initialized_state.health_snapshot,
             'modelNames': initialized_state.model_names,
             'surfaceIndex': initialized_state.surface_index,
+            'surfaceFingerprints': initialized_state.surface_fingerprints,
             'customLookups': initialized_state.custom_lookups,
+            'customLookupsFingerprint': initialized_state.custom_lookups_fingerprint,
             'venvInfo': venv_info.to_dict() if venv_info else None,
             'staticFallback': initialized_state.static_fallback,
+            'staticFallbackFingerprint': initialized_state.static_fallback_fingerprint,
         }
 
     def _surface_index_notification(
@@ -893,8 +1015,11 @@ class DaemonServer:
             'health': initialized_state.health_snapshot,
             'modelNames': initialized_state.model_names,
             'surfaceIndex': initialized_state.surface_index,
+            'surfaceFingerprints': initialized_state.surface_fingerprints,
             'customLookups': initialized_state.custom_lookups,
+            'customLookupsFingerprint': initialized_state.custom_lookups_fingerprint,
             'staticFallback': initialized_state.static_fallback,
+            'staticFallbackFingerprint': initialized_state.static_fallback_fingerprint,
         }
 
     def _build_static_fallback(
@@ -941,55 +1066,98 @@ class DaemonServer:
         model_graph: ModelGraph,
         model_names: list[str],
     ) -> None:
-        def worker() -> None:
-            started_at = time.perf_counter()
+        started_at = time.perf_counter()
+
+        def _apply_surface_index(surface_index: dict[str, object]) -> None:
+            surface_fingerprints = fingerprint_surface_index(surface_index)
+            save_surface_index(
+                workspace_root,
+                source_fingerprint=source_snapshot.fingerprint,
+                runtime_fingerprint=_runtime_cache_fingerprint(runtime),
+                surface_index=surface_index,
+            )
+            static_fallback = self._build_static_fallback(
+                model_graph=model_graph,
+                surface_index=surface_index,
+            )
+            static_fallback_fingerprint = (
+                fingerprint_json_payload(static_fallback)
+                if static_fallback
+                else None
+            )
+            custom_lookups_fingerprint = fingerprint_json_payload(
+                runtime.custom_lookups
+            )
+            with self._state_lock:
+                if generation != self._state_generation:
+                    return
+                self._last_surface_index = surface_index
+                self._last_surface_fingerprints = surface_fingerprints
+                self._last_model_names = model_names
+                self._last_static_fallback = static_fallback
+                self._last_static_fallback_fingerprint = static_fallback_fingerprint
+                self._last_custom_lookups_fingerprint = custom_lookups_fingerprint
+
+            _log_initialize_step(
+                'prebuild_surface_index(background) '
+                f'models={len(surface_index)} '
+                f'elapsed={time.perf_counter() - started_at:.2f}s'
+            )
+            self._write_notification(
+                'surfaceIndexChanged',
+                {
+                    'health': health_snapshot,
+                    'modelNames': model_names,
+                    'surfaceIndex': surface_index,
+                    'surfaceFingerprints': surface_fingerprints,
+                    'customLookups': runtime.custom_lookups,
+                    'customLookupsFingerprint': custom_lookups_fingerprint,
+                    'staticFallback': static_fallback,
+                    'staticFallbackFingerprint': static_fallback_fingerprint,
+                },
+            )
+
+        def _log_failure() -> None:
+            print(
+                '[initialize] prebuild_surface_index(background) failed '
+                f'{traceback.format_exc(limit=6)}',
+                file=sys.stderr,
+                flush=True,
+            )
+
+        if self._bg_pool is not None:
+            future = self._bg_pool.submit(_bg_prebuild_surface_index)
+            self._surface_prebuild_future = future
+
+            def _on_done(f: Any) -> None:
+                try:
+                    surface_index = f.result()
+                    _apply_surface_index(surface_index)
+                except Exception:
+                    _log_failure()
+                finally:
+                    if self._surface_prebuild_future is f:
+                        self._surface_prebuild_future = None
+
+            future.add_done_callback(_on_done)
+            return
+
+        def _fallback_worker() -> None:
             try:
                 surface_index = prebuild_member_surface_cache(static_index, runtime)
-                save_surface_index(
-                    workspace_root,
-                    source_fingerprint=source_snapshot.fingerprint,
-                    runtime_fingerprint=_runtime_cache_fingerprint(runtime),
-                    surface_index=surface_index,
-                )
-                static_fallback = self._build_static_fallback(
-                    model_graph=model_graph,
-                    surface_index=surface_index,
-                )
-                with self._state_lock:
-                    if generation != self._state_generation:
-                        return
-                    self._last_surface_index = surface_index
-                    self._last_model_names = model_names
-                    self._last_static_fallback = static_fallback
-
-                _log_initialize_step(
-                    'prebuild_surface_index(background) '
-                    f'models={len(surface_index)} '
-                    f'elapsed={time.perf_counter() - started_at:.2f}s'
-                )
-                self._write_notification(
-                    'surfaceIndexChanged',
-                    {
-                        'health': health_snapshot,
-                        'modelNames': model_names,
-                        'surfaceIndex': surface_index,
-                        'customLookups': runtime.custom_lookups,
-                        'staticFallback': static_fallback,
-                    },
-                )
+                _apply_surface_index(surface_index)
             except Exception:
-                print(
-                    '[initialize] prebuild_surface_index(background) failed '
-                    f'{traceback.format_exc(limit=6)}',
-                    file=sys.stderr,
-                    flush=True,
-                )
+                _log_failure()
+            finally:
+                self._surface_prebuild_future = None
 
-        threading.Thread(
-            target=worker,
+        thread = threading.Thread(
+            target=_fallback_worker,
             name='surface-index-prebuild',
             daemon=True,
-        ).start()
+        )
+        self._surface_prebuild_future = thread
+        thread.start()
 
     def _start_source_snapshot_verification(
         self,
@@ -1136,8 +1304,20 @@ class DaemonServer:
                     reverse_affected.add(candidate.label)
         affected_labels = affected_labels | reverse_affected
 
-        # Update static index
-        model_graph = build_model_graph(new_static_index, runtime)
+        # Update static index and refresh only the graph slices touched by this
+        # file and by reverse-relation invalidation.
+        previous_model_graph = self.model_graph
+        model_graph = (
+            rebuild_model_graph_for_labels(
+                previous_model_graph,
+                old_static_index=static_index,
+                static_index=new_static_index,
+                runtime=runtime,
+                affected_labels=affected_labels,
+            )
+            if previous_model_graph is not None
+            else build_model_graph(new_static_index, runtime)
+        )
         with self._state_lock:
             self.static_index = new_static_index
             self.model_graph = model_graph
@@ -1149,6 +1329,23 @@ class DaemonServer:
 
         surface_index = rebuild_surface_for_models(
             new_static_index, runtime, affected_labels, existing_surface,
+        )
+        removed_labels = sorted(
+            label for label in affected_labels if label not in surface_index
+        )
+        added_labels = sorted(new_labels - old_labels)
+        changed_labels = sorted(
+            label for label in affected_labels
+            if label in surface_index and label not in new_labels - old_labels
+        )
+        surface_index_delta = {
+            label: surface_index[label]
+            for label in sorted(affected_labels)
+            if label in surface_index
+        }
+        surface_fingerprints = fingerprint_surface_index(
+            surface_index,
+            labels=set(surface_index_delta),
         )
 
         # Build model names
@@ -1185,8 +1382,19 @@ class DaemonServer:
 
         # Cache for next request
         self._last_surface_index = surface_index
+        self._last_surface_fingerprints = {
+            **(self._last_surface_fingerprints or {}),
+            **surface_fingerprints,
+        }
+        for label in removed_labels:
+            self._last_surface_fingerprints.pop(label, None)
         self._last_model_names = model_names
         self._last_static_fallback = static_fallback if static_fallback else None
+        self._last_static_fallback_fingerprint = (
+            fingerprint_json_payload(self._last_static_fallback)
+            if self._last_static_fallback
+            else None
+        )
 
         # Refresh background workers with updated state.
         self._rebuild_bg_pool()
@@ -1199,10 +1407,13 @@ class DaemonServer:
         )
 
         return {
-            'surfaceIndex': surface_index,
-            'modelNames': model_names,
+            'surfaceIndexDelta': surface_index_delta,
+            'surfaceFingerprints': surface_fingerprints,
             'staticFallback': static_fallback if static_fallback else None,
-            'changedLabels': sorted(affected_labels),
+            'staticFallbackFingerprint': self._last_static_fallback_fingerprint,
+            'addedLabels': added_labels,
+            'changedLabels': changed_labels,
+            'removedLabels': removed_labels,
         }
 
     def _health(self) -> dict[str, Any]:
@@ -1544,7 +1755,14 @@ class DaemonServer:
             settings_module,
             runtime,
         )
+        runtime_cache_fingerprint = _runtime_cache_fingerprint(runtime)
         model_graph = build_model_graph(static_index, runtime)
+        save_model_graph(
+            workspace_root,
+            source_fingerprint=source_snapshot.fingerprint,
+            runtime_fingerprint=runtime_cache_fingerprint,
+            model_graph=model_graph,
+        )
         semantic_graph = build_semantic_graph(workspace_profile, static_index, runtime)
         health_snapshot = build_health_snapshot(
             workspace=workspace_profile,
@@ -1579,6 +1797,14 @@ class DaemonServer:
                 model_graph=model_graph,
                 surface_index=self._last_surface_index,
             )
+            self._last_static_fallback_fingerprint = (
+                fingerprint_json_payload(self._last_static_fallback)
+                if self._last_static_fallback
+                else None
+            )
+        self._last_custom_lookups_fingerprint = fingerprint_json_payload(
+            runtime.custom_lookups
+        )
 
         # Runtime warmup produced better state; refresh worker pool.
         self._rebuild_bg_pool()

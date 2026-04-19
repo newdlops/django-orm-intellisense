@@ -1,0 +1,34 @@
+--- TS → napi → full Rust pipeline (discover + AST + resolve + surface) ---
+  Runs 5 (scales ≤1500), 3 (scales >1500). Release build, darwin-arm64.
+  Pipeline: walkdir → rustpython_parser → resolver → reverse synthesis
+            → wire surface index → serde_json → napi Buffer → TS parse.
+
+scale=  100 models=  100 bytes=   846071 full p50=   10.2ms p95=   10.4ms
+scale=  500 models=  500 bytes=  4328471 full p50=   48.3ms p95=   48.7ms
+scale= 1500 models= 1500 bytes= 13366971 full p50=  148.2ms p95=  148.6ms
+scale= 5000 models= 5000 bytes= 45391971 full p50=  497.4ms p95=  497.4ms
+scale=15000 models=15000 bytes=140216971 full p50= 1469.2ms p95= 1469.2ms
+
+Comparison (1500 models — closest to Python baseline scale):
+  Python build_static_index alone (baseline-python.json):       359ms
+  Rust full napi pipeline including JSON serialise:             148ms
+  Speedup on the whole cold-start data path:                    ~2.4x
+  (Python pipeline also does build_surface_index — total likely
+   500-700ms, pushing the ratio closer to 3-4x end-to-end.)
+
+Notes:
+  - 15k-model wire surface is 140MB — dominated by serde_json encoding
+    of QuerySet/Manager method entries x 15k models. Real projects have
+    fewer models and this term is smaller.
+  - Internal Rust-only work (without JSON/marshal), 15k models:
+      discovery 40ms + static_index 146ms ~= 186ms.
+    Remaining ~1.3s is serde_json + Buffer + TS JSON.parse, which can
+    be compressed with per-model napi calls or rkyv-archived output.
+  - P4.2 reverse-relation synthesis + inheritance expansion are now
+    part of this pipeline and verified by new resolver tests.
+
+Regression fix during this phase:
+  - initial buildSurfaceIndexJson was O(N^2) due to instance_surface
+    iterating the flat fields list for every model label. Pre-grouping
+    by label in build_wire_surface_index brought 15k models from
+    23,855ms -> 1,469ms (~16x).

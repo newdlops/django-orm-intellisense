@@ -1,0 +1,213 @@
+{
+  "timestamp": "2026-04-19T04:56:39.275Z",
+  "nodeVersion": "v22.22.2",
+  "platform": "darwin",
+  "arch": "arm64",
+  "results": [
+    {
+      "modelCount": 3000,
+      "buildWorkspaceIndexMs": 67.615334,
+      "diffNoOpMs": 6.574916999999999,
+      "diffOneChangedMs": 6.899500000000003,
+      "incrementalUpdateMs": 0.12008300000000816,
+      "trieBuildP50Ms": 0.007958999999999605,
+      "trieBuildP95Ms": 0.010499999999993292,
+      "trieBuildTotalMs": 0.9437549999999959,
+      "completionP50Ms": 0.007417000000003782,
+      "completionP95Ms": 0.012583999999975504,
+      "completionTotalMs": 5.898957000000038,
+      "heapDeltaMB": 45.94041442871094,
+      "rssDeltaMB": 78.296875,
+      "totalHeapMB": 49.54737091064453,
+      "checks": [
+        {
+          "metric": "buildWorkspaceIndex",
+          "actual": 67.615334,
+          "budget": 150,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "diffSurfaceIndex (no-op)",
+          "actual": 6.574916999999999,
+          "budget": 10,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "incrementalUpdate (1 model)",
+          "actual": 0.12008300000000816,
+          "budget": 20,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "completion p50",
+          "actual": 0.007417000000003782,
+          "budget": 5,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "completion p95",
+          "actual": 0.012583999999975504,
+          "budget": 15,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "trie build p95",
+          "actual": 0.010499999999993292,
+          "budget": 1,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "heap delta",
+          "actual": 45.94041442871094,
+          "budget": 60,
+          "unit": "MB",
+          "pass": true
+        }
+      ],
+      "allPassed": true
+    },
+    {
+      "modelCount": 15000,
+      "buildWorkspaceIndexMs": 290.378,
+      "diffNoOpMs": 26.00400000000002,
+      "diffOneChangedMs": 29.832041000000004,
+      "incrementalUpdateMs": 0.08904199999994944,
+      "trieBuildP50Ms": 0.003708999999957996,
+      "trieBuildP95Ms": 0.005832999999938693,
+      "trieBuildTotalMs": 0.4279169999997521,
+      "completionP50Ms": 0.0072499999999990905,
+      "completionP95Ms": 0.008833000000095126,
+      "completionTotalMs": 0.7811270000009927,
+      "heapDeltaMB": 163.3236541748047,
+      "rssDeltaMB": 166.71875,
+      "totalHeapMB": 212.90119171142578,
+      "checks": [
+        {
+          "metric": "buildWorkspaceIndex",
+          "actual": 290.378,
+          "budget": 600,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "diffSurfaceIndex (no-op)",
+          "actual": 26.00400000000002,
+          "budget": 45,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "incrementalUpdate (1 model)",
+          "actual": 0.08904199999994944,
+          "budget": 20,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "completion p50",
+          "actual": 0.0072499999999990905,
+          "budget": 5,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "completion p95",
+          "actual": 0.008833000000095126,
+          "budget": 25,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "trie build p95",
+          "actual": 0.005832999999938693,
+          "budget": 1,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "heap delta",
+          "actual": 163.3236541748047,
+          "budget": 250,
+          "unit": "MB",
+          "pass": true
+        }
+      ],
+      "allPassed": true
+    },
+    {
+      "modelCount": 30000,
+      "buildWorkspaceIndexMs": 601.2254580000001,
+      "diffNoOpMs": 57.857957999999826,
+      "diffOneChangedMs": 68.57150000000001,
+      "incrementalUpdateMs": 0.06445800000005875,
+      "trieBuildP50Ms": 0.002459000000044398,
+      "trieBuildP95Ms": 0.0037919999999758147,
+      "trieBuildTotalMs": 0.27104099999883147,
+      "completionP50Ms": 0.006750000000010914,
+      "completionP95Ms": 0.0072909999998955755,
+      "completionTotalMs": 0.710289999999759,
+      "heapDeltaMB": 203.0097427368164,
+      "rssDeltaMB": 214.84375,
+      "totalHeapMB": 415.9228744506836,
+      "checks": [
+        {
+          "metric": "buildWorkspaceIndex",
+          "actual": 601.2254580000001,
+          "budget": 1500,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "diffSurfaceIndex (no-op)",
+          "actual": 57.857957999999826,
+          "budget": 90,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "incrementalUpdate (1 model)",
+          "actual": 0.06445800000005875,
+          "budget": 20,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "completion p50",
+          "actual": 0.006750000000010914,
+          "budget": 5,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "completion p95",
+          "actual": 0.0072909999998955755,
+          "budget": 30,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "trie build p95",
+          "actual": 0.0037919999999758147,
+          "budget": 1,
+          "unit": "ms",
+          "pass": true
+        },
+        {
+          "metric": "heap delta",
+          "actual": 203.0097427368164,
+          "budget": 500,
+          "unit": "MB",
+          "pass": true
+        }
+      ],
+      "allPassed": true
+    }
+  ],
+  "allPassed": true
+}

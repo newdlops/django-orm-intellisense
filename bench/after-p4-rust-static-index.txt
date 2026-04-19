@@ -1,0 +1,34 @@
+--- rust build_static_index bench (runs=10/5, release, darwin-arm64) ---
+scale=   100 files=  100 models=  100 fields=  1700  build p50=   1.44ms p95=   1.58ms
+scale=   500 files=  500 models=  500 fields=  8500  build p50=   5.13ms p95=   5.25ms
+scale=  1500 files= 1500 models= 1500 fields= 25500  build p50=  14.78ms p95=  15.07ms
+scale=  5000 files= 5000 models= 5000 fields= 85000  build p50=  46.60ms p95=  47.82ms
+scale= 15000 files=15000 models=15000 fields=255000  build p50= 145.83ms p95= 147.92ms
+
+vs Python baseline (bench/baseline-python.json, 1500 models):
+  Python build_static_index: 359.47ms
+  Rust build_static_index:    14.78ms
+  Speedup: ~24x
+
+Projections:
+  @  5000 models → Python ~1198ms (linear), Rust 46.60ms → ~26x
+  @ 15000 models → Python ~3594ms (linear), Rust 146ms → ~25x
+  500ms budget holds through 15000+ models on Rust path
+
+E2E napi verified via:
+  src/client/native/indexer.test.ts → buildStaticIndexJson / parseModuleJson
+
+P4.1 scope (this phase):
+  - Parse .py file, extract class X(...) model candidates
+  - Extract field declarations: name = XxField(...)
+  - Relation detection: ForeignKey/OneToOneField/ManyToManyField/ParentalKey*
+  - related_name / related_query_name from kwargs
+  - class Meta: abstract / app_label
+  - Import bindings: import, from-import, aliased
+  - Module-scope field_aliases: Foo = models.CharField
+
+Deferred to P4.2 (task #11):
+  - Cross-module base class resolution (abstract model chains)
+  - Reverse relation generation with default_reverse_name()
+  - Editable install source dir walk
+  - Import alias resolution across files

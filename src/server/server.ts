@@ -35,6 +35,7 @@ import {
   type SurfaceIndex,
   type SurfaceIndexDiff,
 } from './workspaceIndexer.js';
+import { loadSurfaceCache, saveSurfaceCache } from './nativeCache.js';
 import { parseLookupChain, getCompletionCandidates } from './lookupResolver.js';
 import { recordTiming, incrementCounter, setGauge, getAllStats, getAllCounters, getAllGauges } from './perfTracker.js';
 import { CompletionItemKind } from 'vscode-languageserver/node';
@@ -88,6 +89,9 @@ const COMPLETION_CACHE_MAX = 256;
 
 let previousSurfaceIndex: SurfaceIndex | null = null;
 let previousCustomLookups: Record<string, string[]> | undefined;
+let previousCustomLookupsFingerprint: string | undefined;
+let previousStaticFallback: Record<string, { fields: string[]; relations: string[] }> | undefined;
+let previousStaticFallbackFingerprint: string | null | undefined;
 const modelVersions = new Map<string, number>();
 const modelFingerprints = new Map<string, string>();
 
@@ -215,9 +219,59 @@ connection.onInitialized(() => {
   void connection.client.register(DidChangeConfigurationNotification.type, undefined);
 
   loadUsageFrequency();
+
+  // Pre-warm from the Rust bincode cache so completions are available
+  // before the Python daemon finishes its own startup. The authoritative
+  // surfaceIndex arrives via django/updateSurfaceIndex and overwrites
+  // this; a stale cache only affects the first ~1 second.
+  tryPrewarmFromNativeCache();
+
   connection.console.log('[ls] initialized — starting workspace indexing');
   void startWorkspaceIndexing();
 });
+
+function tryPrewarmFromNativeCache(): void {
+  if (!workspaceRoot) return;
+  if (previousSurfaceIndex !== null) return;
+  const _t0 = performance.now();
+  const cached = loadSurfaceCache(workspaceRoot);
+  if (!cached) {
+    connection.console.log(
+      `[ls] native cache pre-warm: miss (${(performance.now() - _t0).toFixed(1)}ms)`,
+    );
+    return;
+  }
+  const built = buildWorkspaceIndex(
+    cached.surfaceIndex,
+    cached.modelNames,
+    cached.customLookups,
+    cached.staticFallback,
+  );
+  workspaceIndex.models = built.models;
+  workspaceIndex.perFile = built.perFile;
+  workspaceIndex.modelLabelByName = built.modelLabelByName;
+  workspaceIndex.fieldTrieByModel = built.fieldTrieByModel;
+  workspaceIndex.lookupTrie = built.lookupTrie;
+  workspaceIndex.transformTrie = built.transformTrie;
+  previousSurfaceIndex = cached.surfaceIndex;
+  previousCustomLookups = cached.customLookups;
+  previousCustomLookupsFingerprint = cached.customLookupsFingerprint;
+  previousStaticFallback = cached.staticFallback;
+  previousStaticFallbackFingerprint = cached.staticFallbackFingerprint;
+  modelFingerprints.clear();
+  for (const label of Object.keys(cached.surfaceIndex)) {
+    modelFingerprints.set(
+      label,
+      cached.surfaceFingerprints?.[label] ?? JSON.stringify(cached.surfaceIndex[label]),
+    );
+  }
+  setGauge('models.total', workspaceIndex.models.size);
+  const _elapsed = performance.now() - _t0;
+  recordTiming('index.prewarm', _elapsed);
+  connection.console.log(
+    `[ls] native cache pre-warm: ${built.models.size} models ${_elapsed.toFixed(1)}ms`,
+  );
+}
 
 /**
  * Placeholder for the initial workspace scan.  In Phase 0 this logs and
@@ -240,15 +294,75 @@ async function startWorkspaceIndexing(): Promise<void> {
   }
 }
 
+function replaceWorkspaceIndexFromSurface(params: {
+  surfaceIndex: SurfaceIndex;
+  modelNames?: string[];
+  customLookups?: Record<string, string[]>;
+  surfaceFingerprints?: Record<string, string>;
+  staticFallback?: Record<string, { fields: string[]; relations: string[] }>;
+  staticFallbackFingerprint?: string | null;
+  customLookupsFingerprint?: string;
+}): number {
+  const built = buildWorkspaceIndex(
+    params.surfaceIndex,
+    params.modelNames ?? [],
+    params.customLookups,
+    params.staticFallback,
+  );
+  workspaceIndex.models = built.models;
+  workspaceIndex.perFile = built.perFile;
+  workspaceIndex.modelLabelByName = built.modelLabelByName;
+  workspaceIndex.fieldTrieByModel = built.fieldTrieByModel;
+  workspaceIndex.lookupTrie = built.lookupTrie;
+  workspaceIndex.transformTrie = built.transformTrie;
+  previousSurfaceIndex = params.surfaceIndex;
+  previousCustomLookups = params.customLookups;
+  previousCustomLookupsFingerprint = params.customLookupsFingerprint;
+  previousStaticFallback = params.staticFallback;
+  previousStaticFallbackFingerprint = params.staticFallbackFingerprint;
+  modelFingerprints.clear();
+  for (const label of Object.keys(params.surfaceIndex)) {
+    modelFingerprints.set(
+      label,
+      params.surfaceFingerprints?.[label] ?? JSON.stringify(params.surfaceIndex[label]),
+    );
+  }
+  return built.models.size;
+}
+
+function persistSurfaceCacheSnapshot(modelNames?: string[]): void {
+  if (!workspaceRoot || previousSurfaceIndex === null) {
+    return;
+  }
+  try {
+    saveSurfaceCache(workspaceRoot, {
+      surfaceIndex: previousSurfaceIndex,
+      modelNames: modelNames ?? [],
+      surfaceFingerprints: Object.fromEntries(modelFingerprints),
+      customLookups: previousCustomLookups,
+      customLookupsFingerprint: previousCustomLookupsFingerprint,
+      staticFallback: previousStaticFallback,
+      staticFallbackFingerprint: previousStaticFallbackFingerprint,
+    });
+  } catch (err) {
+    connection.console.warn(
+      `[ls] native cache save failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Surface index notification from extension (Python daemon → LS)
 // ---------------------------------------------------------------------------
 
 connection.onNotification('django/updateSurfaceIndex', (params: {
   surfaceIndex: SurfaceIndex;
-  modelNames: string[];
+  modelNames?: string[];
+  surfaceFingerprints?: Record<string, string>;
   customLookups?: Record<string, string[]>;
+  customLookupsFingerprint?: string;
   staticFallback?: Record<string, { fields: string[]; relations: string[] }>;
+  staticFallbackFingerprint?: string | null;
 }) => {
   const _t0 = performance.now();
   const surfaceKeys = Object.keys(params.surfaceIndex);
@@ -256,7 +370,7 @@ connection.onNotification('django/updateSurfaceIndex', (params: {
     ? Object.values(params.customLookups).reduce((sum, v) => sum + v.length, 0)
     : 0;
   connection.console.log(
-    `[ls] received surfaceIndex: ${surfaceKeys.length} labels, ${params.modelNames.length} names` +
+    `[ls] received surfaceIndex: ${surfaceKeys.length} labels` +
     (customLookupCount > 0 ? ` customLookups=${customLookupCount}` : '') +
     (surfaceKeys.length > 0 ? ` first=${surfaceKeys[0]}` : '')
   );
@@ -264,27 +378,21 @@ connection.onNotification('django/updateSurfaceIndex', (params: {
   if (previousSurfaceIndex === null) {
     // --- First load: full build ---
     completionCache.clear();
-    const built = buildWorkspaceIndex(params.surfaceIndex, params.modelNames, params.customLookups, params.staticFallback);
-    workspaceIndex.models = built.models;
-    workspaceIndex.perFile = built.perFile;
-    workspaceIndex.modelLabelByName = built.modelLabelByName;
-    workspaceIndex.fieldTrieByModel = built.fieldTrieByModel;
-    workspaceIndex.lookupTrie = built.lookupTrie;
-    workspaceIndex.transformTrie = built.transformTrie;
-
-    // Initialise fingerprint cache for future diffs
-    for (const label of Object.keys(params.surfaceIndex)) {
-      modelFingerprints.set(label, JSON.stringify(params.surfaceIndex[label]));
-    }
+    const modelCount = replaceWorkspaceIndexFromSurface(params);
 
     const _buildMs = performance.now() - _t0;
     recordTiming('index.build', _buildMs);
     connection.console.log(
-      `[ls] full build: ${built.models.size} models ${_buildMs.toFixed(0)}ms (tries=lazy)`
+      `[ls] full build: ${modelCount} models ${_buildMs.toFixed(0)}ms (tries=lazy)`
     );
   } else {
     // --- Incremental update ---
-    const diff = diffSurfaceIndex(previousSurfaceIndex, params.surfaceIndex, modelFingerprints);
+    const diff = diffSurfaceIndex(
+      previousSurfaceIndex,
+      params.surfaceIndex,
+      modelFingerprints,
+      params.surfaceFingerprints,
+    );
     const totalChanges = diff.added.length + diff.removed.length + diff.changed.length;
 
     if (totalChanges === 0) {
@@ -293,6 +401,21 @@ connection.onNotification('django/updateSurfaceIndex', (params: {
       const _noop = performance.now() - _t0;
       connection.console.log(`[ls] incremental update: no-op ${_noop.toFixed(1)}ms`);
     } else {
+      const staticFallbackChanged =
+        previousStaticFallbackFingerprint !== (params.staticFallbackFingerprint ?? null);
+      if (staticFallbackChanged) {
+        completionCache.clear();
+        const modelCount = replaceWorkspaceIndexFromSurface(params);
+        const _buildMs = performance.now() - _t0;
+        recordTiming('index.build', _buildMs);
+        connection.console.log(
+          `[ls] full rebuild (staticFallback changed): ${modelCount} models ${_buildMs.toFixed(0)}ms`
+        );
+        setGauge('models.total', workspaceIndex.models.size);
+        setGauge('tries.built', workspaceIndex.fieldTrieByModel.size);
+        persistSurfaceCacheSnapshot(params.modelNames);
+        return;
+      }
       updateWorkspaceIndexIncremental(
         workspaceIndex,
         params.surfaceIndex,
@@ -319,8 +442,102 @@ connection.onNotification('django/updateSurfaceIndex', (params: {
 
   previousSurfaceIndex = params.surfaceIndex;
   previousCustomLookups = params.customLookups;
+  previousCustomLookupsFingerprint = params.customLookupsFingerprint;
+  previousStaticFallback = params.staticFallback;
+  previousStaticFallbackFingerprint = params.staticFallbackFingerprint;
   setGauge('models.total', workspaceIndex.models.size);
   setGauge('tries.built', workspaceIndex.fieldTrieByModel.size);
+
+  persistSurfaceCacheSnapshot(params.modelNames);
+});
+
+connection.onNotification('django/updateSurfaceIndexDelta', (params: {
+  surfaceIndexDelta: SurfaceIndex;
+  surfaceFingerprints?: Record<string, string>;
+  addedLabels?: string[];
+  changedLabels?: string[];
+  removedLabels?: string[];
+  staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
+  staticFallbackFingerprint?: string | null;
+}) => {
+  if (previousSurfaceIndex === null) {
+    connection.console.warn('[ls] surfaceIndex delta ignored before initial snapshot');
+    return;
+  }
+
+  const _t0 = performance.now();
+  const added = params.addedLabels ?? [];
+  const changed = params.changedLabels ?? [];
+  const removed = params.removedLabels ?? [];
+  const totalChanges = added.length + changed.length + removed.length;
+  if (totalChanges === 0) {
+    incrementCounter('index.noop_update');
+    connection.console.log('[ls] incremental delta update: no-op');
+    return;
+  }
+
+  for (const label of removed) {
+    delete previousSurfaceIndex[label];
+    modelFingerprints.delete(label);
+    modelVersions.delete(label);
+  }
+  for (const label of [...added, ...changed]) {
+    const nextEntry = params.surfaceIndexDelta[label];
+    if (!nextEntry) {
+      continue;
+    }
+    previousSurfaceIndex[label] = nextEntry;
+    modelFingerprints.set(
+      label,
+      params.surfaceFingerprints?.[label] ?? JSON.stringify(nextEntry),
+    );
+  }
+
+  const staticFallbackChanged =
+    previousStaticFallbackFingerprint !== (params.staticFallbackFingerprint ?? previousStaticFallbackFingerprint ?? null);
+  if (staticFallbackChanged) {
+    previousStaticFallback = params.staticFallback ?? undefined;
+    previousStaticFallbackFingerprint = params.staticFallbackFingerprint ?? null;
+    completionCache.clear();
+    const modelCount = replaceWorkspaceIndexFromSurface({
+      surfaceIndex: previousSurfaceIndex,
+      surfaceFingerprints: Object.fromEntries(modelFingerprints),
+      customLookups: previousCustomLookups,
+      customLookupsFingerprint: previousCustomLookupsFingerprint,
+      staticFallback: previousStaticFallback,
+      staticFallbackFingerprint: previousStaticFallbackFingerprint,
+    });
+    const _buildMs = performance.now() - _t0;
+    recordTiming('index.build', _buildMs);
+    connection.console.log(
+      `[ls] full rebuild from delta (staticFallback changed): ${modelCount} models ${_buildMs.toFixed(0)}ms`
+    );
+    setGauge('models.total', workspaceIndex.models.size);
+    setGauge('tries.built', workspaceIndex.fieldTrieByModel.size);
+    persistSurfaceCacheSnapshot();
+    return;
+  }
+
+  updateWorkspaceIndexIncremental(
+    workspaceIndex,
+    previousSurfaceIndex,
+    { added, changed, removed },
+    previousCustomLookups,
+    previousCustomLookups,
+  );
+
+  for (const label of [...added, ...changed]) {
+    modelVersions.set(label, (modelVersions.get(label) ?? 0) + 1);
+  }
+
+  const _buildMs = performance.now() - _t0;
+  recordTiming('index.build', _buildMs);
+  connection.console.log(
+    `[ls] incremental delta update: +${added.length} ~${changed.length} -${removed.length} ${_buildMs.toFixed(0)}ms`
+  );
+  setGauge('models.total', workspaceIndex.models.size);
+  setGauge('tries.built', workspaceIndex.fieldTrieByModel.size);
+  persistSurfaceCacheSnapshot();
 });
 
 // ---------------------------------------------------------------------------

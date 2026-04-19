@@ -1,8 +1,10 @@
 from .store import (
+    load_cached_model_graph,
     load_cached_source_snapshot,
     load_cached_runtime_inspection,
     load_cached_static_index,
     load_cached_surface_index,
+    save_model_graph,
     save_source_snapshot,
     save_runtime_inspection,
     save_static_index,
@@ -10,10 +12,12 @@ from .store import (
 )
 
 __all__ = [
+    'load_cached_model_graph',
     'load_cached_source_snapshot',
     'load_cached_runtime_inspection',
     'load_cached_static_index',
     'load_cached_surface_index',
+    'save_model_graph',
     'save_source_snapshot',
     'save_runtime_inspection',
     'save_static_index',

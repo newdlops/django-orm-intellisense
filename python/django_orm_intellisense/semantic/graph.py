@@ -198,27 +198,11 @@ def build_model_graph(
     static_index: StaticIndex,
     runtime: RuntimeInspection,
 ) -> ModelGraph:
-    runtime_model_by_label = {
-        model.label: model
-        for model in runtime.model_catalog
-    }
-    runtime_label_by_module_and_name = {
-        (model.module, _model_object_name(model.label)): model.label
-        for model in runtime.model_catalog
-    }
-    runtime_label_by_static_label = {
-        candidate.label: runtime_label
-        for candidate in static_index.concrete_model_candidates
-        if (
-            runtime_label := runtime_label_by_module_and_name.get(
-                (candidate.module, candidate.object_name)
-            )
-        )
-    }
-    static_label_by_runtime_label = {
-        runtime_label: static_label
-        for static_label, runtime_label in runtime_label_by_static_label.items()
-    }
+    (
+        runtime_model_by_label,
+        runtime_label_by_static_label,
+        static_label_by_runtime_label,
+    ) = _runtime_graph_maps(static_index, runtime)
 
     model_labels = set(runtime_model_by_label)
     model_labels.update(
@@ -229,69 +213,21 @@ def build_model_graph(
     fields_by_model_label: dict[str, dict[str, FieldCandidate]] = {}
     static_source_labels: dict[str, str] = {}
     for model_label in model_labels:
-        static_source_label = model_label
-        if static_index.find_model_candidate(static_source_label) is None:
-            static_source_label = static_label_by_runtime_label.get(
-                model_label,
-                model_label,
-            )
+        static_source_label = _resolve_static_source_label(
+            model_label=model_label,
+            static_index=static_index,
+            static_label_by_runtime_label=static_label_by_runtime_label,
+        )
         static_source_labels[model_label] = static_source_label
 
-        fields_by_name = {
-            field.name: _remap_field_candidate_labels(
-                field,
-                target_model_label=model_label,
-                runtime_label_by_static_label=runtime_label_by_static_label,
-            )
-            for field in static_index.fields_for_model(static_source_label)
-        }
-        runtime_model = runtime_model_by_label.get(model_label)
-        if runtime_model is not None:
-            model_candidate = static_index.find_model_candidate(model_label)
-            if model_candidate is None and static_source_label != model_label:
-                model_candidate = static_index.find_model_candidate(static_source_label)
-            fallback_file_path = model_candidate.file_path if model_candidate else ''
-            fallback_line = model_candidate.line if model_candidate else 1
-            fallback_column = model_candidate.column if model_candidate else 1
-
-            for runtime_field in runtime_model.fields:
-                existing = fields_by_name.get(runtime_field.name)
-                if (
-                    existing is not None
-                    and existing.is_relation == runtime_field.is_relation
-                    and existing.related_model_label == runtime_field.related_model_label
-                    and existing.field_kind == runtime_field.field_kind
-                ):
-                    continue
-
-                fields_by_name[runtime_field.name] = FieldCandidate(
-                    model_label=model_label,
-                    name=runtime_field.name,
-                    file_path=existing.file_path if existing is not None else fallback_file_path,
-                    line=existing.line if existing is not None else fallback_line,
-                    column=existing.column if existing is not None else fallback_column,
-                    field_kind=runtime_field.field_kind,
-                    is_relation=runtime_field.is_relation,
-                    relation_direction=runtime_field.direction,
-                    related_model_label=runtime_field.related_model_label,
-                    declared_model_label=existing.declared_model_label if existing is not None else model_label,
-                    related_name=existing.related_name if existing is not None else None,
-                    related_query_name=existing.related_query_name if existing is not None else None,
-                    source='runtime',
-                )
-
-        _add_related_query_alias_fields(fields_by_name=fields_by_name)
-        if runtime.bootstrap_status == 'ready':
-            _add_primary_key_alias_field(
-                runtime=runtime,
-                model_label=model_label,
-                fields_by_name=fields_by_name,
-            )
-            _add_relation_attname_alias_fields(
-                runtime=runtime,
-                model_label=model_label,
-                fields_by_name=fields_by_name,
-            )
+        fields_by_name = _build_fields_by_name(
+            static_index=static_index,
+            runtime=runtime,
+            model_label=model_label,
+            static_source_label=static_source_label,
+            runtime_model_by_label=runtime_model_by_label,
+            runtime_label_by_static_label=runtime_label_by_static_label,
+        )
 
         if fields_by_name:
             fields_by_model_label[model_label] = fields_by_name
@@ -313,6 +249,89 @@ def build_model_graph(
         if node.import_path
     }
     edges_by_source_label = _build_edges_by_source_label(fields_by_model_label)
+
+    return ModelGraph(
+        fields_by_model_label=fields_by_model_label,
+        nodes_by_label=nodes_by_label,
+        nodes_by_object_name=nodes_by_object_name,
+        node_by_import_path=node_by_import_path,
+        edges_by_source_label=edges_by_source_label,
+    )
+
+
+def rebuild_model_graph_for_labels(
+    current_graph: ModelGraph,
+    *,
+    old_static_index: StaticIndex,
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+    affected_labels: set[str],
+) -> ModelGraph:
+    (
+        runtime_model_by_label,
+        runtime_label_by_static_label,
+        static_label_by_runtime_label,
+    ) = _runtime_graph_maps(static_index, runtime)
+    (
+        _old_runtime_model_by_label,
+        old_runtime_label_by_static_label,
+        _old_static_label_by_runtime_label,
+    ) = _runtime_graph_maps(old_static_index, runtime)
+
+    affected_graph_labels: set[str] = set()
+    for label in affected_labels:
+        affected_graph_labels.add(label)
+        affected_graph_labels.add(runtime_label_by_static_label.get(label, label))
+        affected_graph_labels.add(old_runtime_label_by_static_label.get(label, label))
+
+    fields_by_model_label = dict(current_graph.fields_by_model_label)
+    nodes_by_label = dict(current_graph.nodes_by_label)
+    edges_by_source_label = dict(current_graph.edges_by_source_label)
+
+    for model_label in affected_graph_labels:
+        fields_by_model_label.pop(model_label, None)
+        nodes_by_label.pop(model_label, None)
+        edges_by_source_label.pop(model_label, None)
+
+    for model_label in sorted(affected_graph_labels):
+        static_source_label = _resolve_static_source_label(
+            model_label=model_label,
+            static_index=static_index,
+            static_label_by_runtime_label=static_label_by_runtime_label,
+        )
+        runtime_model = runtime_model_by_label.get(model_label)
+        if runtime_model is None and static_index.find_model_candidate(static_source_label) is None:
+            continue
+
+        fields_by_name = _build_fields_by_name(
+            static_index=static_index,
+            runtime=runtime,
+            model_label=model_label,
+            static_source_label=static_source_label,
+            runtime_model_by_label=runtime_model_by_label,
+            runtime_label_by_static_label=runtime_label_by_static_label,
+        )
+        if fields_by_name:
+            fields_by_model_label[model_label] = fields_by_name
+
+        nodes_by_label[model_label] = _build_model_graph_node(
+            model_label=model_label,
+            static_source_label=static_source_label,
+            fields_by_name=fields_by_name,
+            static_index=static_index,
+            runtime_model=runtime_model,
+        )
+
+        rebuilt_edges = _build_edges_by_source_label({model_label: fields_by_name})
+        if model_label in rebuilt_edges:
+            edges_by_source_label[model_label] = rebuilt_edges[model_label]
+
+    nodes_by_object_name = _index_nodes_by_object_name(nodes_by_label)
+    node_by_import_path = {
+        node.import_path: node
+        for node in nodes_by_label.values()
+        if node.import_path
+    }
 
     return ModelGraph(
         fields_by_model_label=fields_by_model_label,
@@ -387,6 +406,120 @@ def _build_model_graph_node(
         model_candidate=model_candidate,
         runtime_model=runtime_model,
     )
+
+
+def _runtime_graph_maps(
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+) -> tuple[
+    dict[str, RuntimeModelSummary],
+    dict[str, str],
+    dict[str, str],
+]:
+    runtime_model_by_label = {
+        model.label: model
+        for model in runtime.model_catalog
+    }
+    runtime_label_by_module_and_name = {
+        (model.module, _model_object_name(model.label)): model.label
+        for model in runtime.model_catalog
+    }
+    runtime_label_by_static_label = {
+        candidate.label: runtime_label
+        for candidate in static_index.concrete_model_candidates
+        if (
+            runtime_label := runtime_label_by_module_and_name.get(
+                (candidate.module, candidate.object_name)
+            )
+        )
+    }
+    static_label_by_runtime_label = {
+        runtime_label: static_label
+        for static_label, runtime_label in runtime_label_by_static_label.items()
+    }
+    return (
+        runtime_model_by_label,
+        runtime_label_by_static_label,
+        static_label_by_runtime_label,
+    )
+
+
+def _resolve_static_source_label(
+    *,
+    model_label: str,
+    static_index: StaticIndex,
+    static_label_by_runtime_label: dict[str, str],
+) -> str:
+    if static_index.find_model_candidate(model_label) is not None:
+        return model_label
+    return static_label_by_runtime_label.get(model_label, model_label)
+
+
+def _build_fields_by_name(
+    *,
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+    model_label: str,
+    static_source_label: str,
+    runtime_model_by_label: dict[str, RuntimeModelSummary],
+    runtime_label_by_static_label: dict[str, str],
+) -> dict[str, FieldCandidate]:
+    fields_by_name = {
+        field.name: _remap_field_candidate_labels(
+            field,
+            target_model_label=model_label,
+            runtime_label_by_static_label=runtime_label_by_static_label,
+        )
+        for field in static_index.fields_for_model(static_source_label)
+    }
+    runtime_model = runtime_model_by_label.get(model_label)
+    if runtime_model is not None:
+        model_candidate = static_index.find_model_candidate(model_label)
+        if model_candidate is None and static_source_label != model_label:
+            model_candidate = static_index.find_model_candidate(static_source_label)
+        fallback_file_path = model_candidate.file_path if model_candidate else ''
+        fallback_line = model_candidate.line if model_candidate else 1
+        fallback_column = model_candidate.column if model_candidate else 1
+
+        for runtime_field in runtime_model.fields:
+            existing = fields_by_name.get(runtime_field.name)
+            if (
+                existing is not None
+                and existing.is_relation == runtime_field.is_relation
+                and existing.related_model_label == runtime_field.related_model_label
+                and existing.field_kind == runtime_field.field_kind
+            ):
+                continue
+
+            fields_by_name[runtime_field.name] = FieldCandidate(
+                model_label=model_label,
+                name=runtime_field.name,
+                file_path=existing.file_path if existing is not None else fallback_file_path,
+                line=existing.line if existing is not None else fallback_line,
+                column=existing.column if existing is not None else fallback_column,
+                field_kind=runtime_field.field_kind,
+                is_relation=runtime_field.is_relation,
+                relation_direction=runtime_field.direction,
+                related_model_label=runtime_field.related_model_label,
+                declared_model_label=existing.declared_model_label if existing is not None else model_label,
+                related_name=existing.related_name if existing is not None else None,
+                related_query_name=existing.related_query_name if existing is not None else None,
+                source='runtime',
+            )
+
+    _add_related_query_alias_fields(fields_by_name=fields_by_name)
+    if runtime.bootstrap_status == 'ready':
+        _add_primary_key_alias_field(
+            runtime=runtime,
+            model_label=model_label,
+            fields_by_name=fields_by_name,
+        )
+        _add_relation_attname_alias_fields(
+            runtime=runtime,
+            model_label=model_label,
+            fields_by_name=fields_by_name,
+        )
+    return fields_by_name
 
 
 def _index_nodes_by_object_name(

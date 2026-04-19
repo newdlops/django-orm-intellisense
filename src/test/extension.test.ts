@@ -398,62 +398,60 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
-  test('preserves chained lookup completions when the local fast path is enabled', async function () {
+  test('preserves chained lookup completions through the local fast path', async function () {
     this.timeout(20_000);
 
     const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
     await setWorkspaceRoot(fixtureRoot);
 
-    await withProcessEnv('DJLS_ENABLE_LOCAL_LOOKUP_FAST_PATH', '1', async () => {
-      const document = await openFixtureDocument(
-        fixtureRoot,
-        'blog/query_examples.py'
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+
+    const blankCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Post.objects.filter()',
+      'filter('
+    );
+    const blankCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        blankCompletionPosition
       );
 
-      const blankCompletionPosition = positionAfterTextInContainer(
-        document,
-        'Post.objects.filter()',
-        'filter('
-      );
-      const blankCompletionList =
-        await vscode.commands.executeCommand<vscode.CompletionList>(
-          'vscode.executeCompletionItemProvider',
-          document.uri,
-          blankCompletionPosition
-        );
+    assert.ok(
+      hasCompletionItemLabel(blankCompletionList?.items, 'author__profile'),
+      `Expected local fast path completion to include eager chained lookups. Received: ${(blankCompletionList?.items ?? [])
+        .slice(0, 20)
+        .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
+        .join(', ')}`
+    );
+    assert.ok(
+      hasCompletionItemLabel(blankCompletionList?.items, 'author__in'),
+      'Expected local fast path completion to include prefixed lookup operators.'
+    );
 
-      assert.ok(
-        hasCompletionItemLabel(blankCompletionList?.items, 'author__profile'),
-        `Expected local fast path completion to include eager chained lookups. Received: ${(blankCompletionList?.items ?? [])
-          .slice(0, 20)
-          .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
-          .join(', ')}`
-      );
-      assert.ok(
-        hasCompletionItemLabel(blankCompletionList?.items, 'author__in'),
-        'Expected local fast path completion to include prefixed lookup operators.'
+    const nestedCompletionPosition = positionAfterTextInContainer(
+      document,
+      'Post.objects.values("author__profile__timezone")',
+      'author__profile__tim'
+    );
+    const nestedCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        nestedCompletionPosition
       );
 
-      const nestedCompletionPosition = positionAfterTextInContainer(
-        document,
-        'Post.objects.values("author__profile__timezone")',
-        'author__profile__tim'
-      );
-      const nestedCompletionList =
-        await vscode.commands.executeCommand<vscode.CompletionList>(
-          'vscode.executeCompletionItemProvider',
-          document.uri,
-          nestedCompletionPosition
-        );
-
-      assert.ok(
-        hasCompletionItemLabel(nestedCompletionList?.items, 'timezone'),
-        `Expected local fast path completion to preserve nested segment suggestions. Received: ${(nestedCompletionList?.items ?? [])
-          .slice(0, 20)
-          .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
-          .join(', ')}`
-      );
-    });
+    assert.ok(
+      hasCompletionItemLabel(nestedCompletionList?.items, 'timezone'),
+      `Expected local fast path completion to preserve nested segment suggestions. Received: ${(nestedCompletionList?.items ?? [])
+        .slice(0, 20)
+        .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
+        .join(', ')}`
+    );
   });
 
   test('reindexes configured workspaceRoot files through the file watcher', async function () {

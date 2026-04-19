@@ -1,0 +1,89 @@
+name: rust-prebuild
+
+# Produces platform-specific native addon artifacts. Uploaded as workflow
+# artifacts and (on tag push) attached to the GitHub release for packaging
+# into the .vsix.
+
+on:
+  push:
+    branches: [main, rust-migration]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/build-native.sh"
+      - ".github/workflows/rust-prebuild.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.triple }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            triple: darwin-arm64
+          - os: macos-13
+            triple: darwin-x64
+          - os: ubuntu-22.04
+            triple: linux-x64-gnu
+          - os: windows-2022
+            triple: win32-x64-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.82"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.triple }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build native (unix)
+        if: runner.os != 'Windows'
+        run: bash scripts/build-native.sh
+
+      - name: Build native (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash scripts/build-native.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.triple }}
+          path: native/${{ matrix.triple }}/index.node
+          if-no-files-found: error
+
+  release:
+    name: attach-to-release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Package per-triple
+        run: |
+          cd artifacts
+          for dir in native-*; do
+            triple="${dir#native-}"
+            tar -czf "django-orm-native-${triple}.tar.gz" -C "$dir" .
+          done
+          ls -la *.tar.gz
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.tar.gz

@@ -1,0 +1,31 @@
+[workspace]
+members = ["crates/core", "crates/node"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/newdlops/django-orm-intellisense"
+
+[workspace.dependencies]
+napi = { version = "2.16", default-features = false, features = ["napi4", "serde-json"] }
+napi-derive = "2.16"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = { version = "2.0", features = ["serde"] }
+sha2 = "0.10"
+memmap2 = "0.9"
+tempfile = "3.14"
+walkdir = "2.5"
+rayon = "1.10"
+rustpython-parser = "0.4"
+rustpython-ast = "0.4"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+panic = "abort"

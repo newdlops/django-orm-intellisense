@@ -133,7 +133,8 @@ const RELATION_FIELD_KINDS = new Set([
 /**
  * Infer a best-effort Django field kind from a surfaceIndex entry.
  *
- * The Python daemon stores entries as `[returnKind, returnModelLabel]` where:
+ * The Python daemon stores entries as
+ * `[returnKind, returnModelLabel, memberKind?, fieldKind?]` where:
  *   - returnKind is one of "scalar", "instance", "related_manager",
  *     "queryset", "model_class", "manager", or null
  *   - returnModelLabel is the related model label (for relations) or the
@@ -231,13 +232,20 @@ function buildTransformTrie(): RadixTrieNode<TransformInfo> {
 /**
  * Surface index shape coming from the Python daemon.
  *
- * Structure: `{ [modelLabel]: { [receiverKind]: { [memberName]: [returnKind, returnModelLabel] } } }`
+ * Structure: `{ [modelLabel]: { [receiverKind]: { [memberName]: SurfaceMemberTuple } } }`
  *
  * Receiver kinds include "instance", "model_class", "manager", etc.
  */
+export type SurfaceMemberTuple = [
+  returnKind: string,
+  returnModelLabel: string | null,
+  memberKind?: string,
+  fieldKind?: string | null,
+];
+
 export type SurfaceIndex = Record<
   string,
-  Record<string, Record<string, [string, string | null]>>
+  Record<string, Record<string, SurfaceMemberTuple>>
 >;
 
 // ---------------------------------------------------------------------------
@@ -262,6 +270,7 @@ export function diffSurfaceIndex(
   prev: SurfaceIndex,
   next: SurfaceIndex,
   fingerprints: Map<string, string>,
+  nextFingerprints?: Record<string, string>,
 ): SurfaceIndexDiff {
   const _t0 = performance.now();
   const added: string[] = [];
@@ -274,7 +283,7 @@ export function diffSurfaceIndex(
   // Build new fingerprints and detect added/changed
   const newFingerprints = new Map<string, string>();
   for (const label of nextKeys) {
-    const fp = JSON.stringify(next[label]);
+    const fp = nextFingerprints?.[label] ?? JSON.stringify(next[label]);
     newFingerprints.set(label, fp);
 
     if (!prevKeys.has(label)) {
@@ -403,7 +412,7 @@ export function getOrBuildFieldTrie(
 
 function buildModelInfo(
   modelLabel: string,
-  receivers: Record<string, Record<string, [string, string | null]>>,
+  receivers: Record<string, Record<string, SurfaceMemberTuple>>,
   customLookups?: Record<string, string[]>,
 ): ModelInfo {
   const objectName = modelLabel.includes('.')
@@ -415,12 +424,21 @@ function buildModelInfo(
   const reverseRelations = new Map<string, RelationInfo>();
 
   const instanceMembers = receivers['instance'] ?? {};
-  for (const [memberName, [returnKind, returnModelLabel]] of Object.entries(instanceMembers)) {
+  for (const [memberName, [returnKind, returnModelLabel, memberKind, explicitFieldKind]] of Object.entries(instanceMembers)) {
+    if (
+      memberKind !== undefined &&
+      memberKind !== 'field' &&
+      memberKind !== 'relation' &&
+      memberKind !== 'reverse_relation'
+    ) {
+      continue;
+    }
     const { fieldKind, isRelation } = inferFieldKind(returnKind);
-    let lookups = getLookupsForField(fieldKind);
-    const transforms = getTransformsForField(fieldKind);
+    const effectiveFieldKind = explicitFieldKind ?? fieldKind;
+    let lookups = getLookupsForField(effectiveFieldKind);
+    const transforms = getTransformsForField(effectiveFieldKind);
 
-    const extraLookups = customLookups?.[fieldKind];
+    const extraLookups = customLookups?.[effectiveFieldKind];
     if (extraLookups && extraLookups.length > 0) {
       const lookupSet = new Set(lookups);
       for (const cl of extraLookups) {
@@ -431,7 +449,7 @@ function buildModelInfo(
 
     const fieldInfo: FieldInfo = {
       name: memberName,
-      fieldKind,
+      fieldKind: effectiveFieldKind,
       isRelation,
       lookups,
       transforms,
@@ -445,7 +463,7 @@ function buildModelInfo(
 
       const relationInfo: RelationInfo = {
         name: memberName,
-        fieldKind,
+        fieldKind: effectiveFieldKind,
         targetModelLabel,
         direction,
       };

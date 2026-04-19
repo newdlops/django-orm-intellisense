@@ -1,0 +1,36 @@
+{
+  "timestamp": "2026-04-19T13:22:35.766572",
+  "python_version": "3.11.15 (main, Apr  7 2026, 19:58:42) [Clang 21.0.0 (clang-2100.0.123.102)]",
+  "platform": "Darwin",
+  "results": {
+    "model_count": 1500,
+    "generate_project_s": 0.15741250000428408,
+    "snapshot_python_sources_s": 0.0383340000116732,
+    "snapshot_file_count": 1530,
+    "build_static_index_s": 0.35947466699872166,
+    "model_candidate_count": 1500,
+    "field_count": 28500,
+    "reindex_fast_path_s": 0.055329166003502905,
+    "reindex_fast_path_affected": 0,
+    "reindex_slow_path_s": 0.07696479099104181,
+    "reindex_slow_path_affected": 1,
+    "reindex_batch_p50_s": 0.0798227500054054,
+    "reindex_batch_p95_s": 0.0861456660204567,
+    "reindex_batch_total_s": 0.7566840009822045
+  },
+  "checks": [
+    {
+      "metric": "reindex_fast_path_s",
+      "actual_ms": 55.329166003502905,
+      "budget_ms": 20.0,
+      "pass": false
+    },
+    {
+      "metric": "reindex_slow_path_s",
+      "actual_ms": 76.96479099104181,
+      "budget_ms": 50.0,
+      "pass": false
+    }
+  ],
+  "all_passed": false
+}

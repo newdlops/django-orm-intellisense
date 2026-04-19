@@ -1,0 +1,16 @@
+--- rust snapshot_python_sources bench (runs=20, release, darwin-arm64) ---
+scale=   100 files=   102  snapshot p50=   0.71ms p95=   0.95ms
+scale=   500 files=   510  snapshot p50=   1.50ms p95=   1.59ms
+scale=  1500 files=  1530  snapshot p50=   4.22ms p95=   4.43ms
+scale=  5000 files=  5100  snapshot p50=  13.03ms p95=  13.80ms
+scale= 15000 files= 15300  snapshot p50=  39.81ms p95=  40.37ms
+
+vs Python baseline (bench/baseline-python.json, 1500 models, ThreadPoolExecutor max_workers=8):
+  snapshot_python_sources_s: 0.03833s (38.3ms, 1530 files)
+  Rust equivalent @ 1530 files: 4.22ms
+  Speedup: ~9x (rayon + walkdir + sha2 in parallel)
+
+Fingerprint byte-compatibility verified via examples/verify_fp.rs:
+  input: relative_path='app/models.py', size=42, mtime_ns=1_234_567_890
+  python _file_fingerprint: dda99b28e96922cd85870431f0a0b129e173c47f9bf0ec0733f9aed8f7448137
+  rust   file_fingerprint:  dda99b28e96922cd85870431f0a0b129e173c47f9bf0ec0733f9aed8f7448137

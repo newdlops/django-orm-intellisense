@@ -192,19 +192,26 @@ export interface InitializeResult {
   protocolVersion: string;
   health: HealthSnapshot;
   modelNames?: string[];
-  surfaceIndex?: Record<string, Record<string, Record<string, [string, string | null]>>>;
+  surfaceIndex?: Record<string, Record<string, Record<string, [string, string | null, string?, (string | null)?]>>>;
+  surfaceFingerprints?: Record<string, string>;
   customLookups?: Record<string, string[]>;
+  customLookupsFingerprint?: string;
   staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
+  staticFallbackFingerprint?: string | null;
 }
 
 export interface ReindexFileResult {
-  surfaceIndex: Record<string, Record<string, Record<string, [string, string | null]>>>;
-  modelNames: string[];
+  surfaceIndex?: Record<string, Record<string, Record<string, [string, string | null, string?, (string | null)?]>>>;
+  surfaceIndexDelta?: Record<string, Record<string, Record<string, [string, string | null, string?, (string | null)?]>>>;
+  surfaceFingerprints?: Record<string, string>;
+  modelNames?: string[];
   staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
+  staticFallbackFingerprint?: string | null;
   /** When true, no model changes were detected — surfaceIndex/modelNames are omitted. */
   unchanged?: boolean;
-  /** When present, only these labels changed (delta update). */
+  addedLabels?: string[];
   changedLabels?: string[];
+  removedLabels?: string[];
 }
 
 export interface RequestMessage {
@@ -239,9 +246,12 @@ export interface SurfaceIndexChangedNotificationMessage {
   params?: {
     health?: HealthSnapshot;
     modelNames?: string[];
-    surfaceIndex?: Record<string, Record<string, Record<string, [string, string | null]>>>;
+    surfaceIndex?: Record<string, Record<string, Record<string, [string, string | null, string?, (string | null)?]>>>;
+    surfaceFingerprints?: Record<string, string>;
     customLookups?: Record<string, string[]>;
+    customLookupsFingerprint?: string;
     staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
+    staticFallbackFingerprint?: string | null;
   };
 }
 

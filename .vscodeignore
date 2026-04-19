@@ -39,6 +39,14 @@ python/django_orm_intellisense/stress_test.py
 scripts/**
 docs/**
 
+# Rust source (only the built native/<triple>/index.node ships in the vsix)
+crates/**
+Cargo.toml
+Cargo.lock
+target/**
+.cargo/**
+bench/**
+
 # Markdown (keep only README, CHANGELOG, LICENSE)
 CONTRIBUTING.md
 SECURITY.md

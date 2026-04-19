@@ -109,9 +109,11 @@
     "lookup"
   ],
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run build:native && npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "build:native": "bash scripts/build-native.sh",
+    "build:native:dev": "CARGO_PROFILE=dev bash scripts/build-native.sh",
     "pretest": "npm run compile",
     "test": "vscode-test",
     "benchmark": "node out/test/benchmark.js",

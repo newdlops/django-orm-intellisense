@@ -1,0 +1,28 @@
+--- P8 minimal: TS surfaceIndex Rust bincode pre-warm ---
+
+Saved cache (1500 models, 20 fields + 1 FK per model) via nativeCache.ts:
+  save = 9.5ms   (TS JSON.stringify + napi save + bincode + fsync)
+  load = 3.6ms   (napi load + bincode + JSON.parse)
+
+What this delivers end-to-end:
+  Before: LSP startup waits for Python daemon cold boot (~500-1000ms)
+          before completions work.
+  After:  LSP startup loads surfaceIndex from Rust bincode cache in
+          ~10-30ms (3.6ms napi + ~10ms buildWorkspaceIndex for 1500
+          models) on warm restart. First cold run still pays Python
+          daemon cost; every subsequent restart is pre-warmed.
+
+Regression check (TS bench, full suite):
+  all three scales (3k/15k/30k models) PASSED vs baseline-ts.json.
+  compare.js exit=0, no metric exceeds +15% noise floor.
+
+Scope:
+  - server.ts onInitialized() tries loadSurfaceCache before Python
+    daemon handshake. Cache hit pre-populates workspaceIndex.
+  - On each django/updateSurfaceIndex notification, the payload is
+    persisted via saveSurfaceCache for next session.
+  - Cache key: workspace_cache_dir(cacheRoot, workspaceRoot) from
+    Rust, matches Python side naming.
+  - Full Python daemon IPC removal (plan's original P8) still requires
+    P5+P6 completion to produce the surfaceIndex from Rust. This
+    minimal P8 provides the user-visible speedup without that work.

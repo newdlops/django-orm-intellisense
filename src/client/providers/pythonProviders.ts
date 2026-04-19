@@ -5670,14 +5670,10 @@ async function listLookupPathCompletionsFast(
   prefix: string,
   method: string
 ): Promise<LookupPathCompletionsResult> {
-  if (process.env.DJLS_ENABLE_LOCAL_LOOKUP_FAST_PATH === '1') {
-    return (
-      daemon.listLookupPathCompletionsLocal(baseModelLabel, prefix, method) ??
-      await daemon.listLookupPathCompletions(baseModelLabel, prefix, method)
-    );
-  }
-
-  return daemon.listLookupPathCompletions(baseModelLabel, prefix, method);
+  return (
+    daemon.listLookupPathCompletionsLocal(baseModelLabel, prefix, method) ??
+    await daemon.listLookupPathCompletions(baseModelLabel, prefix, method)
+  );
 }
 
 function mergeLookupCompletionItems(

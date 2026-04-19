@@ -1,0 +1,20 @@
+[package]
+name = "django-orm-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+napi = { workspace = true }
+napi-derive = { workspace = true }
+serde_json = { workspace = true }
+django-orm-core = { path = "../core" }
+
+[build-dependencies]
+napi-build = "2.1"

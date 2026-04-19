@@ -11,3 +11,5 @@ __pycache__/
 .e2e*
 .vscode
 .claude
+target/
+native/*/index.node

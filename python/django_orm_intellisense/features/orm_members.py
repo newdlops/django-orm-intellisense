@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
+import json
 import os
 import re
 import threading
@@ -226,12 +228,55 @@ def build_surface_index(
                     kind_entry[item.name] = [
                         item.return_kind,
                         item.return_model_label or item.model_label,
+                        item.member_kind,
+                        item.field_kind,
                     ]
             if kind_entry:
                 model_entry[kind] = kind_entry
         if model_entry:
             index[candidate.label] = model_entry
     return index
+
+
+def fingerprint_surface_index(
+    surface_index: dict[str, object],
+    *,
+    labels: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> dict[str, str]:
+    if labels is None:
+        selected_labels = surface_index.keys()
+    else:
+        selected_labels = labels
+
+    fingerprints: dict[str, str] = {}
+    for label in selected_labels:
+        entry = surface_index.get(label)
+        if entry is None:
+            continue
+        payload = json.dumps(
+            entry,
+            ensure_ascii=True,
+            separators=(',', ':'),
+            sort_keys=True,
+        )
+        fingerprints[label] = hashlib.blake2b(
+            payload.encode('utf-8'),
+            digest_size=16,
+        ).hexdigest()
+    return fingerprints
+
+
+def fingerprint_json_payload(payload: object) -> str:
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(',', ':'),
+        sort_keys=True,
+    )
+    return hashlib.blake2b(
+        serialized.encode('utf-8'),
+        digest_size=16,
+    ).hexdigest()
 
 
 def rebuild_surface_for_models(
@@ -281,6 +326,8 @@ def rebuild_surface_for_models(
                     kind_entry[item.name] = [
                         item.return_kind,
                         item.return_model_label or item.model_label,
+                        item.member_kind,
+                        item.field_kind,
                     ]
             if kind_entry:
                 model_entry[kind] = kind_entry

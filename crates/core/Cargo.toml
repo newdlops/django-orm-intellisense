@@ -1,0 +1,37 @@
+[package]
+name = "django-orm-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+sha2 = { workspace = true }
+memmap2 = { workspace = true }
+walkdir = { workspace = true }
+rayon = { workspace = true }
+rustpython-parser = { workspace = true }
+rustpython-ast = { workspace = true }
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bench]]
+name = "cache_bench"
+harness = false
+
+[[bench]]
+name = "discovery_bench"
+harness = false
+
+[[bench]]
+name = "static_index_bench"
+harness = false

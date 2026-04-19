@@ -11,13 +11,17 @@ from pathlib import Path, PurePosixPath
 
 from ..discovery.workspace import PythonSourceSnapshot
 from ..runtime.inspector import RuntimeInspection
+from ..runtime.inspector import RuntimeModelSummary
+from ..semantic.graph import ModelGraph, ModelGraphEdge, ModelGraphNode
 from ..static_index.indexer import ModuleIndex, StaticIndex, build_static_index
+from ..static_index.indexer import FieldCandidate, ModelCandidate
 
 CACHE_SCHEMA_VERSION = 13
 SOURCE_SNAPSHOT_CACHE_NAME = 'source-snapshot.json'
 STATIC_INDEX_CACHE_NAME = 'static-index.json'
 STATIC_INDEX_FULL_CACHE_NAME = 'static-index-full.json'
 RUNTIME_CACHE_NAME = 'runtime-inspection.json'
+MODEL_GRAPH_CACHE_NAME = 'model-graph.json'
 SURFACE_INDEX_CACHE_NAME = 'surface-index.json'
 
 
@@ -293,6 +297,63 @@ def save_runtime_inspection(
     )
 
 
+def load_cached_model_graph(
+    workspace_root: Path,
+    source_fingerprint: str,
+    runtime_fingerprint: str,
+) -> ModelGraph | None:
+    payload = _read_cache_payload(
+        _workspace_cache_dir(workspace_root) / MODEL_GRAPH_CACHE_NAME
+    )
+    if payload is None:
+        return None
+
+    metadata = payload.get('metadata')
+    if not isinstance(metadata, dict):
+        return None
+
+    if (
+        metadata.get('schemaVersion') != CACHE_SCHEMA_VERSION
+        or metadata.get('workspaceRoot') != str(workspace_root)
+        or metadata.get('sourceFingerprint') != source_fingerprint
+        or metadata.get('runtimeFingerprint') != runtime_fingerprint
+    ):
+        return None
+
+    cached_payload = payload.get('payload')
+    if not isinstance(cached_payload, dict):
+        return None
+
+    try:
+        return _model_graph_from_cache_dict(cached_payload)
+    except (KeyError, TypeError, ValueError):
+        _unlink_quietly(
+            _workspace_cache_dir(workspace_root) / MODEL_GRAPH_CACHE_NAME
+        )
+        return None
+
+
+def save_model_graph(
+    workspace_root: Path,
+    source_fingerprint: str,
+    runtime_fingerprint: str,
+    model_graph: ModelGraph,
+) -> None:
+    _write_cache_payload(
+        _workspace_cache_dir(workspace_root) / MODEL_GRAPH_CACHE_NAME,
+        {
+            'metadata': {
+                'schemaVersion': CACHE_SCHEMA_VERSION,
+                'workspaceRoot': str(workspace_root),
+                'sourceFingerprint': source_fingerprint,
+                'runtimeFingerprint': runtime_fingerprint,
+                'createdAt': datetime.now(timezone.utc).isoformat(),
+            },
+            'payload': _model_graph_to_cache_dict(model_graph),
+        },
+    )
+
+
 def load_cached_surface_index(
     workspace_root: Path,
     source_fingerprint: str,
@@ -414,6 +475,189 @@ def _unlink_quietly(cache_path: Path) -> None:
         cache_path.unlink(missing_ok=True)
     except OSError:
         return
+
+
+def _field_candidate_to_cache_dict(field: FieldCandidate) -> dict[str, object]:
+    payload = field.to_dict()
+    payload['declaredModelLabel'] = field.declared_model_label
+    payload['relatedName'] = field.related_name
+    payload['relatedQueryName'] = field.related_query_name
+    return payload
+
+
+def _field_candidate_from_cache_dict(payload: dict[str, object]) -> FieldCandidate:
+    return FieldCandidate(
+        model_label=str(payload['modelLabel']),
+        name=str(payload['name']),
+        file_path=str(payload['filePath']),
+        line=int(payload['line']),
+        column=int(payload['column']),
+        field_kind=str(payload['fieldKind']),
+        is_relation=bool(payload['isRelation']),
+        relation_direction=_string_or_none(payload.get('relationDirection')),
+        related_model_label=_string_or_none(payload.get('relatedModelLabel')),
+        declared_model_label=_string_or_none(payload.get('declaredModelLabel')),
+        related_name=_string_or_none(payload.get('relatedName')),
+        related_query_name=_string_or_none(payload.get('relatedQueryName')),
+        source=str(payload.get('source', 'static')),
+    )
+
+
+def _model_graph_to_cache_dict(model_graph: ModelGraph) -> dict[str, object]:
+    return {
+        'fieldsByModelLabel': {
+            model_label: {
+                field_name: _field_candidate_to_cache_dict(field)
+                for field_name, field in fields_by_name.items()
+            }
+            for model_label, fields_by_name in model_graph.fields_by_model_label.items()
+        },
+        'nodesByLabel': {
+            label: {
+                'label': node.label,
+                'appLabel': node.app_label,
+                'objectName': node.object_name,
+                'module': node.module,
+                'importPath': node.import_path,
+                'filePath': node.file_path,
+                'line': node.line,
+                'column': node.column,
+                'fieldNames': list(node.field_names),
+                'relationNames': list(node.relation_names),
+                'reverseRelationNames': list(node.reverse_relation_names),
+                'managerNames': list(node.manager_names),
+                'modelCandidate': (
+                    node.model_candidate.to_dict()
+                    if node.model_candidate is not None
+                    else None
+                ),
+                'runtimeModel': (
+                    node.runtime_model.to_dict()
+                    if node.runtime_model is not None
+                    else None
+                ),
+            }
+            for label, node in model_graph.nodes_by_label.items()
+        },
+        'edgesBySourceLabel': {
+            source_label: [
+                {
+                    'sourceLabel': edge.source_label,
+                    'targetLabel': edge.target_label,
+                    'direction': edge.direction,
+                    'fieldNames': list(edge.field_names),
+                    'fieldKinds': list(edge.field_kinds),
+                }
+                for edge in edges
+            ]
+            for source_label, edges in model_graph.edges_by_source_label.items()
+        },
+    }
+
+
+def _model_graph_from_cache_dict(payload: dict[str, object]) -> ModelGraph:
+    raw_fields = payload.get('fieldsByModelLabel')
+    raw_nodes = payload.get('nodesByLabel')
+    raw_edges = payload.get('edgesBySourceLabel')
+    if not isinstance(raw_fields, dict) or not isinstance(raw_nodes, dict) or not isinstance(raw_edges, dict):
+        raise ValueError('invalid model graph cache payload')
+
+    fields_by_model_label: dict[str, dict[str, FieldCandidate]] = {}
+    for model_label, field_payload in raw_fields.items():
+        if not isinstance(field_payload, dict):
+            continue
+        fields_by_model_label[str(model_label)] = {
+            str(field_name): _field_candidate_from_cache_dict(dict(field))
+            for field_name, field in field_payload.items()
+            if isinstance(field, dict)
+        }
+
+    nodes_by_label: dict[str, ModelGraphNode] = {}
+    for label, node_payload in raw_nodes.items():
+        if not isinstance(node_payload, dict):
+            continue
+        model_candidate_payload = node_payload.get('modelCandidate')
+        runtime_model_payload = node_payload.get('runtimeModel')
+        node = ModelGraphNode(
+            label=str(node_payload['label']),
+            app_label=str(node_payload['appLabel']),
+            object_name=str(node_payload['objectName']),
+            module=str(node_payload['module']),
+            import_path=str(node_payload['importPath']),
+            file_path=_string_or_none(node_payload.get('filePath')),
+            line=_int_or_none(node_payload.get('line')),
+            column=_int_or_none(node_payload.get('column')),
+            field_names=tuple(str(name) for name in node_payload.get('fieldNames', [])),
+            relation_names=tuple(str(name) for name in node_payload.get('relationNames', [])),
+            reverse_relation_names=tuple(
+                str(name) for name in node_payload.get('reverseRelationNames', [])
+            ),
+            manager_names=tuple(str(name) for name in node_payload.get('managerNames', [])),
+            model_candidate=(
+                ModelCandidate.from_dict(dict(model_candidate_payload))
+                if isinstance(model_candidate_payload, dict)
+                else None
+            ),
+            runtime_model=(
+                RuntimeModelSummary.from_dict(dict(runtime_model_payload))
+                if isinstance(runtime_model_payload, dict)
+                else None
+            ),
+        )
+        nodes_by_label[str(label)] = node
+
+    edges_by_source_label: dict[str, tuple[ModelGraphEdge, ...]] = {}
+    for source_label, edges_payload in raw_edges.items():
+        if not isinstance(edges_payload, list):
+            continue
+        edges: list[ModelGraphEdge] = []
+        for edge_payload in edges_payload:
+            if not isinstance(edge_payload, dict):
+                continue
+            edges.append(
+                ModelGraphEdge(
+                    source_label=str(edge_payload['sourceLabel']),
+                    target_label=str(edge_payload['targetLabel']),
+                    direction=str(edge_payload['direction']),
+                    field_names=tuple(str(name) for name in edge_payload.get('fieldNames', [])),
+                    field_kinds=tuple(str(name) for name in edge_payload.get('fieldKinds', [])),
+                )
+            )
+        edges_by_source_label[str(source_label)] = tuple(edges)
+
+    nodes_by_object_name: dict[str, tuple[ModelGraphNode, ...]] = {}
+    for node in nodes_by_label.values():
+        nodes_by_object_name[node.object_name] = (
+            *nodes_by_object_name.get(node.object_name, ()),
+            node,
+        )
+
+    node_by_import_path = {
+        node.import_path: node
+        for node in nodes_by_label.values()
+        if node.import_path
+    }
+
+    return ModelGraph(
+        fields_by_model_label=fields_by_model_label,
+        nodes_by_label=nodes_by_label,
+        nodes_by_object_name=nodes_by_object_name,
+        node_by_import_path=node_by_import_path,
+        edges_by_source_label=edges_by_source_label,
+    )
+
+
+def _int_or_none(value: object) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _string_or_none(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
 
 
 def _load_reusable_module_indices(

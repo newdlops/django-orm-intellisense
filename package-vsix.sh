@@ -20,6 +20,14 @@ VSIX_NAME="$(node -p "const pkg = require('./package.json'); [pkg.name, pkg.vers
 echo "Compiling extension..."
 npm run compile
 
+# Build native addon for the host platform. CI-produced prebuilds for other
+# platforms can be dropped into native/<triple>/index.node before invoking
+# this script; they will be included in the .vsix as-is.
+if [[ "${SKIP_NATIVE_BUILD:-0}" != "1" ]]; then
+  echo "Building native addon for host platform..."
+  bash scripts/build-native.sh
+fi
+
 echo "Packaging VSIX..."
 npx --yes @vscode/vsce package "$@"
 

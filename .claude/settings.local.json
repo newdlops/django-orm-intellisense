@@ -11,7 +11,12 @@
       "Bash(wc -l /Users/lky/project/django-orm-intellisense/src/server/*.ts /Users/lky/project/django-orm-intellisense/python/django_orm_intellisense/features/*.py)",
       "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d.get\\('scripts',{}\\), indent=2\\)\\)\")",
       "Bash(pkill -f \"Visual Studio Code\")",
-      "Bash(env)"
+      "Bash(env)",
+      "Bash(git checkout *)",
+      "Bash(tee /Users/lky/project/django-orm-intellisense/bench/baseline-ts.json)",
+      "Bash(node /Users/lky/project/django-orm-intellisense/out/test/benchmark.js --full --json)",
+      "Bash(/Users/lky/project/django-orm-intellisense/.e2e-django5/bin/python -m benchmarks.bench_reindex --json)",
+      "Bash(tee /Users/lky/project/django-orm-intellisense/bench/baseline-python.json)"
     ]
   }
 }

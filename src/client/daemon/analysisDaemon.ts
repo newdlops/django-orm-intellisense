@@ -6,6 +6,15 @@ import * as readline from 'readline';
 import * as vscode from 'vscode';
 import { getExtensionSettings } from '../config/settings';
 import {
+  hydrateNativeFastPathFromSurface,
+  isNativeFastPathReady,
+  dropNativeFastPath,
+  nativeResolveRelationTarget,
+  nativeListRelationTargets,
+  nativeResolveLookupPath,
+  nativeResolveOrmMember,
+} from './nativeFastPath';
+import {
   resolvePythonInterpreter,
   validatePythonInterpreterPath,
 } from '../python/interpreter';
@@ -192,8 +201,11 @@ export class AnalysisDaemon implements vscode.Disposable {
   modelNames: Set<string> = new Set();
   modelLabelByName: Map<string, string> = new Map();
   surfaceIndex: SurfaceIndex = {};
+  surfaceFingerprints: Record<string, string> = {};
   customLookups: Record<string, string[]> = {};
+  customLookupsFingerprint?: string;
   staticFallback: StaticFallback | null = null;
+  staticFallbackFingerprint: string | null = null;
   private localWorkspaceIndex: WorkspaceIndex = createEmptyWorkspaceIndex();
   private localModelFingerprints = new Map<string, string>();
   private lastLaunchContext?: LaunchContext;
@@ -264,20 +276,29 @@ export class AnalysisDaemon implements vscode.Disposable {
     );
     this.localModelFingerprints.clear();
     for (const [label, receivers] of Object.entries(this.surfaceIndex)) {
-      this.localModelFingerprints.set(label, JSON.stringify(receivers));
+      this.localModelFingerprints.set(
+        label,
+        this.surfaceFingerprints[label] ?? JSON.stringify(receivers),
+      );
     }
   }
 
   private updateLocalWorkspaceIndex(
     nextSurfaceIndex: SurfaceIndex,
     nextStaticFallback: StaticFallback | null,
+    nextSurfaceFingerprints?: Record<string, string>,
+    nextStaticFallbackFingerprint?: string | null,
   ): void {
     if (
       this.localWorkspaceIndex.models.size === 0 ||
-      JSON.stringify(this.staticFallback) !== JSON.stringify(nextStaticFallback)
+      this.staticFallbackFingerprint !== (nextStaticFallbackFingerprint ?? null)
     ) {
       this.surfaceIndex = nextSurfaceIndex;
+      this.surfaceFingerprints = { ...(nextSurfaceFingerprints ?? {}) };
       this.staticFallback = nextStaticFallback;
+      this.staticFallbackFingerprint = nextStaticFallbackFingerprint ?? null;
+      this.rebuildModelLabelByName();
+      this.rebuildModelNames();
       this.rebuildLocalWorkspaceIndex();
       return;
     }
@@ -286,6 +307,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       this.surfaceIndex,
       nextSurfaceIndex,
       this.localModelFingerprints,
+      nextSurfaceFingerprints,
     );
 
     updateWorkspaceIndexIncremental(
@@ -295,16 +317,69 @@ export class AnalysisDaemon implements vscode.Disposable {
       this.customLookups,
       this.customLookups,
     );
+    this.surfaceIndex = nextSurfaceIndex;
+    this.surfaceFingerprints = { ...(nextSurfaceFingerprints ?? this.surfaceFingerprints) };
+    this.staticFallback = nextStaticFallback;
+    this.staticFallbackFingerprint = nextStaticFallbackFingerprint ?? null;
+    this.rebuildModelLabelByName();
+    this.rebuildModelNames();
   }
 
   private rebuildModelLabelByName(): void {
     this.modelLabelByName = new Map();
-    for (const label of Object.keys(this.surfaceIndex)) {
+    for (const label of [
+      ...Object.keys(this.surfaceIndex),
+      ...Object.keys(this.staticFallback ?? {}),
+    ]) {
       const name = label.split('.').at(-1);
       if (name) {
         this.modelLabelByName.set(name, label);
       }
     }
+  }
+
+  private rebuildModelNames(): void {
+    this.modelNames = new Set(this.modelLabelByName.keys());
+  }
+
+  private applySurfaceIndexDelta(
+    surfaceIndexDelta: SurfaceIndex,
+    addedLabels: string[],
+    changedLabels: string[],
+    removedLabels: string[],
+    surfaceFingerprints?: Record<string, string>,
+  ): void {
+    for (const label of removedLabels) {
+      delete this.surfaceIndex[label];
+      delete this.surfaceFingerprints[label];
+      this.localModelFingerprints.delete(label);
+    }
+    for (const label of [...addedLabels, ...changedLabels]) {
+      const nextEntry = surfaceIndexDelta[label];
+      if (!nextEntry) {
+        continue;
+      }
+      this.surfaceIndex[label] = nextEntry;
+      const fp = surfaceFingerprints?.[label] ?? JSON.stringify(nextEntry);
+      this.surfaceFingerprints[label] = fp;
+      this.localModelFingerprints.set(label, fp);
+    }
+  }
+
+  private refreshNativeFastPathFromSurface(reason: string): void {
+    const workspaceRoot = this.lastLaunchContext?.workspaceRoot;
+    if (!workspaceRoot) {
+      return;
+    }
+
+    void hydrateNativeFastPathFromSurface({
+      workspaceRoot,
+      surfaceIndex: this.surfaceIndex,
+      reason,
+      log: (level, message) => {
+        this.log(level === 'info' ? 'info' : 'info', message);
+      },
+    });
   }
 
   async start(scope?: vscode.ConfigurationScope): Promise<HealthSnapshot> {
@@ -451,6 +526,12 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   async listRelationTargets(prefix: string): Promise<RelationTargetsResult> {
+    const native = isNativeFastPathReady()
+      ? nativeListRelationTargets(prefix)
+      : undefined;
+    if (native) {
+      return native;
+    }
     return this.cachedRequest<RelationTargetsResult>('relationTargets', { prefix });
   }
 
@@ -458,6 +539,18 @@ export class AnalysisDaemon implements vscode.Disposable {
     value: string,
     background: boolean = false
   ): Promise<RelationTargetResolution> {
+    // Native fast-path: static graph lookup completes in microseconds.
+    // Python daemon was measured at 950-3084ms for this call on real
+    // projects. A static `resolved: true` is authoritative; a
+    // `not_found` is also authoritative for the static graph, so we
+    // return it directly. Only route through Python when the native
+    // state is not yet initialised.
+    const native = isNativeFastPathReady()
+      ? nativeResolveRelationTarget(value)
+      : undefined;
+    if (native) {
+      return native;
+    }
     return this.cachedRequest<RelationTargetResolution>('resolveRelationTarget', {
       value,
     }, background);
@@ -493,15 +586,55 @@ export class AnalysisDaemon implements vscode.Disposable {
       return result;
     }
 
-    const nextSurfaceIndex = result.surfaceIndex ?? {};
-    const nextModelNames = new Set(result.modelNames ?? []);
+    const addedLabels = result.addedLabels ?? [];
+    const changedLabels = result.changedLabels ?? [];
+    const removedLabels = result.removedLabels ?? [];
     const nextStaticFallback = result.staticFallback ?? null;
-    this.updateLocalWorkspaceIndex(nextSurfaceIndex, nextStaticFallback);
-    // Update local state with new surface data
-    this.surfaceIndex = nextSurfaceIndex;
-    this.modelNames = nextModelNames;
+    const nextStaticFallbackFingerprint = result.staticFallbackFingerprint ?? null;
+    if (result.surfaceIndexDelta) {
+      this.applySurfaceIndexDelta(
+        result.surfaceIndexDelta,
+        addedLabels,
+        changedLabels,
+        removedLabels,
+        result.surfaceFingerprints,
+      );
+      if (this.localWorkspaceIndex.models.size === 0) {
+        this.staticFallback = nextStaticFallback;
+        this.staticFallbackFingerprint = nextStaticFallbackFingerprint;
+        this.rebuildModelLabelByName();
+        this.rebuildModelNames();
+        this.rebuildLocalWorkspaceIndex();
+      } else if (this.staticFallbackFingerprint !== nextStaticFallbackFingerprint) {
+        this.staticFallback = nextStaticFallback;
+        this.staticFallbackFingerprint = nextStaticFallbackFingerprint;
+        this.rebuildModelLabelByName();
+        this.rebuildModelNames();
+        this.rebuildLocalWorkspaceIndex();
+      } else {
+        updateWorkspaceIndexIncremental(
+          this.localWorkspaceIndex,
+          this.surfaceIndex,
+          { added: addedLabels, changed: changedLabels, removed: removedLabels },
+          this.customLookups,
+          this.customLookups,
+        );
+      }
+    } else {
+      const nextSurfaceIndex = result.surfaceIndex ?? {};
+      this.updateLocalWorkspaceIndex(
+        nextSurfaceIndex,
+        nextStaticFallback,
+        result.surfaceFingerprints,
+        nextStaticFallbackFingerprint,
+      );
+    }
+
     this.staticFallback = nextStaticFallback;
+    this.staticFallbackFingerprint = nextStaticFallbackFingerprint;
     this.rebuildModelLabelByName();
+    this.rebuildModelNames();
+    this.refreshNativeFastPathFromSurface('reindex');
     return result;
   }
 
@@ -636,6 +769,21 @@ export class AnalysisDaemon implements vscode.Disposable {
     method: string,
     background: boolean = false
   ): Promise<LookupPathResolution> {
+    // Native fast-path: static FSM walk on the resident model graph.
+    // Python daemon was measured at up to 2.6s for one `title__startswith`
+    // resolve. Only defer to Python when native can't answer (e.g.
+    // custom runtime lookups registered via `register_lookup`).
+    if (isNativeFastPathReady()) {
+      const native = nativeResolveLookupPath(baseModelLabel, value, method);
+      if (native) {
+        // A static `resolved: true` is authoritative. For `resolved: false`
+        // with reason `unknown_lookup` we fall through to Python, which
+        // has access to runtime-registered lookups.
+        if (native.resolved || native.reason !== 'unknown_lookup') {
+          return native;
+        }
+      }
+    }
     return this.cachedRequest<LookupPathResolution>('resolveLookupPath', {
       baseModelLabel,
       value,
@@ -661,9 +809,9 @@ export class AnalysisDaemon implements vscode.Disposable {
    * List ORM members from the local surface index without IPC.
    *
    * This is intentionally limited to receiver kinds whose surface entries are
-   * stable enough to classify locally. Instance receivers still fall back to
-   * daemon IPC because surfaceIndex does not preserve enough metadata to
-   * distinguish fields from instance methods safely.
+   * stable enough to classify locally. Surface tuples may carry memberKind
+   * and fieldKind metadata; older two-item cache entries still work with
+   * conservative defaults.
    */
   listOrmMemberCompletionsLocal(
     modelLabel: string,
@@ -692,12 +840,12 @@ export class AnalysisDaemon implements vscode.Disposable {
     const normalizedPrefix = prefix.trim();
     const items: OrmMemberItem[] = [];
 
-    for (const [name, [returnKind, returnModelLabel]] of Object.entries(kindEntry)) {
+    for (const [name, [returnKind, returnModelLabel, surfaceMemberKind]] of Object.entries(kindEntry)) {
       if (normalizedPrefix && !name.startsWith(normalizedPrefix)) {
         continue;
       }
 
-      const memberKind = returnKind === 'manager' ? 'manager' : 'method';
+      const memberKind = surfaceMemberKind ?? (returnKind === 'manager' ? 'manager' : 'method');
       let detail = 'Django ORM member';
       if (memberKind === 'manager') {
         detail = 'Django manager';
@@ -794,22 +942,26 @@ export class AnalysisDaemon implements vscode.Disposable {
 
     const instanceEntry = this.surfaceIndex[modelLabel]?.instance;
     if (instanceEntry) {
-      for (const [name, [returnKind, returnModelLabel]] of Object.entries(instanceEntry)) {
+      for (const [name, [returnKind, returnModelLabel, surfaceMemberKind, fieldKind]] of Object.entries(instanceEntry)) {
         if (itemsByName.has(name)) {
           continue;
         }
 
+        const memberKind = surfaceMemberKind ?? (returnKind === 'manager' ? 'manager' : 'method');
         addItem({
           name,
-          memberKind: returnKind === 'manager' ? 'manager' : 'method',
+          memberKind,
           modelLabel,
           receiverKind: 'instance',
           detail:
-            returnKind === 'manager'
+            memberKind === 'field'
+              ? (fieldKind ?? 'Django model field')
+              : returnKind === 'manager'
               ? 'Django manager'
               : 'Django model instance method',
           source: 'local',
-          isRelation: false,
+          fieldKind: memberKind === 'field' ? (fieldKind ?? undefined) : undefined,
+          isRelation: returnKind === 'instance' || returnKind === 'related_manager',
           returnKind,
           returnModelLabel: returnModelLabel || undefined,
         });
@@ -830,6 +982,16 @@ export class AnalysisDaemon implements vscode.Disposable {
     name: string,
     managerName?: string
   ): Promise<OrmMemberResolution> {
+    // Native fast-path: declared fields, reverse relations, and Django
+    // built-in methods are all static data. Undefined return means the
+    // member is not in the static surface — defer to Python for
+    // project-defined methods and runtime managers.
+    if (isNativeFastPathReady()) {
+      const native = nativeResolveOrmMember(modelLabel, receiverKind, name, managerName);
+      if (native) {
+        return native;
+      }
+    }
     return this.cachedRequest<OrmMemberResolution>('resolveOrmMember', {
       modelLabel,
       receiverKind,
@@ -881,18 +1043,19 @@ export class AnalysisDaemon implements vscode.Disposable {
     if (!kindEntry) return undefined;
     const member = kindEntry[name];
     if (!member) return undefined;
-    const [returnKind, returnModelLabel] = member;
+    const [returnKind, returnModelLabel, memberKind, fieldKind] = member;
     // surfaceIndex member found
     return {
       resolved: true,
       item: {
         name,
-        memberKind: 'field',
+        memberKind: memberKind ?? 'field',
         modelLabel,
         receiverKind,
-        detail: '',
+        detail: fieldKind ?? '',
         source: 'local',
-        isRelation: !!returnModelLabel,
+        fieldKind: fieldKind ?? undefined,
+        isRelation: returnKind === 'instance' || returnKind === 'related_manager',
         returnKind,
         returnModelLabel: returnModelLabel || undefined,
       },
@@ -1270,6 +1433,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     this.stopRequested = true;
     this.clearResponseCache();
     this.rejectAllPending(new Error('Analysis daemon stopped.'));
+    dropNativeFastPath();
 
     const child = this.process;
     const stdoutReader = this.stdoutReader;
@@ -1303,6 +1467,7 @@ export class AnalysisDaemon implements vscode.Disposable {
   dispose(): void {
     void this.stop();
     this.stateEmitter.dispose();
+    dropNativeFastPath();
   }
 
   private async startProcess(
@@ -1428,13 +1593,17 @@ export class AnalysisDaemon implements vscode.Disposable {
         'initialSync'
       );
       const snapshot = this.decorateSnapshot(initializeResult.health);
-      this.modelNames = new Set(initializeResult.modelNames ?? []);
       this.surfaceIndex = initializeResult.surfaceIndex ?? {};
+      this.surfaceFingerprints = initializeResult.surfaceFingerprints ?? {};
       this.customLookups = initializeResult.customLookups ?? {};
+      this.customLookupsFingerprint = initializeResult.customLookupsFingerprint;
       this.staticFallback = initializeResult.staticFallback ?? null;
+      this.staticFallbackFingerprint = initializeResult.staticFallbackFingerprint ?? null;
       this.rebuildModelLabelByName();
+      this.rebuildModelNames();
       this.rebuildLocalWorkspaceIndex();
       console.log(`[PERF] daemon initialized: modelNames=${this.modelNames.size} surfaceIndex=${Object.keys(this.surfaceIndex).length} modelLabelByName=${this.modelLabelByName.size}`);
+      this.refreshNativeFastPathFromSurface('initialize');
       this.updateState(snapshot);
       return snapshot;
     } catch (error) {
@@ -1840,11 +2009,15 @@ export class AnalysisDaemon implements vscode.Disposable {
     this.clearResponseCache();
     if (message.params?.surfaceIndex) {
       this.surfaceIndex = message.params.surfaceIndex;
-      this.modelNames = new Set(message.params.modelNames ?? []);
+      this.surfaceFingerprints = message.params.surfaceFingerprints ?? {};
       this.customLookups = message.params.customLookups ?? {};
+      this.customLookupsFingerprint = message.params.customLookupsFingerprint;
       this.staticFallback = message.params.staticFallback ?? null;
+      this.staticFallbackFingerprint = message.params.staticFallbackFingerprint ?? null;
       this.rebuildModelLabelByName();
+      this.rebuildModelNames();
       this.rebuildLocalWorkspaceIndex();
+      this.refreshNativeFastPathFromSurface('surfaceIndexChanged');
     }
 
     const nextSnapshot = message.params?.health
