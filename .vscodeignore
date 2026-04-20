@@ -61,3 +61,4 @@ index.md
 **/*.ts
 *.vsix
 .DS_Store
+.zoek-rs

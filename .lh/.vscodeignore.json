@@ -1,0 +1,18 @@
+{
+    "sourceFile": ".vscodeignore",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 0,
+            "patches": [
+                {
+                    "date": 1776672785702,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                }
+            ],
+            "date": 1776672785702,
+            "name": "Commit-0",
+            "content": "# Source & config\n.vscode/**\nsrc/**\ntsconfig.json\n.vscode-test.mjs\n.mcp.json\n.gitignore\n.npmignore\n.eslintrc*\n.prettierrc*\n.tool-versions\npackage-vsix.sh\n\n# Test & fixture environments\n.vscode-test/**\nfixtures/**\n.e2e-homebrew313/**\n.e2e-django5/**\n.e2e-system/**\n.e2e-*/**\n.django_orm_intellisense/**\n.mypy_cache/**\n\n# Test output\nout/test/**\n\n# Python non-runtime\npython/**/tests/**\npython/**/benchmarks/**\npython/**/__pycache__/**\n**/__pycache__/**\n**/*.pyc\npython/django_orm_intellisense/stress_test.py\n\n# Dev tooling\n.git/**\n.github/**\n.claude/**\nscripts/**\ndocs/**\n\n# Rust source (only the built native/<triple>/index.node ships in the vsix)\ncrates/**\nCargo.toml\nCargo.lock\ntarget/**\n.cargo/**\nbench/**\n\n# Markdown (keep only README, CHANGELOG, LICENSE)\nCONTRIBUTING.md\nSECURITY.md\nimplementation_plan.md\noptimization_plan.md\ne2e_failure_fix.md\ntype_assumption_failure.md\nindex.md\n\n# Build artifacts\n**/*.map\n**/*.ts\n*.vsix\n.DS_Store\n.zoek-rs"
+        }
+    ]
+}
