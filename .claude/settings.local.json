@@ -33,7 +33,22 @@
       "Bash(DJLS_E2E_DEBUG=1 DJLS_E2E_BASE_PYTHON=/Users/lky/project/django-orm-intellisense/.e2e-homebrew313/bin/python npm test)",
       "Bash(awk '/^\\\\s+[0-9]+\\\\\\) Django ORM Intellisense UI/{getline; print}' /tmp/e2e_round2.txt)",
       "Bash(awk '/^\\\\s+[0-9]+\\\\\\)/{print}' /tmp/e2e_round2.txt)",
-      "Bash(awk '/^\\\\s+12\\\\\\) Django/,/^\\\\s+13\\\\\\) /' /tmp/e2e_pk.txt)"
+      "Bash(awk '/^\\\\s+12\\\\\\) Django/,/^\\\\s+13\\\\\\) /' /tmp/e2e_pk.txt)",
+      "Bash(DJANGO_ORM_INTELLISENSE_TEST_GREP='stub override' npx vscode-test --label 0)",
+      "Bash(tee /tmp/djotest.log)",
+      "Bash(tee /tmp/djotest2.log)",
+      "Bash(tee /tmp/djotest3.log)",
+      "Bash(tee /tmp/djotest4.log)",
+      "Bash(tee /tmp/djotest5.log)",
+      "Bash(tee /tmp/djotest6.log)",
+      "Bash(tee /tmp/djotest7.log)",
+      "Bash(tee /tmp/djotest8.log)",
+      "Bash(tee /tmp/djotest9.log)",
+      "Bash(tee /tmp/djotest10.log)",
+      "Bash(tee /tmp/djotest11.log)",
+      "Bash(tee /tmp/djotest12.log)",
+      "Bash(tee /tmp/djotest13.log)",
+      "Bash(tee /tmp/djotest_final.log)"
     ]
   }
 }

@@ -2,7 +2,7 @@
   "name": "django-orm-intellisense",
   "displayName": "Django ORM Intellisense",
   "description": "Framework-aware autocomplete, hover, go-to-definition, and diagnostics for Django ORM lookup paths, relation strings, and queryset chains.",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -47,7 +47,7 @@
       },
       {
         "command": "djangoOrmIntellisense.configurePylanceDiagnostics",
-        "title": "Django ORM: Suppress Pylance False Positives (attribute-access, unknown-type)"
+        "title": "Django ORM: Override Default Django Stubs (Pylance / Python Extension / Pyright / basedpyright)"
       },
       {
         "command": "djangoOrmIntellisense.selectSettingsModule",

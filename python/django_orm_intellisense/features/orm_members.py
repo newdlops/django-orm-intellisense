@@ -244,8 +244,12 @@ def build_surface_index(
                     ]
             if kind_entry:
                 model_entry[kind] = kind_entry
-        if model_entry:
-            index[candidate.label] = model_entry
+        # Always register concrete candidates — even ones whose receivers came
+        # back empty (e.g. inheritance-only models where every field lives on
+        # an abstract base). Dropping them silently hides the model from the
+        # TS-side surfaceIndex, which breaks receiver-aware completion on the
+        # extension host because our lookup path keys off the candidate label.
+        index[candidate.label] = model_entry
     return index
 
 
@@ -659,11 +663,18 @@ def _instance_surface(
     items: list[OrmMemberItem] = []
     seen_names: set[str] = set()
 
-    field_source = (
-        model_graph.fields_for_model(model_label)
-        if model_graph is not None
-        else static_index.fields_for_model(model_label)
-    )
+    field_source: list = []
+    if model_graph is not None:
+        field_source = list(model_graph.fields_for_model(model_label))
+    if not field_source:
+        field_source = list(static_index.fields_for_model(model_label))
+    if not field_source:
+        # Inheritance-only concrete models (fields all come from abstract base
+        # classes) have no direct fields in the static index and, when runtime
+        # introspection misses them, no entry in the model graph either. Walk
+        # the recorded base_class_refs so we still surface inherited lookup
+        # fields instead of reporting an empty completion list.
+        field_source = _fields_from_base_classes(static_index, model_label, set())
     for field in field_source:
         item = _field_member_item(field)
         items.append(item)
@@ -697,6 +708,80 @@ def _instance_surface(
         seen_names.add(item.name)
 
     return items
+
+
+def _fields_from_base_classes(
+    static_index: StaticIndex,
+    model_label: str,
+    visited: set[str],
+) -> list[FieldCandidate]:
+    """Collect fields from the static bases of ``model_label``.
+
+    Walks ``ModelCandidate.base_class_refs`` recursively so concrete models
+    that inherit every field from an abstract base class still surface
+    lookup-friendly field candidates. Returning this list lets callers (e.g.
+    ``_instance_surface``) back-fill when the primary sources produce an
+    empty field set.
+    """
+    if model_label in visited:
+        return []
+    visited.add(model_label)
+
+    candidate = static_index.find_model_candidate(model_label)
+    if candidate is None:
+        return []
+
+    fields: list[FieldCandidate] = []
+    seen_names: set[str] = set()
+    for base_ref in candidate.base_class_refs:
+        base_candidate = _resolve_base_candidate(
+            static_index=static_index,
+            module_name=candidate.module,
+            base_ref=base_ref,
+        )
+        if base_candidate is None:
+            continue
+        for field in static_index.fields_for_model(base_candidate.label):
+            if field.name in seen_names:
+                continue
+            seen_names.add(field.name)
+            fields.append(field)
+        # Recurse into the base's own bases so we capture fields from
+        # deep inheritance chains (e.g. Company -> BaseCompany -> TimestampedModel).
+        for inherited in _fields_from_base_classes(
+            static_index=static_index,
+            model_label=base_candidate.label,
+            visited=visited,
+        ):
+            if inherited.name in seen_names:
+                continue
+            seen_names.add(inherited.name)
+            fields.append(inherited)
+
+    return fields
+
+
+def _resolve_base_candidate(
+    *,
+    static_index: StaticIndex,
+    module_name: str,
+    base_ref: str,
+) -> ModelCandidate | None:
+    if not base_ref:
+        return None
+    local_candidate = static_index.find_model_candidate_by_module_and_name(
+        module_name, base_ref
+    )
+    if local_candidate is not None:
+        return local_candidate
+    if '.' in base_ref:
+        base_module, _, base_name = base_ref.rpartition('.')
+        dotted_candidate = static_index.find_model_candidate_by_module_and_name(
+            base_module, base_name
+        )
+        if dotted_candidate is not None:
+            return dotted_candidate
+    return None
 
 
 def _model_class_surface(

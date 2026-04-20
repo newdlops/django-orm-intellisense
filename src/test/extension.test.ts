@@ -44,7 +44,8 @@ let fixtureHarnessWorkspacePath: string | undefined;
 const E2E_PROCESS_TAG = `${process.pid}`;
 
 suite('Django ORM Intellisense UI', () => {
-  suiteSetup(async () => {
+  suiteSetup(async function () {
+    this.timeout(120_000);
     testCacheRoot = fs.mkdtempSync(
       path.join(os.tmpdir(), 'django-orm-intellisense-test-cache-')
     );
@@ -54,6 +55,20 @@ suite('Django ORM Intellisense UI', () => {
     const extension = vscode.extensions.getExtension(EXTENSION_ID);
     assert.ok(extension, `Extension ${EXTENSION_ID} is not available.`);
     await extension.activate();
+
+    const pylance = vscode.extensions.getExtension('ms-python.vscode-pylance');
+    assert.ok(
+      pylance,
+      'Pylance (ms-python.vscode-pylance) must be installed for the stub-override competition E2E. Install it in the host machine extensions dir.'
+    );
+    await pylance.activate();
+
+    const msPython = vscode.extensions.getExtension('ms-python.python');
+    assert.ok(
+      msPython,
+      'Microsoft Python (ms-python.python) must be installed so the test environment mirrors the real Pylance+Python-extension setup.'
+    );
+    await msPython.activate();
   });
 
   suiteTeardown(async () => {
@@ -9288,6 +9303,411 @@ suite('Django ORM Intellisense UI', () => {
     }
   });
 
+  test('writes Django stub overrides and reverts them via the override command', async function () {
+    this.timeout(20_000);
+
+    const tempWorkspace = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-stub-override-')
+    );
+
+    await removeWorkspaceFoldersFrom(0);
+    await addWorkspaceFolder(tempWorkspace);
+
+    const stubDirectory = path.join(
+      tempWorkspace,
+      '.vscode',
+      'django-orm-intellisense-stubs'
+    );
+    const expectedStubPath = '.vscode/django-orm-intellisense-stubs';
+
+    try {
+      await vscode.commands.executeCommand(
+        'djangoOrmIntellisense.configurePylanceDiagnostics',
+        'recommended'
+      );
+
+      assert.ok(
+        fs.existsSync(stubDirectory),
+        `Expected stub override directory at ${stubDirectory}.`
+      );
+      const pyTypedPath = path.join(stubDirectory, 'django', 'py.typed');
+      assert.ok(
+        fs.existsSync(pyTypedPath),
+        'Expected django/py.typed partial marker.'
+      );
+      assert.strictEqual(
+        fs.readFileSync(pyTypedPath, 'utf8').trim(),
+        'partial',
+        'Expected py.typed to declare PEP 561 partial stubs.'
+      );
+      for (const relative of [
+        'django/db/models/manager.pyi',
+        'django/db/models/query.pyi',
+        'django/db/models/base.pyi',
+        'django/db/models/__init__.pyi',
+      ]) {
+        assert.ok(
+          fs.existsSync(path.join(stubDirectory, relative)),
+          `Expected shim file ${relative} to be written.`
+        );
+      }
+
+      const managerStub = fs.readFileSync(
+        path.join(stubDirectory, 'django', 'db', 'models', 'manager.pyi'),
+        'utf8'
+      );
+      assert.ok(
+        /def filter\(self, \*args: Any, \*\*kwargs: Any\)/.test(managerStub),
+        'Expected Manager.filter override to accept arbitrary keyword lookups.'
+      );
+
+      const writtenSettings = readWorkspaceSettings(tempWorkspace);
+      assert.strictEqual(
+        writtenSettings['python.analysis.stubPath'],
+        expectedStubPath,
+        'Expected python.analysis.stubPath to point at the override directory.'
+      );
+      assert.strictEqual(
+        writtenSettings['basedpyright.analysis.stubPath'],
+        expectedStubPath,
+        'Expected basedpyright.analysis.stubPath to point at the override directory.'
+      );
+
+      await vscode.commands.executeCommand(
+        'djangoOrmIntellisense.configurePylanceDiagnostics',
+        'restore'
+      );
+
+      assert.ok(
+        !fs.existsSync(stubDirectory),
+        'Expected override directory to be removed on restore.'
+      );
+      const restoredSettings = readWorkspaceSettings(tempWorkspace);
+      assert.strictEqual(
+        restoredSettings['python.analysis.stubPath'],
+        undefined,
+        'Expected python.analysis.stubPath to be cleared on restore.'
+      );
+      assert.strictEqual(
+        restoredSettings['basedpyright.analysis.stubPath'],
+        undefined,
+        'Expected basedpyright.analysis.stubPath to be cleared on restore.'
+      );
+    } finally {
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test('preserves unrelated stubPath values during restore', async function () {
+    this.timeout(20_000);
+
+    const tempWorkspace = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-stub-override-keep-')
+    );
+    await removeWorkspaceFoldersFrom(0);
+    await addWorkspaceFolder(tempWorkspace);
+
+    try {
+      const existingStubPath = './typings';
+      writeWorkspaceSettings(tempWorkspace, {
+        'python.analysis.stubPath': existingStubPath,
+      });
+
+      await vscode.commands.executeCommand(
+        'djangoOrmIntellisense.configurePylanceDiagnostics',
+        'recommended'
+      );
+
+      const afterApply = readWorkspaceSettings(tempWorkspace);
+      assert.strictEqual(
+        afterApply['python.analysis.stubPath'],
+        '.vscode/django-orm-intellisense-stubs',
+        'Expected command to take over stubPath while overrides are active.'
+      );
+
+      await vscode.commands.executeCommand(
+        'djangoOrmIntellisense.configurePylanceDiagnostics',
+        'restore'
+      );
+
+      const afterRestore = readWorkspaceSettings(tempWorkspace);
+      assert.strictEqual(
+        afterRestore['python.analysis.stubPath'],
+        undefined,
+        'Restore should clear the stubPath the extension set.'
+      );
+    } finally {
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test('Pylance resolves Manager.filter to our stub override, not site-packages or bundled stubs', async function () {
+    this.timeout(90_000);
+
+    const pylance = vscode.extensions.getExtension('ms-python.vscode-pylance');
+    assert.ok(pylance?.isActive, 'Pylance must be active for this competition test.');
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/minimal_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const activeWorkspace =
+      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? fixtureRoot;
+    const stubDirectory = path.join(
+      activeWorkspace,
+      '.vscode',
+      'django-orm-intellisense-stubs'
+    );
+    const settingsSnapshot = readWorkspaceSettings(activeWorkspace);
+
+    const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+    assert.ok(
+      environment,
+      'Expected fixture E2E environment so Pylance has a Python interpreter to resolve Django imports.'
+    );
+
+    try {
+      writeWorkspaceSettings(activeWorkspace, {
+        ...settingsSnapshot,
+        'python.defaultInterpreterPath': environment.interpreterPath,
+        'python.analysis.extraPaths': [fixtureRoot],
+      });
+      await delay(500);
+
+      await vscode.commands.executeCommand(
+        'djangoOrmIntellisense.configurePylanceDiagnostics',
+        'recommended'
+      );
+
+      assert.ok(
+        fs.existsSync(path.join(stubDirectory, 'django', 'db', 'models', 'manager.pyi')),
+        'Expected our manager.pyi shim to exist before Pylance resolution check.'
+      );
+
+      const document = await openFixtureDocument(
+        fixtureRoot,
+        'blog/query_examples.py'
+      );
+
+      const filterPosition = positionInsideText(
+        document,
+        "Post.objects.filter(author__profile__timezone='Asia/Seoul')",
+        'filter'
+      );
+
+      const expectedStubFile = path
+        .join(stubDirectory, 'django', 'db', 'models', 'manager.pyi')
+        .toLowerCase();
+
+      let definitions: (vscode.Location | vscode.LocationLink)[] = [];
+      let winningPath: string | undefined;
+      const deadline = Date.now() + 45_000;
+      while (Date.now() < deadline) {
+        definitions =
+          (await vscode.commands.executeCommand<
+            (vscode.Location | vscode.LocationLink)[]
+          >('vscode.executeDefinitionProvider', document.uri, filterPosition)) ??
+          [];
+
+        winningPath = definitions
+          .map((definition) => locationFilePath(definition).toLowerCase())
+          .find((p) => p === expectedStubFile);
+
+        if (winningPath) {
+          break;
+        }
+        await delay(500);
+      }
+
+      assert.ok(
+        winningPath,
+        'Pylance should resolve Post.objects.filter to our stub override file. ' +
+          `Received locations (none matched ${expectedStubFile}): ` +
+          definitions
+            .map((definition) => locationFilePath(definition))
+            .join(', ')
+      );
+
+      const foreignStubs = definitions
+        .map((definition) => locationFilePath(definition))
+        .filter((p) => {
+          const lower = p.toLowerCase();
+          return (
+            (lower.includes('site-packages') && lower.includes('django-stubs') ||
+              lower.includes('ms-python.vscode-pylance') ||
+              lower.includes('bundled/stubs/django-stubs')) &&
+            lower !== expectedStubFile
+          );
+        });
+
+      assert.strictEqual(
+        foreignStubs.length,
+        0,
+        'No definition should land in installed or Pylance-bundled django-stubs. ' +
+          `Leaked locations: ${foreignStubs.join(', ')}`
+      );
+    } finally {
+      await vscode.commands.executeCommand(
+        'djangoOrmIntellisense.configurePylanceDiagnostics',
+        'restore'
+      );
+      writeWorkspaceSettings(activeWorkspace, settingsSnapshot);
+      if (fs.existsSync(stubDirectory)) {
+        fs.rmSync(stubDirectory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test('lookup operator completion still fires after stub overrides are applied', async function () {
+    this.timeout(45_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/minimal_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const activeWorkspace =
+      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? fixtureRoot;
+    const stubDirectory = path.join(
+      activeWorkspace,
+      '.vscode',
+      'django-orm-intellisense-stubs'
+    );
+    const settingsSnapshot = readWorkspaceSettings(activeWorkspace);
+
+    const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+    assert.ok(
+      environment,
+      'Expected fixture E2E environment for stub-override completion regression test.'
+    );
+
+    try {
+      writeWorkspaceSettings(activeWorkspace, {
+        ...settingsSnapshot,
+        'python.defaultInterpreterPath': environment.interpreterPath,
+      });
+      await delay(500);
+
+      await vscode.commands.executeCommand(
+        'djangoOrmIntellisense.configurePylanceDiagnostics',
+        'recommended'
+      );
+
+      const document = await openFixtureDocument(
+        fixtureRoot,
+        'blog/query_examples.py'
+      );
+
+      const position = positionAfterTextInContainer(
+        document,
+        "filter(author__='mentor')",
+        'author__'
+      );
+      const completions = await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        position
+      );
+
+      const labels = (completions?.items ?? []).map((item) =>
+        completionItemLabel(item)
+      );
+
+      assert.ok(
+        hasCompletionItemLabel(completions?.items, 'exact'),
+        `Lookup operator 'exact' should still complete after stub overrides are applied. Received labels: ${labels.slice(0, 15).join(', ')}`
+      );
+      assert.ok(
+        hasCompletionItemLabel(completions?.items, 'in'),
+        `Lookup operator 'in' should still complete after stub overrides are applied. Received labels: ${labels.slice(0, 15).join(', ')}`
+      );
+      assert.ok(
+        hasCompletionItemLabel(completions?.items, 'profile'),
+        `Related field 'profile' should still complete after stub overrides are applied. Received labels: ${labels.slice(0, 15).join(', ')}`
+      );
+    } finally {
+      await vscode.commands.executeCommand(
+        'djangoOrmIntellisense.configurePylanceDiagnostics',
+        'restore'
+      );
+      writeWorkspaceSettings(activeWorkspace, settingsSnapshot);
+      if (fs.existsSync(stubDirectory)) {
+        fs.rmSync(stubDirectory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test('our ORM lookup hover still wins with stub overrides active', async function () {
+    this.timeout(30_000);
+
+    const fixtureRoot = path.resolve(
+      __dirname,
+      '../../fixtures/minimal_project'
+    );
+    await setWorkspaceRoot(fixtureRoot);
+
+    const activeWorkspace =
+      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? fixtureRoot;
+    const stubDirectory = path.join(
+      activeWorkspace,
+      '.vscode',
+      'django-orm-intellisense-stubs'
+    );
+    const settingsSnapshot = readWorkspaceSettings(activeWorkspace);
+
+    try {
+      await vscode.commands.executeCommand(
+        'djangoOrmIntellisense.configurePylanceDiagnostics',
+        'recommended'
+      );
+
+      assert.ok(
+        fs.existsSync(stubDirectory),
+        `Expected stub override directory to be created at ${stubDirectory}.`
+      );
+
+      const document = await openFixtureDocument(
+        fixtureRoot,
+        'blog/query_examples.py'
+      );
+
+      const hoverPosition = positionInsideText(
+        document,
+        'author__profile__timezone',
+        'timezone'
+      );
+      const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        hoverPosition
+      );
+      const hoverText = stringifyHovers(hovers);
+
+      assert.ok(
+        hoverText.includes('Owner model: `blog.Profile`'),
+        `Expected our ORM lookup hover to still surface even after stub overrides were applied. Received: ${hoverText}`
+      );
+      assert.ok(
+        hoverText.includes('Field kind: `CharField`'),
+        `Expected our hover to still carry the field kind while stub overrides are active. Received: ${hoverText}`
+      );
+    } finally {
+      await vscode.commands.executeCommand(
+        'djangoOrmIntellisense.configurePylanceDiagnostics',
+        'restore'
+      );
+      writeWorkspaceSettings(activeWorkspace, settingsSnapshot);
+      if (fs.existsSync(stubDirectory)) {
+        fs.rmSync(stubDirectory, { recursive: true, force: true });
+      }
+    }
+  });
+
   test('resolves snake_case variable names to PascalCase model names as fallback', async function () {
     this.timeout(20_000);
 
@@ -9967,6 +10387,15 @@ function firstDefinition(
   }
 
   return first;
+}
+
+function locationFilePath(
+  definition: vscode.Location | vscode.LocationLink
+): string {
+  if ('targetUri' in definition) {
+    return definition.targetUri.fsPath;
+  }
+  return definition.uri.fsPath;
 }
 
 function bestDefinitionForFixture(

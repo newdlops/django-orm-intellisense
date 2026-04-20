@@ -1792,15 +1792,32 @@ export function registerPythonProviders(
               return cancelledCompletionResult(token);
             }
             if (!lookupReceiver) {
+              daemon.logDiagnostic(
+                `[completion:lookup] receiver-unresolved receiverExpression=${JSON.stringify(
+                  lookupContext.receiverExpression
+                )} method=${lookupContext.method} prefix=${JSON.stringify(
+                  lookupContext.prefix
+                )}`
+              );
               return undefined;
             }
 
             const baseModelLabel = lookupReceiver.modelLabel;
+            daemon.logDiagnostic(
+              `[completion:lookup:resolved] model=${baseModelLabel} method=${lookupContext.method} prefix=${JSON.stringify(
+                lookupContext.prefix
+              )}`
+            );
             const result = await listLookupPathCompletionsFast(
               daemon,
               baseModelLabel,
               lookupContext.prefix,
               lookupContext.method
+            );
+            daemon.logDiagnostic(
+              `[completion:lookup:daemon] model=${baseModelLabel} rawItems=${result.items.length} truncated=${Boolean(
+                result.truncated
+              )}`
             );
             if (token.isCancellationRequested) {
               return cancelledCompletionResult(token);
@@ -1851,11 +1868,20 @@ export function registerPythonProviders(
               return completion;
             });
 
-            // Mark as incomplete when truncated or prefix is short — VS Code
-            // will re-request as the user types more, allowing FK descendant
-            // results to load incrementally.
-            const isIncomplete = Boolean(result.truncated) || !lookupContext.prefix.includes('__');
-            return new vscode.CompletionList(completions, isIncomplete);
+            // Always mark as incomplete so VS Code re-invokes the provider on
+            // each keystroke. Filtering an existing complete list cannot add
+            // items the earlier prefix did not produce (e.g. operators that
+            // only appear once the prefix ends with `__`), so "complete" lists
+            // silently drop operators like `exact`/`contains` when users type
+            // past a relation segment in real sessions.
+            daemon.logDiagnostic(
+              `[completion:lookup] prefix=${JSON.stringify(
+                lookupContext.prefix
+              )} items=${completions.length} truncated=${Boolean(
+                result.truncated
+              )}`
+            );
+            return new vscode.CompletionList(completions, true);
           }
 
           if (directFieldContext) {
@@ -5945,11 +5971,54 @@ async function listLookupPathCompletionsFast(
   prefix: string,
   method: string
 ): Promise<LookupPathCompletionsResult> {
+  // Empty prefix means "enumerate every top-level field/relation" — a real
+  // model should never produce 0 items for that, so treat empty results as
+  // "fast path didn't actually have the data" and fall through to the slower
+  // but authoritative IPC daemon. This matters on very large workspaces where
+  // the native index can report resolved=true with no field detail.
+  const requiresCompleteEnumeration = prefix.length === 0;
+
   const local = daemon.listLookupPathCompletionsLocal(baseModelLabel, prefix, method);
-  if (local) return local;
+  if (local && local.resolved && (local.items.length > 0 || !requiresCompleteEnumeration)) {
+    daemon.logDiagnostic(
+      `[completion:lookup:layer] local model=${baseModelLabel} items=${local.items.length} truncated=${Boolean(
+        local.truncated
+      )}`
+    );
+    return local;
+  }
+  if (local) {
+    daemon.logDiagnostic(
+      `[completion:lookup:layer] local-skipped model=${baseModelLabel} resolved=${Boolean(
+        local.resolved
+      )} items=${local.items.length} reason=${local.reason ?? 'unresolved'}`
+    );
+  }
+
   const native = daemon.listLookupPathCompletionsNative(baseModelLabel, prefix, method);
-  if (native) return native;
-  return daemon.listLookupPathCompletions(baseModelLabel, prefix, method);
+  if (native && native.resolved && (native.items.length > 0 || !requiresCompleteEnumeration)) {
+    daemon.logDiagnostic(
+      `[completion:lookup:layer] native model=${baseModelLabel} items=${native.items.length} truncated=${Boolean(
+        native.truncated
+      )}`
+    );
+    return native;
+  }
+  if (native) {
+    daemon.logDiagnostic(
+      `[completion:lookup:layer] native-skipped model=${baseModelLabel} resolved=${Boolean(
+        native.resolved
+      )} items=${native.items.length} reason=${native.reason ?? 'unresolved'}`
+    );
+  }
+
+  const ipc = await daemon.listLookupPathCompletions(baseModelLabel, prefix, method);
+  daemon.logDiagnostic(
+    `[completion:lookup:layer] ipc model=${baseModelLabel} items=${ipc.items.length} resolved=${Boolean(
+      ipc.resolved
+    )} truncated=${Boolean(ipc.truncated)}`
+  );
+  return ipc;
 }
 
 function mergeLookupCompletionItems(

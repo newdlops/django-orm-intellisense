@@ -11,7 +11,7 @@ import { AnalysisDaemon } from './daemon/analysisDaemon';
 import type { ReindexFileResult } from './protocol';
 import { HealthDiagnostics } from './diagnostics/healthDiagnostics';
 import { registerPythonProviders } from './providers/pythonProviders';
-import { excludeDjangoStubsFromPylance } from './pylance/excludeDjangoStubs';
+import { applyStubOverrides } from './pylance/stubOverrides';
 import { normalizePythonInterpreterSettings } from './python/interpreter';
 import { isPylanceAvailable, PYLANCE_EXTENSION_ID } from './python/pylance';
 import { HealthStatusView } from './status/healthStatus';
@@ -395,9 +395,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
   }
 
-  void excludeDjangoStubsFromPylance(output).catch((error) => {
+  void applyStubOverrides(output).catch((error) => {
     output.appendLine(
-      `[pylance] Failed to exclude django-stubs from Pylance analysis: ${String(error)}`
+      `[pylance] Failed to apply Django stub overrides: ${String(error)}`
     );
   });
 

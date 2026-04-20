@@ -16,7 +16,7 @@ from ..semantic.graph import ModelGraph, ModelGraphEdge, ModelGraphNode
 from ..static_index.indexer import ModuleIndex, StaticIndex, build_static_index
 from ..static_index.indexer import FieldCandidate, ModelCandidate
 
-CACHE_SCHEMA_VERSION = 13
+CACHE_SCHEMA_VERSION = 14
 SOURCE_SNAPSHOT_CACHE_NAME = 'source-snapshot.json'
 STATIC_INDEX_CACHE_NAME = 'static-index.json'
 STATIC_INDEX_FULL_CACHE_NAME = 'static-index-full.json'

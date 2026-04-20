@@ -1,0 +1,18 @@
+{
+    "sourceFile": ".gitignore",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 0,
+            "patches": [
+                {
+                    "date": 1776672706235,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                }
+            ],
+            "date": 1776672706235,
+            "name": "Commit-0",
+            "content": "node_modules/\nout/\ndist/\n.vscode-test/\n*.vsix\n.DS_Store\n__pycache__/\n*pycache*\n*.pyc\n.django_orm_intellisense/\n.e2e*\n.vscode\n.claude\ntarget/\nnative/*/index.node\n.zoek-rs"
+        }
+    ]
+}

@@ -1,4 +1,11 @@
 import * as vscode from 'vscode';
+import {
+  applyStubOverrides,
+  revertStubOverrides,
+  STUB_OVERRIDE_RELATIVE_PATH,
+  type ApplyStubOverrideResult,
+  type RevertStubOverrideResult,
+} from '../pylance/stubOverrides';
 import { isPylanceAvailable } from '../python/pylance';
 import {
   readWorkspaceSettingValue,
@@ -59,7 +66,7 @@ export function registerConfigurePylanceDiagnosticsCommand(
         }
 
         await vscode.window.showWarningMessage(
-          'Pylance is not installed. Install the Pylance extension to configure its diagnostics.'
+          'Pylance is not installed. Install the Pylance extension (or another Pyright-based type checker) to override its default Django stubs.'
         );
         return;
       }
@@ -71,6 +78,7 @@ export function registerConfigurePylanceDiagnosticsCommand(
       }
 
       try {
+        const stubOutcome = await applyStubOverridesForProfile(profile, output);
         await applyPylanceDiagnosticProfile(profile);
 
         if (!interactive) {
@@ -78,7 +86,7 @@ export function registerConfigurePylanceDiagnosticsCommand(
         }
 
         const choice = await vscode.window.showInformationMessage(
-          successMessage(profile),
+          successMessage(profile, stubOutcome),
           'Open Settings',
           'Show Status'
         );
@@ -86,7 +94,7 @@ export function registerConfigurePylanceDiagnosticsCommand(
         if (choice === 'Open Settings') {
           await vscode.commands.executeCommand(
             'workbench.action.openSettings',
-            'python.analysis.diagnosticSeverityOverrides'
+            'python.analysis.stubPath'
           );
           return;
         }
@@ -99,7 +107,7 @@ export function registerConfigurePylanceDiagnosticsCommand(
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         output.appendLine(
-          `[extension] Configure Pylance Diagnostics command failed: ${message}`
+          `[extension] Override Default Stubs command failed: ${message}`
         );
 
         if (!interactive) {
@@ -107,7 +115,7 @@ export function registerConfigurePylanceDiagnosticsCommand(
         }
 
         const choice = await vscode.window.showErrorMessage(
-          `Failed to update Pylance diagnostics: ${message}`,
+          `Failed to override default Django stubs: ${message}`,
           'Open Settings',
           'Open Output'
         );
@@ -115,7 +123,7 @@ export function registerConfigurePylanceDiagnosticsCommand(
         if (choice === 'Open Settings') {
           await vscode.commands.executeCommand(
             'workbench.action.openSettings',
-            'python.analysis.diagnosticSeverityOverrides'
+            'python.analysis.stubPath'
           );
           return;
         }
@@ -126,6 +134,34 @@ export function registerConfigurePylanceDiagnosticsCommand(
       }
     }
   );
+}
+
+type StubOverrideOutcome =
+  | { kind: 'applied'; result: ApplyStubOverrideResult }
+  | { kind: 'reverted'; result: RevertStubOverrideResult }
+  | { kind: 'skipped' };
+
+async function applyStubOverridesForProfile(
+  profile: PylanceDiagnosticProfile,
+  output: vscode.OutputChannel
+): Promise<StubOverrideOutcome> {
+  if (!vscode.workspace.workspaceFolders?.length) {
+    return { kind: 'skipped' };
+  }
+
+  if (profile === 'restore') {
+    const result = await revertStubOverrides(output);
+    if (!result) {
+      return { kind: 'skipped' };
+    }
+    return { kind: 'reverted', result };
+  }
+
+  const result = await applyStubOverrides(output);
+  if (!result) {
+    return { kind: 'skipped' };
+  }
+  return { kind: 'applied', result };
 }
 
 async function applyPylanceDiagnosticProfile(
@@ -177,28 +213,32 @@ async function pickProfile(): Promise<PylanceDiagnosticProfile | undefined> {
     [
       {
         label: 'Recommended',
-        description: 'Downgrade common Django ORM dynamic false positives',
+        description:
+          'Inject partial stub overrides and downgrade remaining dynamic false positives',
         detail:
-          'Keeps likely real issues visible while reducing error-level noise from dynamic model fields, managers, and queryset calls.',
+          `Writes partial stubs under ${STUB_OVERRIDE_RELATIVE_PATH} that replace Model / Manager / QuerySet surfaces bundled with Pylance / Python Extension / Pyright / basedpyright, sets python.analysis.stubPath + basedpyright.analysis.stubPath to that directory, and downgrades error-level noise from dynamic ORM access.`,
         profile: 'recommended',
       },
       {
         label: 'Suppress',
-        description: 'Hide known dynamic ORM false positives',
+        description:
+          'Inject partial stub overrides and silence dynamic ORM diagnostics',
         detail:
-          'Silences the managed Pylance rules entirely for this workspace.',
+          `Writes the same partial stub overrides and silences the managed type-checker rules entirely for this workspace.`,
         profile: 'suppress',
       },
       {
         label: 'Restore',
-        description: 'Remove Django ORM Intellisense-managed overrides',
+        description:
+          'Remove Django ORM Intellisense-managed stub overrides and diagnostics',
         detail:
-          'Leaves any unrelated Pylance diagnostic overrides untouched.',
+          `Deletes ${STUB_OVERRIDE_RELATIVE_PATH}, clears python.analysis.stubPath / basedpyright.analysis.stubPath when they point at that directory, and drops the managed diagnostic overrides.`,
         profile: 'restore',
       },
     ],
     {
-      placeHolder: 'Choose how Django ORM Intellisense should adjust Pylance diagnostics',
+      placeHolder:
+        'Choose how Django ORM Intellisense should override default Django stubs across Pylance / Python Extension / Pyright / basedpyright',
       ignoreFocusOut: true,
     }
   );
@@ -206,16 +246,60 @@ async function pickProfile(): Promise<PylanceDiagnosticProfile | undefined> {
   return selection?.profile;
 }
 
-function successMessage(profile: PylanceDiagnosticProfile): string {
+function successMessage(
+  profile: PylanceDiagnosticProfile,
+  stubOutcome: StubOverrideOutcome
+): string {
   if (profile === 'restore') {
-    return 'Removed Django ORM Intellisense-managed Pylance diagnostic overrides.';
+    const summary = summarizeRevert(stubOutcome);
+    if (summary) {
+      return `${summary} Cleared the managed diagnostic overrides.`;
+    }
+    return 'Cleared the managed diagnostic overrides. No stub overrides were present to remove.';
   }
 
+  const stubDescription = describeApply(stubOutcome);
   if (profile === 'suppress') {
-    return 'Configured Pylance to suppress the managed dynamic Django ORM diagnostic rules for this workspace.';
+    return `${stubDescription} Suppressed the managed dynamic Django ORM diagnostic rules for this workspace.`;
   }
 
-  return 'Configured Pylance to downgrade the managed dynamic Django ORM diagnostic rules for this workspace.';
+  return `${stubDescription} Downgraded the managed dynamic Django ORM diagnostic rules for this workspace.`;
+}
+
+function describeApply(outcome: StubOverrideOutcome): string {
+  if (outcome.kind !== 'applied') {
+    return 'Did not write stub overrides (no workspace folder open).';
+  }
+
+  const settingsTouched = outcome.result.stubPathUpdates.size;
+  const fileCount = outcome.result.writtenFiles.length;
+  const settingsNote =
+    settingsTouched > 0
+      ? `Pointed ${settingsTouched} stubPath setting(s) at the override directory.`
+      : 'stubPath settings were already pointing at the override directory.';
+
+  return `Generated ${fileCount} stub file(s) under ${STUB_OVERRIDE_RELATIVE_PATH}. ${settingsNote}`;
+}
+
+function summarizeRevert(outcome: StubOverrideOutcome): string | undefined {
+  if (outcome.kind !== 'reverted') {
+    return undefined;
+  }
+
+  const parts: string[] = [];
+  if (outcome.result.directoryRemoved) {
+    parts.push(`Removed ${STUB_OVERRIDE_RELATIVE_PATH}`);
+  }
+  if (outcome.result.stubPathReverts.length > 0) {
+    parts.push(
+      `cleared ${outcome.result.stubPathReverts.join(' and ')}`
+    );
+  }
+
+  if (parts.length === 0) {
+    return undefined;
+  }
+  return `${parts.join('; ')}.`;
 }
 
 function configurationTarget(): vscode.ConfigurationTarget {

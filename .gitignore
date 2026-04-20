@@ -13,3 +13,4 @@ __pycache__/
 .claude
 target/
 native/*/index.node
+.zoek-rs

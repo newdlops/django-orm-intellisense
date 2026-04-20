@@ -733,9 +733,25 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
 
     const index = this.localWorkspaceIndex;
-    if (!index.models.has(baseModelLabel)) {
+    const model = index.models.get(baseModelLabel);
+    if (!model) {
+      const objectName = baseModelLabel.includes('.')
+        ? baseModelLabel.split('.').pop()!
+        : baseModelLabel;
+      const candidateKeys = Object.keys(this.surfaceIndex).filter((key) => {
+        if (key === baseModelLabel) return true;
+        const keyObject = key.includes('.') ? key.split('.').pop() : key;
+        return keyObject === objectName;
+      });
+      const nameMapped = this.modelLabelByName.get(objectName);
+      this.logDiagnostic(
+        `[completion:lookup:local:miss] model=${baseModelLabel} indexSize=${index.models.size} surfaceKeys=${Object.keys(this.surfaceIndex).length} hasSurfaceEntry=${Boolean(this.surfaceIndex[baseModelLabel])} nameMapped=${nameMapped ?? '<none>'} candidates=${JSON.stringify(candidateKeys.slice(0, 10))}`
+      );
       return undefined;
     }
+    this.logDiagnostic(
+      `[completion:lookup:local:hit] model=${baseModelLabel} fields=${model.fields.size} relations=${model.relations.size} reverseRelations=${model.reverseRelations.size}`
+    );
 
     const { completedSegments, currentPartial } = this.splitLocalLookupPrefix(
       prefix,
