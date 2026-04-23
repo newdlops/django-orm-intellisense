@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 4,
+            "activePatchIndex": 5,
             "patches": [
                 {
                     "date": 1776590170672,
@@ -24,6 +24,10 @@
                 {
                     "date": 1776909739662,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-orm-intellisense\",\n   \"displayName\": \"Django ORM Intellisense\",\n   \"description\": \"Framework-aware autocomplete, hover, go-to-definition, and diagnostics for Django ORM lookup paths, relation strings, and queryset chains.\",\n-  \"version\": \"0.1.8\",\n+  \"version\": \"0.1.9\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
+                },
+                {
+                    "date": 1776920327325,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-orm-intellisense\",\n   \"displayName\": \"Django ORM Intellisense\",\n   \"description\": \"Framework-aware autocomplete, hover, go-to-definition, and diagnostics for Django ORM lookup paths, relation strings, and queryset chains.\",\n-  \"version\": \"0.1.9\",\n+  \"version\": \"0.1.91\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
                 }
             ],
             "date": 1776590170672,

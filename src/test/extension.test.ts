@@ -849,7 +849,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      186,
+      190,
       'Expected app-label-overridden reverse lookup definition to target AppLabelCorporateRegistration.registration_code.'
     );
 
@@ -1444,7 +1444,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       queryNameDefinitionTarget!.range.start.line + 1,
-      160,
+      164,
       'Expected reverse related_query_name definition to target FaqLink.label.'
     );
 
