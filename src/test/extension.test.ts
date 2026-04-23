@@ -530,6 +530,13 @@ suite('Django ORM Intellisense UI', () => {
           ),
         15_000
       );
+      await waitForCondition(
+        () =>
+          Boolean(
+            daemon.surfaceIndex['blog.InheritedOnlyLog']?.instance?.created_at
+          ),
+        15_000
+      );
 
       const document = await openFixtureDocument(
         tempRoot,
@@ -549,6 +556,154 @@ suite('Django ORM Intellisense UI', () => {
           .slice(0, 20)
           .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
           .join(', ')}`
+      );
+
+      const inheritedLookupCompletionPosition = positionAfterTextInContainer(
+        document,
+        "InheritedOnlyLog.objects.filter(cr='entry')",
+        'cr'
+      );
+      const inheritedLookupCompletionList =
+        await vscode.commands.executeCommand<vscode.CompletionList>(
+          'vscode.executeCompletionItemProvider',
+          document.uri,
+          inheritedLookupCompletionPosition
+        );
+
+      assert.ok(
+        hasCompletionItemLabel(
+          inheritedLookupCompletionList?.items ?? [],
+          'created_at'
+        ),
+        `Expected file-watcher reindex to preserve inherited-only model lookup completion. Received: ${(inheritedLookupCompletionList?.items ?? [])
+          .slice(0, 20)
+          .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
+          .join(', ')}`
+      );
+    } finally {
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('reindexes inherited lookup surfaces when an abstract base file changes', async function () {
+    this.timeout(30_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+    assert.ok(environment, 'Expected a reusable E2E environment for the fixture project.');
+
+    const tempRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'django-orm-intellisense-inheritance-watcher-root-')
+    );
+    copyDirectory(fixtureRoot, tempRoot);
+
+    const watcherExamplesPath = path.join(
+      tempRoot,
+      'org',
+      'inheritance_watcher_examples.py'
+    );
+    fs.writeFileSync(
+      watcherExamplesPath,
+      [
+        'from org.models import Vendor',
+        '',
+        '',
+        'def vendor_lookup_examples():',
+        "    Vendor.objects.filter(up='watcher')",
+        "    Vendor.objects.filter(updated_by__bog='watcher')",
+        '',
+      ].join('\n'),
+      'utf8'
+    );
+
+    await removeWorkspaceFoldersFrom(0);
+
+    try {
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon, 'Expected the analysis daemon to be active after extension activation.');
+
+      const fixtureWorkspace = ensureFixtureWorkspace(tempRoot, environment);
+      await addWorkspaceFolder(fixtureWorkspace);
+      await applyFixtureWorkspaceSettings(fixtureWorkspace, tempRoot, environment);
+
+      const initialSnapshot = await daemon.restart(vscode.Uri.file(fixtureWorkspace));
+      const snapshot =
+        initialSnapshot.phase === 'ready' &&
+        initialSnapshot.runtime?.bootstrapStatus === 'ready'
+          ? initialSnapshot
+          : await waitForHealthSnapshot(
+              daemon,
+              (candidate) =>
+                candidate.phase === 'ready' &&
+                candidate.runtime?.bootstrapStatus === 'ready',
+              30_000
+            );
+      assertFixtureE2EHealth(snapshot, tempRoot, environment);
+
+      const basePath = path.join(tempRoot, 'org', 'models', 'base.py');
+      const originalBase = fs.readFileSync(basePath, 'utf8');
+      const updatedBase = originalBase.replace(
+        "    class Meta:\n        abstract = True\n",
+        "    updated_by = models.CharField(max_length=128, blank=True)\n\n    class Meta:\n        abstract = True\n"
+      );
+      assert.notStrictEqual(
+        updatedBase,
+        originalBase,
+        'Expected to inject an inherited watcher test field into org.VendorBase.'
+      );
+      fs.writeFileSync(basePath, updatedBase, 'utf8');
+
+      await waitForCondition(
+        () => Boolean(daemon.surfaceIndex['org.Vendor']?.instance?.updated_by),
+        15_000
+      );
+
+      const document = await openFixtureDocument(
+        tempRoot,
+        'org/inheritance_watcher_examples.py'
+      );
+      const completionPosition = positionAfterTextInContainer(
+        document,
+        "Vendor.objects.filter(up='watcher')",
+        'up'
+      );
+      const completionList =
+        await vscode.commands.executeCommand<vscode.CompletionList>(
+          'vscode.executeCompletionItemProvider',
+          document.uri,
+          completionPosition
+        );
+
+      assert.ok(
+        hasCompletionItemLabel(completionList?.items ?? [], 'updated_by'),
+        `Expected file-watcher reindex to propagate abstract-base field additions into inherited lookup completion. Received: ${(completionList?.items ?? [])
+          .slice(0, 20)
+          .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
+          .join(', ')}`
+      );
+
+      const updatedLookupResolution = await daemon.resolveLookupPath(
+        'org.Vendor',
+        'updated_by__bog',
+        'filter',
+        true
+      );
+
+      assert.strictEqual(
+        updatedLookupResolution.resolved,
+        false,
+        `Expected file-watcher reindex to propagate abstract-base field additions into inherited lookup resolution. Received: ${JSON.stringify(updatedLookupResolution)}`
+      );
+      assert.strictEqual(
+        updatedLookupResolution.reason,
+        'invalid_lookup_operator',
+        `Expected file-watcher reindex to treat \`updated_by\` as a resolved inherited field before rejecting \`bog\`. Received: ${JSON.stringify(updatedLookupResolution)}`
+      );
+      assert.strictEqual(
+        updatedLookupResolution.missingSegment,
+        'bog',
+        `Expected file-watcher reindex to expose the invalid inherited lookup operator segment. Received: ${JSON.stringify(updatedLookupResolution)}`
       );
     } finally {
       await removeWorkspaceFoldersFrom(0);
@@ -2983,6 +3138,71 @@ suite('Django ORM Intellisense UI', () => {
       'Expected imported TYPE_CHECKING manager completion to resolve the manager class even when it is excluded from `__all__`.'
     );
 
+    const inheritedRelatedManagerFilterCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.company_question_thread_set.filter(he='inherited')",
+        'filter(he'
+      );
+    const inheritedRelatedManagerFilterCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        inheritedRelatedManagerFilterCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(
+        inheritedRelatedManagerFilterCompletionList?.items,
+        'help_type'
+      ),
+      `Expected concrete-inheritance reverse related-manager filter() field completion to include the inherited \`help_type\` field. Received: ${(inheritedRelatedManagerFilterCompletionList?.items ?? [])
+        .slice(0, 20)
+        .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
+        .join(', ')}`
+    );
+
+    const inheritedRelatedManagerLookupOperatorCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.company_question_thread_set.filter(help_type__i='inherited')",
+        'help_type__i'
+      );
+    const inheritedRelatedManagerLookupOperatorCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        inheritedRelatedManagerLookupOperatorCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        inheritedRelatedManagerLookupOperatorCompletionList?.items,
+        'icontains'
+      ),
+      'Expected concrete-inheritance reverse related-manager lookup-operator completion to include `icontains` for the inherited `help_type` field.'
+    );
+
+    const inheritedRelatedManagerExcludeCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "self.company.company_question_thread_set.exclude(he='inherited')",
+        'exclude(he'
+      );
+    const inheritedRelatedManagerExcludeCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        inheritedRelatedManagerExcludeCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(
+        inheritedRelatedManagerExcludeCompletionList?.items,
+        'help_type'
+      ),
+      'Expected concrete-inheritance reverse related-manager exclude() field completion to include the inherited `help_type` field.'
+    );
+
     const captainMessageCreateCompletionPosition = positionAfterTextInContainer(
       document,
       `self.get_company_question_thread(
@@ -3806,6 +4026,49 @@ suite('Django ORM Intellisense UI', () => {
       'Expected imported package model lookup completion to include `name`.'
     );
 
+    const inheritedLookupCompletionPosition = positionAfterTextInContainer(
+      document,
+      "Vendor.objects.filter(cre='demo')",
+      'cre'
+    );
+    const inheritedLookupCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        inheritedLookupCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(inheritedLookupCompletionList?.items, 'created_by'),
+      'Expected imported package model lookup completion to include the inherited relation field `created_by`.'
+    );
+
+    const inheritedRelatedLookupCompletionPosition = positionAfterTextInContainer(
+      document,
+      "Vendor.objects.filter(created_by__na='demo')",
+      'created_by__na'
+    );
+    const inheritedRelatedLookupCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        inheritedRelatedLookupCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(inheritedRelatedLookupCompletionList?.items, 'name'),
+      'Expected imported package model lookup completion to traverse the inherited relation field `created_by` and include `name`.'
+    );
+    const inheritedRelatedLookupNameItem = findCompletionItemByLabel(
+      inheritedRelatedLookupCompletionList?.items,
+      'name'
+    );
+    assert.strictEqual(
+      completionItemFilterValue(inheritedRelatedLookupNameItem!),
+      'created_by__name',
+      'Expected inherited related lookup completion to preserve the full path for editor filtering.'
+    );
+
     const qCompletionPosition = positionAfterTextInContainer(
       document,
       'Vendor.objects.exclude(Q(settlement_cycles__isnull=True) | Q(settlement_cycles=[]))',
@@ -3840,6 +4103,10 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hasCompletionItemLabel(instanceCompletionList?.items, 'settlement_cycles'),
       'Expected imported package model instance completion to include `settlement_cycles`.'
+    );
+    assert.ok(
+      hasCompletionItemLabel(instanceCompletionList?.items, 'created_by'),
+      'Expected imported package model instance completion to include the inherited relation field `created_by`.'
     );
   });
 
@@ -3963,6 +4230,41 @@ suite('Django ORM Intellisense UI', () => {
       'Expected abstract-base model keyword lookup completion to include `name`.'
     );
 
+    const inheritedOnlyCompletionPosition = positionAfterTextInContainer(
+      document,
+      "InheritedOnlyLog.objects.filter(cr='entry')",
+      'cr'
+    );
+    const inheritedOnlyCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        inheritedOnlyCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(inheritedOnlyCompletionList?.items, 'created_at'),
+      'Expected inheritance-only concrete model keyword lookup completion to include `created_at`.'
+    );
+
+    const inheritedOnlyOperatorCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        'InheritedOnlyLog.objects.filter(created_at__ye=2024)',
+        'created_at__ye'
+      );
+    const inheritedOnlyOperatorCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        inheritedOnlyOperatorCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(inheritedOnlyOperatorCompletionList?.items, 'year'),
+      'Expected inheritance-only concrete model lookup operator completion to include `year` for `created_at`.'
+    );
+
     const multiInheritedCompletionPosition = positionAfterTextInContainer(
       document,
       "MultiInheritedLog.objects.filter(sl='entry')",
@@ -3980,6 +4282,130 @@ suite('Django ORM Intellisense UI', () => {
       'Expected multiple-abstract-inheritance keyword lookup completion to include `slug`.'
     );
 
+    const concreteInheritedCompletionPosition = positionAfterTextInContainer(
+      document,
+      "CompanyQuestionThread.objects.filter(he='inherited')",
+      'filter(he'
+    );
+    const concreteInheritedCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        concreteInheritedCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(concreteInheritedCompletionList?.items, 'help_type'),
+      'Expected concrete-inheritance keyword lookup completion to include `help_type`.'
+    );
+
+    const concreteInheritedOperatorCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "CompanyQuestionThread.objects.filter(help_type__i='inherited')",
+        'help_type__i'
+      );
+    const concreteInheritedOperatorCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        concreteInheritedOperatorCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(concreteInheritedOperatorCompletionList?.items, 'icontains'),
+      'Expected concrete-inheritance lookup operator completion to include `icontains` for `help_type`.'
+    );
+
+    const concreteInheritedHoverPosition = positionInsideText(
+      document,
+      "CompanyQuestionThread.objects.filter(help_type__icontains='inherited')",
+      'help_type__icontains'
+    );
+    const concreteInheritedHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        concreteInheritedHoverPosition
+      );
+    const concreteInheritedHoverText = stringifyHovers(concreteInheritedHovers);
+
+    assert.ok(
+      concreteInheritedHoverText.includes('Owner model: `blog.CompanyQuestionThread`'),
+      `Expected concrete-inheritance lookup hover to mention blog.CompanyQuestionThread. Received: ${concreteInheritedHoverText}`
+    );
+    assert.ok(
+      concreteInheritedHoverText.includes('Field kind: `CharField`'),
+      `Expected concrete-inheritance lookup hover to mention CharField. Received: ${concreteInheritedHoverText}`
+    );
+    assert.ok(
+      concreteInheritedHoverText.includes('Lookup operator: `icontains`'),
+      `Expected concrete-inheritance lookup hover to mention the inherited lookup operator. Received: ${concreteInheritedHoverText}`
+    );
+
+    const proxyInheritedCompletionPosition = positionAfterTextInContainer(
+      document,
+      "ProxyRegistrationServiceQuestionThread.objects.filter(he='proxy')",
+      'filter(he'
+    );
+    const proxyInheritedCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        proxyInheritedCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(proxyInheritedCompletionList?.items, 'help_type'),
+      'Expected proxy-inheritance keyword lookup completion to include `help_type`.'
+    );
+
+    const proxyInheritedOperatorCompletionPosition =
+      positionAfterTextInContainer(
+        document,
+        "ProxyRegistrationServiceQuestionThread.objects.filter(help_type__i='proxy')",
+        'help_type__i'
+      );
+    const proxyInheritedOperatorCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        proxyInheritedOperatorCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(proxyInheritedOperatorCompletionList?.items, 'icontains'),
+      'Expected proxy-inheritance lookup operator completion to include `icontains` for `help_type`.'
+    );
+
+    const proxyInheritedHoverPosition = positionInsideText(
+      document,
+      "ProxyRegistrationServiceQuestionThread.objects.filter(help_type__icontains='proxy')",
+      'help_type__icontains'
+    );
+    const proxyInheritedHovers =
+      await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider',
+        document.uri,
+        proxyInheritedHoverPosition
+      );
+    const proxyInheritedHoverText = stringifyHovers(proxyInheritedHovers);
+
+    assert.ok(
+      proxyInheritedHoverText.includes(
+        'Owner model: `blog.ProxyRegistrationServiceQuestionThread`'
+      ),
+      `Expected proxy-inheritance lookup hover to mention blog.ProxyRegistrationServiceQuestionThread. Received: ${proxyInheritedHoverText}`
+    );
+    assert.ok(
+      proxyInheritedHoverText.includes('Field kind: `CharField`'),
+      `Expected proxy-inheritance lookup hover to mention CharField. Received: ${proxyInheritedHoverText}`
+    );
+    assert.ok(
+      proxyInheritedHoverText.includes('Lookup operator: `icontains`'),
+      `Expected proxy-inheritance lookup hover to mention the inherited lookup operator. Received: ${proxyInheritedHoverText}`
+    );
+
     const multilineCompletionPosition = positionAfterTextInContainer(
       document,
       "filter(\n        author__profile__time='Asia/Seoul',\n    )",
@@ -3995,6 +4421,26 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       hasCompletionItemLabel(multilineCompletionList?.items, 'timezone'),
       'Expected multiline keyword lookup completion to include `timezone`.'
+    );
+
+    const inheritedLookupDiagnostics = await waitForDiagnostics(
+      document.uri,
+      (items) =>
+        items.some((item) => item.message.includes('created_at__bog')) &&
+        items.some((item) => item.message.includes('help_type__bog'))
+    );
+
+    assert.ok(
+      inheritedLookupDiagnostics.some((item) =>
+        item.message.includes('Unknown Django lookup operator `bog` in `created_at__bog`')
+      ),
+      `Expected inheritance-only lookup diagnostics to flag invalid inherited operators. Received: ${stringifyDiagnostics(inheritedLookupDiagnostics)}`
+    );
+    assert.ok(
+      inheritedLookupDiagnostics.some((item) =>
+        item.message.includes('Unknown Django lookup operator `bog` in `help_type__bog`')
+      ),
+      `Expected concrete/proxy inheritance lookup diagnostics to flag invalid inherited operators. Received: ${stringifyDiagnostics(inheritedLookupDiagnostics)}`
     );
 
     const operatorCompletionPosition = positionAfterTextInContainer(

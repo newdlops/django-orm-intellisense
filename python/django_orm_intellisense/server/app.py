@@ -71,6 +71,30 @@ from ..static_index.indexer import StaticIndex, build_static_index, reindex_sing
 INITIAL_SYNC_SURFACE_INDEX_MODEL_LIMIT = 200
 
 
+def _inheritance_dependent_labels(
+    static_index: StaticIndex,
+    seed_labels: set[str],
+) -> set[str]:
+    if not seed_labels:
+        return set()
+
+    affected = set(seed_labels)
+    changed = True
+    while changed:
+        changed = False
+        for candidate in static_index.model_candidates:
+            if candidate.label in affected:
+                continue
+            base_labels = static_index._resolve_model_base_labels(candidate)
+            if not base_labels:
+                continue
+            if any(base_label in affected for base_label in base_labels):
+                affected.add(candidate.label)
+                changed = True
+
+    return affected - seed_labels
+
+
 # ---------------------------------------------------------------------------
 # Background worker process — runs in a separate OS process (no GIL sharing)
 # ---------------------------------------------------------------------------
@@ -1333,6 +1357,12 @@ class DaemonServer:
                 file=sys.stderr,
             )
             return {'unchanged': True}
+
+        # Inheritance changes propagate beyond the edited module: when an
+        # abstract/base model changes, every descendant model that inherits its
+        # fields must refresh lookup/hover/diagnostic surfaces as well.
+        affected_labels |= _inheritance_dependent_labels(static_index, affected_labels)
+        affected_labels |= _inheritance_dependent_labels(new_static_index, affected_labels)
 
         # Also invalidate reverse-relation targets: models that reference
         # affected models may have changed reverse relations.

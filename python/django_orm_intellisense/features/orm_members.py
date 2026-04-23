@@ -344,13 +344,14 @@ def rebuild_surface_for_models(
                         item.return_model_label or item.model_label,
                         item.member_kind,
                         item.field_kind,
-                    ]
+                ]
             if kind_entry:
                 model_entry[kind] = kind_entry
-        if model_entry:
-            index[candidate.label] = model_entry
-        else:
-            index.pop(candidate.label, None)
+        # Keep concrete models registered even when every receiver surface is
+        # temporarily empty. Dropping the label here makes incremental rebuilds
+        # diverge from full initialization and can hide inheritance-only
+        # concrete models from TS lookup completion until the next full restart.
+        index[candidate.label] = model_entry
 
     elapsed = time.perf_counter() - started
     print(

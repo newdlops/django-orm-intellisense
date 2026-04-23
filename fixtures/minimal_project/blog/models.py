@@ -132,6 +132,10 @@ class AuditLog(TimeStampedBaseModel):
     note = models.TextField(blank=True)
 
 
+class InheritedOnlyLog(TimeStampedBaseModel):
+    pass
+
+
 class MultiInheritedLog(TimeStampedBaseModel, SluggedBaseModel):
     title = models.CharField(max_length=255)
 

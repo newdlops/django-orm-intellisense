@@ -1,14 +1,16 @@
 from django.db import models as db_models
 from django.db.models import F, Prefetch, Q
 
-from blog import AuditLog, Company, MultiInheritedLog, Post
+from blog import AuditLog, Company, InheritedOnlyLog, MultiInheritedLog, Post
 from blog.models import (
     AppLabelCompany,
     CaptainCompany,
+    CompanyQuestionThread,
     CaptainQuestionThread,
     Faq,
     HiddenReverseTag,
     InheritedManagerCompany,
+    ProxyRegistrationServiceQuestionThread,
     ProxyCompany,
     QuestionThread,
 )
@@ -66,6 +68,9 @@ def lookup_examples():
     )
     AuditLog.objects.filter(na='entry')
     AuditLog.objects.exclude(Q(na='entry'))
+    InheritedOnlyLog.objects.filter(cr='entry')
+    InheritedOnlyLog.objects.filter(created_at__ye=2024)
+    InheritedOnlyLog.objects.filter(created_at__bog='entry')
     MultiInheritedLog.objects.filter(sl='entry')
     Faq.objects.filter(ti='faq')
     Faq.objects.filter(title='faq')
@@ -77,6 +82,14 @@ def lookup_examples():
     Faq.objects.prefetch_related("link_set")
     Company.objects.exclude(db_models.Q(st='READY'))
     Company.objects.get(name=db_models.F("st"))
+    CompanyQuestionThread.objects.filter(he='inherited')
+    CompanyQuestionThread.objects.filter(help_type__i='inherited')
+    CompanyQuestionThread.objects.filter(help_type__icontains='inherited')
+    CompanyQuestionThread.objects.filter(help_type__bog='inherited')
+    ProxyRegistrationServiceQuestionThread.objects.filter(he='proxy')
+    ProxyRegistrationServiceQuestionThread.objects.filter(help_type__i='proxy')
+    ProxyRegistrationServiceQuestionThread.objects.filter(help_type__icontains='proxy')
+    ProxyRegistrationServiceQuestionThread.objects.filter(help_type__bog='proxy')
     Post.objects.values("author__unknown")
     Post.objects.filter(author__profile__timezone__bogus='Asia/Seoul')
     Post.objects.filter(title__name='x')
@@ -276,6 +289,11 @@ class CaptainImportedCompanyQuestionServiceExamples:
 class InheritedManagerCompanyQuestionServiceExamples:
     def __init__(self, company: InheritedManagerCompany) -> None:
         self.company: "InheritedManagerCompany" = company
+
+    def method_examples(self):
+        self.company.company_question_thread_set.filter(he='inherited')
+        self.company.company_question_thread_set.filter(help_type__i='inherited')
+        self.company.company_question_thread_set.exclude(he='inherited')
 
     def create_company_question_thread(
         self,
