@@ -16,7 +16,7 @@ from ..semantic.graph import ModelGraph, ModelGraphEdge, ModelGraphNode
 from ..static_index.indexer import ModuleIndex, StaticIndex, build_static_index
 from ..static_index.indexer import FieldCandidate, ModelCandidate
 
-CACHE_SCHEMA_VERSION = 14
+CACHE_SCHEMA_VERSION = 15
 SOURCE_SNAPSHOT_CACHE_NAME = 'source-snapshot.json'
 STATIC_INDEX_CACHE_NAME = 'static-index.json'
 STATIC_INDEX_FULL_CACHE_NAME = 'static-index-full.json'
@@ -121,14 +121,22 @@ def load_cached_static_index(
 
     cached_directory_fingerprints = cached_payload.get('directoryFingerprints')
     cached_module_entries = cached_payload.get('moduleEntries')
+    cached_unparseable_entries = cached_payload.get('unparseableEntries') or {}
     if not isinstance(cached_directory_fingerprints, dict) or not isinstance(
         cached_module_entries, dict
     ):
         return None, 'miss'
+    if not isinstance(cached_unparseable_entries, dict):
+        cached_unparseable_entries = {}
 
     try:
         reusable_module_indices = _load_reusable_module_indices(
             cached_module_entries=cached_module_entries,
+            cached_directory_fingerprints=cached_directory_fingerprints,
+            source_snapshot=source_snapshot,
+        )
+        reusable_unparseable_files = _load_reusable_unparseable_entries(
+            cached_unparseable_entries=cached_unparseable_entries,
             cached_directory_fingerprints=cached_directory_fingerprints,
             source_snapshot=source_snapshot,
         )
@@ -138,13 +146,14 @@ def load_cached_static_index(
         )
         return None, 'miss'
 
-    if not reusable_module_indices:
+    if not reusable_module_indices and not reusable_unparseable_files:
         return None, 'miss'
 
     result = build_static_index(
         workspace_root,
         python_files=source_snapshot.files,
         cached_module_indices=reusable_module_indices,
+        cached_unparseable_files=reusable_unparseable_files,
     )
     return result, 'partial'
 
@@ -175,12 +184,46 @@ def _try_load_full_static_index(
         return None
 
     try:
-        return StaticIndex.from_cache_dict(dict(cached_payload))
+        cached_static_index = StaticIndex.from_cache_dict(dict(cached_payload))
     except (KeyError, TypeError, ValueError):
         _unlink_quietly(
             _workspace_cache_dir(workspace_root) / STATIC_INDEX_FULL_CACHE_NAME
         )
         return None
+
+    # Completeness check: the cache must account for every file in the
+    # current source snapshot. Without this, a cache that was saved while
+    # one or more files temporarily failed to AST-parse would be trusted
+    # forever — the rootTreeFingerprint matches the snapshot but a model
+    # like `db.Company` is silently absent. Falling through to the partial
+    # path forces a re-parse of any uncovered file. See
+    # `StaticIndex.unparseable_files` / `shadowed_files`.
+    expected_file_count = len(source_snapshot.entries)
+    represented_count = (
+        len(cached_static_index.modules)
+        + len(cached_static_index.unparseable_files)
+        + len(cached_static_index.shadowed_files)
+    )
+    if (
+        cached_static_index.python_file_count != expected_file_count
+        or represented_count != expected_file_count
+    ):
+        print(
+            f'[cache] reject_full_static_index workspace={workspace_root.name} '
+            f'snapshot_files={expected_file_count} '
+            f'cache_python_file_count={cached_static_index.python_file_count} '
+            f'cache_modules={len(cached_static_index.modules)} '
+            f'cache_unparseable={len(cached_static_index.unparseable_files)} '
+            f'cache_shadowed={len(cached_static_index.shadowed_files)} '
+            f'reason=incomplete_or_count_mismatch',
+            file=__import__('sys').stderr,
+        )
+        _unlink_quietly(
+            _workspace_cache_dir(workspace_root) / STATIC_INDEX_FULL_CACHE_NAME
+        )
+        return None
+
+    return cached_static_index
 
 
 def save_static_index(
@@ -207,6 +250,16 @@ def save_static_index(
             'moduleIndex': module_index.to_dict(),
         }
 
+    unparseable_entries: dict[str, object] = {}
+    for relative_path, error_kind in static_index.unparseable_files.items():
+        entry = entry_by_path.get(relative_path)
+        if entry is None:
+            continue
+        unparseable_entries[relative_path] = {
+            'fileFingerprint': entry.fingerprint,
+            'errorKind': error_kind,
+        }
+
     _write_cache_payload(
         _workspace_cache_dir(workspace_root) / STATIC_INDEX_CACHE_NAME,
         {
@@ -219,6 +272,7 @@ def save_static_index(
             'payload': {
                 'directoryFingerprints': source_snapshot.directory_fingerprints,
                 'moduleEntries': module_entries,
+                'unparseableEntries': unparseable_entries,
             },
         },
     )
@@ -696,6 +750,46 @@ def _load_reusable_module_indices(
         )
 
     return reusable_modules
+
+
+def _load_reusable_unparseable_entries(
+    *,
+    cached_unparseable_entries: dict[str, object],
+    cached_directory_fingerprints: dict[str, object],
+    source_snapshot: PythonSourceSnapshot,
+) -> dict[str, str]:
+    """Reuse cached parse-failure tombstones for files whose contents have
+    not changed. Files with changed fingerprints are dropped so the partial
+    rebuild re-parses them — they may have been fixed since the last save.
+    """
+    reusable: dict[str, str] = {}
+    unchanged_directories = {
+        directory_path
+        for directory_path, fingerprint in source_snapshot.directory_fingerprints.items()
+        if cached_directory_fingerprints.get(directory_path) == fingerprint
+    }
+
+    for entry in source_snapshot.entries:
+        cached_entry = cached_unparseable_entries.get(entry.relative_path)
+        if not isinstance(cached_entry, dict):
+            continue
+
+        cached_file_fingerprint = cached_entry.get('fileFingerprint')
+        file_is_unchanged = cached_file_fingerprint == entry.fingerprint
+        tree_is_unchanged = _is_under_unchanged_tree(
+            entry.directory_path,
+            unchanged_directories,
+        )
+        if not file_is_unchanged and not tree_is_unchanged:
+            continue
+
+        error_kind = cached_entry.get('errorKind')
+        if not isinstance(error_kind, str) or not error_kind:
+            error_kind = 'UnknownError'
+
+        reusable[entry.relative_path] = error_kind
+
+    return reusable
 
 
 def _is_under_unchanged_tree(

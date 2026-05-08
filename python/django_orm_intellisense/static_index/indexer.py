@@ -388,6 +388,21 @@ class StaticIndex:
     explicit_all_count: int
     modules: dict[str, ModuleIndex]
     model_candidates: list[ModelCandidate]
+    # Files visited by the source snapshot whose AST parse failed. Tracked
+    # explicitly so the cache can preserve the "we tried, it didn't parse"
+    # state — silently dropping these from `modules` causes the full cache
+    # to look complete (`rootTreeFingerprint` matches the snapshot) while
+    # missing models from those files forever, which is what manifested as
+    # "db.Company not in surfaceIndex" in #captain. Maps relative path →
+    # short error kind (e.g. "SyntaxError").
+    unparseable_files: dict[str, str] = dataclasses.field(default_factory=dict)
+    # Source files whose `module_name` collides with another file that won
+    # the slot (`pkg/mod.py` is shadowed by `pkg/mod/__init__.py` per
+    # Python import semantics). These parsed fine but their ModuleIndex is
+    # discarded by `_should_replace_module_index`. Tracked separately so
+    # the invariant `python_file_count == len(modules) + len(unparseable_files)
+    # + len(shadowed_files)` can be verified at cache load.
+    shadowed_files: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._module_export_cache: dict[str, dict[str, ExportResolution]] = {}
@@ -456,15 +471,23 @@ class StaticIndex:
             'modelCandidates': [
                 candidate.to_dict() for candidate in self.model_candidates
             ],
+            'unparseableFiles': dict(self.unparseable_files),
+            'shadowedFiles': dict(self.shadowed_files),
         }
 
     @classmethod
     def from_cache_dict(cls, payload: dict[str, object]) -> StaticIndex:
         raw_modules = payload.get('modules') or {}
         raw_model_candidates = payload.get('modelCandidates') or []
+        raw_unparseable = payload.get('unparseableFiles') or {}
+        raw_shadowed = payload.get('shadowedFiles') or {}
 
         if not isinstance(raw_modules, dict):
             raise ValueError('Invalid static index cache payload: modules.')
+        if not isinstance(raw_unparseable, dict):
+            raise ValueError('Invalid static index cache payload: unparseableFiles.')
+        if not isinstance(raw_shadowed, dict):
+            raise ValueError('Invalid static index cache payload: shadowedFiles.')
 
         return cls(
             python_file_count=int(payload['pythonFileCount']),
@@ -482,6 +505,12 @@ class StaticIndex:
                 for candidate in raw_model_candidates
                 if isinstance(candidate, dict)
             ],
+            unparseable_files={
+                str(rel): str(kind) for rel, kind in raw_unparseable.items()
+            },
+            shadowed_files={
+                str(rel): str(winner) for rel, winner in raw_shadowed.items()
+            },
         )
 
     def resolve_export_origin(
@@ -1217,45 +1246,96 @@ def build_static_index(
     root: Path,
     python_files: list[Path] | tuple[Path, ...] | None = None,
     cached_module_indices: dict[str, ModuleIndex] | None = None,
+    cached_unparseable_files: dict[str, str] | None = None,
 ) -> StaticIndex:
     modules: dict[str, ModuleIndex] = {}
+    unparseable_files: dict[str, str] = {}
+    # relative_path → relative_path of the file that won the module slot.
+    # Tracked so the invariant len(modules) + len(unparseable_files) +
+    # len(shadowed_files) == python_file_count holds even when sibling
+    # `pkg/mod.py` and `pkg/mod/__init__.py` exist (only one wins the
+    # `pkg.mod` slot per Python import semantics).
+    shadowed_files: dict[str, str] = {}
+    # Track which relative_path is currently occupying each module_name
+    # slot so we know which file becomes shadowed when a replacement wins.
+    module_slot_owner: dict[str, str] = {}
     source_files = list(python_files) if python_files is not None else iter_python_files(root)
     cached_modules = cached_module_indices or {}
+    cached_unparseable = cached_unparseable_files or {}
     has_fresh_modules = False
+
+    def _record_slot(module_name: str, candidate: ModuleIndex, relative_path: str) -> None:
+        existing = modules.get(module_name)
+        if existing is None:
+            modules[module_name] = candidate
+            module_slot_owner[module_name] = relative_path
+            return
+        if _should_replace_module_index(existing, candidate):
+            previous_owner = module_slot_owner.get(module_name)
+            if previous_owner is not None and previous_owner != relative_path:
+                shadowed_files[previous_owner] = relative_path
+            modules[module_name] = candidate
+            module_slot_owner[module_name] = relative_path
+        else:
+            current_owner = module_slot_owner.get(module_name, '')
+            shadowed_files[relative_path] = current_owner
 
     for python_file in source_files:
         relative_path = python_file.relative_to(root).as_posix()
         module_name = _module_name_from_path(root, python_file)
         cached_module = cached_modules.get(relative_path)
         if cached_module is not None:
-            existing_module = modules.get(module_name)
-            if (
-                existing_module is None
-                or _should_replace_module_index(existing_module, cached_module)
-            ):
-                modules[module_name] = cached_module
+            _record_slot(module_name, cached_module, relative_path)
             continue
 
         has_fresh_modules = True
         try:
             file_text = python_file.read_text(encoding='utf-8')
             parsed_module = ast.parse(file_text)
-        except (OSError, SyntaxError, UnicodeDecodeError):
+        except (OSError, SyntaxError, UnicodeDecodeError) as parse_error:
+            unparseable_files[relative_path] = type(parse_error).__name__
+            print(
+                f'[static_index] parse_failed file={relative_path} '
+                f'error={type(parse_error).__name__}: {parse_error}',
+                file=__import__('sys').stderr,
+            )
             continue
 
         module_index = _build_module_index(root, python_file, module_name, parsed_module)
-        existing_module = modules.get(module_name)
-        if existing_module is None or _should_replace_module_index(
-            existing_module,
-            module_index,
-        ):
-            modules[module_name] = module_index
+        _record_slot(module_name, module_index, relative_path)
+
+    # Carry over previously-known unparseable entries for files that we did
+    # not visit fresh and that still aren't represented in `modules`. This
+    # keeps the count invariant stable across partial-cache reloads even
+    # when a persistent failure already exists in the cache.
+    for relative_path, error_kind in cached_unparseable.items():
+        if relative_path in unparseable_files:
+            continue
+        if relative_path in shadowed_files:
+            continue
+        module_name = _module_name_from_relative_path(relative_path)
+        if module_name in modules:
+            continue
+        unparseable_files[relative_path] = error_kind
 
     return _static_index_from_modules(
         python_file_count=len(source_files),
         modules=modules,
         expand_inheritance=has_fresh_modules,
+        unparseable_files=unparseable_files,
+        shadowed_files=shadowed_files,
     )
+
+
+def _module_name_from_relative_path(relative_path: str) -> str:
+    parts = relative_path.split('/')
+    if not parts:
+        return ''
+    if parts[-1].endswith('.py'):
+        parts[-1] = parts[-1][:-3]
+    if parts and parts[-1] == '__init__':
+        parts.pop()
+    return '.'.join(p for p in parts if p)
 
 
 def _module_models_unchanged(
@@ -1295,6 +1375,10 @@ def reindex_single_file(
         - new_labels: model labels from the new version of this file
     """
     module_name = _module_name_from_path(root, file_path)
+    try:
+        relative_path = file_path.relative_to(root).as_posix()
+    except ValueError:
+        relative_path = None
 
     # Collect old model labels from this module
     old_labels: set[str] = set()
@@ -1302,43 +1386,78 @@ def reindex_single_file(
     if old_module is not None:
         old_labels = {c.label for c in old_module.model_candidates}
 
-    # Copy existing modules and replace the changed one
+    # Copy existing modules + unparseable + shadowed so that updates here
+    # don't mutate the previously-returned StaticIndex (callers may keep a
+    # reference).
     modules = dict(existing_static_index.modules)
+    unparseable_files = dict(existing_static_index.unparseable_files)
+    shadowed_files = dict(existing_static_index.shadowed_files)
 
     new_module: ModuleIndex | None = None
     new_labels: set[str] = set()
+    parse_failed = False
     if file_path.exists():
         try:
             file_text = file_path.read_text(encoding='utf-8')
             parsed_module = ast.parse(file_text)
-        except (OSError, SyntaxError, UnicodeDecodeError):
-            # Syntax error or unreadable: keep old module, report no changes
-            return existing_static_index, set(), set()
+        except (OSError, SyntaxError, UnicodeDecodeError) as parse_error:
+            parse_failed = True
+            if relative_path is not None:
+                unparseable_files[relative_path] = type(parse_error).__name__
+                print(
+                    f'[static_index] reindex_parse_failed file={relative_path} '
+                    f'error={type(parse_error).__name__}: {parse_error}',
+                    file=__import__('sys').stderr,
+                )
+            modules.pop(module_name, None)
 
-        new_module = _build_module_index(root, file_path, module_name, parsed_module)
-        modules[module_name] = new_module
-        new_labels = {c.label for c in new_module.model_candidates}
+        if not parse_failed:
+            new_module = _build_module_index(root, file_path, module_name, parsed_module)
+            modules[module_name] = new_module
+            new_labels = {c.label for c in new_module.model_candidates}
+            if relative_path is not None:
+                unparseable_files.pop(relative_path, None)
     else:
         # File deleted
         modules.pop(module_name, None)
+        if relative_path is not None:
+            unparseable_files.pop(relative_path, None)
+
+    # Drop any prior shadow record for this file — the reindex either
+    # reaffirms it (caller will reissue) or is now obsolete.
+    if relative_path is not None:
+        shadowed_files.pop(relative_path, None)
+
+    # Recompute python_file_count from the post-update sets so the
+    # invariant `python_file_count == len(modules) + len(unparseable_files)
+    # + len(shadowed_files)` survives add/modify/delete reindex outcomes
+    # equally. This is what the cache validator at load time relies on to
+    # detect silent drift.
+    new_python_file_count = (
+        len(modules) + len(unparseable_files) + len(shadowed_files)
+    )
 
     # Fast path: if model definitions are unchanged, skip expensive
     # _expand_model_candidates_via_imports and _resolve_fields.
     # This covers the common case of editing views, utils, tests, etc.
-    if _module_models_unchanged(old_module, new_module):
+    if not parse_failed and _module_models_unchanged(old_module, new_module):
         new_static_index = _static_index_from_modules(
-            python_file_count=existing_static_index.python_file_count,
+            python_file_count=new_python_file_count,
             modules=modules,
             expand_inheritance=False,
             cached_fields=existing_static_index.fields,
+            unparseable_files=unparseable_files,
+            shadowed_files=shadowed_files,
         )
         return new_static_index, old_labels, new_labels
 
     # Slow path: model definitions changed, full rebuild needed.
     new_static_index = _static_index_from_modules(
-        python_file_count=existing_static_index.python_file_count,
+        python_file_count=new_python_file_count,
         modules=modules,
         expand_inheritance=True,
+        unparseable_files=unparseable_files,
+        shadowed_files=shadowed_files,
     )
     return new_static_index, old_labels, new_labels
 
@@ -2378,6 +2497,8 @@ def _static_index_from_modules(
     modules: dict[str, ModuleIndex],
     expand_inheritance: bool = True,
     cached_fields: list[FieldCandidate] | None = None,
+    unparseable_files: dict[str, str] | None = None,
+    shadowed_files: dict[str, str] | None = None,
 ) -> StaticIndex:
     package_init_count = 0
     reexport_module_count = 0
@@ -2437,6 +2558,8 @@ def _static_index_from_modules(
             explicit_all_count=explicit_all_count,
             modules=modules,
             model_candidates=model_candidates,
+            unparseable_files=dict(unparseable_files) if unparseable_files else {},
+            shadowed_files=dict(shadowed_files) if shadowed_files else {},
         )
     finally:
         StaticIndex._pre_resolved_fields = None

@@ -48,7 +48,17 @@
       "Bash(tee /tmp/djotest11.log)",
       "Bash(tee /tmp/djotest12.log)",
       "Bash(tee /tmp/djotest13.log)",
-      "Bash(tee /tmp/djotest_final.log)"
+      "Bash(tee /tmp/djotest_final.log)",
+      "Bash(.e2e-django5/bin/python -c \"import django; print\\(django.get_version\\(\\)\\)\")",
+      "Bash(.e2e-homebrew313/bin/python -c \"import django; print\\(django.get_version\\(\\)\\)\")",
+      "Bash(DJLS_E2E_BASE_PYTHON=/Users/lky/project/django-orm-intellisense/.e2e-django5/bin/python npm test)",
+      "Bash(tee /tmp/e2e-output.log)",
+      "Read(//private/tmp/**)",
+      "Bash(/Users/lky/project/captain/.venv/bin/python -c ' *)",
+      "Read(//Users/lky/Library/Caches/**)",
+      "Read(//tmp/**)",
+      "Bash(/Users/lky/project/captain/.venv/bin/python *)",
+      "Bash(tee /tmp/e2e-output2.log)"
     ]
   }
 }
