@@ -37,10 +37,20 @@ pub fn expand_via_inheritance(
     }
 
     // reverse_imports[(source_module, symbol)] = [(importing_module, alias)]
+    // for direct `from source import symbol` bindings.
     let mut reverse_imports: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+    // star_re_exporters[source_module] = [importing_module, ...] for
+    // `from source_module import *` bindings — the importing module
+    // re-exposes every symbol of source_module under the same local name,
+    // so seed propagation has to follow these chains.
+    let mut star_re_exporters: HashMap<String, Vec<String>> = HashMap::new();
     for m in modules.iter() {
         for b in &m.import_bindings {
             if b.is_star {
+                star_re_exporters
+                    .entry(b.module.clone())
+                    .or_default()
+                    .push(m.module_name.clone());
                 continue;
             }
             if let Some(sym) = &b.symbol {
@@ -52,16 +62,39 @@ pub fn expand_via_inheritance(
         }
     }
 
+    // Collect every (importing_module, local_alias) pair that effectively
+    // sees `(seed_module, seed_symbol)` — directly or through any number
+    // of `__init__.py` star re-exports.
+    let importers_of = |seed_module: &str, seed_symbol: &str| -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut visited_origins: HashSet<(String, String)> = HashSet::new();
+        let mut work: Vec<(String, String)> =
+            vec![(seed_module.to_string(), seed_symbol.to_string())];
+        while let Some((src_mod, sym)) = work.pop() {
+            if !visited_origins.insert((src_mod.clone(), sym.clone())) {
+                continue;
+            }
+            if let Some(dests) = reverse_imports.get(&(src_mod.clone(), sym.clone())) {
+                out.extend(dests.iter().cloned());
+            }
+            if let Some(star_re) = star_re_exporters.get(&src_mod) {
+                for re_mod in star_re {
+                    // The star-importing module itself locally exposes
+                    // `sym` under the same name, so it counts as an
+                    // importer; then recurse to chase further re-exports.
+                    out.push((re_mod.clone(), sym.clone()));
+                    work.push((re_mod.clone(), sym.clone()));
+                }
+            }
+        }
+        out
+    };
+
     // importers[importing_module] = {local_alias_of_known_model, ...}
     let mut importers: HashMap<String, HashSet<String>> = HashMap::new();
     for c in initial {
-        if let Some(dests) = reverse_imports.get(&(c.module.clone(), c.object_name.clone())) {
-            for (importing, alias) in dests {
-                importers
-                    .entry(importing.clone())
-                    .or_default()
-                    .insert(alias.clone());
-            }
+        for (importing, alias) in importers_of(&c.module, &c.object_name) {
+            importers.entry(importing).or_default().insert(alias);
         }
     }
 
@@ -139,20 +172,16 @@ pub fn expand_via_inheritance(
                 .or_default()
                 .insert(class_name.clone());
 
-            // Propagate: anyone importing this newly-discovered model
-            // re-enters the queue.
-            if let Some(dests) = reverse_imports
-                .get(&(module_name.clone(), class_name.clone()))
-                .cloned()
-            {
-                for (importing, alias) in dests {
-                    importers
-                        .entry(importing.clone())
-                        .or_default()
-                        .insert(alias);
-                    if !visited.contains(&importing) {
-                        queue.push_back(importing);
-                    }
+            // Propagate: anyone (transitively) importing this newly-
+            // discovered model — including through star re-exports — re-
+            // enters the queue.
+            for (importing, alias) in importers_of(&module_name, &class_name) {
+                importers
+                    .entry(importing.clone())
+                    .or_default()
+                    .insert(alias);
+                if !visited.contains(&importing) {
+                    queue.push_back(importing);
                 }
             }
         }
@@ -607,6 +636,56 @@ mod tests {
         // Both the declared base and the derived class should be present.
         assert!(labels.contains(&"base.TimestampedModel"));
         assert!(labels.contains(&"shop.Product"));
+    }
+
+    #[test]
+    fn expands_model_via_star_reexport_chain() {
+        // Mirrors the captain layout: an abstract base lives in a
+        // submodule, the package __init__.py star-imports it, and
+        // downstream code imports the symbol via the package path.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_tree(
+            root,
+            &[
+                (
+                    "common/models/__init__.py",
+                    "from .timestamped import *\nfrom .soft_deletable import *\n",
+                ),
+                (
+                    "common/models/timestamped.py",
+                    "from django.db import models\n\nclass TimestampedModel(models.Model):\n    class Meta:\n        abstract = True\n",
+                ),
+                (
+                    "common/models/soft_deletable.py",
+                    "from django.db import models\n\nclass SoftDeletableModel(models.Model):\n    class Meta:\n        abstract = True\n",
+                ),
+                (
+                    "company/models.py",
+                    "from common.models import TimestampedModel, SoftDeletableModel\n\nclass Company(TimestampedModel, SoftDeletableModel):\n    pass\n",
+                ),
+            ],
+        );
+        let idx = crate::static_index::build_static_index_resolved(
+            root,
+            &[
+                root.join("common/models/__init__.py"),
+                root.join("common/models/timestamped.py"),
+                root.join("common/models/soft_deletable.py"),
+                root.join("company/models.py"),
+            ],
+        );
+        let labels: Vec<&str> = idx
+            .model_candidates
+            .iter()
+            .map(|m| m.label.as_str())
+            .collect();
+        assert!(labels.contains(&"common.TimestampedModel"));
+        assert!(labels.contains(&"common.SoftDeletableModel"));
+        assert!(
+            labels.contains(&"company.Company"),
+            "Company should be discovered through star re-export chain; got labels: {labels:?}"
+        );
     }
 
     #[test]

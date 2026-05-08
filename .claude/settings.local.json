@@ -58,7 +58,8 @@
       "Read(//Users/lky/Library/Caches/**)",
       "Read(//tmp/**)",
       "Bash(/Users/lky/project/captain/.venv/bin/python *)",
-      "Bash(tee /tmp/e2e-output2.log)"
+      "Bash(tee /tmp/e2e-output2.log)",
+      "Bash(python3 *)"
     ]
   }
 }

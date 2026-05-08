@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind } from 'vscode-languageclient/node';
+import { registerClearCacheAndReindexCommand } from './commands/clearCacheAndReindex';
 import { registerConfigurePylanceDiagnosticsCommand } from './commands/configurePylanceDiagnostics';
 import { registerRestartDaemonCommand } from './commands/restartDaemon';
 import { registerSelectSettingsModuleCommand } from './commands/selectSettingsModule';
@@ -297,6 +298,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     diagnostics,
     registerShowStatusCommand(daemon, output),
     registerRestartDaemonCommand(daemon),
+    registerClearCacheAndReindexCommand(daemon, output),
     registerConfigurePylanceDiagnosticsCommand(output),
     registerSelectSettingsModuleCommand(daemon, output),
     registerSelectPythonInterpreterCommand(daemon, output),

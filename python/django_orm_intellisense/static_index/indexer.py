@@ -2334,21 +2334,50 @@ def _expand_model_candidates_via_imports(
 
     # 역방향 import 인덱스: (source_module, symbol) → [(importing_module, alias)]
     reverse_imports: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    # `from source_module import *` 바인딩: source_module이 export하는
+    # 모든 심볼을 importing_module이 같은 이름으로 재노출하므로
+    # seed 전파가 이 체인을 따라가야 한다.
+    star_re_exporters: dict[str, list[str]] = {}
     for module_name, module_index in modules.items():
         for binding in module_index.import_bindings:
-            if binding.symbol is None or binding.is_star:
+            if binding.is_star:
+                star_re_exporters.setdefault(binding.module, []).append(
+                    module_name
+                )
+                continue
+            if binding.symbol is None:
                 continue
             key = (binding.module, binding.symbol)
             reverse_imports.setdefault(key, []).append(
                 (module_name, binding.alias)
             )
 
+    def importers_of(
+        seed_module: str, seed_symbol: str
+    ) -> list[tuple[str, str]]:
+        """seed (origin_module, origin_symbol)을 직접·간접(__init__.py
+        star re-export)으로 import하는 (importing_module, local_alias)
+        목록. 임의 깊이의 star 체인을 따라간다."""
+        out: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        stack: list[tuple[str, str]] = [(seed_module, seed_symbol)]
+        while stack:
+            src_mod, sym = stack.pop()
+            if (src_mod, sym) in seen:
+                continue
+            seen.add((src_mod, sym))
+            out.extend(reverse_imports.get((src_mod, sym), ()))
+            for re_mod in star_re_exporters.get(src_mod, ()):
+                # star-importer는 같은 이름으로 sym을 노출하므로
+                # 그 자체가 importer이고, 이후 체인도 추적한다.
+                out.append((re_mod, sym))
+                stack.append((re_mod, sym))
+        return out
+
     # importers: model candidate를 import하는 모듈 → {local_alias}
     importers: dict[str, set[str]] = {}
     for c in initial_candidates:
-        for importing_module, alias in reverse_imports.get(
-            (c.module, c.object_name), []
-        ):
+        for importing_module, alias in importers_of(c.module, c.object_name):
             importers.setdefault(importing_module, set()).add(alias)
 
     pending_parse_queue: list[tuple[str, ModuleIndex, str, str]] = []
@@ -2396,9 +2425,10 @@ def _expand_model_candidates_via_imports(
             names_by_module.setdefault(module_name, set()).add(
                 class_name
             )
-            # O(1) 조회: 이 새 candidate를 import하는 모듈을 큐에 추가
-            for importing_module, alias in reverse_imports.get(
-                (module_name, class_name), []
+            # 새로 발견된 candidate를 (간접) import하는 모듈 — star
+            # re-export 체인 포함 — 을 모두 큐에 추가.
+            for importing_module, alias in importers_of(
+                module_name, class_name
             ):
                 importers.setdefault(importing_module, set()).add(alias)
                 if importing_module not in visited_modules:
