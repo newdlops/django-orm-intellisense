@@ -217,7 +217,195 @@ const EXPRESSION_PATH_METHOD_PREFIX = 'expression_path:';
 const ANNOTATED_MEMBER_SOURCE = 'annotation_expression';
 const INITIAL_DIAGNOSTIC_REFRESH_DELAY_MS = 500;
 const EDIT_DIAGNOSTIC_DEBOUNCE_MS = 1000;
-const DIAGNOSTIC_TIME_BUDGET_MS = 10_000;
+function diagnosticTimeBudgetMs(): number {
+  const override = parseInt(process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS ?? '', 10);
+  return Number.isFinite(override) && override > 0 ? override : 10_000;
+}
+
+// Survives across provider re-registrations so the extension layer can ask
+// "is any registration currently doing real diagnostic work?" before
+// disposing+recreating provider registrations. Avoids killing a 10s scan
+// just to bump provider priority by one slot.
+let activeDiagnosticScanRunningCount = 0;
+export function isAnyDiagnosticScanInFlight(): boolean {
+  return activeDiagnosticScanRunningCount > 0;
+}
+
+/** Test-only: peek the in-flight counter for regression assertions. */
+export function getActiveDiagnosticScanRunningCountForTesting(): number {
+  return activeDiagnosticScanRunningCount;
+}
+
+/** Test-only: clear the cross-registration receiver/lookup caches so a
+ *  fresh run starts from cold caches (mirrors a daemon restart without
+ *  actually restarting). */
+export function clearReceiverAndLookupCachesForTesting(): void {
+  _receiverCachesAcrossRegistrations.clear();
+  _lookupResolutionCachesAcrossRegistrations.clear();
+  _scanCacheAcrossRegistrations.clear();
+}
+
+/** Test-only: simulate the cache clearing that `daemon.onDidChangeState`
+ *  performs on a `ready` transition. Production captain trace showed this
+ *  clear was wiping the scan cache too aggressively because scan results are
+ *  pure functions of document text. The fix is for this clear to leave the
+ *  scan cache intact; this hook lets the test prove it. */
+export function simulateDaemonReadyCacheClearForTesting(): void {
+  clearLookupResolutionAndReceiverCachesAcrossRegistrations();
+}
+
+/** Test-only: directly invoke the diagnostic noRecv classifier on an
+ *  arbitrary receiver expression. Reproduces the captain bug where the
+ *  classifier sees `return X.objects...` and extracts `return` as the
+ *  root identifier (instead of normalizing the keyword prefix first). */
+export function classifyNoRecvReasonForTesting(
+  daemon: AnalysisDaemon,
+  receiverExpression: string,
+): string {
+  return classifyNoRecvReason(daemon, receiverExpression);
+}
+
+// Receiver-resolution cache shared across provider re-registrations and
+// keyed by (document URI, version). When a re-registration creates a fresh
+// provider scope mid-edit-session, the new scope's diagnostic cycle reuses
+// receiver resolutions computed in the previous cycle instead of redoing
+// them all. The version key invalidates the cache automatically when the
+// user edits the document.
+const _receiverCachesAcrossRegistrations = new Map<string, {
+  version: number;
+  entries: Map<string, Promise<OrmReceiverInfo | null>>;
+}>();
+
+function getReceiverCacheForDocument(
+  document: vscode.TextDocument
+): Map<string, Promise<OrmReceiverInfo | null>> {
+  const key = document.uri.toString();
+  const existing = _receiverCachesAcrossRegistrations.get(key);
+  if (existing && existing.version === document.version) {
+    return existing.entries;
+  }
+  const entries = new Map<string, Promise<OrmReceiverInfo | null>>();
+  _receiverCachesAcrossRegistrations.set(key, { version: document.version, entries });
+  return entries;
+}
+
+// Same pattern for daemon-resolved lookup paths. Results depend on the daemon
+// model graph, so we invalidate explicitly when the daemon state transitions
+// (see daemon.onDidChangeState handler in registerPythonProviders).
+const _lookupResolutionCachesAcrossRegistrations = new Map<string, {
+  version: number;
+  entries: Map<string, Promise<LookupPathResolution>>;
+}>();
+
+function getLookupResolutionCacheForDocument(
+  document: vscode.TextDocument
+): Map<string, Promise<LookupPathResolution>> {
+  const key = document.uri.toString();
+  const existing = _lookupResolutionCachesAcrossRegistrations.get(key);
+  if (existing && existing.version === document.version) {
+    return existing.entries;
+  }
+  const entries = new Map<string, Promise<LookupPathResolution>>();
+  _lookupResolutionCachesAcrossRegistrations.set(key, { version: document.version, entries });
+  return entries;
+}
+
+// Scan-result cache (lookup + relation contexts) keyed by document URI,
+// scoped per version. Stores the UNION of all ranges scanned so far in the
+// current cycle (and prior cycles on the same version). Subsequent range
+// queries reuse the cached contexts via interval-overlap checks, so even
+// queries with different start/end lines hit the cache as long as their
+// lines are covered.
+//
+// Captain regression A: small scrolls drift the visible range by 50-100
+// lines between cycles. The prior implementation keyed by exact
+// `start-end` strings, so any drift produced a fresh miss and ~1.5s of
+// scan work was repeated. With interval coverage tracking, the second
+// cycle reuses the first cycle's full scan output via filter-by-line.
+interface FullScanCacheEntry {
+  version: number;
+  // Sorted, non-overlapping intervals of [startLine, endLine) that have
+  // been scanned. Merged opportunistically on each add().
+  scanned: Array<[number, number]>;
+  lookups: LookupDiagnosticContext[];
+  relations: RelationDiagnosticContext[];
+}
+
+const _scanCacheAcrossRegistrations = new Map<string, FullScanCacheEntry>();
+
+function getScanCacheEntry(
+  document: vscode.TextDocument,
+): FullScanCacheEntry {
+  const key = document.uri.toString();
+  const existing = _scanCacheAcrossRegistrations.get(key);
+  if (existing && existing.version === document.version) {
+    return existing;
+  }
+  const fresh: FullScanCacheEntry = {
+    version: document.version,
+    scanned: [],
+    lookups: [],
+    relations: [],
+  };
+  _scanCacheAcrossRegistrations.set(key, fresh);
+  return fresh;
+}
+
+/** Returns true if every line in [startLine, endLine) is inside one of the
+ *  cached intervals. */
+function intervalsCover(
+  intervals: Array<[number, number]>,
+  startLine: number,
+  endLine: number,
+): boolean {
+  if (startLine >= endLine) return true;
+  for (const [s, e] of intervals) {
+    if (s <= startLine && endLine <= e) return true;
+  }
+  return false;
+}
+
+/** Merge [start, end) into the sorted, non-overlapping interval list. */
+function intervalsAdd(
+  intervals: Array<[number, number]>,
+  start: number,
+  end: number,
+): void {
+  if (start >= end) return;
+  const next: Array<[number, number]> = [];
+  let inserted = false;
+  let curStart = start;
+  let curEnd = end;
+  for (const [s, e] of intervals) {
+    if (e < curStart) {
+      next.push([s, e]);
+      continue;
+    }
+    if (s > curEnd) {
+      if (!inserted) {
+        next.push([curStart, curEnd]);
+        inserted = true;
+      }
+      next.push([s, e]);
+      continue;
+    }
+    curStart = Math.min(curStart, s);
+    curEnd = Math.max(curEnd, e);
+  }
+  if (!inserted) next.push([curStart, curEnd]);
+  intervals.length = 0;
+  intervals.push(...next);
+}
+
+function clearLookupResolutionAndReceiverCachesAcrossRegistrations(): void {
+  _receiverCachesAcrossRegistrations.clear();
+  _lookupResolutionCachesAcrossRegistrations.clear();
+  // NOTE: do NOT clear the scan cache here. Scan results are a pure function
+  // of document text (version) and don't depend on daemon model graph or
+  // resolver state. Clearing them on daemon state transitions defeats the
+  // cross-registration cache entirely because daemon-state changes always
+  // precede provider re-registration in production.
+}
 const DIAGNOSTIC_REQUEST_BUDGET = 1000;
 const DIAGNOSTIC_LOOKUP_PARALLELISM = 4;
 const modelSubclassRelationCache = new Map<string, boolean>();
@@ -798,6 +986,15 @@ interface OrmReceiverInfo {
   virtualFields?: VirtualOrmField[];
   classSource?: ClassDefinitionSource;
   specialKind?: SpecialClassKind;
+  /**
+   * Marker for receivers synthesized by the captain P2 phantom fallback —
+   * `<PascalCase>.objects` patterns where the daemon's indices have no
+   * record of the model. modelLabel is the bare identifier with no
+   * namespace, so downstream BG IPC (resolveLookupPath etc.) cannot
+   * produce useful results and only wastes budget. Callers should
+   * short-circuit those IPCs when this flag is set.
+   */
+  synthetic?: 'phantom-objects';
 }
 
 interface VirtualOrmField {
@@ -877,31 +1074,48 @@ export function registerPythonProviders(
   const COMPLETION_DIAGNOSTIC_DEFER_MS = 3_000;
   const scheduleDiagnosticsRefresh = (
     document: vscode.TextDocument,
-    delayMs = 200
+    delayMs = 200,
+    reason = 'unknown'
   ): void => {
     if (!shouldAnalyzeDocument(document, daemon.getState().workspaceRoot)) {
+      // Do NOT log here: this branch fires for every output-channel/log
+      // document edit, which itself happens for every log line — creating
+      // a feedback loop that floods the log with skip messages.
       return;
     }
+    const shortPath = document.uri.fsPath.split('/').slice(-2).join('/');
 
     // Defer diagnostics while completions are in-flight to avoid flooding
     // the event loop with concurrent IPC calls and redundant scans.
+    const originalDelay = delayMs;
+    let deferred = false;
     if (activeCompletionCount > 0) {
       delayMs = Math.max(delayMs, COMPLETION_DIAGNOSTIC_DEFER_MS);
+      deferred = delayMs !== originalDelay;
     }
 
     const key = document.uri.toString();
     if (lastDiagnosedDocumentVersions.get(key) === document.version) {
+      daemon.logDiagnostic(`[diagnostics:trigger] skip reason=${reason} cause=same-version v=${document.version} ${shortPath}`);
       return;
     }
 
     const existingTimer = diagnosticTimers.get(key);
+    const coalesced = existingTimer != null;
     if (existingTimer) {
       clearTimeout(existingTimer);
     }
 
+    daemon.logDiagnostic(
+      `[diagnostics:trigger] schedule reason=${reason} v=${document.version} delay=${delayMs}ms`
+      + `${deferred ? ` (deferred-from=${originalDelay}ms completionsInflight=${activeCompletionCount})` : ''}`
+      + `${coalesced ? ' coalesced=1' : ''}`
+      + ` ${shortPath}`
+    );
+
     const timer = setTimeout(() => {
       diagnosticTimers.delete(key);
-      void refreshDiagnostics(document);
+      void refreshDiagnostics(document, reason);
     }, delayMs);
     diagnosticTimers.set(key, timer);
   };
@@ -940,7 +1154,7 @@ export function registerPythonProviders(
         continue;
       }
 
-      scheduleDiagnosticsRefresh(document, staggerDelay);
+      scheduleDiagnosticsRefresh(document, staggerDelay, 'tracked-refresh');
       staggerDelay += STAGGER_INCREMENT_MS;
     }
   };
@@ -959,23 +1173,31 @@ export function registerPythonProviders(
   };
 
   const refreshDiagnostics = async (
-    document: vscode.TextDocument
-  ): Promise<void> => daemon.withDeadline(performance.now() + DIAGNOSTIC_TIME_BUDGET_MS, () =>
+    document: vscode.TextDocument,
+    triggerReason = 'unknown'
+  ): Promise<void> => daemon.withDeadline(performance.now() + diagnosticTimeBudgetMs(), () =>
   daemon.withRequestSource('diagnostic', async () => {
+    activeDiagnosticScanRunningCount++;
+    try {
     if (diagnosticsDisposed) {
       return;
     }
     const key = document.uri.toString();
+    const shortPath = document.uri.fsPath.split('/').slice(-2).join('/');
 
     // Prevent overlapping scans of the same document from concurrent triggers
     if (activeDiagnosticScans.has(key)) {
+      daemon.logDiagnostic(`[diagnostics:trigger] skip reason=${triggerReason} cause=active-scan ${shortPath}`);
       return;
     }
 
     const documentVersion = document.version;
     if (lastDiagnosedDocumentVersions.get(key) === documentVersion) {
+      daemon.logDiagnostic(`[diagnostics:trigger] skip reason=${triggerReason} cause=same-version-at-fire v=${documentVersion} ${shortPath}`);
       return;
     }
+
+    daemon.logDiagnostic(`[diagnostics:trigger] fire reason=${triggerReason} v=${documentVersion} ${shortPath}`);
 
     if (!shouldAnalyzeDocument(document, daemon.getState().workspaceRoot)) {
       if (!diagnosticsDisposed) {
@@ -1017,6 +1239,38 @@ export function registerPythonProviders(
     let diagnosticRequestCount = 0;
     let diagnosticBudgetLogged = false;
     let diagnosticPhase = 'setup';
+    // Per-cycle perf counters. Logged as a `[diagnostics:perf]` summary
+    // right before publish so captain-style trace analysis can see at a
+    // glance where time/IPC/cache pressure went.
+    let perfReceiverCacheHit = 0;
+    let perfReceiverCacheMiss = 0;
+    let perfReceiverCacheStaleInvalidated = 0;
+    let perfLookupPathCacheHit = 0;
+    let perfLookupPathCacheMiss = 0;
+    let perfScanCacheHit = 0;
+    let perfScanCacheMiss = 0;
+    let perfReceiverIpcMs = 0;
+    let perfLookupPathIpcMs = 0;
+    // captain 옵션 3 관측 — phase 단위로 timeout 발동 횟수를 세서
+    // [diagnostics:perf] 라인에 노출. captain 의 9.5s 폭주가 정말 차단됐는지,
+    // 또 1.5s cap 이 너무 공격적이라 false-negative 가 많아졌는지 측정 가능.
+    let perfReceiverTimeoutCount = 0;
+    // Captain receiver-chain analysis: snapshot IPC stats at cycle start so
+    // the perf summary can show a per-cycle delta by IPC method (which
+    // resolveX call dominated the receiver-resolution time).
+    const perfIpcBaseline = daemon.snapshotIpcStats();
+    // Slow-receiver threshold: when an individual receiver resolution
+    // takes longer than this, log its expression so trace analysis can
+    // identify the offender. captain showed individual receivers at 4s+.
+    const PERF_SLOW_RECEIVER_MS = 500;
+    // captain regression (log.txt:374) — a single `company_user_relation_qs`
+    // receiver took 7466ms, consuming most of the 10s diagnostic budget and
+    // leaving 17 other receivers to fail with `cancelled-before-batch`. Per-
+    // receiver Promise.race timeout so one runaway expression doesn't take
+    // down the whole phase. Tunable via env var for incident response.
+    const PER_RECEIVER_TIMEOUT_MS = Number(
+      process.env.DJLS_RECEIVER_TRACE_TIMEOUT_MS ?? 1500
+    ) || 1500;
     const beginDiagnosticPhase = (phase: string): number => {
       diagnosticPhase = phase;
       return performance.now();
@@ -1037,11 +1291,12 @@ export function registerPythonProviders(
         return true;
       }
       const elapsed = Date.now() - diagnosticStartTime;
-      if (elapsed > DIAGNOSTIC_TIME_BUDGET_MS) {
+      const budgetMs = diagnosticTimeBudgetMs();
+      if (elapsed > budgetMs) {
         if (!diagnosticBudgetLogged) {
           diagnosticBudgetLogged = true;
           daemon.logDiagnostic(
-            `[diagnostics] time budget exhausted (${elapsed}ms > ${DIAGNOSTIC_TIME_BUDGET_MS}ms, ${diagnosticRequestCount} requests, phase=${diagnosticPhase}) for ${document.uri.fsPath}`
+            `[diagnostics] time budget exhausted (${elapsed}ms > ${budgetMs}ms, ${diagnosticRequestCount} requests, phase=${diagnosticPhase}) for ${document.uri.fsPath}`
           );
         }
         return true;
@@ -1066,19 +1321,54 @@ export function registerPythonProviders(
     );
     const visibleRange = visibleEditor?.visibleRanges[0];
     const useVisibleRangeScan = document.lineCount >= VISIBLE_RANGE_SCAN_THRESHOLD && visibleRange != null;
-    // Expand visible range by a margin to catch surrounding context
+    // Expand visible range by a margin to catch surrounding context.
+    // Snap boundaries to a coarse grid so small visible-range drifts (a
+    // few-line scroll or editor resize) produce identical scan cache keys.
+    // Captain regression A: Cycle 1 scanned 143–290 and Cycle 2 scanned
+    // 140–287 for the same document version, wasting ~1.5s rescanning.
     const VISIBLE_MARGIN = 50;
-    const visStartLine = useVisibleRangeScan ? Math.max(0, visibleRange!.start.line - VISIBLE_MARGIN) : 0;
-    const visEndLine = useVisibleRangeScan ? Math.min(document.lineCount, visibleRange!.end.line + VISIBLE_MARGIN) : document.lineCount;
+    const VISIBLE_RANGE_GRID = 50;
+    const snapStart = (line: number): number =>
+      Math.max(0, Math.floor(line / VISIBLE_RANGE_GRID) * VISIBLE_RANGE_GRID);
+    const snapEnd = (line: number): number =>
+      Math.min(
+        document.lineCount,
+        Math.ceil(line / VISIBLE_RANGE_GRID) * VISIBLE_RANGE_GRID,
+      );
+    const visStartLine = useVisibleRangeScan
+      ? snapStart(visibleRange!.start.line - VISIBLE_MARGIN)
+      : 0;
+    const visEndLine = useVisibleRangeScan
+      ? snapEnd(visibleRange!.end.line + VISIBLE_MARGIN)
+      : document.lineCount;
 
     daemon.logDiagnostic(`[diagnostics:scan] starting sync scan for ${document.uri.fsPath.split('/').slice(-2).join('/')}${useVisibleRangeScan ? ` (visible-first: lines ${visStartLine}-${visEndLine})` : ''}`);
     const _scanStart = beginDiagnosticPhase('scan-visible');
 
     // Phase 1: scan visible range (or full doc for small files)
-    const _relationContexts = findRelationDiagnosticContexts(document, visStartLine, visEndLine);
-    const _lookupContexts = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, visStartLine, visEndLine);
-    daemon.logDiagnostic(`[diagnostics:scan] complete ${(performance.now() - _scanStart).toFixed(0)}ms relations=${_relationContexts.length} lookups=${_lookupContexts.length}`);
-    logDiagnosticPhase('scan-visible', _scanStart, `relations=${_relationContexts.length} lookups=${_lookupContexts.length}`);
+    const _scanCache = getScanCacheEntry(document);
+    let _relationContexts: RelationDiagnosticContext[];
+    let _lookupContexts: LookupDiagnosticContext[];
+    let _visScanCacheHit = false;
+    if (intervalsCover(_scanCache.scanned, visStartLine, visEndLine)) {
+      _relationContexts = _scanCache.relations.filter((c) =>
+        c.range.start.line >= visStartLine && c.range.start.line < visEndLine,
+      );
+      _lookupContexts = _scanCache.lookups.filter((c) =>
+        c.range.start.line >= visStartLine && c.range.start.line < visEndLine,
+      );
+      _visScanCacheHit = true;
+      perfScanCacheHit++;
+    } else {
+      perfScanCacheMiss++;
+      _relationContexts = findRelationDiagnosticContexts(document, visStartLine, visEndLine);
+      _lookupContexts = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, visStartLine, visEndLine);
+      _scanCache.relations.push(..._relationContexts);
+      _scanCache.lookups.push(..._lookupContexts);
+      intervalsAdd(_scanCache.scanned, visStartLine, visEndLine);
+    }
+    daemon.logDiagnostic(`[diagnostics:scan] complete ${(performance.now() - _scanStart).toFixed(0)}ms relations=${_relationContexts.length} lookups=${_lookupContexts.length} cache=${_visScanCacheHit ? 'hit' : 'miss'}`);
+    logDiagnosticPhase('scan-visible', _scanStart, `relations=${_relationContexts.length} lookups=${_lookupContexts.length} cache=${_visScanCacheHit ? 'hit' : 'miss'}`);
 
     // Deduplicate relation target resolution within a single scan.
     // The same model string (e.g. "User") may appear in many ForeignKey
@@ -1126,25 +1416,141 @@ export function registerPythonProviders(
       batchIdx: number;
     }> = [];
     const _batchItems: Array<{ baseModelLabel: string; value: string; method: string }> = [];
-    const _receiverCache = new Map<string, Promise<OrmReceiverInfo | null>>();
-    const _lookupResolutionCache = new Map<string, Promise<LookupPathResolution>>();
-    const resolveCachedLookupReceiverInfo = (
+    const _receiverCache = getReceiverCacheForDocument(document);
+    const _lookupResolutionCache = getLookupResolutionCacheForDocument(document);
+    const resolveCachedLookupReceiverInfo = async (
       context: LookupDiagnosticContext
     ): Promise<OrmReceiverInfo | null> => {
       const receiverCacheKey = context.receiverExpression;
       const cached = _receiverCache.get(receiverCacheKey);
       if (cached) {
-        return cached;
+        const cachedResult = await cached;
+        if (cachedResult !== null) {
+          perfReceiverCacheHit++;
+          return cachedResult;
+        }
+        // Stale-null check (captain regression D): the write-time guard only
+        // invalidates when the root is already known at resolution. If the
+        // surface delta arrives AFTER the resolution completes, the null
+        // pins indefinitely and subsequent cycles return it. Re-check at
+        // read time: if the root identifier is now a known model, drop the
+        // entry and fall through to a fresh resolution.
+        const normalized = normalizeReceiverExpression(
+          context.receiverExpression || ''
+        ) || (context.receiverExpression || '');
+        const rootIdentifier = receiverRootIdentifier(normalized);
+        const rootIsKnownNow = !!rootIdentifier && (
+          daemon.hasModelByShortName(rootIdentifier) ||
+          snakeToPascalCaseVariants(rootIdentifier).some((variant) =>
+            daemon.hasModelByShortName(variant)
+          )
+        );
+        if (!rootIsKnownNow) {
+          return null;
+        }
+        _receiverCache.delete(receiverCacheKey);
+        perfReceiverCacheStaleInvalidated++;
+        // Fall through to the fresh-resolution path below.
       }
 
+      perfReceiverCacheMiss++;
+      const _perfReceiverIpcStart = performance.now();
       let request!: Promise<OrmReceiverInfo | null>;
-      request = resolveLookupReceiverInfoForReceiver(
-        daemon,
-        document,
-        context.receiverExpression,
-        context.range.end
-      )
-        .then((receiver) => receiver ?? null)
+      // captain regression — race the resolver against a per-receiver
+      // timeout. Single runaway expressions (e.g. `company_user_relation_qs`
+      // at 7.5s) used to pre-empt the entire diagnostic phase budget;
+      // timeout returns null (≈unknown_root) so the next receiver can run.
+      // captain 옵션 3 관측 — 어떤 receiver 처리 중 timeout 이 발동했는지
+      // 분석할 수 있도록 file path / 라인 번호도 함께 emit. timeout fire 시
+      // perfReceiverTimeoutCount 증가 → phase summary 에 합산 노출.
+      const fileRel = (() => {
+        const fsPath = document.uri.fsPath;
+        return fsPath.length > 60 ? '...' + fsPath.slice(-57) : fsPath;
+      })();
+      const linePos = context.range.end.line + 1;
+      const tracedResolve = (async (): Promise<OrmReceiverInfo | null> => {
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        let timedOut = false;
+        const timeoutPromise = new Promise<OrmReceiverInfo | null>(
+          (resolve) => {
+            timeoutId = setTimeout(() => {
+              timedOut = true;
+              perfReceiverTimeoutCount++;
+              const expr = (context.receiverExpression || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+              const exprTruncated =
+                expr.length > 100 ? expr.slice(0, 97) + '...' : expr;
+              daemon.logDiagnostic(
+                `[receiver-trace:timeout] elapsed=${PER_RECEIVER_TIMEOUT_MS}ms ` +
+                `cap=${PER_RECEIVER_TIMEOUT_MS}ms ` +
+                `file=${fileRel}:${linePos} ` +
+                `expr=${JSON.stringify(exprTruncated)}`
+              );
+              resolve(null);
+            }, PER_RECEIVER_TIMEOUT_MS);
+          }
+        );
+        try {
+          const raced = await Promise.race([
+            resolveLookupReceiverInfoForReceiver(
+              daemon,
+              document,
+              context.receiverExpression,
+              context.range.end
+            ),
+            timeoutPromise,
+          ]);
+          // captain 관측: timeout 이 우승했더라도 underlying 이 늦게 끝났는지
+          // background 에서 elapsed 를 측정해두면 cap 값 조정 근거가 됨.
+          // (await Promise.race 가 끝났는데도 underlying 이 계속 돌면 무관한
+          // background task — 결과 무시 OK).
+          if (timedOut) {
+            return null;
+          }
+          return raced ?? null;
+        } finally {
+          if (timeoutId !== undefined) {
+            clearTimeout(timeoutId);
+          }
+        }
+      })();
+      request = tracedResolve
+        .then((receiver) => {
+          const elapsed = performance.now() - _perfReceiverIpcStart;
+          perfReceiverIpcMs += elapsed;
+          if (elapsed > PERF_SLOW_RECEIVER_MS) {
+            const expr = (context.receiverExpression || '').replace(/\s+/g, ' ').trim();
+            const exprTruncated = expr.length > 100 ? expr.slice(0, 97) + '...' : expr;
+            daemon.logDiagnostic(
+              `[receiver-trace:slow] elapsed=${elapsed.toFixed(0)}ms resolved=${receiver != null} expr=${JSON.stringify(exprTruncated)}`
+            );
+          }
+          const result = receiver ?? null;
+          // Don't pin a stale `null` when the root identifier is a known
+          // model (directly, or via the snake→PascalCase fuzzy variants).
+          // The failure was likely a transient resolver state (daemon
+          // mid-initialize, surface index still warming, BG cache miss),
+          // and a later cycle may succeed. Permanent unresolvables
+          // (unknown root, parser-polluted expressions) still get cached
+          // because their root won't ever match a model name.
+          if (result === null) {
+            const rootIdentifier = receiverRootIdentifier(
+              context.receiverExpression || ''
+            );
+            if (rootIdentifier) {
+              const rootIsKnownModel =
+                daemon.hasModelByShortName(rootIdentifier) ||
+                snakeToPascalCaseVariants(rootIdentifier).some((variant) =>
+                  daemon.hasModelByShortName(variant)
+                );
+              if (rootIsKnownModel && _receiverCache.get(receiverCacheKey) === request) {
+                _receiverCache.delete(receiverCacheKey);
+              }
+            }
+          }
+          return result;
+        })
         .catch((error) => {
           if (_receiverCache.get(receiverCacheKey) === request) {
             _receiverCache.delete(receiverCacheKey);
@@ -1163,12 +1569,20 @@ export function registerPythonProviders(
       const resolutionCacheKey = `${baseModelLabel}\u0000${method}\u0000${value}`;
       const cached = _lookupResolutionCache.get(resolutionCacheKey);
       if (cached) {
+        perfLookupPathCacheHit++;
         return cached;
       }
 
+      perfLookupPathCacheMiss++;
+      const _perfLookupIpcStart = performance.now();
       let request!: Promise<LookupPathResolution>;
       request = daemon.resolveLookupPath(baseModelLabel, value, method, true)
+        .then((resolution) => {
+          perfLookupPathIpcMs += performance.now() - _perfLookupIpcStart;
+          return resolution;
+        })
         .catch((error) => {
+          perfLookupPathIpcMs += performance.now() - _perfLookupIpcStart;
           if (_lookupResolutionCache.get(resolutionCacheKey) === request) {
             _lookupResolutionCache.delete(resolutionCacheKey);
           }
@@ -1215,6 +1629,9 @@ export function registerPythonProviders(
     const _receiverResolveStart = beginDiagnosticPhase('receivers-visible');
     let _receiverMisses = 0;
     let _virtualResolved = 0;
+    const _receiverMissSamples = new Set<string>();
+    const _receiverMissReasonCounts = new Map<string, number>();
+    const VISIBLE_NO_RECV_SAMPLE_LIMIT = 5;
     for (const context of _validatedLookupContexts) {
       if (isDiagnosticsCancelled()) break;
       try {
@@ -1222,6 +1639,15 @@ export function registerPythonProviders(
         if (isDiagnosticsCancelled()) break;
         if (!lookupReceiver) {
           _receiverMisses++;
+          const reason = classifyNoRecvReason(daemon, context.receiverExpression || '');
+          _receiverMissReasonCounts.set(reason, (_receiverMissReasonCounts.get(reason) ?? 0) + 1);
+          if (_receiverMissSamples.size < VISIBLE_NO_RECV_SAMPLE_LIMIT) {
+            const raw = (context.receiverExpression || '').replace(/\s+/g, ' ').trim();
+            if (raw) {
+              const truncated = raw.length > 80 ? raw.slice(0, 77) + '...' : raw;
+              _receiverMissSamples.add(`${truncated}#${reason}`);
+            }
+          }
           continue;
         }
 
@@ -1229,6 +1655,13 @@ export function registerPythonProviders(
         if (virtualRes?.resolved) {
           // Virtual lookup resolved successfully — skip daemon
           _virtualResolved++;
+          continue;
+        }
+        // Phantom receiver short-circuit: same rationale as the phase2
+        // branch — synthesizing a manager with a bare PascalCase label
+        // means the daemon has no record of the model. Calling
+        // resolveLookupPath wastes hundreds of ms per call.
+        if (lookupReceiver.synthetic === 'phantom-objects') {
           continue;
         }
         // virtualRes is null or { resolved: false } — need daemon resolution
@@ -1247,15 +1680,42 @@ export function registerPythonProviders(
         continue;
       }
     }
+    const _visibleNoRecvReasonsPart = _receiverMissReasonCounts.size > 0
+      ? ` noRecvReasons=${[..._receiverMissReasonCounts.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([reason, count]) => `${reason}:${count}`)
+          .join(',')}`
+      : '';
+    const _visibleNoRecvSamplesPart = _receiverMissSamples.size > 0
+      ? ` noRecvSamples=[${[..._receiverMissSamples].map((s) => `"${s}"`).join(',')}]`
+      : '';
     logDiagnosticPhase(
       'receivers-visible',
       _receiverResolveStart,
       `validated=${_validatedLookupContexts.length} pending=${_lookupPending.length} batchItems=${_batchItems.length} receivers=${_receiverCache.size} missing=${_receiverMisses} virtual=${_virtualResolved}`
+      + _visibleNoRecvReasonsPart
+      + _visibleNoRecvSamplesPart
     );
 
     // Pass 2: Batch resolve lookup paths
     if (isDiagnosticsCancelled()) {
       logDiagnosticPhase('cancelled-before-batch', performance.now(), `diagnostics=${diagnostics.length}`);
+      // If the cancellation was caused by budget exhaustion (not by disposal
+      // or version change), mark the version so tracked-refresh storms do not
+      // keep retrying the same heavy scan. Disposal/version-change paths are
+      // intentionally left unmarked so the next valid refresh can run.
+      if (diagnosticBudgetLogged && !diagnosticsDisposed && document.version === documentVersion) {
+        partialDiagnosticResults.set(key, {
+          version: documentVersion,
+          diagnostics: [...diagnostics],
+          seenRanges: new Set(seenRanges),
+          budgetExhausted: true,
+        });
+        lastDiagnosedDocumentVersions.set(key, documentVersion);
+      }
+      // Clear active-scan even on disposal/version-change so subsequent
+      // tracked-refresh triggers are not silently dropped.
+      activeDiagnosticScans.delete(key);
       return;
     }
     const _batchResolveStart = beginDiagnosticPhase('batch-lookups-visible');
@@ -1378,12 +1838,31 @@ export function registerPythonProviders(
         if (isDiagnosticsCancelled()) break;
 
         const _phase2ScanStart = beginDiagnosticPhase(`phase2-scan:${rStart}-${rEnd}`);
-        const extraRelations = findRelationDiagnosticContexts(document, rStart, rEnd);
-        const extraLookups = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, rStart, rEnd);
+        const scanCache = getScanCacheEntry(document);
+        let extraRelations: RelationDiagnosticContext[];
+        let extraLookups: LookupDiagnosticContext[];
+        let _scanCacheHit = false;
+        if (intervalsCover(scanCache.scanned, rStart, rEnd)) {
+          extraRelations = scanCache.relations.filter((c) =>
+            c.range.start.line >= rStart && c.range.start.line < rEnd,
+          );
+          extraLookups = scanCache.lookups.filter((c) =>
+            c.range.start.line >= rStart && c.range.start.line < rEnd,
+          );
+          _scanCacheHit = true;
+          perfScanCacheHit++;
+        } else {
+          perfScanCacheMiss++;
+          extraRelations = findRelationDiagnosticContexts(document, rStart, rEnd);
+          extraLookups = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, rStart, rEnd);
+          scanCache.relations.push(...extraRelations);
+          scanCache.lookups.push(...extraLookups);
+          intervalsAdd(scanCache.scanned, rStart, rEnd);
+        }
         logDiagnosticPhase(
           `phase2-scan:${rStart}-${rEnd}`,
           _phase2ScanStart,
-          `relations=${extraRelations.length} lookups=${extraLookups.length}`
+          `relations=${extraRelations.length} lookups=${extraLookups.length} cache=${_scanCacheHit ? 'hit' : 'miss'}`
         );
 
         const _phase2RelationStart = beginDiagnosticPhase(`phase2-relations:${rStart}-${rEnd}`);
@@ -1416,21 +1895,122 @@ export function registerPythonProviders(
         const extraDocText = getDocumentText(document);
         const extraValidated = validateLookupContexts(extraLookups, extraDocText, isDiagnosticsCancelled);
         let _phase2LookupAdded = 0;
+        let _exitCancelled = 0;
+        let _exitNoReceiver = 0;
+        let _exitVirtualResolved = 0;
+        let _exitResolvedOk = 0;
+        let _exitPartialSuppress = 0;
+        let _exitDedup = 0;
+        let _exitNullDiagOther = 0;
+        let _exitException = 0;
+        let _exitTimeout = 0;
+        const _noReceiverSamples = new Set<string>();
+        const _noReceiverReasonCounts = new Map<string, number>();
+        const NO_RECEIVER_SAMPLE_LIMIT = 5;
+        // Per-context time budget: prevents a single slow daemon round-trip
+        // from monopolising the overall diagnostic budget. Captain trace
+        // showed phase2-lookups spending 7s on 12 contexts because a few
+        // BG IPCs were stuck — at concurrency=4, 4 slow contexts can
+        // consume the entire budget. Capping each context bounds the
+        // worst-case wall time to roughly `cap * ceil(N/concurrency)`.
+        const PHASE2_PER_CONTEXT_TIMEOUT_MS = (() => {
+          const override = parseInt(
+            process.env.DJLS_DIAGNOSTIC_PER_CONTEXT_TIMEOUT_MS ?? '',
+            10
+          );
+          return Number.isFinite(override) && override > 0 ? override : 1500;
+        })();
+        // Margin reserved before the hard budget so an in-flight context's
+        // timeout always fires before the global budget exhaust trigger.
+        // Without this, a context awaiting a 1200ms BG IPC that started
+        // 1500ms before budget end will run 700ms past budget and trigger
+        // the "time budget exhausted" log → publish.partial=true. Keeping
+        // the per-context cap = remaining-margin pushes all in-flight
+        // resolutions to terminate (or timeout) before the hard cutoff.
+        const PHASE2_BUDGET_MARGIN_MS = 150;
+        // Stop scheduling NEW work once we're inside this fraction of the
+        // budget. In-flight contexts are still given the adaptive cap to
+        // wind down cleanly.
+        const PHASE2_SOFT_STOP_FRACTION = 0.85;
+        const computeAdaptiveCap = (): number => {
+          const elapsed = Date.now() - diagnosticStartTime;
+          const budgetMs = diagnosticTimeBudgetMs();
+          const remaining = budgetMs - elapsed - PHASE2_BUDGET_MARGIN_MS;
+          if (remaining <= 0) return 1;
+          return Math.min(PHASE2_PER_CONTEXT_TIMEOUT_MS, remaining);
+        };
+        const isPhase2SoftStop = (): boolean => {
+          const elapsed = Date.now() - diagnosticStartTime;
+          const budgetMs = diagnosticTimeBudgetMs();
+          return elapsed > budgetMs * PHASE2_SOFT_STOP_FRACTION;
+        };
+        const TIMEOUT_SENTINEL: unique symbol = Symbol('phase2-context-timeout');
+        type WithTimeout<T> = T | typeof TIMEOUT_SENTINEL;
+        const raceWithTimeout = <T,>(p: Promise<T>): Promise<WithTimeout<T>> => {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const cap = computeAdaptiveCap();
+          const timeoutPromise = new Promise<typeof TIMEOUT_SENTINEL>(
+            (resolve) => {
+              timer = setTimeout(
+                () => resolve(TIMEOUT_SENTINEL),
+                cap,
+              );
+            }
+          );
+          return Promise.race([p, timeoutPromise]).finally(() => {
+            if (timer !== undefined) clearTimeout(timer);
+          });
+        };
 
         await runWithConcurrency(extraValidated, DIAGNOSTIC_LOOKUP_PARALLELISM, isDiagnosticsCancelled, async (context) => {
-          if (isDiagnosticsCancelled()) return;
+          // Soft-stop: once we're past PHASE2_SOFT_STOP_FRACTION of the
+          // budget, stop dispatching new contexts. In-flight ones still
+          // finish or time out via the adaptive cap, but no new IPC fires
+          // — that prevents the budget-exhaust trigger entirely on
+          // captain-class workloads where input >> processable count.
+          if (isPhase2SoftStop()) { _exitCancelled++; return; }
+          if (isDiagnosticsCancelled()) { _exitCancelled++; return; }
           try {
-            const lookupReceiver = await resolveCachedLookupReceiverInfo(context);
-            if (isDiagnosticsCancelled()) return;
-            if (!lookupReceiver) return;
-            const virtualRes = resolveVirtualLookupPath(lookupReceiver, context.value, context.method);
-            if (virtualRes?.resolved) return;
-            const resolution = await resolveCachedDiagnosticLookupPath(
-              lookupReceiver.modelLabel,
-              context.value,
-              context.method
+            const lookupReceiver = await raceWithTimeout(
+              resolveCachedLookupReceiverInfo(context)
             );
-            if (isDiagnosticsCancelled()) return;
+            if (lookupReceiver === TIMEOUT_SENTINEL) { _exitTimeout++; return; }
+            if (isDiagnosticsCancelled()) { _exitCancelled++; return; }
+            if (!lookupReceiver) {
+              _exitNoReceiver++;
+              const reason = classifyNoRecvReason(daemon, context.receiverExpression || '');
+              _noReceiverReasonCounts.set(reason, (_noReceiverReasonCounts.get(reason) ?? 0) + 1);
+              if (_noReceiverSamples.size < NO_RECEIVER_SAMPLE_LIMIT) {
+                const raw = (context.receiverExpression || '').replace(/\s+/g, ' ').trim();
+                if (raw) {
+                  const truncated = raw.length > 80 ? raw.slice(0, 77) + '...' : raw;
+                  _noReceiverSamples.add(`${truncated}#${reason}`);
+                }
+              }
+              return;
+            }
+            const virtualRes = resolveVirtualLookupPath(lookupReceiver, context.value, context.method);
+            if (virtualRes?.resolved) { _exitVirtualResolved++; return; }
+            // Phantom receiver short-circuit: the modelLabel was synthesized
+            // from a bare PascalCase identifier the daemon has no record of.
+            // Calling resolveLookupPath against this label costs hundreds
+            // of ms (sometimes seconds) for daemon to confirm it doesn't
+            // know the model. Skip the IPC — the diagnostic engine treats
+            // this as "lookup unresolved against an unknown model" which
+            // produces no spurious warnings.
+            if (lookupReceiver.synthetic === 'phantom-objects') {
+              _exitNullDiagOther++;
+              return;
+            }
+            const resolution = await raceWithTimeout(
+              resolveCachedDiagnosticLookupPath(
+                lookupReceiver.modelLabel,
+                context.value,
+                context.method
+              )
+            );
+            if (resolution === TIMEOUT_SENTINEL) { _exitTimeout++; return; }
+            if (isDiagnosticsCancelled()) { _exitCancelled++; return; }
             if (!resolution.resolved) {
               const partialCompletions = {
                 items: mergeLookupCompletionItems(
@@ -1444,19 +2024,42 @@ export function registerPythonProviders(
                   context.value,
                   partialCompletions.items
                 )
-              ) return;
+              ) { _exitPartialSuppress++; return; }
             }
             const diagnostic = buildLookupDiagnostic(context, lookupReceiver.modelLabel, resolution);
+            if (!diagnostic) {
+              if (resolution.resolved) _exitResolvedOk++;
+              else _exitNullDiagOther++;
+              return;
+            }
             if (addDiagnosticIfNew(diagnostic)) {
               _phase2LookupAdded++;
               incrementalPublish();
+            } else {
+              _exitDedup++;
             }
-          } catch { return; }
+          } catch { _exitException++; return; }
         });
+        const _noRecvReasonsPart = _noReceiverReasonCounts.size > 0
+          ? ` noRecvReasons=${[..._noReceiverReasonCounts.entries()]
+              .sort((a, b) => b[1] - a[1])
+              .map(([reason, count]) => `${reason}:${count}`)
+              .join(',')}`
+          : '';
+        const _noRecvSamplesPart = _noReceiverSamples.size > 0
+          ? ` noRecvSamples=[${[..._noReceiverSamples].map((s) => `"${s}"`).join(',')}]`
+          : '';
         logDiagnosticPhase(
           `phase2-lookups:${rStart}-${rEnd}`,
           _phase2LookupStart,
           `input=${extraLookups.length} valid=${extraValidated.length} added=${_phase2LookupAdded}`
+          + ` exit=cancelled:${_exitCancelled},noRecv:${_exitNoReceiver},virtual:${_exitVirtualResolved}`
+          + `,resolvedOk:${_exitResolvedOk},partialSuppress:${_exitPartialSuppress}`
+          + `,dedup:${_exitDedup},nullDiag:${_exitNullDiagOther},err:${_exitException}`
+          + `,timeout:${_exitTimeout}`
+          + ` seenRangesSize=${seenRanges.size}`
+          + _noRecvReasonsPart
+          + _noRecvSamplesPart
         );
       }
       logDiagnosticPhase(
@@ -1675,6 +2278,40 @@ export function registerPythonProviders(
       return;
     }
 
+    // Per-cycle perf summary. Captain-style production trace analysis often
+    // needs to know "where did the budget go" — wall-time alone doesn't
+    // distinguish slow IPCs from cache miss explosions. This one-line dump
+    // shows cache effectiveness and IPC time consumed in the cycle.
+    const receiverCacheTotal = perfReceiverCacheHit + perfReceiverCacheMiss;
+    const lookupCacheTotal = perfLookupPathCacheHit + perfLookupPathCacheMiss;
+    const scanCacheTotal = perfScanCacheHit + perfScanCacheMiss;
+    const cycleWallMs = Date.now() - diagnosticStartTime;
+    // Per-IPC-method delta for this cycle: receiver-chain analysis needs
+    // to break recv-ipc-ms down into resolveRelationTarget vs
+    // resolveExportOrigin vs resolveModule vs resolveOrmMember. Each of
+    // those is a separate daemon round-trip; the chain calls them serially
+    // inside `resolveLookupReceiverInfoForReceiver`, so the slow one is
+    // the actual bottleneck.
+    const ipcDelta = daemon.diffIpcStats(perfIpcBaseline);
+    const ipcBreakdown = ipcDelta.length === 0
+      ? 'none'
+      : ipcDelta
+          .map((e) => `${e.method}=${e.count}/${e.totalMs.toFixed(0)}ms`)
+          .join(',');
+    daemon.logDiagnostic(
+      `[diagnostics:perf] wall=${cycleWallMs}ms ` +
+      `recv-cache=${perfReceiverCacheHit}/${receiverCacheTotal} ` +
+      `recv-stale-invalidate=${perfReceiverCacheStaleInvalidated} ` +
+      `recv-timeout=${perfReceiverTimeoutCount}/${PER_RECEIVER_TIMEOUT_MS}ms ` +
+      `lookup-cache=${perfLookupPathCacheHit}/${lookupCacheTotal} ` +
+      `scan-cache=${perfScanCacheHit}/${scanCacheTotal} ` +
+      `recv-ipc-ms=${perfReceiverIpcMs.toFixed(0)} ` +
+      `lookup-ipc-ms=${perfLookupPathIpcMs.toFixed(0)} ` +
+      `requests=${diagnosticRequestCount} ` +
+      `partial=${diagnosticBudgetLogged} ` +
+      `ipc-by-method=[${ipcBreakdown}]`
+    );
+
     diagnosticCollection.set(document.uri, diagnostics);
     logDiagnosticPhase(
       'publish',
@@ -1691,13 +2328,20 @@ export function registerPythonProviders(
         seenRanges: new Set(seenRanges),
         budgetExhausted: true,
       });
-      // Do NOT set lastDiagnosedDocumentVersions — allow re-scanning
-      // when triggered again (e.g., after a tab switch or scroll).
-    } else {
-      lastDiagnosedDocumentVersions.set(key, documentVersion);
+    }
+    // Mark this version as handled — even on budget exhaustion — so tracked
+    // refreshes from visible-editors-changed do not re-fire the same heavy
+    // scan repeatedly on a single document version. Edits bump the version,
+    // and daemon-state transitions clear this map explicitly, so genuine
+    // re-validation paths still work.
+    lastDiagnosedDocumentVersions.set(key, documentVersion);
+    if (!diagnosticBudgetLogged) {
       partialDiagnosticResults.delete(key);
     }
     activeDiagnosticScans.delete(key);
+    } finally {
+      activeDiagnosticScanRunningCount--;
+    }
   }));
 
   const completionProvider = vscode.languages.registerCompletionItemProvider(
@@ -1814,8 +2458,29 @@ export function registerPythonProviders(
               lookupContext.prefix,
               lookupContext.method
             );
+            // Captain regression P3: daemon (and local index) had no record
+            // of db.Company even though Pylance resolved the receiver. Both
+            // `listLookupPathCompletionsLocal` and the BG IPC came back
+            // with 0 items, so the user got an empty completion popup on
+            // `Company.objects.filter(<cursor>)`. Synthesize a small set of
+            // universal Django ORM lookup items so completion remains
+            // useful as a last resort.
+            const virtualItems = virtualLookupCompletionItems(
+              lookupReceiver,
+              lookupContext.prefix,
+              lookupContext.method,
+            );
+            let fallbackItems: LookupPathItem[] = [];
+            const totalKnownItems = result.items.length + virtualItems.length;
+            if (totalKnownItems === 0) {
+              fallbackItems = genericDjangoLookupFallbackItems(
+                baseModelLabel,
+                lookupContext.prefix,
+                lookupContext.method,
+              );
+            }
             daemon.logDiagnostic(
-              `[completion:lookup:daemon] model=${baseModelLabel} rawItems=${result.items.length} truncated=${Boolean(
+              `[completion:lookup:daemon] model=${baseModelLabel} rawItems=${result.items.length} virtual=${virtualItems.length} fallback=${fallbackItems.length} truncated=${Boolean(
                 result.truncated
               )}`
             );
@@ -1823,12 +2488,8 @@ export function registerPythonProviders(
               return cancelledCompletionResult(token);
             }
             const mergedLookupItems = mergeLookupCompletionItems(
-              result.items,
-              virtualLookupCompletionItems(
-                lookupReceiver,
-                lookupContext.prefix,
-                lookupContext.method
-              )
+              [...result.items, ...fallbackItems],
+              virtualItems,
             );
             const sortedItems = prioritizeLookupCompletionItems(
               mergedLookupItems,
@@ -3228,7 +3889,7 @@ export function registerPythonProviders(
       if (!isVisibleDocument(document)) {
         return;
       }
-      scheduleDiagnosticsRefresh(document);
+      scheduleDiagnosticsRefresh(document, 200, 'open');
     }),
     vscode.workspace.onDidChangeTextDocument((event) => {
       if (diagnosticsDisposed) {
@@ -3240,7 +3901,7 @@ export function registerPythonProviders(
       if (!isVisibleDocument(event.document)) {
         return;
       }
-      scheduleDiagnosticsRefresh(event.document, EDIT_DIAGNOSTIC_DEBOUNCE_MS);
+      scheduleDiagnosticsRefresh(event.document, EDIT_DIAGNOSTIC_DEBOUNCE_MS, 'edit');
     }),
     vscode.window.onDidChangeVisibleTextEditors(() => {
       if (diagnosticsDisposed) {
@@ -3251,6 +3912,7 @@ export function registerPythonProviders(
       }
       // Delay diagnostics refresh on tab switch to let hover requests
       // settle first and avoid flooding the event loop.
+      daemon.logDiagnostic('[diagnostics:trigger] tracked-refresh source=visible-editors-changed delay=500ms');
       scheduleTrackedDiagnosticsRefresh(500);
     }),
     vscode.workspace.onDidCloseTextDocument((document) => {
@@ -3261,6 +3923,7 @@ export function registerPythonProviders(
       lastDiagnosedDocumentVersions.delete(key);
       partialDiagnosticResults.delete(key);
       _ormReceiverCacheByDocument.delete(key);
+      _scanCacheAcrossRegistrations.delete(key);
       const timer = diagnosticTimers.get(key);
       if (timer) {
         clearTimeout(timer);
@@ -3295,6 +3958,15 @@ export function registerPythonProviders(
         return;
       }
 
+      daemon.logDiagnostic(`[diagnostics:trigger] tracked-refresh source=daemon-state phase=${snapshot.phase} delay=0ms`);
+      // Daemon capability changed (ready/degraded). Allow one fresh
+      // validation pass even for versions previously marked as
+      // budget-exhausted — the daemon may now produce different results.
+      lastDiagnosedDocumentVersions.clear();
+      partialDiagnosticResults.clear();
+      // Daemon model graph may have shifted; drop receiver/lookup caches
+      // so the next cycle re-resolves with the updated state.
+      clearLookupResolutionAndReceiverCachesAcrossRegistrations();
       scheduleTrackedDiagnosticsRefresh(0);
     }),
     new vscode.Disposable(() => {
@@ -6486,6 +7158,33 @@ function virtualFieldToLookupPathItem(
   };
 }
 
+/**
+ * Universal Django ORM lookup items emitted when the daemon has no record
+ * of the target model AND no virtual fields are available. Every Django
+ * model has `pk` (the primary key alias) and almost all have `id` — these
+ * suffice to keep the completion popup useful when the lookup path
+ * resolver came up empty (captain regression P3: db.Company unresolved
+ * but Pylance had typed the receiver).
+ */
+function genericDjangoLookupFallbackItems(
+  modelLabel: string,
+  prefix: string,
+  method: string,
+): LookupPathItem[] {
+  void method;
+  const normalizedPrefix = prefix.trim();
+  const candidates = ['pk', 'id'];
+  return candidates
+    .filter((name) => name.startsWith(normalizedPrefix))
+    .map((name) => ({
+      name,
+      modelLabel,
+      fieldKind: 'AutoField',
+      isRelation: false,
+      source: 'generic-fallback',
+    }));
+}
+
 function createEnsureStartedOnce(
   daemon: AnalysisDaemon,
   scope: vscode.ConfigurationScope
@@ -6820,7 +7519,14 @@ async function findLookupDiagnosticContexts(
 ): Promise<LookupDiagnosticContext[]> {
   const contexts: LookupDiagnosticContext[] = [];
   const seen = new Set<string>();
-  const SCAN_CHUNK_LINES = 50;
+  // Chunk size for cooperative yielding. Bumped from 50 → 250 because the
+  // captain trace showed cold-start phase2-scan inflating from ~500ms to
+  // 4241ms when the daemon was concurrently sending a 22MB surface payload:
+  // each `setTimeout(0)` yield waited for the IPC handler to drain a chunk
+  // of that payload. With 250 lines per chunk we yield ~5× less often, so
+  // the scan no longer interleaves with every daemon write while staying
+  // small enough that cancellation latency stays under ~50ms.
+  const SCAN_CHUNK_LINES = 250;
   const lineCount = endLine - startLine;
   const isSmallFile = lineCount < 500;
 
@@ -7843,6 +8549,14 @@ async function resolveOrmReceiverAtOffset(
   if (!normalizedExpression) {
     return undefined;
   }
+  // Same captain guard as `resolveLookupReceiverAtOffset`: a receiver that
+  // contains top-level commas or kwarg `=` was sliced incorrectly by the
+  // scanner. Resolving it would burn seconds in BG IPC waits. Reject up
+  // front and cache the rejection so subsequent identical receivers in
+  // the same cycle don't redo the work.
+  if (isMalformedReceiverExpression(normalizedExpression)) {
+    return undefined;
+  }
 
   const cacheKey = `${normalizedExpression}@${beforeOffset}`;
   const cached = getCachedOrmReceiver(document, cacheKey);
@@ -8041,11 +8755,15 @@ async function resolveOrmReceiverAtOffsetCore(
     beforeOffset
   );
   if (!assignment) {
-    // Fallback: snake_case variable name → PascalCase model name convention
-    const pascalName = snakeToPascalCase(rootIdentifier);
-    const fallbackLabel = daemon.modelLabelByName.get(pascalName);
-    if (fallbackLabel) {
-      return { kind: 'instance', modelLabel: fallbackLabel };
+    // Fallback: snake_case variable name → PascalCase model name convention,
+    // with light pluralization variants (vendors → Vendor,
+    // directors_meeting → DirectorMeeting) so collection-style parameter
+    // names still resolve to the underlying instance model.
+    for (const pascalName of snakeToPascalCaseVariants(rootIdentifier)) {
+      const fallbackLabel = daemon.modelLabelByName.get(pascalName);
+      if (fallbackLabel) {
+        return { kind: 'instance', modelLabel: fallbackLabel };
+      }
     }
     return undefined;
   }
@@ -8061,11 +8779,13 @@ async function resolveOrmReceiverAtOffsetCore(
     return assignmentReceiver;
   }
 
-  // Fallback: assignment resolution failed, try snake_case → PascalCase
-  const pascalName = snakeToPascalCase(rootIdentifier);
-  const fallbackLabel = daemon.modelLabelByName.get(pascalName);
-  if (fallbackLabel) {
-    return { kind: 'instance', modelLabel: fallbackLabel };
+  // Fallback: assignment resolution failed; try snake_case → PascalCase
+  // along with light pluralization variants.
+  for (const pascalName of snakeToPascalCaseVariants(rootIdentifier)) {
+    const fallbackLabel = daemon.modelLabelByName.get(pascalName);
+    if (fallbackLabel) {
+      return { kind: 'instance', modelLabel: fallbackLabel };
+    }
   }
   return undefined;
 }
@@ -9401,6 +10121,17 @@ async function resolveBaseModelLabelForReceiverAtOffset(
     beforeOffset
   );
   if (!assignment) {
+    // Mirror the snake→PascalCase fallback that resolveOrmReceiverAtOffsetCore
+    // already uses for member-access receivers. Without this, an unannotated
+    // collection-style parameter referenced directly as the queryset call
+    // receiver (e.g. `vendors.filter(...)`) lands in noRecv even though
+    // `Vendor` exists in the model graph.
+    for (const pascalName of snakeToPascalCaseVariants(rootIdentifier)) {
+      const fallbackLabel = daemon.modelLabelByName.get(pascalName);
+      if (fallbackLabel) {
+        return fallbackLabel;
+      }
+    }
     return undefined;
   }
 
@@ -9423,6 +10154,38 @@ function asLookupReceiver(
   return receiver;
 }
 
+/**
+ * Time an awaited step inside the receiver-resolution chain. When the
+ * elapsed time exceeds 500ms, emit a `[receiver-step:slow]` log so
+ * captain-style trace analysis can isolate which specific sub-call is
+ * eating the wall time. Cheap when steps are fast (a single
+ * performance.now() pair); only logs when interesting. Gated on a
+ * production-noise-control env var so the receiver path stays quiet in
+ * normal runs.
+ */
+async function timeReceiverStep<T>(
+  daemon: AnalysisDaemon,
+  step: string,
+  context: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (process.env.DJLS_DISABLE_RECEIVER_STEP_TRACE === '1') {
+    return fn();
+  }
+  const start = performance.now();
+  try {
+    return await fn();
+  } finally {
+    const elapsed = performance.now() - start;
+    if (elapsed > 500) {
+      const ctxTruncated = context.length > 80 ? context.slice(0, 77) + '...' : context;
+      daemon.logDiagnostic(
+        `[receiver-step:slow] step=${step} elapsed=${elapsed.toFixed(0)}ms ctx=${JSON.stringify(ctxTruncated)}`
+      );
+    }
+  }
+}
+
 async function resolveLookupReceiverAtOffset(
   daemon: AnalysisDaemon,
   document: vscode.TextDocument,
@@ -9435,6 +10198,16 @@ async function resolveLookupReceiverAtOffset(
   if (!normalizedExpression) {
     return undefined;
   }
+  // Captain regression 2026-05-12 17:44: function-call argument lists like
+  // `directors_meeting, user=self.user, context=self.context` were
+  // reaching the resolver and spending 9.9s in resolveOrmReceiverAtOffset
+  // before timing out — 10k+ slow-step traces consumed per session.
+  // A valid receiver is a single Python expression; top-level commas or
+  // kwarg `=` prove the scanner sliced garbage. Reject before the chain
+  // wastes any wall time.
+  if (isMalformedReceiverExpression(normalizedExpression)) {
+    return undefined;
+  }
 
   const visitKey = `${document.uri.toString()}:lookup:${normalizedExpression}@${beforeOffset}`;
   if (visited.has(visitKey) || visited.size > 12) {
@@ -9444,29 +10217,38 @@ async function resolveLookupReceiverAtOffset(
 
   const memberAccess = splitTopLevelMemberAccess(normalizedExpression);
   if (memberAccess) {
-    const lookupObjectReceiver = await resolveLookupReceiverAtOffset(
-      daemon,
-      document,
-      memberAccess.objectExpression,
-      beforeOffset,
-      visited
-    );
-    const ormObjectReceiver = await resolveOrmReceiverAtOffset(
-      daemon,
-      document,
-      memberAccess.objectExpression,
-      beforeOffset,
-      new Set()
-    );
-    const objectReceiver = lookupObjectReceiver ?? ormObjectReceiver;
-    const annotatedMemberReceiver = asLookupReceiver(
-      await resolveAnnotatedReceiverForMemberAccess(
+    const lookupObjectReceiver = await timeReceiverStep(
+      daemon, 'memberAccess.recursive-lookup', normalizedExpression,
+      () => resolveLookupReceiverAtOffset(
         daemon,
         document,
         memberAccess.objectExpression,
-        memberAccess.memberName,
         beforeOffset,
-        new Set()
+        visited,
+      ),
+    );
+    const ormObjectReceiver = await timeReceiverStep(
+      daemon, 'memberAccess.orm-receiver', normalizedExpression,
+      () => resolveOrmReceiverAtOffset(
+        daemon,
+        document,
+        memberAccess.objectExpression,
+        beforeOffset,
+        new Set(),
+      ),
+    );
+    const objectReceiver = lookupObjectReceiver ?? ormObjectReceiver;
+    const annotatedMemberReceiver = asLookupReceiver(
+      await timeReceiverStep(
+        daemon, 'memberAccess.annotated', normalizedExpression,
+        () => resolveAnnotatedReceiverForMemberAccess(
+          daemon,
+          document,
+          memberAccess.objectExpression,
+          memberAccess.memberName,
+          beforeOffset,
+          new Set(),
+        ),
       )
     );
     if (objectReceiver) {
@@ -9484,11 +10266,14 @@ async function resolveLookupReceiverAtOffset(
           );
         }
       }
-      const resolution = await daemon.resolveOrmMember(
-        objectReceiver.modelLabel,
-        objectReceiver.kind,
-        memberAccess.memberName,
-        objectReceiver.managerName
+      const resolution = await timeReceiverStep(
+        daemon, 'memberAccess.resolveOrmMember', normalizedExpression,
+        () => daemon.resolveOrmMember(
+          objectReceiver.modelLabel,
+          objectReceiver.kind,
+          memberAccess.memberName,
+          objectReceiver.managerName,
+        ),
       );
       const resolvedReceiver = asLookupReceiver(
         receiverFromOrmMemberResolution(resolution)
@@ -9501,18 +10286,86 @@ async function resolveLookupReceiverAtOffset(
           objectReceiver
         );
       }
+      // Synthesize `<model_class>.objects` as a manager receiver when both
+      // local surface and BG IPC failed to resolve it. Django's metaclass
+      // implicitly attaches `objects = Manager()` to every Model subclass,
+      // so a model that exists in the graph is guaranteed to support
+      // `.objects`. The outer `resolveBaseModelLabelForReceiverAtOffset`
+      // fallback also catches this case but returns `kind: 'model_class'`;
+      // this shortcut produces the more accurate `kind: 'manager'` shape
+      // so downstream consumers that branch on receiver kind (e.g. method
+      // completion) get the right behavior.
+      if (
+        objectReceiver.kind === 'model_class' &&
+        memberAccess.memberName === 'objects'
+      ) {
+        return preferAnnotatedMemberReceiver(
+          daemon,
+          {
+            kind: 'manager',
+            modelLabel: objectReceiver.modelLabel,
+            managerName: 'objects',
+          },
+          annotatedMemberReceiver,
+          objectReceiver
+        );
+      }
     }
     if (annotatedMemberReceiver) {
       return annotatedMemberReceiver;
     }
+    // Cold-daemon defensive fallback for `<KnownModel>.objects`. When the
+    // recursive `resolveLookupReceiverAtOffset(objectExpression)` returned
+    // undefined because the BG IPC was aborted/busy (captain trace: surface
+    // index still being prebuilt during the first diagnostic cycle), the
+    // parent call had no way to synthesize the manager receiver. But the
+    // local `modelLabelByName` index is populated synchronously from the
+    // surface delta, so a sync check here catches the case as soon as the
+    // model name is known — no IPC required.
+    if (
+      !objectReceiver &&
+      memberAccess.memberName === 'objects' &&
+      /^[A-Za-z_][\w]*$/.test(memberAccess.objectExpression)
+    ) {
+      const directLabel = daemon.findModelLabelByShortName(memberAccess.objectExpression);
+      if (directLabel) {
+        return {
+          kind: 'manager',
+          modelLabel: directLabel,
+          managerName: 'objects',
+        };
+      }
+      // Final phantom fallback: the daemon has no record of this
+      // identifier, BUT the `<PascalCase>.objects` shape strongly suggests
+      // a Django model whose indexing got dropped/missed (captain trace
+      // showed `CompanyQuestionThread.objects` permanently in unknown_root
+      // every cycle even though it's a real workspace model). Synthesize a
+      // phantom manager with the bare identifier as the label — downstream
+      // daemon queries against that label may still come back unresolved,
+      // but at least the lookup no longer falls into the generic
+      // `unknown_root` noRecv bucket. PascalCase guard avoids hijacking
+      // legitimate lowercase identifiers (instances/parameters) that have
+      // their own resolution paths.
+      if (/^[A-Z][A-Za-z0-9_]*$/.test(memberAccess.objectExpression)) {
+        return {
+          kind: 'manager',
+          modelLabel: memberAccess.objectExpression,
+          managerName: 'objects',
+          synthetic: 'phantom-objects',
+        };
+      }
+    }
   }
 
   if (/^[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?$/.test(normalizedExpression)) {
-    const modelLabel = await resolveModelLabelFromSymbol(
-      daemon,
-      document,
-      normalizedExpression,
-      beforeOffset
+    const modelLabel = await timeReceiverStep(
+      daemon, 'modelLabelFromSymbol', normalizedExpression,
+      () => resolveModelLabelFromSymbol(
+        daemon,
+        document,
+        normalizedExpression,
+        beforeOffset,
+      ),
     );
     if (modelLabel) {
       return {
@@ -9522,12 +10375,15 @@ async function resolveLookupReceiverAtOffset(
     }
   }
 
-  const callResolvedReceiver = await resolveLookupReceiverFromCallExpression(
-    daemon,
-    document,
-    normalizedExpression,
-    beforeOffset,
-    visited
+  const callResolvedReceiver = await timeReceiverStep(
+    daemon, 'callExpression', normalizedExpression,
+    () => resolveLookupReceiverFromCallExpression(
+      daemon,
+      document,
+      normalizedExpression,
+      beforeOffset,
+      visited,
+    ),
   );
   if (callResolvedReceiver) {
     return callResolvedReceiver;
@@ -9539,12 +10395,15 @@ async function resolveLookupReceiverAtOffset(
   }
 
   const loopTargetReceiver = asLookupReceiver(
-    await resolveOrmReceiverFromLoopTarget(
-      daemon,
-      document,
-      rootIdentifier,
-      beforeOffset,
-      visited
+    await timeReceiverStep(
+      daemon, 'loopTarget', normalizedExpression,
+      () => resolveOrmReceiverFromLoopTarget(
+        daemon,
+        document,
+        rootIdentifier,
+        beforeOffset,
+        visited,
+      ),
     )
   );
   if (loopTargetReceiver) {
@@ -9552,11 +10411,14 @@ async function resolveLookupReceiverAtOffset(
   }
 
   const annotatedReceiver = asLookupReceiver(
-    await resolveAnnotatedReceiverForIdentifier(
-      daemon,
-      document,
-      rootIdentifier,
-      beforeOffset
+    await timeReceiverStep(
+      daemon, 'annotatedIdentifier', normalizedExpression,
+      () => resolveAnnotatedReceiverForIdentifier(
+        daemon,
+        document,
+        rootIdentifier,
+        beforeOffset,
+      ),
     )
   );
   if (annotatedReceiver) {
@@ -9569,6 +10431,17 @@ async function resolveLookupReceiverAtOffset(
     beforeOffset
   );
   if (!assignment) {
+    // Bare-identifier receivers (e.g. `vendors.filter(...)` where `vendors`
+    // is an unannotated parameter) reach this point with no assignment in
+    // scope. Mirror the snake→PascalCase fallback used elsewhere so the
+    // identifier resolves to an instance of the matching model rather than
+    // landing in noRecv.
+    for (const pascalName of snakeToPascalCaseVariants(rootIdentifier)) {
+      const fallbackLabel = daemon.modelLabelByName.get(pascalName);
+      if (fallbackLabel) {
+        return { kind: 'instance', modelLabel: fallbackLabel };
+      }
+    }
     return undefined;
   }
 
@@ -9867,8 +10740,15 @@ async function resolveModelLabelFromSymbol(
   beforeOffset: number
 ): Promise<string | undefined> {
   if (daemon.isAborted()) { return undefined; }
+  // Test-only hatch: simulate the captain race where the recursive object
+  // receiver resolution returns undefined even though the model is locally
+  // known. Production trigger is daemon-aborted state mid-cycle; tests can
+  // force the same observable failure deterministically.
+  if (process.env.DJLS_TEST_FORCE_RESOLVE_MODEL_LABEL_NULL === '1') {
+    return undefined;
+  }
   const simpleName = symbol.includes('.') ? symbol.split('.').at(-1)! : symbol;
-  const localLabel = daemon.modelLabelByName.get(simpleName);
+  const localLabel = daemon.findModelLabelByShortName(simpleName);
   if (localLabel) {
     return localLabel;
   }
@@ -11982,8 +12862,14 @@ function normalizeReceiverExpression(value: string): string {
   while (true) {
     let strippedPrefix = false;
 
-    for (const prefix of ['return', 'await']) {
-      if (!current.startsWith(prefix) || current.length === prefix.length) {
+    // Strip leading Python statement / boolean-context keywords. Require a
+    // word-boundary (space) after the keyword so we don't accidentally chew
+    // through identifiers like `notify_user` (`not` prefix) or `iterator`
+    // (`if` prefix).
+    for (const prefix of [
+      'return', 'await', 'not', 'if', 'and', 'or', 'elif', 'while', 'assert', 'yield',
+    ]) {
+      if (!current.startsWith(prefix + ' ')) {
         continue;
       }
 
@@ -12103,6 +12989,118 @@ function snakeToPascalCase(snake: string): string {
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join('');
+}
+
+/**
+ * Produces the standard snake→PascalCase conversion, plus a small set of
+ * fuzzy variants that try to recover from common pluralization mismatches
+ * between variable names and model names. Variants are returned in
+ * decreasing-confidence order; callers should try them in sequence and
+ * stop at the first match.
+ *
+ * Examples for input `vendors`:
+ *   `Vendors`  (literal pascal-case)
+ *   `Vendor`   (drop trailing 's' from last segment)
+ *
+ * Examples for input `directors_meeting`:
+ *   `DirectorsMeeting`
+ *   `DirectorMeeting`   (drop trailing 's' from first segment)
+ */
+function snakeToPascalCaseVariants(snake: string): string[] {
+  const segments = snake.split('_').filter(Boolean);
+  if (segments.length === 0) return [];
+  const cap = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1);
+  const variants: string[] = [];
+  const seen = new Set<string>();
+  const push = (parts: string[]): void => {
+    const v = parts.map(cap).join('');
+    if (!seen.has(v)) {
+      seen.add(v);
+      variants.push(v);
+    }
+  };
+  push(segments);
+  // Drop trailing 's' from the LAST segment (e.g. vendors → Vendor).
+  const last = segments[segments.length - 1];
+  if (last.length > 1 && last.endsWith('s')) {
+    push([...segments.slice(0, -1), last.slice(0, -1)]);
+  }
+  // Drop trailing 's' from the FIRST segment (e.g. directors_meeting →
+  // DirectorMeeting). Only when there's more than one segment so that the
+  // identifier still looks like a compound noun.
+  if (segments.length > 1) {
+    const first = segments[0];
+    if (first.length > 1 && first.endsWith('s')) {
+      push([first.slice(0, -1), ...segments.slice(1)]);
+    }
+  }
+  return variants;
+}
+
+/**
+ * Diagnostic helper: classify why a receiver expression failed to resolve.
+ * Used only for logging — does not block the main resolver flow. Cheap
+ * synchronous checks against `daemon.modelLabelByName` and string shape;
+ * no IPC, no async work.
+ *
+ * Returned categories:
+ *   `unknown_root`        — root identifier not in model graph, no fuzzy
+ *                            variant matches. Most likely workspace model
+ *                            indexing miss (or a genuinely unknown name).
+ *   `fuzzy_matched:Name`  — a snake→pascal fuzzy variant maps to a known
+ *                            model `Name`, but the chain still failed —
+ *                            usually means a reverse accessor / member is
+ *                            not in the surface index.
+ *   `root_matched:Name`   — root resolves to `Name` directly, but the
+ *                            member chain after the root failed. Indicates
+ *                            an unindexed attribute/method on a known model.
+ *   `parse_polluted`      — receiver expression contains `#` or starts
+ *                            with non-identifier characters, signaling a
+ *                            parser path that swallowed comment/docstring
+ *                            text into the expression.
+ *   `no_root_identifier`  — could not extract a root identifier at all
+ *                            (e.g. starts with a literal or punctuation).
+ */
+function classifyNoRecvReason(
+  daemon: AnalysisDaemon,
+  receiverExpression: string,
+): string {
+  if (!receiverExpression) {
+    return 'no_root_identifier';
+  }
+  if (receiverExpression.includes('#')) {
+    return 'parse_polluted';
+  }
+  // Normalize first (strip Python keyword prefixes like `return`, `await`,
+  // `not`, etc.) so the root identifier extraction matches what the
+  // resolver actually attempted. Captain trace L81/L138 showed
+  // `return Director.objects.get_queryset()` bucketed as `unknown_root`
+  // because the raw expression's first identifier is `return`.
+  const normalized = normalizeReceiverExpression(receiverExpression) || receiverExpression;
+  // Detect self/cls/super references — captain shows 23+ per cycle in the
+  // `self.<X>_set` shape. Mark them with a dedicated bucket so the
+  // diagnostics surface separates them from the generic no_root_identifier
+  // catch-all (literals, punctuation starts, etc.).
+  const selfPrefixMatch = /^(self|cls|super)\b/.exec(normalized);
+  if (selfPrefixMatch) {
+    return `self_reference:${selfPrefixMatch[1]}`;
+  }
+  const rootIdentifier = receiverRootIdentifier(normalized);
+  if (!rootIdentifier) {
+    return 'no_root_identifier';
+  }
+  const hasMemberChain = normalized.length > rootIdentifier.length;
+  if (daemon.hasModelByShortName(rootIdentifier)) {
+    return hasMemberChain
+      ? `root_matched:${rootIdentifier}`
+      : `root_matched_bare:${rootIdentifier}`;
+  }
+  for (const variant of snakeToPascalCaseVariants(rootIdentifier)) {
+    if (variant !== rootIdentifier && daemon.hasModelByShortName(variant)) {
+      return `fuzzy_matched:${variant}`;
+    }
+  }
+  return 'unknown_root';
 }
 
 function receiverRootIdentifier(receiverExpression: string): string | undefined {
@@ -14554,7 +15552,15 @@ function resolveRelativeModuleName(
 }
 
 function compactPythonExpression(value: string): string {
-  return value.replace(/\s+/g, '');
+  // Collapse all whitespace, but preserve a single space when it sits
+  // between two word characters — otherwise expressions like
+  // `not Foo.objects.filter(...)` collapse into `notFoo.objects.filter(...)`,
+  // making the leading keyword look like part of the receiver identifier.
+  return value.replace(/\s+/g, (match, offset: number, str: string) => {
+    const before = str[offset - 1] ?? '';
+    const after = str[offset + match.length] ?? '';
+    return /\w/.test(before) && /\w/.test(after) ? ' ' : '';
+  });
 }
 
 function trimLeadingUnmatchedOpeningDelimiters(value: string): string {
@@ -15749,6 +16755,63 @@ function countTopLevelArgumentsBeforeOffset(
 
 function hasTopLevelEquals(text: string): boolean {
   return findTopLevelEqualsIndex(text) >= 0;
+}
+
+/**
+ * True when `text` contains a comma at top level (outside parens / brackets
+ * / braces / strings). Captain trace 2026-05-12 17:44 showed function-call
+ * argument lists like `directors_meeting, user=self.user, context=self.context`
+ * being passed to `resolveOrmReceiverAtOffset` as receiver expressions —
+ * 10k+ slow steps consumed by the resolver chewing on garbage that could
+ * never be a valid Python receiver. Top-level commas reliably mark such
+ * malformed slices.
+ */
+function hasTopLevelComma(text: string): boolean {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let activeQuote: '"' | "'" | undefined;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (!char) continue;
+
+    if (activeQuote) {
+      if (escaped) { escaped = false; continue; }
+      if (char === '\\') { escaped = true; continue; }
+      if (char === activeQuote) activeQuote = undefined;
+      continue;
+    }
+
+    if (char === "'" || char === '"') { activeQuote = char; continue; }
+    if (char === '(') { parenDepth += 1; continue; }
+    if (char === '[') { bracketDepth += 1; continue; }
+    if (char === '{') { braceDepth += 1; continue; }
+    if (char === ')' && parenDepth > 0) { parenDepth -= 1; continue; }
+    if (char === ']' && bracketDepth > 0) { bracketDepth -= 1; continue; }
+    if (char === '}' && braceDepth > 0) { braceDepth -= 1; continue; }
+
+    if (
+      char === ',' &&
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/** Detect receiver-expression slices that are obviously argument lists
+ *  (not single Python expressions). Either a top-level comma or a
+ *  top-level `=` proves the scanner captured too much. Cheap sync check;
+ *  used as an early bail-out before the receiver chain spends seconds
+ *  trying to resolve the garbage. */
+function isMalformedReceiverExpression(text: string): boolean {
+  return hasTopLevelComma(text) || hasTopLevelEquals(text);
 }
 
 function findTopLevelEqualsIndex(text: string): number {

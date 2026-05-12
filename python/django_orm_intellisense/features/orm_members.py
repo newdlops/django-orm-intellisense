@@ -7,6 +7,7 @@ import json
 import os
 import re
 import threading
+import dataclasses
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -216,17 +217,390 @@ class OrmMemberItem:
         return d
 
 
+def log_surface_index_gap(
+    static_index: StaticIndex,
+    model_graph: ModelGraph | None,
+    surface_index: dict[str, object],
+) -> None:
+    """Captain regression: `db.Company` (and similar workspace models) are
+    present in the runtime ModelGraph but missing from the surfaceIndex sent
+    to TS — diagnostics and completion lose the model entirely. The gap can
+    come from:
+      - abstract:    intentionally excluded by build_surface_index
+      - unparseable: source file failed AST parse (StaticIndex tracks these)
+      - shadowed:    file's module slot was taken by a sibling __init__.py
+      - graph-only:  in ModelGraph (e.g. via inheritance/runtime) but no
+                     matching static ModelCandidate at all
+    Without this log the gap is invisible — users see "no completion items"
+    with no path to debugging which model or file is at fault.
+    Emits one summary line plus per-category file lists when non-empty.
+    """
+    import sys
+    if model_graph is None:
+        return
+    surface_labels = set(surface_index.keys())
+    graph_labels = set(model_graph.nodes_by_label.keys())
+    missing = graph_labels - surface_labels
+    if not missing:
+        print(
+            f'[surface:gap] none — surfaceIndex covers all {len(graph_labels)} graph models',
+            file=sys.stderr,
+        )
+        return
+
+    # Index candidates for lookup.
+    candidates_by_label: dict[str, ModelCandidate] = {
+        candidate.label: candidate for candidate in static_index.model_candidates
+    }
+    # Captain regression follow-up: surface a `(module, object_name)` index so
+    # we can detect "the AST found a candidate, but stored it under a
+    # different `app_label.Class` key than ModelGraph used". This happens
+    # when Django's AppConfig sets a custom `app_label` that the indexer's
+    # `module_name.split('.', 1)[0]` heuristic does NOT recover. captain
+    # registers `zuzu.db` with `app_label='db'`, but the indexer derives
+    # `app_label='zuzu'` and stores the candidate as `zuzu.Company` while
+    # ModelGraph stores it as `db.Company` — the labels never match and
+    # every workspace model permanently appears in surface:gap.
+    candidates_by_module_and_name: dict[tuple[str, str], ModelCandidate] = {
+        (candidate.module, candidate.object_name): candidate
+        for candidate in static_index.model_candidates
+    }
+    # Reverse-lookup: file → set of missing labels in that file.
+    abstract_labels: list[str] = []
+    unparseable_labels: list[tuple[str, str, str]] = []  # (label, file, reason)
+    shadowed_labels: list[tuple[str, str, str]] = []
+    graph_only_labels: list[tuple[str, str | None]] = []  # (label, file_path_or_None)
+
+    unparseable_files: dict[str, str] = getattr(static_index, 'unparseable_files', {}) or {}
+    shadowed_files: dict[str, str] = getattr(static_index, 'shadowed_files', {}) or {}
+
+    def _normalize_path(path: str | None) -> str | None:
+        if not path:
+            return None
+        return path
+
+    for label in sorted(missing):
+        candidate = candidates_by_label.get(label)
+        graph_node = model_graph.nodes_by_label.get(label)
+        if candidate is None:
+            file_path = _normalize_path(graph_node.file_path if graph_node else None)
+            graph_only_labels.append((label, file_path))
+            continue
+        if candidate.is_abstract:
+            abstract_labels.append(label)
+            continue
+        # Concrete candidate that should have surfaced — check why not.
+        file_path = candidate.file_path
+        if file_path in unparseable_files:
+            reason = unparseable_files[file_path]
+            unparseable_labels.append((label, file_path, reason))
+            continue
+        if file_path in shadowed_files:
+            reason = shadowed_files[file_path]
+            shadowed_labels.append((label, file_path, reason))
+            continue
+        # Concrete + parseable + non-shadowed yet still missing. This is the
+        # genuinely surprising bucket — surface enumeration produced an empty
+        # entry that got dropped, OR the candidate slipped past index. Treat
+        # as graph-only so it shows up explicitly.
+        graph_only_labels.append((label, file_path))
+
+    total_missing = len(missing)
+    print(
+        f'[surface:gap] total={total_missing} '
+        f'abstract={len(abstract_labels)} '
+        f'unparseable={len(unparseable_labels)} '
+        f'shadowed={len(shadowed_labels)} '
+        f'graph-only={len(graph_only_labels)} '
+        f'graph={len(graph_labels)} surface={len(surface_labels)}',
+        file=sys.stderr,
+    )
+    SAMPLE = 8
+    if unparseable_labels:
+        # Each entry shows the captain-relevant info: which label, which file,
+        # and what parse error blocked it. This is the highest-priority
+        # bucket because every label here is a real model the user wrote
+        # that we silently dropped due to a syntax/AST error.
+        sample = unparseable_labels[:SAMPLE]
+        formatted = ', '.join(
+            f'{label}@{file_path}:{reason}'
+            for label, file_path, reason in sample
+        )
+        more = '' if len(unparseable_labels) <= SAMPLE else f' (+{len(unparseable_labels) - SAMPLE} more)'
+        print(f'[surface:gap:unparseable] {formatted}{more}', file=sys.stderr)
+    if shadowed_labels:
+        sample = shadowed_labels[:SAMPLE]
+        formatted = ', '.join(
+            f'{label}@{file_path}:{reason}'
+            for label, file_path, reason in sample
+        )
+        more = '' if len(shadowed_labels) <= SAMPLE else f' (+{len(shadowed_labels) - SAMPLE} more)'
+        print(f'[surface:gap:shadowed] {formatted}{more}', file=sys.stderr)
+    if graph_only_labels:
+        # Captain regression: 109 of 109 missing models landed here with
+        # file_path=None — they were discovered via Django runtime introspection
+        # but the AST indexer never produced a ModelCandidate. Split into
+        # workspace vs external so the user can immediately see which models
+        # they're responsible for fixing vs which are just packaged Django/
+        # site-packages models (where missing surface is acceptable).
+        EXTERNAL_MODULE_PREFIXES = (
+            'django.',
+            'django_',
+            'rest_framework.',
+            'axes.',
+            'corsheaders.',
+            'allauth.',
+            'debug_toolbar.',
+            'graphene.',
+            'channels.',
+            'storages.',
+            'silk.',
+            'oauth2_provider.',
+            'guardian.',
+            'taggit.',
+        )
+
+        def _is_external(node) -> bool:
+            module = (node.module or '').strip()
+            import_path = (node.import_path or '').strip()
+            for prefix in EXTERNAL_MODULE_PREFIXES:
+                if module.startswith(prefix) or import_path.startswith(prefix):
+                    return True
+            # site-packages anywhere in import path → external
+            if 'site-packages' in import_path:
+                return True
+            return False
+
+        workspace_entries: list[tuple[str, object]] = []
+        external_entries: list[tuple[str, object]] = []
+        for label, _file_path in graph_only_labels:
+            node = model_graph.nodes_by_label.get(label)
+            if node is None:
+                external_entries.append((label, None))
+                continue
+            if _is_external(node):
+                external_entries.append((label, node))
+            else:
+                workspace_entries.append((label, node))
+
+        # Workspace entries: dump ALL of them with module + runtime info so
+        # the user can locate every missing workspace model. captain's
+        # `db.Company` will be here.
+        if workspace_entries:
+            WORKSPACE_DUMP = 64
+            details = []
+            for label, node in workspace_entries[:WORKSPACE_DUMP]:
+                if node is None:
+                    details.append(f'{label}@? module=? runtime=?')
+                    continue
+                runtime = 'yes' if node.runtime_model is not None else 'no'
+                candidate = 'yes' if node.model_candidate is not None else 'no'
+                module = node.module or '?'
+                # Look up an AST candidate keyed by (module, object_name) —
+                # captures the case where the indexer stored a candidate
+                # under a different app_label-based label than ModelGraph
+                # used. If found, surface its label so the mismatch is
+                # visible. Otherwise mark `candidate_alt=none` so the
+                # user can tell "really no AST candidate" vs "candidate
+                # exists but under a different label".
+                sibling = candidates_by_module_and_name.get(
+                    (node.module, node.object_name)
+                )
+                if sibling is not None and sibling.label != label:
+                    alt_label = sibling.label
+                else:
+                    alt_label = 'none'
+                details.append(
+                    f'{label} module={module} runtime={runtime} '
+                    f'candidate={candidate} candidate_alt={alt_label}'
+                )
+            more = (
+                ''
+                if len(workspace_entries) <= WORKSPACE_DUMP
+                else f' (+{len(workspace_entries) - WORKSPACE_DUMP} more)'
+            )
+            print(
+                f'[surface:gap:graph-only:workspace] count={len(workspace_entries)} {", ".join(details)}{more}',
+                file=sys.stderr,
+            )
+
+        # External entries: just count + small sample, since these are
+        # site-packages models we don't expect to surface anyway.
+        if external_entries:
+            EXTERNAL_DUMP = 6
+            sample = external_entries[:EXTERNAL_DUMP]
+            details = []
+            for label, node in sample:
+                if node is None:
+                    details.append(label)
+                else:
+                    top_module = (node.module or '').split('.')[0]
+                    details.append(f'{label}({top_module})')
+            more = (
+                ''
+                if len(external_entries) <= EXTERNAL_DUMP
+                else f' (+{len(external_entries) - EXTERNAL_DUMP} more)'
+            )
+            print(
+                f'[surface:gap:graph-only:external] count={len(external_entries)} {", ".join(details)}{more}',
+                file=sys.stderr,
+            )
+    if abstract_labels:
+        # Abstract is intentional; just emit count so the breakdown adds up.
+        sample = abstract_labels[:SAMPLE]
+        more = '' if len(abstract_labels) <= SAMPLE else f' (+{len(abstract_labels) - SAMPLE} more)'
+        print(
+            f'[surface:gap:abstract] {", ".join(sample)}{more}',
+            file=sys.stderr,
+        )
+
+
+def _build_static_to_graph_label_map(
+    static_index: StaticIndex,
+    model_graph: ModelGraph | None,
+) -> dict[str, str]:
+    """Map ``ModelCandidate.label`` → graph (runtime) label via (module, object_name).
+
+    Captain's `zuzu/db/models/company/company.py` reproduces the canonical
+    split: the AST candidate is stored as ``zuzu.Company`` (module-segment
+    heuristic) while Django's runtime model is ``db.Company`` (AppConfig
+    label='db'). The ModelGraph linker already joins these via
+    ``(candidate.module, candidate.object_name)`` and exposes the node under
+    the runtime label. This helper hoists that join so callers — most
+    importantly ``build_surface_index`` — can present a single canonical
+    label to TS (the runtime label, matching what Pylance hands back).
+    """
+    if model_graph is None:
+        return {}
+
+    nodes_by_module_and_name: dict[tuple[str, str], str] = {}
+    for graph_label, node in model_graph.nodes_by_label.items():
+        if not node.module:
+            continue
+        nodes_by_module_and_name.setdefault(
+            (node.module, node.object_name), graph_label,
+        )
+
+    label_map: dict[str, str] = {}
+    for candidate in static_index.model_candidates:
+        graph_label = nodes_by_module_and_name.get(
+            (candidate.module, candidate.object_name)
+        )
+        if graph_label and graph_label != candidate.label:
+            label_map[candidate.label] = graph_label
+    return label_map
+
+
+def _remap_label(label: str | None, label_map: dict[str, str]) -> str | None:
+    if label is None:
+        return None
+    return label_map.get(label, label)
+
+
+def _resolve_graph_label_for_static_label(
+    static_index: StaticIndex,
+    model_graph: ModelGraph | None,
+    model_label: str,
+) -> str | None:
+    """Given a candidate.label, return the graph (runtime) label for the same
+    ``(module, object_name)`` pair when they diverge — captain pattern.
+
+    Returns ``None`` when the candidate is unknown to the static index, or
+    when no graph node matches its module/object_name. Returns the same
+    ``model_label`` when graph and static agree (the common case).
+    """
+    if model_graph is None:
+        return None
+    candidate = static_index.find_model_candidate(model_label)
+    if candidate is None:
+        return None
+    for node in model_graph.nodes_by_object_name.get(candidate.object_name, ()):
+        if node.module == candidate.module:
+            return node.label
+    return None
+
+
+def _normalize_to_static_label(
+    static_index: StaticIndex,
+    model_graph: ModelGraph | None,
+    model_label: str,
+) -> str:
+    """Translate a TS-facing graph label back to the static candidate label.
+
+    After option C, TS receives surface entries keyed by the runtime/graph
+    label (e.g. ``db.Company``). When TS calls back into the daemon with
+    that label, downstream resolvers that key off
+    ``static_index.find_model_candidate(label)`` would miss — the static
+    index is keyed by ``candidate.label`` (e.g. ``zuzu.Company``). This
+    helper performs the inverse of the Step-3 label map so the internal
+    resolution chain keeps working regardless of which label the caller
+    holds; only public return values need to be re-flipped to the graph
+    label on the way out.
+    """
+    if static_index.find_model_candidate(model_label) is not None:
+        return model_label
+    if model_graph is None:
+        return model_label
+    node = model_graph.node_for_model(model_label)
+    if node is not None and node.model_candidate is not None:
+        return node.model_candidate.label
+    return model_label
+
+
+def _remap_member_item_for_output(
+    item: OrmMemberItem,
+    label_map: dict[str, str],
+) -> OrmMemberItem:
+    """Flip ``model_label`` and ``return_model_label`` from static → graph label.
+
+    Used when an OrmMemberItem is about to leave the daemon (resolve_orm_member
+    return path, chain resolution). Ensures the labels TS sees are consistent
+    with the surface index keys so receiver-chain lookups don't dead-end on the
+    extension host.
+    """
+    if not label_map:
+        return item
+    new_model_label = label_map.get(item.model_label, item.model_label)
+    new_return_label = _remap_label(item.return_model_label, label_map)
+    if (
+        new_model_label == item.model_label
+        and new_return_label == item.return_model_label
+    ):
+        return item
+    return dataclasses.replace(
+        item,
+        model_label=new_model_label,
+        return_model_label=new_return_label,
+    )
+
+
 def build_surface_index(
     static_index: StaticIndex,
     runtime: RuntimeInspection,
     model_graph: ModelGraph | None = None,
 ) -> dict[str, object]:
-    """전체 model surface를 경량 dict로 빌드. TS에 전송하여 로컬 O(1) 해석."""
+    """전체 model surface를 경량 dict로 빌드. TS에 전송하여 로컬 O(1) 해석.
+
+    Surface entries are keyed by the **graph (runtime) label** when the
+    ModelGraph exposes one for ``(candidate.module, candidate.object_name)``;
+    otherwise we fall back to ``candidate.label``. This bridges the captain
+    pattern where `AppConfig.label` diverges from the module's first segment
+    (`zuzu.Company` candidate ↔ `db.Company` runtime label) — TS now finds
+    the surface entry under the same label Pylance hands back.
+    """
+    label_map = _build_static_to_graph_label_map(static_index, model_graph)
+
     index: dict[str, dict[str, dict[str, list[str | None]]]] = {}
     receiver_kinds = ['instance', 'model_class', 'manager', 'queryset', 'related_manager']
     for candidate in static_index.model_candidates:
         if candidate.is_abstract:
             continue
+        # Internal lookups (StaticIndex.find_model_candidate, field tables)
+        # are keyed by candidate.label; only the OUTER dict key flips to the
+        # graph label. This is the smallest change that fixes the captain
+        # pattern without rippling label semantics into every downstream
+        # resolver — those migrations belong in the audit step.
+        surface_key = label_map.get(candidate.label, candidate.label)
         model_entry: dict[str, dict[str, list[str | None]]] = {}
         for kind in receiver_kinds:
             surface = _surface_cache.get_list(
@@ -238,18 +612,34 @@ def build_surface_index(
                 if item.return_kind:
                     kind_entry[item.name] = [
                         item.return_kind,
-                        item.return_model_label or item.model_label,
+                        _remap_label(
+                            item.return_model_label or item.model_label,
+                            label_map,
+                        ),
                         item.member_kind,
                         item.field_kind,
                     ]
             if kind_entry:
                 model_entry[kind] = kind_entry
+
+        # Django attaches `objects = Manager()` to every concrete Model via
+        # its metaclass. The static enumeration above can miss it when the
+        # source declaration uses an unusual pattern (custom base class,
+        # late binding, etc.), and the captain workspace trace showed
+        # `<model>.objects.filter(...)` landing in noRecv as a result.
+        # Guarantee the entry exists; if surface enumeration produced a
+        # richer record for `objects` it wins via dict insertion order.
+        model_class_entry = model_entry.setdefault('model_class', {})
+        if 'objects' not in model_class_entry:
+            model_class_entry['objects'] = [
+                'manager', surface_key, 'manager', None,
+            ]
         # Always register concrete candidates — even ones whose receivers came
         # back empty (e.g. inheritance-only models where every field lives on
         # an abstract base). Dropping them silently hides the model from the
         # TS-side surfaceIndex, which breaks receiver-aware completion on the
         # extension host because our lookup path keys off the candidate label.
-        index[candidate.label] = model_entry
+        index[surface_key] = model_entry
     return index
 
 
@@ -316,20 +706,30 @@ def rebuild_surface_for_models(
     for label in affected_labels:
         _surface_cache.invalidate_model(label)
 
+    label_map = _build_static_to_graph_label_map(static_index, model_graph)
+
     # Build a shallow copy of the existing surface index
     index: dict[str, dict[str, dict[str, list[str | None]]]] = dict(existing_surface_index)  # type: ignore[arg-type]
 
-    # Remove labels that no longer exist
-    current_labels = {c.label for c in static_index.model_candidates if not c.is_abstract}
+    # Remove labels that no longer exist. Match against both candidate labels
+    # and their graph-remapped keys so the captain split (candidate=zuzu.X,
+    # surface=db.X) doesn't leave dead `db.X` entries behind on deletion.
+    current_surface_keys = {
+        label_map.get(c.label, c.label)
+        for c in static_index.model_candidates
+        if not c.is_abstract
+    }
     for label in affected_labels:
-        if label not in current_labels:
-            index.pop(label, None)
+        surface_key = label_map.get(label, label)
+        if surface_key not in current_surface_keys:
+            index.pop(surface_key, None)
 
     # Rebuild affected labels
     receiver_kinds = ['instance', 'model_class', 'manager', 'queryset', 'related_manager']
     for candidate in static_index.model_candidates:
         if candidate.is_abstract or candidate.label not in affected_labels:
             continue
+        surface_key = label_map.get(candidate.label, candidate.label)
         model_entry: dict[str, dict[str, list[str | None]]] = {}
         for kind in receiver_kinds:
             surface = _surface_cache.get_list(
@@ -341,7 +741,10 @@ def rebuild_surface_for_models(
                 if item.return_kind:
                     kind_entry[item.name] = [
                         item.return_kind,
-                        item.return_model_label or item.model_label,
+                        _remap_label(
+                            item.return_model_label or item.model_label,
+                            label_map,
+                        ),
                         item.member_kind,
                         item.field_kind,
                 ]
@@ -351,7 +754,7 @@ def rebuild_surface_for_models(
         # temporarily empty. Dropping the label here makes incremental rebuilds
         # diverge from full initialization and can hide inheritance-only
         # concrete models from TS lookup completion until the next full restart.
-        index[candidate.label] = model_entry
+        index[surface_key] = model_entry
 
     elapsed = time.perf_counter() - started
     print(
@@ -390,6 +793,7 @@ def prebuild_member_surface_cache(
         f'surfaceIndex={len(surface_index)} models',
         file=__import__("sys").stderr,
     )
+    log_surface_index_gap(static_index, model_graph, surface_index)
     return surface_index
 
 
@@ -404,7 +808,11 @@ def resolve_orm_member_chain(
     manager_name: str | None = None,
 ) -> dict[str, object]:
     """멤버 체인을 한 번에 해석. IPC 1회로 여러 단계 해석."""
-    current_label = model_label
+    # Captain-pattern bridge: keep all cache lookups in the static-label
+    # space (cache key matches surface build), then remap return labels back
+    # to the graph label before responding to TS.
+    label_map = _build_static_to_graph_label_map(static_index, model_graph)
+    current_label = _normalize_to_static_label(static_index, model_graph, model_label)
     current_kind = receiver_kind
     current_manager = manager_name
     visited: set[tuple[str, str, str]] = set()
@@ -416,7 +824,7 @@ def resolve_orm_member_chain(
                 'resolved': False,
                 'reason': 'cycle_detected',
                 'failedAt': name,
-                'modelLabel': current_label,
+                'modelLabel': label_map.get(current_label, current_label),
                 'receiverKind': current_kind,
             }
         visited.add(visit_key)
@@ -429,7 +837,7 @@ def resolve_orm_member_chain(
                 'resolved': False,
                 'reason': 'not_found',
                 'failedAt': name,
-                'modelLabel': current_label,
+                'modelLabel': label_map.get(current_label, current_label),
                 'receiverKind': current_kind,
             }
 
@@ -442,7 +850,12 @@ def resolve_orm_member_chain(
             }
 
         return_label = item.return_model_label or item.model_label
-        current_label = return_label
+        # The cache stores the static label internally; the next iteration
+        # also looks up by static label, so we don't remap mid-chain — only
+        # the final modelLabel returned to TS gets flipped to the graph label.
+        current_label = _normalize_to_static_label(
+            static_index, model_graph, return_label,
+        )
         current_kind = return_kind
         current_manager = (
             item.manager_name or item.name
@@ -452,7 +865,7 @@ def resolve_orm_member_chain(
 
     return {
         'resolved': True,
-        'modelLabel': current_label,
+        'modelLabel': label_map.get(current_label, current_label),
         'receiverKind': current_kind,
         'managerName': current_manager,
     }
@@ -472,10 +885,16 @@ def resolve_orm_member(
     if not normalized_name:
         return {'resolved': False, 'reason': 'empty'}
 
+    # Captain-pattern bridge: TS calls back with the graph (runtime) label, but
+    # all the resolvers below key off candidate.label. Translate once at the
+    # boundary, then remap return labels back to the graph label.
+    internal_label = _normalize_to_static_label(static_index, model_graph, model_label)
+    label_map = _build_static_to_graph_label_map(static_index, model_graph)
+
     direct_item = _direct_resolve_member_item(
         static_index=static_index,
         runtime=runtime,
-        model_label=model_label,
+        model_label=internal_label,
         receiver_kind=receiver_kind,
         name=normalized_name,
         manager_name=manager_name,
@@ -483,11 +902,11 @@ def resolve_orm_member(
     if direct_item is not None:
         return {
             'resolved': True,
-            'item': direct_item.to_dict(),
+            'item': _remap_member_item_for_output(direct_item, label_map).to_dict(),
         }
 
     item = _surface_cache.find(
-        static_index, runtime, model_graph, model_label, receiver_kind,
+        static_index, runtime, model_graph, internal_label, receiver_kind,
         normalized_name, manager_name,
     )
     if item is None:
@@ -498,7 +917,7 @@ def resolve_orm_member(
 
     return {
         'resolved': True,
-        'item': item.to_dict(),
+        'item': _remap_member_item_for_output(item, label_map).to_dict(),
     }
 
 
@@ -667,6 +1086,17 @@ def _instance_surface(
     field_source: list = []
     if model_graph is not None:
         field_source = list(model_graph.fields_for_model(model_label))
+        if not field_source:
+            # Captain split-label bridge: the cache key uses candidate.label
+            # (e.g. `zuzu.Company`) but model_graph indexes fields under the
+            # runtime label (e.g. `db.Company`). Re-query via the graph node
+            # for (candidate.module, candidate.object_name) so runtime-only
+            # fields still surface for AppConfig-label-split models.
+            graph_label = _resolve_graph_label_for_static_label(
+                static_index, model_graph, model_label,
+            )
+            if graph_label is not None and graph_label != model_label:
+                field_source = list(model_graph.fields_for_model(graph_label))
     if not field_source:
         field_source = list(static_index.fields_for_model(model_label))
     if not field_source:

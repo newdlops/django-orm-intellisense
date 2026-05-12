@@ -956,6 +956,14 @@ class DaemonServer:
         )
         surface_index_status = 'load_cached'
         should_prebuild_surface_index = False
+        if surface_index is not None:
+            # Captain regression: with a warm cache the prebuild path never
+            # runs, so its surface-vs-graph gap log never fires either.
+            # Run it explicitly here so cached-load sessions still surface
+            # the diagnostic (`[surface:gap]` etc.) needed to find why
+            # `db.Company` & friends were dropped.
+            from django_orm_intellisense.features.orm_members import log_surface_index_gap
+            log_surface_index_gap(static_index, model_graph, surface_index)
         if surface_index is None:
             if static_index.model_candidate_count <= INITIAL_SYNC_SURFACE_INDEX_MODEL_LIMIT:
                 surface_index = prebuild_member_surface_cache(
@@ -1933,6 +1941,57 @@ def _clean_optional_string(value: Any) -> str | None:
     return text or None
 
 
+_resource_usage_start_wall = time.monotonic()
+_resource_usage_start_proc = time.process_time()
+_resource_usage_lock = threading.Lock()
+_resource_usage_last_wall = _resource_usage_start_wall
+_resource_usage_last_proc = _resource_usage_start_proc
+
+try:
+    import resource as _resource_module
+except ImportError:  # pragma: no cover — Windows fallback
+    _resource_module = None  # type: ignore[assignment]
+
+
+def _sample_cpu_percent() -> tuple[float, float]:
+    """Return (cpu_now%, cpu_avg%) for the daemon main process.
+
+    cpu_now is process CPU% since the previous sample call;
+    cpu_avg is the cumulative process CPU% since daemon startup.
+    Only main-process CPU is measured — ProcessPoolExecutor workers
+    are separate OS processes and not counted here.
+    """
+    global _resource_usage_last_wall, _resource_usage_last_proc
+    now_wall = time.monotonic()
+    now_proc = time.process_time()
+    with _resource_usage_lock:
+        wall_delta = now_wall - _resource_usage_last_wall
+        proc_delta = now_proc - _resource_usage_last_proc
+        _resource_usage_last_wall = now_wall
+        _resource_usage_last_proc = now_proc
+    cpu_now = (proc_delta / wall_delta * 100.0) if wall_delta > 0 else 0.0
+    total_wall = now_wall - _resource_usage_start_wall
+    total_proc = now_proc - _resource_usage_start_proc
+    cpu_avg = (total_proc / total_wall * 100.0) if total_wall > 0 else 0.0
+    return cpu_now, cpu_avg
+
+
+def _current_rss_mb() -> float:
+    if _resource_module is None:
+        return 0.0
+    rss = _resource_module.getrusage(_resource_module.RUSAGE_SELF).ru_maxrss
+    # macOS reports ru_maxrss in bytes; Linux reports kilobytes.
+    if sys.platform == 'darwin':
+        return rss / (1024 * 1024)
+    return rss / 1024
+
+
+def _format_resource_usage() -> str:
+    cpu_now, cpu_avg = _sample_cpu_percent()
+    rss_mb = _current_rss_mb()
+    return f'cpu={cpu_now:.1f}%/avg={cpu_avg:.1f}% rss={rss_mb:.1f}MB'
+
+
 def _log_ipc(
     thread: str,
     method: str | None,
@@ -1951,7 +2010,8 @@ def _log_ipc(
     items_info = f' items={item_count}' if item_count is not None else ''
     print(
         f'[ipc:{tag}] [{thread}] {method}#{request_id}'
-        f' source={source} {elapsed:.3f}s {status}{batch_info}{items_info}',
+        f' source={source} {elapsed:.3f}s {status}{batch_info}{items_info}'
+        f' {_format_resource_usage()}',
         file=sys.stderr,
         flush=True,
     )
@@ -1984,7 +2044,8 @@ def _log_bg_queue(
         f' source={source} inflight={inflight} total_inflight={total_inflight}'
         f' running_est={running_est} queued_est={queued_est}'
         f' submitted={submitted} completed={completed}'
-        f' failed={failed} peak={peak}{status}',
+        f' failed={failed} peak={peak}{status}'
+        f' {_format_resource_usage()}',
         file=sys.stderr,
         flush=True,
     )

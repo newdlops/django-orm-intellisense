@@ -2169,14 +2169,34 @@ def _is_builtin_model_base_name(dotted_name: str) -> bool:
     )
 
 
+# Django/주요 라이브러리가 제공하는 추상 베이스 클래스들 — `*Model` suffix 가 없어
+# suffix 휴리스틱으로는 인식 안 됨. captain 의 `db.User(AbstractUser)` 같은 패턴이
+# 영원히 graph-only 로 빠지는 원인.
+_KNOWN_ABSTRACT_BASE_SUFFIXES: tuple[str, ...] = (
+    'AbstractUser',           # django.contrib.auth.models.AbstractUser
+    'AbstractBaseUser',       # django.contrib.auth.models.AbstractBaseUser
+    'AbstractBaseSession',    # django.contrib.sessions.base_session
+    'AbstractPage',           # wagtail.models.AbstractPage
+    'Page',                   # wagtail.models.Page (구체이지만 widely subclassed)
+    'PolymorphicModel',       # django-polymorphic (필드 명 'Model' 로 안 끝남? — 'Model'로 끝남, but 명시)
+    'TranslatableModel',      # django-parler
+)
+
+
 def _is_model_base_name(dotted_name: str) -> bool:
-    return (
-        _is_builtin_model_base_name(dotted_name)
-        or dotted_name.endswith('Model')
+    if _is_builtin_model_base_name(dotted_name):
+        return True
+    if (
+        dotted_name.endswith('Model')
         or dotted_name.endswith('BaseModel')
         or dotted_name.endswith('JobModel')
         or dotted_name.endswith('Orderable')
-    )
+    ):
+        return True
+    for suffix in _KNOWN_ABSTRACT_BASE_SUFFIXES:
+        if dotted_name == suffix or dotted_name.endswith(f'.{suffix}'):
+            return True
+    return False
 
 
 def _dotted_name(expression: ast.expr) -> str:

@@ -186,6 +186,106 @@ function prependToPath(
     : [segment, existingPath].join(path.delimiter);
 }
 
+const TEST_LOG_BUFFER_LIMIT = 5000;
+const testLogBuffer: string[] = [];
+
+function isTestLogCaptureEnabled(): boolean {
+  return process.env.DJLS_TEST_CAPTURE_LOGS === '1';
+}
+
+// Minimal static-fallback entries for Django's most commonly referenced
+// built-in models. The workspace-discovery pass naturally misses these
+// because they live inside the Django package, not the project source.
+// Receivers like `User.objects.filter(...)` would otherwise land in the
+// diagnostic noRecv bucket and produce no feedback at all.
+//
+// The `fields` set lists every concrete model field plus reverse manager
+// names. `relations` lists fields that point at another model — same as
+// the workspace-derived staticFallback shape consumed by
+// `buildWorkspaceIndex` / `rebuildModelLabelByName`.
+const DJANGO_BUILTIN_STATIC_FALLBACK: Readonly<
+  Record<string, { fields: string[]; relations: string[] }>
+> = {
+  'auth.User': {
+    fields: [
+      'id', 'pk', 'password', 'last_login', 'is_superuser', 'username',
+      'first_name', 'last_name', 'email', 'is_staff', 'is_active', 'date_joined',
+      'groups', 'user_permissions',
+    ],
+    relations: ['groups', 'user_permissions'],
+  },
+  'auth.Group': {
+    fields: ['id', 'pk', 'name', 'permissions', 'user_set'],
+    relations: ['permissions', 'user_set'],
+  },
+  'auth.Permission': {
+    fields: ['id', 'pk', 'name', 'content_type', 'codename', 'group_set', 'user_set'],
+    relations: ['content_type', 'group_set', 'user_set'],
+  },
+  'contenttypes.ContentType': {
+    fields: ['id', 'pk', 'app_label', 'model', 'permission_set'],
+    relations: ['permission_set'],
+  },
+  'sessions.Session': {
+    fields: ['session_key', 'pk', 'session_data', 'expire_date'],
+    relations: [],
+  },
+};
+
+/** Test-only: read all captured diagnostic log lines (requires DJLS_TEST_CAPTURE_LOGS=1). */
+export function getDiagnosticLogBufferForTesting(): readonly string[] {
+  return testLogBuffer;
+}
+
+/** Test-only: clear the captured log buffer. */
+export function clearDiagnosticLogBufferForTesting(): void {
+  testLogBuffer.length = 0;
+}
+
+/** Test-only: simulate the captain trace where `daemon.modelLabelByName` is
+ *  missing entries that `localWorkspaceIndex.modelLabelByName` still has.
+ *  Lets E2E tests verify the cross-map fallback in `findModelLabelByShortName`
+ *  / `hasModelByShortName` recovers the lookup. */
+export function clearDaemonModelLabelByNameForTesting(daemon: AnalysisDaemon): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (daemon as any).modelLabelByName = new Map<string, string>();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (daemon as any).modelNames = new Set<string>();
+}
+
+/** Test-only: drop a specific full-label entry from EVERY local index so the
+ *  daemon behaves as if it never knew about that model. Reproduces the
+ *  captain regression where `CompanyQuestionThread` was referenced in user
+ *  code, was a real Django model, but happened to be absent from this
+ *  particular daemon session's surfaceIndex / localWorkspaceIndex.models /
+ *  modelLabelByName trio — `CompanyQuestionThread.objects` stayed in
+ *  `unknown_root` every cycle. */
+export function dropModelFromAllIndicesForTesting(
+  daemon: AnalysisDaemon,
+  fullLabel: string,
+): void {
+  const shortName = fullLabel.includes('.')
+    ? fullLabel.slice(fullLabel.lastIndexOf('.') + 1)
+    : fullLabel;
+  // Daemon's short-name index.
+  daemon.modelLabelByName.delete(shortName);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ((daemon as any).modelNames as Set<string>).delete(shortName);
+  // Surface index (daemon's source of truth from Python).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  delete ((daemon as any).surfaceIndex as Record<string, unknown>)[fullLabel];
+  // localWorkspaceIndex (client-side derived index used by completion).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const lwi = (daemon as any).localWorkspaceIndex as WorkspaceIndex;
+  lwi.models.delete(fullLabel);
+  lwi.modelLabelByName.delete(shortName);
+  lwi.fieldTrieByModel.delete(fullLabel);
+  // Invalidate the cached full-label inverted index so the next short-name
+  // lookup rebuilds without the dropped label.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (daemon as any)._shortNameFromFullLabelIndex = null;
+}
+
 export class AnalysisDaemon implements vscode.Disposable {
   private readonly stateEmitter = new vscode.EventEmitter<HealthSnapshot>();
   private readonly pendingRequests = new Map<string, PendingRequest>();
@@ -205,6 +305,20 @@ export class AnalysisDaemon implements vscode.Disposable {
   private stopRequested = false;
   modelNames: Set<string> = new Set();
   modelLabelByName: Map<string, string> = new Map();
+  // Lazy inverted index over `localWorkspaceIndex.models.keys()` (full labels).
+  // Maps short name -> full label, populated on first miss in
+  // `findModelLabelByShortName`, invalidated when the workspace index is
+  // rebuilt. Captain regression: `zuzu.CompanyQuestionThread` lived in
+  // `localWorkspaceIndex.models` but not in either modelLabelByName, so
+  // receivers like `CompanyQuestionThread.objects` permanently landed in
+  // noRecv. The full-label keys are the ground truth.
+  private _shortNameFromFullLabelIndex: Map<string, string> | null = null;
+  // Per-IPC perf counters keyed by IPC method name. Captain receiver-chain
+  // analysis needs to know WHICH IPC dominates the wall time — bare
+  // `recv-ipc-ms` aggregates everything inside `resolveLookupReceiverInfoForReceiver`
+  // and hides the contributing IPC types. Diagnostic cycles call
+  // `snapshotIpcStats()` at start and end to compute a per-cycle delta.
+  private _ipcStats: Map<string, { count: number; totalMs: number }> = new Map();
   surfaceIndex: SurfaceIndex = {};
   surfaceFingerprints: Record<string, string> = {};
   customLookups: Record<string, string[]> = {};
@@ -277,8 +391,9 @@ export class AnalysisDaemon implements vscode.Disposable {
       this.surfaceIndex,
       Array.from(this.modelNames),
       this.customLookups,
-      this.staticFallback ?? undefined,
+      this.effectiveStaticFallback(),
     );
+    this._shortNameFromFullLabelIndex = null;
     this.localModelFingerprints.clear();
     for (const [label, receivers] of Object.entries(this.surfaceIndex)) {
       this.localModelFingerprints.set(
@@ -322,6 +437,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       this.customLookups,
       this.customLookups,
     );
+    this._shortNameFromFullLabelIndex = null;
     this.surfaceIndex = nextSurfaceIndex;
     this.surfaceFingerprints = { ...(nextSurfaceFingerprints ?? this.surfaceFingerprints) };
     this.staticFallback = nextStaticFallback;
@@ -330,14 +446,32 @@ export class AnalysisDaemon implements vscode.Disposable {
     this.rebuildModelNames();
   }
 
+  /**
+   * Returns staticFallback with Django built-in models merged in. Workspace
+   * entries take precedence over built-ins on key collision (e.g. a custom
+   * `auth.User` swap). Used everywhere staticFallback feeds downstream
+   * lookups so built-ins receive the same treatment as workspace models.
+   */
+  private effectiveStaticFallback(): StaticFallback {
+    return {
+      ...DJANGO_BUILTIN_STATIC_FALLBACK,
+      ...(this.staticFallback ?? {}),
+    };
+  }
+
   private rebuildModelLabelByName(): void {
     this.modelLabelByName = new Map();
+    // Workspace-defined surface models come first; effectiveStaticFallback
+    // then fills in any gaps (including Django built-ins) so receivers like
+    // `User.objects.filter(...)` resolve even when the workspace does not
+    // directly subclass them — otherwise every such receiver lands in the
+    // diagnostic noRecv bucket with no lookup-path feedback.
     for (const label of [
       ...Object.keys(this.surfaceIndex),
-      ...Object.keys(this.staticFallback ?? {}),
+      ...Object.keys(this.effectiveStaticFallback()),
     ]) {
       const name = label.split('.').at(-1);
-      if (name) {
+      if (name && !this.modelLabelByName.has(name)) {
         this.modelLabelByName.set(name, label);
       }
     }
@@ -345,6 +479,99 @@ export class AnalysisDaemon implements vscode.Disposable {
 
   private rebuildModelNames(): void {
     this.modelNames = new Set(this.modelLabelByName.keys());
+  }
+
+  /**
+   * Resolve a short model name (e.g. `CompanyQuestionThread`) to a full label
+   * (e.g. `zuzu.CompanyQuestionThread`). Production captain trace showed
+   * `daemon.modelLabelByName` and `localWorkspaceIndex.modelLabelByName` can
+   * disagree because of different short-name collision semantics:
+   *   - `daemon.modelLabelByName`: first-come wins (rebuildModelLabelByName)
+   *   - `localWorkspaceIndex.modelLabelByName`: last-come wins (buildWorkspaceIndex)
+   * When a workspace contains both `db.X` and `zuzu.X`, the two maps return
+   * different labels for the bare name `X`. Worse, in the captain trace
+   * `daemon.modelLabelByName.has('CompanyQuestionThread')` returned false
+   * altogether, leaving the lookup in unknown_root every cycle.
+   *
+   * This helper consults both maps so a name registered in either resolves.
+   * Sync, no IPC. Callers should prefer this over direct
+   * `daemon.modelLabelByName.get(...)` for diagnostic / receiver-resolution
+   * paths.
+   */
+  findModelLabelByShortName(shortName: string): string | undefined {
+    const direct = this.modelLabelByName.get(shortName);
+    if (direct) return direct;
+    const lwi = this.localWorkspaceIndex.modelLabelByName.get(shortName);
+    if (lwi) return lwi;
+    // Final fallback: iterate the full-label keys of localWorkspaceIndex.models
+    // looking for any label whose last segment matches `shortName`. Cached so
+    // subsequent calls are O(1). The captain workload exercises ~1.3k labels
+    // so the first miss costs <1ms and warms the cache.
+    if (this._shortNameFromFullLabelIndex === null) {
+      const built = new Map<string, string>();
+      for (const fullLabel of this.localWorkspaceIndex.models.keys()) {
+        const tail = fullLabel.includes('.')
+          ? fullLabel.slice(fullLabel.lastIndexOf('.') + 1)
+          : fullLabel;
+        if (!built.has(tail)) built.set(tail, fullLabel);
+      }
+      this._shortNameFromFullLabelIndex = built;
+    }
+    return this._shortNameFromFullLabelIndex.get(shortName);
+  }
+
+  /** Sync `has` companion to `findModelLabelByShortName`. */
+  hasModelByShortName(shortName: string): boolean {
+    return this.findModelLabelByShortName(shortName) !== undefined;
+  }
+
+  /**
+   * Record an IPC call's wall time under a method-name bucket. Called by the
+   * IPC dispatch wrappers so per-cycle perf summaries can break down where
+   * the receiver-chain time is going.
+   */
+  private _trackIpcCall(method: string, elapsedMs: number): void {
+    const existing = this._ipcStats.get(method);
+    if (existing) {
+      existing.count += 1;
+      existing.totalMs += elapsedMs;
+    } else {
+      this._ipcStats.set(method, { count: 1, totalMs: elapsedMs });
+    }
+  }
+
+  /** Snapshot the current IPC stats. Returns a deep copy so subtraction
+   *  against a later snapshot produces a per-cycle delta. */
+  snapshotIpcStats(): Map<string, { count: number; totalMs: number }> {
+    const snap = new Map<string, { count: number; totalMs: number }>();
+    for (const [method, entry] of this._ipcStats) {
+      snap.set(method, { count: entry.count, totalMs: entry.totalMs });
+    }
+    return snap;
+  }
+
+  /** Compute delta (current - baseline) for each IPC method. Returns
+   *  entries with non-zero deltas sorted by totalMs descending. */
+  diffIpcStats(
+    baseline: Map<string, { count: number; totalMs: number }>,
+  ): Array<{ method: string; count: number; totalMs: number }> {
+    const result: Array<{ method: string; count: number; totalMs: number }> = [];
+    for (const [method, entry] of this._ipcStats) {
+      const before = baseline.get(method);
+      const count = entry.count - (before?.count ?? 0);
+      const totalMs = entry.totalMs - (before?.totalMs ?? 0);
+      if (count > 0) {
+        result.push({ method, count, totalMs });
+      }
+    }
+    result.sort((a, b) => b.totalMs - a.totalMs);
+    return result;
+  }
+
+  /** Test-only: read access to the otherwise private localWorkspaceIndex
+   *  for assertions about the cross-map fallback. */
+  get localWorkspaceIndexForTesting(): WorkspaceIndex {
+    return this.localWorkspaceIndex;
   }
 
   private applySurfaceIndexDelta(
@@ -554,6 +781,19 @@ export class AnalysisDaemon implements vscode.Disposable {
     value: string,
     background: boolean = false
   ): Promise<RelationTargetResolution> {
+    const _ipcStart = performance.now();
+    const _track = () => {
+      this._trackIpcCall('resolveRelationTarget', performance.now() - _ipcStart);
+    };
+    // Test-only escape hatch: simulate captain's state where a Django model
+    // was dropped from EVERY index (client + daemon) — the BG resolver has
+    // no way to recover the label. Mirrors the production captain trace
+    // where `CompanyQuestionThread.objects` stays in `unknown_root` every
+    // cycle because neither client maps nor daemon knows it any more.
+    if (process.env.DJLS_TEST_FORCE_RESOLVE_RELATION_UNRESOLVED === '1') {
+      _track();
+      return { resolved: false } as RelationTargetResolution;
+    }
     const source = this.currentRequestSource();
     const allowLocationlessNative = background || source === 'diagnostic';
     // Native fast-path: static graph lookup completes in microseconds.
@@ -568,20 +808,30 @@ export class AnalysisDaemon implements vscode.Disposable {
       native.target &&
       (native.target.filePath || allowLocationlessNative)
     ) {
+      _track();
       return native;
     }
     if (native && allowLocationlessNative && !native.resolved) {
+      _track();
       return native;
     }
-    return this.cachedRequest<RelationTargetResolution>('resolveRelationTarget', {
-      value,
-    }, background);
+    try {
+      return await this.cachedRequest<RelationTargetResolution>('resolveRelationTarget', {
+        value,
+      }, background);
+    } finally {
+      _track();
+    }
   }
 
   async resolveExportOrigin(
     moduleName: string,
     symbol: string
   ): Promise<ExportOriginResolution> {
+    const _ipcStart = performance.now();
+    const _track = () => {
+      this._trackIpcCall('resolveExportOrigin', performance.now() - _ipcStart);
+    };
     const source = this.currentRequestSource();
     const allowLocationlessNative = source === 'diagnostic';
     // Native fast-path: recursive re-export walk on the resident static
@@ -596,30 +846,46 @@ export class AnalysisDaemon implements vscode.Disposable {
       native?.resolved &&
       (native.originFilePath || allowLocationlessNative)
     ) {
+      _track();
       return native;
     }
     if (native && allowLocationlessNative && !native.resolved) {
+      _track();
       return native;
     }
-    return this.cachedRequest<ExportOriginResolution>('resolveExportOrigin', {
-      module: moduleName,
-      symbol,
-    });
+    try {
+      return await this.cachedRequest<ExportOriginResolution>('resolveExportOrigin', {
+        module: moduleName,
+        symbol,
+      });
+    } finally {
+      _track();
+    }
   }
 
   async resolveModule(moduleName: string): Promise<ModuleResolution> {
+    const _ipcStart = performance.now();
+    const _track = () => {
+      this._trackIpcCall('resolveModule', performance.now() - _ipcStart);
+    };
     const source = this.currentRequestSource();
     const allowLocationlessNative = source === 'diagnostic';
     const native = nativeResolveModule(moduleName);
     if (native?.resolved && (native.filePath || allowLocationlessNative)) {
+      _track();
       return native;
     }
     if (native && allowLocationlessNative && !native.resolved) {
+      _track();
       return native;
     }
-    return this.cachedRequest<ModuleResolution>('resolveModule', {
-      module: moduleName,
-    });
+    try {
+      return await this.cachedRequest<ModuleResolution>('resolveModule', {
+        module: moduleName,
+      });
+    } finally {
+      _track();
+    }
   }
 
   async reindexFile(filePath: string): Promise<ReindexFileResult> {
@@ -669,6 +935,7 @@ export class AnalysisDaemon implements vscode.Disposable {
           this.customLookups,
           this.customLookups,
         );
+        this._shortNameFromFullLabelIndex = null;
       }
     } else {
       const nextSurfaceIndex = result.surfaceIndex ?? {};
@@ -870,7 +1137,33 @@ export class AnalysisDaemon implements vscode.Disposable {
         ) {
           return native;
         }
+        // For diagnostic-background calls, skip the Python fallback when
+        // it cannot disagree: if the daemon's Django runtime is not bootstrapped
+        // (no `register_lookup` calls were executed), Python uses the same
+        // default operator set that the Rust native path already evaluated.
+        // The IPC roundtrip alone was measured at 1.4s under event-loop
+        // pressure on a 1ms daemon-side operation — pure overhead for an
+        // answer we already know.
+        if (
+          allowLocationlessNative &&
+          native.resolved === false &&
+          (
+            this.currentState.runtime?.bootstrapStatus !== 'ready' ||
+            process.env.DJLS_TEST_FORCE_RUNTIME_NOT_READY === '1'
+          )
+        ) {
+          return native;
+        }
       }
+    }
+    // Test-only knob: artificially slow the BG IPC so per-context
+    // timeout in the phase2-lookups loop can be exercised by E2E.
+    const lookupDelayMs = parseInt(
+      process.env.DJLS_TEST_RESOLVE_LOOKUP_PATH_DELAY_MS ?? '',
+      10
+    );
+    if (Number.isFinite(lookupDelayMs) && lookupDelayMs > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, lookupDelayMs));
     }
     return this.cachedRequest<LookupPathResolution>('resolveLookupPath', {
       baseModelLabel,
@@ -1086,6 +1379,10 @@ export class AnalysisDaemon implements vscode.Disposable {
     name: string,
     managerName?: string
   ): Promise<OrmMemberResolution> {
+    const _ipcStart = performance.now();
+    const _track = () => {
+      this._trackIpcCall('resolveOrmMember', performance.now() - _ipcStart);
+    };
     // Native fast-path: declared fields, reverse relations, and Django
     // built-in methods are all static data. Undefined return means the
     // member is not in the static surface — defer to Python for
@@ -1100,15 +1397,39 @@ export class AnalysisDaemon implements vscode.Disposable {
           native.item?.memberKind === 'method'
         )
       ) {
+        _track();
         return native;
       }
     }
-    return this.cachedRequest<OrmMemberResolution>('resolveOrmMember', {
-      modelLabel,
-      receiverKind,
-      name,
-      managerName,
-    });
+    // Test-only escape hatch: simulate the production "Python daemon
+    // cannot resolve" state (captain workspace runs without Django
+    // installed, so Python's static index has the model but lacks the
+    // implicit `objects` / reverse-manager entries). Lets E2E tests
+    // exercise the client-side fallbacks (e.g. `<model_class>.objects`
+    // synthetic manager) without spinning up a non-Django workspace.
+    if (process.env.DJLS_TEST_FORCE_ORM_MEMBER_UNRESOLVED === '1') {
+      _track();
+      return { resolved: false };
+    }
+    // Test-only knob: artificially slow the BG IPC so per-context
+    // timeout in the phase2-lookups loop can be exercised by E2E.
+    const delayMs = parseInt(
+      process.env.DJLS_TEST_RESOLVE_ORM_MEMBER_DELAY_MS ?? '',
+      10
+    );
+    if (Number.isFinite(delayMs) && delayMs > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    }
+    try {
+      return await this.cachedRequest<OrmMemberResolution>('resolveOrmMember', {
+        modelLabel,
+        receiverKind,
+        name,
+        managerName,
+      });
+    } finally {
+      _track();
+    }
   }
 
   async resolveOrmMemberBatch(
@@ -1131,6 +1452,13 @@ export class AnalysisDaemon implements vscode.Disposable {
     const fallbackItems: Array<{ baseModelLabel: string; value: string; method: string }> = [];
     const fallbackIndexes: number[] = [];
 
+    // Same trust-native-when-runtime-not-ready gate as resolveLookupPath:
+    // batches are always background, so we can use native's "not resolved"
+    // verdict when Python is guaranteed to produce the same answer.
+    const skipPythonForUnresolved =
+      this.currentState.runtime?.bootstrapStatus !== 'ready' ||
+      process.env.DJLS_TEST_FORCE_RUNTIME_NOT_READY === '1';
+
     if (isNativeFastPathReady()) {
       for (const [index, item] of items.entries()) {
         const native = nativeResolveLookupPath(
@@ -1139,6 +1467,10 @@ export class AnalysisDaemon implements vscode.Disposable {
           item.method,
         );
         if (native?.resolved && native.target) {
+          results[index] = native;
+          continue;
+        }
+        if (native && native.resolved === false && skipPythonForUnresolved) {
           results[index] = native;
           continue;
         }
@@ -1834,7 +2166,9 @@ export class AnalysisDaemon implements vscode.Disposable {
           const summary = paramSummary
             ? `${sourceSummary}, ${paramSummary}`
             : sourceSummary;
-          this.output.appendLine(
+          // Use logDiagnostic so tests can capture IPC timings via the
+          // module-level log buffer.
+          this.logDiagnostic(
             `  [IPC] ${method}(${summary}): ${ipcMs.toFixed(1)}ms`
           );
           resolve(value);
@@ -1862,6 +2196,19 @@ export class AnalysisDaemon implements vscode.Disposable {
     params: Record<string, unknown>,
     background: boolean = false
   ): Promise<T> {
+    // Track every cachedRequest invocation (including cache hits) so the
+    // per-cycle perf summary's ipc-by-method breakdown captures ALL daemon
+    // IPC types, not just the 4 receiver-chain methods we wrapped
+    // explicitly. Captain trace 2026-05-12 17:14 showed receiver
+    // resolution wall time of 8–20s with only 0–223ms of explicit-method
+    // IPCs accounted for — meaning the time was leaking through
+    // unwrapped methods like resolveOrmMemberChain, lookupPathCompletions,
+    // resolveLookupPath, etc. Instrumenting at this chokepoint surfaces
+    // them all without touching each method site.
+    const _cachedRequestStart = performance.now();
+    const _trackCachedRequest = () => {
+      this._trackIpcCall(`cachedRequest:${method}`, performance.now() - _cachedRequestStart);
+    };
     // Fast-reject if the caller's abort signal has already fired.
     // This prevents orphaned hover resolution bodies from issuing new IPC
     // calls after the hover has been cancelled / timed out.
@@ -1869,6 +2216,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       this.output.appendLine(
         `  [IPC:abort] ${method} rejected (aborted) pending=${this.pendingRequests.size}`
       );
+      _trackCachedRequest();
       return Promise.reject(new Error(`Aborted: ${method}`));
     }
 
@@ -1943,6 +2291,10 @@ export class AnalysisDaemon implements vscode.Disposable {
         this.responseCache.delete(cacheKey);
       }
     });
+    // Settle the perf counter when the underlying IPC resolves, regardless
+    // of success/failure. Cache hits return earlier and track only the
+    // microsecond cache hit; cache misses incorporate the full IPC wait.
+    requestPromise.then(() => _trackCachedRequest(), () => _trackCachedRequest());
     return requestPromise;
   }
 
@@ -2084,6 +2436,12 @@ export class AnalysisDaemon implements vscode.Disposable {
   /** Write a diagnostic line to the output channel (always, regardless of logLevel). */
   logDiagnostic(message: string): void {
     this.output.appendLine(message);
+    if (isTestLogCaptureEnabled()) {
+      testLogBuffer.push(message);
+      if (testLogBuffer.length > TEST_LOG_BUFFER_LIMIT) {
+        testLogBuffer.splice(0, testLogBuffer.length - TEST_LOG_BUFFER_LIMIT);
+      }
+    }
   }
 
   private log(level: 'info' | 'debug', message: string): void {

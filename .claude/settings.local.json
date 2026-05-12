@@ -59,7 +59,20 @@
       "Read(//tmp/**)",
       "Bash(/Users/lky/project/captain/.venv/bin/python *)",
       "Bash(tee /tmp/e2e-output2.log)",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "Bash(awk -F: '$1>=982 && $1<=1750 {print}')",
+      "Bash(awk *)",
+      "Bash(DJLS_TEST_CAPTURE_LOGS=1 npx vscode-test --grep \"captain P1:\")",
+      "Bash(PYTHONPATH=python python3 -m unittest python.tests.test_indexer_app_label -v)",
+      "Bash(PYTHONPATH=python python3 -m unittest python.tests.test_surface_index_graph_keying -v)",
+      "Bash(PYTHONPATH=python python3 -m unittest python.tests.test_surface_index_graph_keying python.tests.test_indexer_app_label -v)",
+      "Bash(PYTHONPATH=python python3 -m unittest discover -s python/tests -v)",
+      "Bash(PYTHONPATH=python python3 -m unittest python.tests.test_indexer_multi_abstract_base -v)",
+      "Bash(PYTHONPATH=python python3 -m unittest python.tests.test_surface_cache_staleness -v)",
+      "Bash(node out/client/providers/receiverTraceTimeout.test.js)",
+      "Bash(PYTHONPATH=python python3 -m unittest discover -s python/tests)",
+      "Bash(node out/client/providers/observabilityMarkers.test.js)",
+      "Bash(node out/client/providers/lookupPathNoTimeout.test.js)"
     ]
   }
 }

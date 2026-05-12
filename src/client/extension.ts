@@ -11,7 +11,10 @@ import { isRelevantConfigurationChange, getExtensionSettings } from './config/se
 import { AnalysisDaemon } from './daemon/analysisDaemon';
 import type { ReindexFileResult } from './protocol';
 import { HealthDiagnostics } from './diagnostics/healthDiagnostics';
-import { registerPythonProviders } from './providers/pythonProviders';
+import {
+  registerPythonProviders,
+  isAnyDiagnosticScanInFlight,
+} from './providers/pythonProviders';
 import { applyStubOverrides } from './pylance/stubOverrides';
 import { normalizePythonInterpreterSettings } from './python/interpreter';
 import { isPylanceAvailable, PYLANCE_EXTENSION_ID } from './python/pylance';
@@ -40,8 +43,28 @@ export function getActiveDaemonForTesting(): AnalysisDaemon | undefined {
   return activeDaemon;
 }
 
+let promotePythonProvidersImpl: ((reason: string) => void) | undefined;
+
+/** Test-only: trigger a Python provider promotion attempt (with deferral logic). */
+export function promotePythonProvidersForTesting(reason: string): void {
+  promotePythonProvidersImpl?.(reason);
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel('Django ORM Intellisense');
+  // 재배포 검증 마커 — captain 분석 시 production extension 이 옵션 1/2/3 fix 를
+  // 반영한 빌드인지 한눈에 확인 가능. log.txt 최상단에서 이 라인이 안 보이면
+  // VSCode 가 옛 vsix 를 캐시하고 있다는 신호 (Developer: Reload Window 필요).
+  const extensionVersion = (context.extension?.packageJSON?.version ?? 'unknown') as string;
+  const recvTimeoutMs = Number(
+    process.env.DJLS_RECEIVER_TRACE_TIMEOUT_MS ?? 1500
+  ) || 1500;
+  output.appendLine(
+    `[extension] activate version=${extensionVersion} ` +
+    `recvTimeoutMs=${recvTimeoutMs} ` +
+    `disableReceiverStepTrace=${process.env.DJLS_DISABLE_RECEIVER_STEP_TRACE === '1'} ` +
+    `diagnosticTimeBudgetMs=${process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS ?? '(default)'}`
+  );
   const daemon = new AnalysisDaemon(context, output);
   const statusView = new HealthStatusView();
   const diagnostics = new HealthDiagnostics();
@@ -218,10 +241,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   let lastProviderRegistrationTime = 0;
   const PROVIDER_REGISTRATION_MIN_INTERVAL_MS = 200;
+  const PROVIDER_PROMOTE_DEFER_DELAY_MS = 250;
+  const PROVIDER_PROMOTE_MAX_DEFERRALS = 40; // ~10s cap, matches diagnostic budget
+  let providerPromoteDeferTimer: ReturnType<typeof setTimeout> | undefined;
 
   const promotePythonProviders = (
     reason: string,
-    expectedActivePythonProviderFingerprint?: string
+    expectedActivePythonProviderFingerprint?: string,
+    deferredCount = 0
   ): void => {
     // Throttle all re-registrations (fingerprinted or not) to avoid
     // disposing in-flight hover/completion requests too aggressively.
@@ -240,11 +267,44 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       ) {
         return;
       }
-      lastAppliedActivePythonProviderFingerprint =
-        expectedActivePythonProviderFingerprint;
     } else {
       // Preserve lastAppliedActivePythonProviderFingerprint so subsequent
       // tab-switch events for the same file are correctly deduplicated.
+    }
+
+    // Avoid killing a long-running diagnostic scan just to bump provider
+    // priority. While a scan is in flight, ALWAYS defer or coalesce —
+    // never fall through to dispose+recreate. The original guard only
+    // checked `providerPromoteDeferTimer === undefined`, which let a
+    // second promote with a DIFFERENT reason bypass the defer and kill
+    // the in-flight scan.
+    if (
+      isAnyDiagnosticScanInFlight() &&
+      deferredCount < PROVIDER_PROMOTE_MAX_DEFERRALS
+    ) {
+      if (providerPromoteDeferTimer !== undefined) {
+        daemon.logDiagnostic(
+          `[extension] Coalesced Python provider promotion (${reason}) — diagnostic scan in flight; another defer is already pending.`
+        );
+        return;
+      }
+      daemon.logDiagnostic(
+        `[extension] Deferred Python provider promotion (${reason}) — diagnostic scan in flight (defer ${deferredCount + 1}/${PROVIDER_PROMOTE_MAX_DEFERRALS}).`
+      );
+      providerPromoteDeferTimer = setTimeout(() => {
+        providerPromoteDeferTimer = undefined;
+        promotePythonProviders(
+          reason,
+          expectedActivePythonProviderFingerprint,
+          deferredCount + 1
+        );
+      }, PROVIDER_PROMOTE_DEFER_DELAY_MS);
+      return;
+    }
+
+    if (expectedActivePythonProviderFingerprint) {
+      lastAppliedActivePythonProviderFingerprint =
+        expectedActivePythonProviderFingerprint;
     }
 
     lastProviderRegistrationTime = Date.now();
@@ -252,9 +312,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     pythonProviderRegistration = vscode.Disposable.from(
       ...registerPythonProviders(daemon)
     );
-    output.appendLine(
+    daemon.logDiagnostic(
       `[extension] Re-registered Python providers (${reason}) to prioritize Django ORM hover/completion.`
     );
+  };
+
+  promotePythonProvidersImpl = (reason: string): void => {
+    promotePythonProviders(reason);
   };
 
   const schedulePythonProviderPromotion = (
@@ -274,6 +338,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       clearTimeout(timer);
     }
     providerPromotionTimers.clear();
+    if (providerPromoteDeferTimer !== undefined) {
+      clearTimeout(providerPromoteDeferTimer);
+      providerPromoteDeferTimer = undefined;
+    }
   };
 
   const schedulePythonProviderPromotionBurst = (

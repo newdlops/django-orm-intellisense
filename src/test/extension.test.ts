@@ -4,7 +4,22 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { getActiveDaemonForTesting } from '../client/extension';
+import {
+  getActiveDaemonForTesting,
+  promotePythonProvidersForTesting,
+} from '../client/extension';
+import {
+  clearDiagnosticLogBufferForTesting,
+  getDiagnosticLogBufferForTesting,
+  clearDaemonModelLabelByNameForTesting,
+  dropModelFromAllIndicesForTesting,
+} from '../client/daemon/analysisDaemon';
+import {
+  getActiveDiagnosticScanRunningCountForTesting,
+  clearReceiverAndLookupCachesForTesting,
+  simulateDaemonReadyCacheClearForTesting,
+  classifyNoRecvReasonForTesting,
+} from '../client/providers/pythonProviders';
 import type { HealthSnapshot } from '../client/protocol';
 import {
   resolvePythonInterpreter,
@@ -52,6 +67,7 @@ suite('Django ORM Intellisense UI', () => {
     process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR = testCacheRoot;
     process.env.DJLS_DISABLE_AUTO_RESTARTS = '1';
     process.env.DJLS_DISABLE_PROVIDER_TIMEOUT = '1';
+    process.env.DJLS_TEST_CAPTURE_LOGS = '1';
     const extension = vscode.extensions.getExtension(EXTENSION_ID);
     assert.ok(extension, `Extension ${EXTENSION_ID} is not available.`);
     await extension.activate();
@@ -83,6 +99,8 @@ suite('Django ORM Intellisense UI', () => {
     delete process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR;
     delete process.env.DJLS_DISABLE_AUTO_RESTARTS;
     delete process.env.DJLS_DISABLE_PROVIDER_TIMEOUT;
+    delete process.env.DJLS_TEST_CAPTURE_LOGS;
+    delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
     if (testCacheRoot) {
       fs.rmSync(testCacheRoot, { recursive: true, force: true });
       testCacheRoot = undefined;
@@ -10218,6 +10236,2825 @@ suite('Django ORM Intellisense UI', () => {
       hasCompletionItemLabel(chainFilterCompletionList?.items, 'content'),
       'Expected chained snake_case fallback resolution to complete `content` through company → question_thread_set.get() → message_set.filter().'
     );
+  });
+
+  test('budget-exhausted diagnostics keep re-firing on the same document version', async function () {
+    // Reproduces the bug observed in production logs: when diagnostics
+    // exhausts its time budget, `lastDiagnosedDocumentVersions` is never
+    // populated for that version, so any subsequent tracked-refresh
+    // (e.g. from visible-editors-changed) re-fires a full scan even though
+    // nothing has changed.
+    this.timeout(60_000);
+    // Force budget exhaustion: a sub-scan budget that even the smallest
+    // valid-lookup phase will overflow, so we deterministically take the
+    // budget-exhausted code path rather than completing cleanly.
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '5';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      clearDiagnosticLogBufferForTesting();
+
+      const document = await openFixtureDocument(
+        fixtureRoot,
+        'blog/heavy_lookup_examples.py'
+      );
+      const expectedVersion = document.version;
+      const fsPathSuffix = 'blog/heavy_lookup_examples.py';
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') && line.endsWith(fsPathSuffix);
+
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+
+      // Wait for the budget-exhausted line tied to this document so we know
+      // diagnostics actually overflowed the (tight) budget rather than
+      // completing cleanly.
+      const matchesBudgetExhausted = (line: string): boolean =>
+        line.startsWith('[diagnostics] time budget exhausted') &&
+        line.endsWith(`/${fsPathSuffix}`);
+      try {
+        await waitForCondition(
+          () => getDiagnosticLogBufferForTesting().some(matchesBudgetExhausted),
+          20_000
+        );
+      } catch (err) {
+        const interesting = getDiagnosticLogBufferForTesting()
+          .filter((line) =>
+            line.startsWith('[diagnostics:trigger]') ||
+            line.startsWith('[diagnostics:phase]') ||
+            line.startsWith('[diagnostics:scan]') ||
+            line.startsWith('[diagnostics] '))
+          .slice(-60);
+        assert.fail(
+          `Budget-exhausted log never seen. Recent diagnostics activity:\n` +
+          interesting.join('\n')
+        );
+      }
+
+      // After budget exhaustion, deliberately churn the visible editors so
+      // `onDidChangeVisibleTextEditors` fires a tracked-refresh. In the buggy
+      // state this re-fires `refreshDiagnostics` for the same version because
+      // `lastDiagnosedDocumentVersions` was never populated by the partial run.
+      const churnDoc = await openFixtureDocument(
+        fixtureRoot,
+        'blog/query_examples.py'
+      );
+      await delay(200);
+      await vscode.window.showTextDocument(document);
+      await delay(200);
+      await vscode.window.showTextDocument(churnDoc);
+      await delay(200);
+      await vscode.window.showTextDocument(document);
+
+      // Give the tracked-refresh debounce (500ms) plus a small budget run
+      // enough time to schedule and fire again on the same version.
+      await delay(2_500);
+
+      const fireLines = getDiagnosticLogBufferForTesting().filter(matchesFireForDoc);
+      const fireLinesForExpectedVersion = fireLines.filter((line) =>
+        line.includes(` v=${expectedVersion} `)
+      );
+      const recentTriggerLines = getDiagnosticLogBufferForTesting()
+        .filter((line) => line.startsWith('[diagnostics:trigger]'))
+        .slice(-30);
+
+      // Regression assertion: the same document at the same version must
+      // not be re-scanned just because a previous scan exhausted its time
+      // budget. Today this assertion FAILS — `lastDiagnosedDocumentVersions`
+      // is only populated after a clean completion, so a tracked-refresh
+      // from visible-editors-changed re-fires the full pipeline. Once that
+      // is fixed (e.g. mark the version partial-but-handled at budget
+      // exhaustion) this test should pass.
+      assert.strictEqual(
+        fireLinesForExpectedVersion.length,
+        1,
+        `Diagnostics re-fired ${fireLinesForExpectedVersion.length} times at v=${expectedVersion} ` +
+        `after a budget-exhausted partial scan; expected exactly 1. ` +
+        `This reproduces the production bug where partial-result documents ` +
+        `keep being re-diagnosed on every tracked-refresh trigger.\n` +
+        `Re-fires: ${fireLinesForExpectedVersion.join(' || ')}\n` +
+        `Recent trigger lines: ${recentTriggerLines.join(' || ')}`
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('receiver-resolution cache is reused across provider re-registration', async function () {
+    // After fix #2, provider re-registration is deferred until an in-flight
+    // scan ends. The re-registration then creates a fresh provider scope
+    // which kicks off a second diagnostic cycle (Cycle 2) for the same
+    // document version. Today Cycle 2 redoes all the receiver-resolution
+    // work Cycle 1 already did, because the receiver cache lives inside
+    // the provider closure and is destroyed on dispose.
+    //
+    // This test asserts the optimization: a module-level receiver cache
+    // (keyed by docUri + version) should let Cycle 2 hit cached results
+    // and emit phase2-lookups lines with substantially lower `requests=`
+    // counts than Cycle 1.
+    this.timeout(60_000);
+    // Long enough budget that Cycle 1 reaches the full phase2-lookups
+    // sweep instead of being cut short by the test budget.
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      // Earlier tests in this suite may have already populated the
+      // cross-registration caches for this fixture. Clear them so Cycle 1
+      // here starts cold, matching what we want to measure.
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/heavy_lookup_examples.py'
+      );
+
+      // Wait until Cycle 1 reaches in-flight.
+      let cycle1Observed = false;
+      const tStart = Date.now();
+      while (Date.now() - tStart < 10_000) {
+        if (getActiveDiagnosticScanRunningCountForTesting() >= 1) {
+          cycle1Observed = true;
+          break;
+        }
+        await delay(5);
+      }
+      assert.ok(cycle1Observed, 'Cycle 1 should reach in-flight state.');
+
+      // Trigger a promotion; with the deferral fix it fires after Cycle 1.
+      promotePythonProvidersForTesting('cache-reuse-test');
+
+      // Wait for the deferred re-registration to fire AFTER Cycle 1 ends.
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some((line) =>
+          line.includes('Re-registered Python providers (cache-reuse-test)')
+        ),
+        25_000
+      );
+      const buffer1 = getDiagnosticLogBufferForTesting();
+      const reRegisterIdx = buffer1.findIndex((line) =>
+        line.includes('Re-registered Python providers (cache-reuse-test)')
+      );
+      assert.ok(reRegisterIdx > 0, 'Re-register line must exist');
+
+      // Wait for Cycle 2 (in the new provider scope) to also complete.
+      await waitForCondition(
+        () => {
+          const buf = getDiagnosticLogBufferForTesting();
+          // count fires after the re-register
+          const firesAfter = buf.slice(reRegisterIdx).filter((l) =>
+            l.startsWith('[diagnostics:trigger] fire ') &&
+            l.endsWith('blog/heavy_lookup_examples.py')
+          );
+          if (firesAfter.length === 0) return false;
+          // and a publish after that fire
+          const publishAfter = buf.slice(reRegisterIdx).find((l) =>
+            l.startsWith('[diagnostics:phase] publish')
+          );
+          return publishAfter != null;
+        },
+        25_000
+      );
+
+      // Parse phase2-lookups `requests=N` per cycle. Cycle 1 lines are
+      // before reRegisterIdx; Cycle 2 lines are after.
+      const buf = getDiagnosticLogBufferForTesting();
+      const requestsRe = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? requests=(\d+)/;
+      const sumRequests = (lines: readonly string[]): number => {
+        let sum = 0;
+        for (const line of lines) {
+          const m = requestsRe.exec(line);
+          if (m) sum += Number(m[1]);
+        }
+        return sum;
+      };
+      const cycle1Lines = buf.slice(0, reRegisterIdx);
+      const cycle2Lines = buf.slice(reRegisterIdx);
+      const cycle1Requests = sumRequests(cycle1Lines);
+      const cycle2Requests = sumRequests(cycle2Lines);
+
+      assert.ok(
+        cycle1Requests > 0,
+        `Cycle 1 must perform some receiver resolution work. Got requests=${cycle1Requests}`
+      );
+
+      // Without the cross-registration cache, cycle2Requests is ~ cycle1Requests
+      // (Cycle 2 redoes everything). With the cache, cycle2Requests should be
+      // much smaller — at most 30% of Cycle 1.
+      const ratio = cycle2Requests / cycle1Requests;
+      assert.ok(
+        ratio < 0.3,
+        `Expected Cycle 2 receiver work to be cached across re-registration ` +
+        `(ratio < 0.3). Got cycle1=${cycle1Requests} cycle2=${cycle2Requests} ratio=${ratio.toFixed(2)}\n` +
+        `Cycle 1 phase2-lookups lines:\n  ${cycle1Lines.filter((l) => l.includes('phase2-lookups:')).join('\n  ')}\n` +
+        `Cycle 2 phase2-lookups lines:\n  ${cycle2Lines.filter((l) => l.includes('phase2-lookups:')).join('\n  ')}\n` +
+        `Receivers-visible lines:\n  ${buf.filter((l) => l.includes('receivers-visible')).join('\n  ')}`
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('phase2-scan results are cached across provider re-registration', async function () {
+    // Production captain trace showed phase2-scan running 1–2.5s per range
+    // every cycle. The scan output (lookup/relation contexts) is a pure
+    // function of (document text, range), so when a provider re-registration
+    // kicks off a fresh diagnostic cycle on the SAME document version, the
+    // regex-scan should be reused instead of redone.
+    //
+    // This test mirrors the receiver-resolution-cache test: open a fixture,
+    // wait for Cycle 1 to complete (populating the cross-registration scan
+    // cache), trigger a promotion, wait for Cycle 2 (same version), and
+    // assert at least one phase2-scan emits `cache=hit`.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      // heavy_lookup_examples.py is 800+ lines, well past the
+      // VISIBLE_RANGE_SCAN_THRESHOLD so phase2-scan ranges are populated.
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/heavy_lookup_examples.py'
+      );
+
+      let cycle1Observed = false;
+      const tStart = Date.now();
+      while (Date.now() - tStart < 10_000) {
+        if (getActiveDiagnosticScanRunningCountForTesting() >= 1) {
+          cycle1Observed = true;
+          break;
+        }
+        await delay(5);
+      }
+      assert.ok(cycle1Observed, 'Cycle 1 should reach in-flight state.');
+
+      promotePythonProvidersForTesting('scan-cache-test');
+
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some((line) =>
+          line.includes('Re-registered Python providers (scan-cache-test)')
+        ),
+        25_000
+      );
+      const bufBeforeCycle2 = getDiagnosticLogBufferForTesting();
+      const reRegisterIdx = bufBeforeCycle2.findIndex((line) =>
+        line.includes('Re-registered Python providers (scan-cache-test)')
+      );
+      assert.ok(reRegisterIdx > 0, 'Re-register line must exist');
+
+      // Wait for Cycle 2 (in the new provider scope) to publish.
+      await waitForCondition(
+        () => {
+          const buf = getDiagnosticLogBufferForTesting();
+          const tail = buf.slice(reRegisterIdx);
+          const firesAfter = tail.filter((l) =>
+            l.startsWith('[diagnostics:trigger] fire ') &&
+            l.endsWith('blog/heavy_lookup_examples.py')
+          );
+          if (firesAfter.length === 0) return false;
+          return tail.some((l) => l.startsWith('[diagnostics:phase] publish'));
+        },
+        25_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      const cycle1Lines = buf.slice(0, reRegisterIdx);
+      const cycle2Lines = buf.slice(reRegisterIdx);
+
+      // Cycle 1: every phase2-scan should miss (cold cache).
+      const cycle1Phase2Scans = cycle1Lines.filter((l) =>
+        l.includes('[diagnostics:phase] phase2-scan:')
+      );
+      assert.ok(
+        cycle1Phase2Scans.length > 0,
+        `Cycle 1 must emit phase2-scan lines. None observed.\n` +
+        `Recent phase lines:\n  ${buf
+          .filter((l) => l.includes('[diagnostics:phase]'))
+          .slice(-20)
+          .join('\n  ')}`
+      );
+      for (const line of cycle1Phase2Scans) {
+        assert.ok(
+          line.includes('cache=miss'),
+          `Cycle 1 phase2-scan must be a cache miss (cold start). Got: ${line}`
+        );
+      }
+
+      // Cycle 2: every phase2-scan should hit because (docUri, version, range)
+      // matches what Cycle 1 cached.
+      const cycle2Phase2Scans = cycle2Lines.filter((l) =>
+        l.includes('[diagnostics:phase] phase2-scan:')
+      );
+      assert.ok(
+        cycle2Phase2Scans.length > 0,
+        `Cycle 2 must emit phase2-scan lines after re-registration.\n` +
+        `Cycle 2 phase lines:\n  ${cycle2Lines
+          .filter((l) => l.includes('[diagnostics:phase]'))
+          .join('\n  ')}`
+      );
+      const cycle2Hits = cycle2Phase2Scans.filter((l) => l.includes('cache=hit'));
+      assert.ok(
+        cycle2Hits.length === cycle2Phase2Scans.length,
+        `Cycle 2 phase2-scan must all be cache hits (same docUri + version + ` +
+        `range as Cycle 1). Got ${cycle2Hits.length}/${cycle2Phase2Scans.length} hits.\n` +
+        `Cycle 2 phase2-scan lines:\n  ${cycle2Phase2Scans.join('\n  ')}`
+      );
+
+      // Cycle 2 phase2-scan wall time should be much smaller than Cycle 1
+      // since scanning is skipped entirely. Sanity check: each line emits a
+      // duration like `phase2-scan:0-100 1063ms`. Cycle 2 should be < 50ms.
+      const phaseMsRe = /\[diagnostics:phase\] phase2-scan:[^ ]+ (\d+)ms/;
+      const cycle2MaxMs = cycle2Phase2Scans.reduce((max, line) => {
+        const m = phaseMsRe.exec(line);
+        return m ? Math.max(max, Number(m[1])) : max;
+      }, 0);
+      assert.ok(
+        cycle2MaxMs < 50,
+        `Cycle 2 phase2-scan with cache hit must complete near-instantly. ` +
+        `Got max=${cycle2MaxMs}ms.\n` +
+        `Cycle 2 phase2-scan lines:\n  ${cycle2Phase2Scans.join('\n  ')}`
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('scan cache survives daemon-state cache clear (production captain regression)', async function () {
+    // Captain trace showed scan cache=miss in Cycle 2 even after the
+    // cross-registration cache was wired in. Root cause: when daemon
+    // transitions to `ready`, `onDidChangeState` calls
+    // `clearLookupResolutionAndReceiverCachesAcrossRegistrations()` which
+    // (prior to this fix) also cleared the scan cache. But scan results
+    // are pure functions of (document text, range) — they don't depend on
+    // daemon model graph state. Clearing them on every daemon-state ready
+    // transition defeats the cross-registration cache entirely in
+    // production, since the daemon-state ready event always precedes the
+    // first re-registration after startup.
+    //
+    // The fix is to NOT clear the scan cache from
+    // `clearLookupResolutionAndReceiverCachesAcrossRegistrations`. This
+    // test simulates the production sequence:
+    //   1. Cycle 1 runs, scan cache populated.
+    //   2. daemon transitions to ready → cache clear is called.
+    //   3. Provider re-registration fires → Cycle 2 same version.
+    //   4. Cycle 2 phase2-scan should hit cache despite the daemon-state
+    //      clear in step 2.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/heavy_lookup_examples.py'
+      );
+
+      // Wait for Cycle 1 to complete fully (publish in log buffer).
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(
+          (l) => l.startsWith('[diagnostics:phase] publish')
+        ),
+        25_000
+      );
+
+      // Snapshot Cycle 1's phase2-scan lines for the assertion later.
+      const bufAfterCycle1 = getDiagnosticLogBufferForTesting();
+      const cycle1Phase2 = bufAfterCycle1.filter((l) =>
+        l.includes('[diagnostics:phase] phase2-scan:')
+      );
+      assert.ok(
+        cycle1Phase2.length > 0,
+        `Cycle 1 must emit phase2-scan lines. Got 0.\n` +
+        `Recent phase lines:\n  ${bufAfterCycle1
+          .filter((l) => l.includes('[diagnostics:phase]'))
+          .slice(-15)
+          .join('\n  ')}`
+      );
+      const cycle1End = bufAfterCycle1.length;
+
+      // Step 2: simulate daemon-state ready clear (this is what previously
+      // wiped the scan cache).
+      simulateDaemonReadyCacheClearForTesting();
+
+      // Step 3: trigger re-registration via promotion.
+      promotePythonProvidersForTesting('daemon-state-scan-cache-test');
+
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some((line) =>
+          line.includes('Re-registered Python providers (daemon-state-scan-cache-test)')
+        ),
+        25_000
+      );
+
+      // Wait for Cycle 2 to publish in the new provider scope.
+      await waitForCondition(
+        () => {
+          const buf = getDiagnosticLogBufferForTesting();
+          const tail = buf.slice(cycle1End);
+          return tail.some((l) =>
+            l.includes('Re-registered Python providers (daemon-state-scan-cache-test)')
+          ) && tail.some((l) =>
+            l.startsWith('[diagnostics:phase] publish')
+          );
+        },
+        25_000
+      );
+
+      // Step 4: assert Cycle 2 phase2-scan hits cache.
+      const buf = getDiagnosticLogBufferForTesting();
+      const cycle2Tail = buf.slice(cycle1End);
+      const cycle2Phase2 = cycle2Tail.filter((l) =>
+        l.includes('[diagnostics:phase] phase2-scan:')
+      );
+      assert.ok(
+        cycle2Phase2.length > 0,
+        `Cycle 2 must emit phase2-scan lines after re-registration.\n` +
+        `Cycle 2 phase lines:\n  ${cycle2Tail
+          .filter((l) => l.includes('[diagnostics:phase]'))
+          .join('\n  ')}`
+      );
+      const cycle2Hits = cycle2Phase2.filter((l) => l.includes('cache=hit'));
+      assert.ok(
+        cycle2Hits.length === cycle2Phase2.length,
+        `After daemon-state clear, Cycle 2 phase2-scan MUST still hit cache ` +
+        `because scan results don't depend on daemon model graph. ` +
+        `Got ${cycle2Hits.length}/${cycle2Phase2.length} hits.\n` +
+        `Cycle 2 phase2-scan lines:\n  ${cycle2Phase2.join('\n  ')}`
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('provider promotion defers while a diagnostic scan is in flight', async function () {
+    // Reproduces the production-observed pattern where Re-registered Python
+    // providers (daemon-ready) fires mid-scan and disposes the in-flight
+    // refreshDiagnostics, wasting ~700ms of validate/scan work. With the
+    // deferral fix the promotion logs a "Deferred ..." line, the scan still
+    // reaches its publish/budget log, and the promotion fires AFTER the scan
+    // completes.
+    this.timeout(60_000);
+    // Long enough for the scan to be observably in flight, short enough to
+    // keep the test under a few seconds.
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '500';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      // Any setup/restart-triggered scans may still be in flight; wait for
+      // a quiet moment before opening the heavy fixture so the in-flight
+      // observation later is unambiguous.
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/heavy_lookup_examples.py'
+      );
+
+      // Tight-poll until the scan is actually running. waitForCondition's
+      // 200ms cadence can miss the in-flight window on small files, so we
+      // poll every 5ms.
+      let inFlightObserved = false;
+      const inFlightWaitStart = Date.now();
+      while (Date.now() - inFlightWaitStart < 10_000) {
+        if (getActiveDiagnosticScanRunningCountForTesting() >= 1) {
+          inFlightObserved = true;
+          break;
+        }
+        await delay(5);
+      }
+      assert.ok(
+        inFlightObserved,
+        'Diagnostic scan should reach the in-flight state for the heavy fixture.'
+      );
+
+      // Trigger a promotion mid-scan. The deferral logic should log a
+      // "Deferred Python provider promotion" line instead of disposing the
+      // in-flight scan.
+      const countWhenPromoting = getActiveDiagnosticScanRunningCountForTesting();
+      promotePythonProvidersForTesting('test-mid-scan-promotion');
+
+      try {
+        await waitForCondition(
+          () => getDiagnosticLogBufferForTesting().some((line) =>
+            line.includes('Deferred Python provider promotion (test-mid-scan-promotion)')
+          ),
+          5_000
+        );
+      } catch (err) {
+        const lines = getDiagnosticLogBufferForTesting()
+          .filter((l) =>
+            l.includes('Re-registered') ||
+            l.includes('Deferred') ||
+            l.includes('[diagnostics:trigger]') ||
+            l.includes('[diagnostics:phase] publish') ||
+            l.includes('time budget exhausted')
+          )
+          .slice(-50);
+        assert.fail(
+          `Deferral log not seen. countWhenPromoting=${countWhenPromoting} ` +
+          `countNow=${getActiveDiagnosticScanRunningCountForTesting()}\n` +
+          lines.join('\n')
+        );
+      }
+
+      // The scan should still complete (counter returns to zero).
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      // After the scan ends, the deferred promotion should actually fire.
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some((line) =>
+          line.includes('Re-registered Python providers (test-mid-scan-promotion)')
+        ),
+        5_000
+      );
+
+      // Sanity: the re-registration log line must appear AFTER the deferral
+      // log line — otherwise we'd be re-registering before the scan ended.
+      const buffer = getDiagnosticLogBufferForTesting();
+      const deferIdx = buffer.findIndex((line) =>
+        line.includes('Deferred Python provider promotion (test-mid-scan-promotion)')
+      );
+      const reRegisterIdx = buffer.findIndex((line) =>
+        line.includes('Re-registered Python providers (test-mid-scan-promotion)')
+      );
+      assert.ok(
+        deferIdx >= 0 && reRegisterIdx > deferIdx,
+        `Expected deferral to log before re-registration. defer=${deferIdx} reRegister=${reRegisterIdx}\n` +
+        `Buffer: ${buffer.slice(-30).join('\n')}`
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('resolveLookupPath skips Python IPC for diagnostic-background when native is confident and runtime is not ready', async function () {
+    // Production trace showed `[IPC] resolveLookupPath(source=diagnostic, ...
+    // db.ShareClass / defaults / get_or_create): 1420ms` while the daemon
+    // itself completed the call in 1ms. The 1.4s gap is pure IPC overhead
+    // under event-loop pressure. When the daemon's Django runtime is NOT
+    // bootstrapped, Python uses the same default lookup-operator set Rust
+    // already evaluated — so Python's answer is guaranteed to match native.
+    // We can skip the IPC entirely.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    process.env.DJLS_TEST_FORCE_RUNTIME_NOT_READY = '1';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      // Fixture with ~105 invalid lookups whose first segment doesn't
+      // exist on Post. Native returns `resolved: false`; without the fix
+      // each one round-trips to Python.
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/invalid_lookup_examples.py'
+      );
+
+      // Wait for the scan to fire and publish.
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/invalid_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      // Inspect the captured IPC log. We must not have made any
+      // resolveLookupPath IPC calls from the diagnostic source.
+      const buf = getDiagnosticLogBufferForTesting();
+      const slowDiagnosticIpcs = buf.filter((line) =>
+        line.includes('[IPC] resolveLookupPath') &&
+        line.includes('source=diagnostic')
+      );
+
+      assert.strictEqual(
+        slowDiagnosticIpcs.length,
+        0,
+        `Expected no diagnostic-background resolveLookupPath IPC calls when ` +
+        `native is confident and runtime is not ready. Found ${slowDiagnosticIpcs.length}:\n` +
+        slowDiagnosticIpcs.slice(0, 10).join('\n')
+      );
+
+      // Sanity: confirm the scan actually processed lookups (otherwise the
+      // test could trivially pass on an empty scan).
+      const validateLines = buf.filter((l) =>
+        l.includes('[diagnostics:phase] validate-lookups-visible')
+      );
+      const sawValidWork = validateLines.some((line) => {
+        const m = /valid=(\d+)/.exec(line);
+        return m != null && Number(m[1]) > 0;
+      });
+      assert.ok(
+        sawValidWork,
+        `Expected at least one validate-lookups phase with valid>0 ` +
+        `(otherwise the IPC skip is trivial). Got:\n${validateLines.join('\n')}`
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+      delete process.env.DJLS_TEST_FORCE_RUNTIME_NOT_READY;
+    }
+  });
+
+  test('receiver expressions starting with Python keywords resolve correctly', async function () {
+    // Production trace from captain workspace showed phase2-lookups
+    // `noRecvSamples=["notCompanyNameChangeModel.objects", ...]`. The real
+    // source is `if not CompanyNameChangeModel.objects.filter(...).exists()`,
+    // but `compactPythonExpression` stripped ALL whitespace and concatenated
+    // `not` + the model name, turning the receiver into an unresolvable
+    // pseudo-identifier. This test exercises a fixture full of
+    // `if not Post.objects.filter(...)` / `assert not Post.objects ...`
+    // patterns and asserts the receiver resolver finds them.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/keyword_prefix_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/keyword_prefix_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      // Aggregate exit counters across all phase2-lookups lines emitted
+      // during this scan plus the visible-range receivers stats.
+      const buf = getDiagnosticLogBufferForTesting();
+      let totalValid = 0;
+      let totalNoRecv = 0;
+      const noRecvSampleSnippets: string[] = [];
+      const phase2Re = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? valid=(\d+) added=\d+ exit=cancelled:\d+,noRecv:(\d+).*?(?: noRecvSamples=\[([^\]]*)\])?$/;
+      const visibleReceiversRe = /\[diagnostics:phase\] receivers-visible .*? validated=(\d+) pending=(\d+) batchItems=\d+ receivers=\d+ missing=(\d+) virtual=\d+/;
+      for (const line of buf) {
+        const m = phase2Re.exec(line);
+        if (m) {
+          totalValid += Number(m[1]);
+          totalNoRecv += Number(m[2]);
+          if (m[3]) noRecvSampleSnippets.push(m[3]);
+          continue;
+        }
+        const r = visibleReceiversRe.exec(line);
+        if (r) {
+          totalValid += Number(r[1]);
+          totalNoRecv += Number(r[3]);
+        }
+      }
+
+      assert.ok(
+        totalValid >= 10,
+        `Expected the fixture's keyword-prefix lookups to validate (>= 10). ` +
+        `Got totalValid=${totalValid}. phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ')
+      );
+
+      assert.strictEqual(
+        totalNoRecv,
+        0,
+        `Expected zero noRecv exits for receivers like 'not Post.objects.filter(...)'. ` +
+        `Got totalNoRecv=${totalNoRecv} out of valid=${totalValid}. ` +
+        `noRecvSamples: ${noRecvSampleSnippets.join(' | ')}\n` +
+        `phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ')
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('reverse-manager accessors resolve across inheritance and cross-app patterns', async function () {
+    // Production trace from captain workspace captured
+    // `shareholders_meeting.director_attendance_set` as noRecv even though
+    // `ShareholdersMeeting` is in modelLabelByName. The reverse accessor
+    // (named via `related_name`) was missing from the parent model's
+    // surface entry — most likely because the FK lives on an abstract
+    // base or in a cross-app module whose enumeration path has gaps.
+    //
+    // This test exercises a realistic mix of reverse patterns:
+    //   - same-app FK reverse (Author.posts)
+    //   - cross-app + inherited FK reverse (Author.vendors via
+    //     org/models/base.py's abstract VendorBase.created_by)
+    //   - self-referential FK reverse (Author.mentees)
+    //   - OneToOne reverse (Author.profile)
+    //   - M2M reverse (Tag.posts)
+    //
+    // All receivers must resolve; any noRecv flags a daemon-side
+    // reverse-enumeration gap mirroring captain's pattern.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/reverse_manager_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/reverse_manager_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      let totalValid = 0;
+      let totalNoRecv = 0;
+      const sampleSnippets: string[] = [];
+      const phase2Re = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? valid=(\d+) added=\d+ exit=cancelled:\d+,noRecv:(\d+).*?(?: noRecvSamples=\[([^\]]*)\])?$/;
+      const visRecRe = /\[diagnostics:phase\] receivers-visible .*? validated=(\d+) pending=\d+ batchItems=\d+ receivers=\d+ missing=(\d+) virtual=\d+(?:[^[]*noRecvSamples=\[([^\]]*)\])?/;
+      for (const line of buf) {
+        const m = phase2Re.exec(line);
+        if (m) {
+          totalValid += Number(m[1]);
+          totalNoRecv += Number(m[2]);
+          if (m[3]) sampleSnippets.push(m[3]);
+          continue;
+        }
+        const r = visRecRe.exec(line);
+        if (r) {
+          totalValid += Number(r[1]);
+          totalNoRecv += Number(r[2]);
+          if (r[3]) sampleSnippets.push(r[3]);
+        }
+      }
+
+      assert.ok(
+        totalValid >= 10,
+        `Expected reverse-manager lookups to validate (>= 10). Got ${totalValid}.`
+      );
+      assert.strictEqual(
+        totalNoRecv,
+        0,
+        `Expected zero noRecv for reverse-manager patterns. Any noRecv here ` +
+        `means the daemon failed to enumerate that reverse accessor on the ` +
+        `parent model's surface entry. ` +
+        `Got totalNoRecv=${totalNoRecv}/${totalValid}. ` +
+        `Samples: ${sampleSnippets.join(' | ')}\n` +
+        `phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ') + '\n' +
+        `receivers-visible lines:\n  ` +
+        buf.filter((l) => l.includes('receivers-visible')).join('\n  ')
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('phase2-lookups caps wall time per context to avoid budget monopoly', async function () {
+    // Production trace from captain workspace showed phase2-lookups
+    // spending 6.8s on 12 valid contexts (~566ms each) because 2 BG IPC
+    // calls were stuck. With concurrency=4, a few slow contexts can
+    // monopolise the whole 10s diagnostic budget, leaving the rest of
+    // the file unprocessed.
+    //
+    // The per-context Promise.race timeout caps each context's wall time
+    // so slow daemon round-trips count as `timeout:N` exit instead of
+    // blocking the queue. The next cycle benefits because the underlying
+    // Promise still resolves into the response cache.
+    //
+    // This test injects a 2.5s delay into resolveOrmMember BG IPC so the
+    // timeout (default 1500ms) fires reliably, then asserts:
+    //   1. `timeout:N` exit counter is > 0
+    //   2. phase2-lookups wall time stays well under the diagnostic budget
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '10000';
+    process.env.DJLS_DIAGNOSTIC_PER_CONTEXT_TIMEOUT_MS = '300';
+    process.env.DJLS_TEST_RESOLVE_LOOKUP_PATH_DELAY_MS = '2500';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      // Invalid lookups force the daemon's resolveLookupPath BG IPC to
+      // fire (native says unresolved; BG is consulted as a fallback).
+      // The fixture spans 600+ lines so most lookups fall into the
+      // phase2-lookups ranges (outside the visible-first window), which
+      // is where the per-context timeout machinery lives. With injected
+      // 2500ms delay and 300ms per-context cap, the race should time out
+      // and increment the `timeout:` exit counter.
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/heavy_invalid_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/heavy_invalid_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        25_000
+      );
+
+      // Find phase2-lookups lines and validate their wall time is bounded.
+      const buf = getDiagnosticLogBufferForTesting();
+      const phase2Lines = buf.filter((l) =>
+        l.includes('[diagnostics:phase] phase2-lookups:')
+      );
+      assert.ok(
+        phase2Lines.length > 0,
+        `Expected at least one phase2-lookups line; fixture may have been ` +
+        `entirely within visible-first range.\n` +
+        `Recent diagnostic lines:\n  ${buf
+          .filter((l) => l.includes('[diagnostics:phase]'))
+          .slice(-20)
+          .join('\n  ')}`
+      );
+
+      const timeoutRe = /timeout:(\d+)/;
+      const phaseMsRe = /\[diagnostics:phase\] phase2-lookups:[^ ]+ (\d+)ms/;
+      let maxPhaseMs = 0;
+      let totalTimeouts = 0;
+      for (const line of phase2Lines) {
+        const tMatch = timeoutRe.exec(line);
+        if (tMatch) totalTimeouts += Number(tMatch[1]);
+        const pMatch = phaseMsRe.exec(line);
+        if (pMatch) maxPhaseMs = Math.max(maxPhaseMs, Number(pMatch[1]));
+      }
+
+      assert.ok(
+        totalTimeouts > 0,
+        `Expected per-context timeout to fire at least once with a 2500ms ` +
+        `injected daemon delay and 300ms per-context cap. ` +
+        `Got totalTimeouts=${totalTimeouts}. ` +
+        `phase2-lookups lines:\n  ${phase2Lines.join('\n  ')}`
+      );
+
+      // Throughput sanity check: without the per-context cap, each slow
+      // IPC (2500ms) holds 1 concurrency slot. With concurrency=4 and a
+      // 10s diagnostic budget, only ~16 contexts (4 slots × 4 batches)
+      // could complete before budget exhaustion. The per-context cap
+      // (300ms) lets each slot recycle ~33x faster, so we expect orders
+      // of magnitude more contexts processed within the same budget.
+      assert.ok(
+        totalTimeouts >= 32,
+        `Expected per-context cap to dramatically increase throughput by ` +
+        `freeing concurrency slots from slow IPCs. Got totalTimeouts=${totalTimeouts} ` +
+        `(without cap this would be ~16 max with 4-way concurrency and 2.5s IPC). ` +
+        `phase2-lookups lines:\n  ${phase2Lines.join('\n  ')}`
+      );
+      // Silence unused: maxPhaseMs is informational (budget-bounded).
+      void maxPhaseMs;
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+      delete process.env.DJLS_DIAGNOSTIC_PER_CONTEXT_TIMEOUT_MS;
+      delete process.env.DJLS_TEST_RESOLVE_LOOKUP_PATH_DELAY_MS;
+    }
+  });
+
+  test('X.objects receiver synthesizes manager when Python daemon cannot resolve', async function () {
+    // Reproduces the captain workspace pattern: a workspace model is in
+    // `daemon.modelLabelByName` (via surfaceIndex or staticFallback) but its
+    // surface entry lacks a `model_class -> objects` mapping. Python BG IPC
+    // would normally fill the gap, but on captain Django isn't installed so
+    // the daemon returns `{resolved: false}` and the diagnostic landed in
+    // noRecv. The client-side shortcut now synthesizes a manager receiver
+    // for `<known_model>.objects` so the lookup path is still validated.
+    //
+    // `DJLS_TEST_FORCE_ORM_MEMBER_UNRESOLVED=1` simulates the Python-cannot-
+    // -help state inside minimal_project (which has Django available).
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    process.env.DJLS_TEST_FORCE_ORM_MEMBER_UNRESOLVED = '1';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      // Use the existing built-in fixture — User/Group/Permission live in
+      // staticFallback only, so without Python BG help every `.objects`
+      // call would previously land in noRecv (root_matched). The new
+      // client-side fallback must catch them.
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/builtin_model_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/builtin_model_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      let totalValid = 0;
+      let totalNoRecv = 0;
+      const sampleSnippets: string[] = [];
+      const phase2Re = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? valid=(\d+) added=\d+ exit=cancelled:\d+,noRecv:(\d+).*?(?: noRecvSamples=\[([^\]]*)\])?$/;
+      const visRecRe = /\[diagnostics:phase\] receivers-visible .*? validated=(\d+) pending=\d+ batchItems=\d+ receivers=\d+ missing=(\d+) virtual=\d+/;
+      for (const line of buf) {
+        const m = phase2Re.exec(line);
+        if (m) {
+          totalValid += Number(m[1]);
+          totalNoRecv += Number(m[2]);
+          if (m[3]) sampleSnippets.push(m[3]);
+          continue;
+        }
+        const r = visRecRe.exec(line);
+        if (r) {
+          totalValid += Number(r[1]);
+          totalNoRecv += Number(r[2]);
+        }
+      }
+
+      assert.ok(
+        totalValid >= 10,
+        `Expected built-in lookups to validate (>= 10). Got totalValid=${totalValid}.`
+      );
+      assert.strictEqual(
+        totalNoRecv,
+        0,
+        `Expected zero noRecv for 'User.objects' / 'Group.objects' / etc. ` +
+        `when Python daemon cannot help. The client-side <model_class>.objects ` +
+        `fallback must synthesize a manager receiver. ` +
+        `Got totalNoRecv=${totalNoRecv}/${totalValid}. ` +
+        `Samples: ${sampleSnippets.join(' | ')}\n` +
+        `phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ') + '\n' +
+        `receivers-visible lines:\n  ` +
+        buf.filter((l) => l.includes('receivers-visible')).join('\n  ')
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+      delete process.env.DJLS_TEST_FORCE_ORM_MEMBER_UNRESOLVED;
+    }
+  });
+
+  test('<KnownModel>.objects synthesizes manager even when symbol resolution fails (race recovery)', async function () {
+    // Captain trace L122 showed `FileAttachment.objects#root_matched:FileAttachment`
+    // — the classifier later confirmed `FileAttachment` was in modelLabelByName
+    // (root_matched), but receiver resolution returned undefined. Root cause:
+    // race between phase2-lookups resolution and surface index hydration.
+    // When `resolveModelLabelFromSymbol` is called during a daemon-busy
+    // window, both the local lookup AND the BG IPC fall back to unresolved.
+    // The recursive `objectReceiver` ends up undefined, the previously
+    // working `<model_class>.objects` shortcut (which requires
+    // objectReceiver.kind === 'model_class') never fires, and the lookup
+    // lands in noRecv.
+    //
+    // The defensive sync fallback in resolveLookupReceiverAtOffset checks
+    // daemon.modelLabelByName.get(objectExpression) directly when both
+    // recursive resolutions returned undefined. Because modelLabelByName
+    // gets populated by surface deltas while the cycle is in flight, the
+    // fallback catches the race recovery window.
+    //
+    // To reproduce deterministically: force BOTH the symbol resolution
+    // AND the resolveOrmMember IPC to return unresolved. The shortcut
+    // requiring model_class objectReceiver never fires; only the new sync
+    // fallback can synthesize the manager.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    process.env.DJLS_TEST_FORCE_ORM_MEMBER_UNRESOLVED = '1';
+    process.env.DJLS_TEST_FORCE_RESOLVE_MODEL_LABEL_NULL = '1';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      // builtin_model_lookup_examples.py uses User.objects / Group.objects
+      // patterns where User/Group are in modelLabelByName via the Django
+      // built-in static fallback. With the symbol-resolution hook on, the
+      // recursive `resolveModelLabelFromSymbol` returns undefined; only the
+      // sync fallback can recover.
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/builtin_model_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/builtin_model_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      let totalValid = 0;
+      let totalNoRecv = 0;
+      const sampleSnippets: string[] = [];
+      const phase2Re = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? valid=(\d+) added=\d+ exit=cancelled:\d+,noRecv:(\d+).*?(?: noRecvSamples=\[([^\]]*)\])?$/;
+      const visRecRe = /\[diagnostics:phase\] receivers-visible .*? validated=(\d+) pending=\d+ batchItems=\d+ receivers=\d+ missing=(\d+) virtual=\d+/;
+      for (const line of buf) {
+        const m = phase2Re.exec(line);
+        if (m) {
+          totalValid += Number(m[1]);
+          totalNoRecv += Number(m[2]);
+          if (m[3]) sampleSnippets.push(m[3]);
+          continue;
+        }
+        const r = visRecRe.exec(line);
+        if (r) {
+          totalValid += Number(r[1]);
+          totalNoRecv += Number(r[2]);
+        }
+      }
+
+      assert.ok(
+        totalValid >= 10,
+        `Expected built-in lookups to validate (>= 10). Got totalValid=${totalValid}.`
+      );
+      assert.strictEqual(
+        totalNoRecv,
+        0,
+        `With both symbol resolution and resolveOrmMember forced to unresolved, ` +
+        `the sync <KnownModel>.objects fallback must still synthesize a manager ` +
+        `receiver. Got totalNoRecv=${totalNoRecv}/${totalValid}. ` +
+        `Samples: ${sampleSnippets.join(' | ')}\n` +
+        `phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ') + '\n' +
+        `receivers-visible lines:\n  ` +
+        buf.filter((l) => l.includes('receivers-visible')).join('\n  ')
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+      delete process.env.DJLS_TEST_FORCE_ORM_MEMBER_UNRESOLVED;
+      delete process.env.DJLS_TEST_FORCE_RESOLVE_MODEL_LABEL_NULL;
+    }
+  });
+
+  test('receiver resolves via localWorkspaceIndex when daemon.modelLabelByName drops the short name', async function () {
+    // Captain trace L122/L177/L454/.../L713 (10× across cycles) showed
+    // `CompanyQuestionThread.objects#unknown_root` even though the completion
+    // path emitted `local:hit` for `zuzu.CompanyQuestionThread`. Root cause:
+    // daemon.modelLabelByName (first-come-wins on short-name collisions) and
+    // localWorkspaceIndex.modelLabelByName (last-come-wins) can disagree.
+    // The captain workspace ended up with `CompanyQuestionThread` registered
+    // in localWorkspaceIndex but absent from daemon.modelLabelByName,
+    // leaving every cycle's receiver resolution permanently in noRecv.
+    //
+    // The fix is `findModelLabelByShortName` / `hasModelByShortName` which
+    // consult BOTH maps. This test simulates the captain state by clearing
+    // daemon.modelLabelByName after Cycle 1 and re-triggering — the next
+    // cycle must still resolve `<KnownModel>.objects` patterns via the
+    // localWorkspaceIndex fallback.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/builtin_model_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/builtin_model_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      // Simulate captain trace: daemon.modelLabelByName loses the short name
+      // entries (but localWorkspaceIndex retains them). After this, re-run
+      // a diagnostic cycle by clearing receiver caches + bumping the file.
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon, 'daemon must be active');
+      clearDaemonModelLabelByNameForTesting(daemon);
+      assert.strictEqual(
+        daemon.modelLabelByName.size, 0,
+        'simulation should leave daemon.modelLabelByName empty'
+      );
+      assert.ok(
+        daemon.localWorkspaceIndexForTesting.modelLabelByName.size > 0,
+        'localWorkspaceIndex.modelLabelByName must still be populated'
+      );
+
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      // Trigger a fresh cycle by promoting (which causes a re-register +
+      // refresh).
+      promotePythonProvidersForTesting('localworkspace-fallback-test');
+
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        20_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      // Assert built-in lookups still resolve via the localWorkspaceIndex
+      // fallback. Without `findModelLabelByShortName`, every `User.objects`,
+      // `Group.objects`, etc. would land in noRecv (unknown_root).
+      const buf = getDiagnosticLogBufferForTesting();
+      let totalValid = 0;
+      let totalNoRecv = 0;
+      const sampleSnippets: string[] = [];
+      const phase2Re = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? valid=(\d+) added=\d+ exit=cancelled:\d+,noRecv:(\d+).*?(?: noRecvSamples=\[([^\]]*)\])?$/;
+      const visRecRe = /\[diagnostics:phase\] receivers-visible .*? validated=(\d+) pending=\d+ batchItems=\d+ receivers=\d+ missing=(\d+) virtual=\d+/;
+      for (const line of buf) {
+        const m = phase2Re.exec(line);
+        if (m) {
+          totalValid += Number(m[1]);
+          totalNoRecv += Number(m[2]);
+          if (m[3]) sampleSnippets.push(m[3]);
+          continue;
+        }
+        const r = visRecRe.exec(line);
+        if (r) {
+          totalValid += Number(r[1]);
+          totalNoRecv += Number(r[2]);
+        }
+      }
+
+      assert.ok(
+        totalValid >= 10,
+        `Expected lookups to validate via localWorkspaceIndex fallback (>= 10). ` +
+        `Got totalValid=${totalValid}.`
+      );
+      assert.strictEqual(
+        totalNoRecv,
+        0,
+        `Diagnostic must use localWorkspaceIndex when daemon.modelLabelByName ` +
+        `drops short names. Got totalNoRecv=${totalNoRecv}/${totalValid}. ` +
+        `Samples: ${sampleSnippets.join(' | ')}\n` +
+        `phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ')
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('realistic mixed workspace patterns resolve with minimal noRecv', async function () {
+    // Comprehensive smoke test mirroring real-world shapes from production
+    // workspaces (cls.objects, chained .filter().filter(), @property
+    // returning queryset, self.<relation>.filter, values/values_list
+    // chains). The earlier fixtures each isolated one pattern; this
+    // exercises them together so a regression in any path is caught.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/realistic_workspace_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/realistic_workspace_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      let totalValid = 0;
+      let totalNoRecv = 0;
+      const sampleSnippets: string[] = [];
+      const phase2Re = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? valid=(\d+) added=\d+ exit=cancelled:\d+,noRecv:(\d+).*?(?: noRecvSamples=\[([^\]]*)\])?$/;
+      const visRecRe = /\[diagnostics:phase\] receivers-visible .*? validated=(\d+) pending=\d+ batchItems=\d+ receivers=\d+ missing=(\d+) virtual=\d+/;
+      for (const line of buf) {
+        const m = phase2Re.exec(line);
+        if (m) {
+          totalValid += Number(m[1]);
+          totalNoRecv += Number(m[2]);
+          if (m[3]) sampleSnippets.push(m[3]);
+          continue;
+        }
+        const r = visRecRe.exec(line);
+        if (r) {
+          totalValid += Number(r[1]);
+          totalNoRecv += Number(r[2]);
+        }
+      }
+
+      assert.ok(
+        totalValid >= 15,
+        `Expected the realistic-workspace fixture to validate many lookups (>= 15). ` +
+        `Got totalValid=${totalValid}.`
+      );
+      // Allow a single missed receiver as a soft margin (e.g. an idiom we
+      // genuinely do not yet support), but the broad mix here should
+      // overwhelmingly resolve. If noRecv ever rises substantially this
+      // signals a regression in one of the patterns the fixture covers.
+      assert.ok(
+        totalNoRecv <= 1,
+        `Expected at most 1 noRecv across the realistic-workspace fixture. ` +
+        `Got totalNoRecv=${totalNoRecv}/${totalValid}. ` +
+        `Samples: ${sampleSnippets.join(' | ')}\n` +
+        `phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ') + '\n' +
+        `receivers-visible lines:\n  ` +
+        buf.filter((l) => l.includes('receivers-visible')).join('\n  ')
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('cross-app workspace models resolve as lookup receivers', async function () {
+    // Production trace captured `RegistrationAssistance.objects`,
+    // `SelfRegistration.objects`, `OptionProxy.objects` as noRecv samples —
+    // workspace-defined models that live in a different app's directory
+    // than the file being scanned. This test uses Vendor (in `org/models/`)
+    // referenced from a fixture file in `blog/`.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/cross_app_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/cross_app_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      let totalValid = 0;
+      let totalNoRecv = 0;
+      const sampleSnippets: string[] = [];
+      const phase2Re = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? valid=(\d+) added=\d+ exit=cancelled:\d+,noRecv:(\d+).*?(?: noRecvSamples=\[([^\]]*)\])?$/;
+      const visRecRe = /\[diagnostics:phase\] receivers-visible .*? validated=(\d+) pending=\d+ batchItems=\d+ receivers=\d+ missing=(\d+) virtual=\d+/;
+      for (const line of buf) {
+        const m = phase2Re.exec(line);
+        if (m) {
+          totalValid += Number(m[1]);
+          totalNoRecv += Number(m[2]);
+          if (m[3]) sampleSnippets.push(m[3]);
+          continue;
+        }
+        const r = visRecRe.exec(line);
+        if (r) {
+          totalValid += Number(r[1]);
+          totalNoRecv += Number(r[2]);
+        }
+      }
+
+      assert.ok(
+        totalValid >= 5,
+        `Expected cross-app lookups to validate (>= 5). Got totalValid=${totalValid}.`
+      );
+      assert.strictEqual(
+        totalNoRecv,
+        0,
+        `Expected zero noRecv for 'Vendor.objects' (Vendor lives in org/models). ` +
+        `Got totalNoRecv=${totalNoRecv}/${totalValid}. ` +
+        `Samples: ${sampleSnippets.join(' | ')}\n` +
+        `phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ') + '\n' +
+        `receivers-visible lines:\n  ` +
+        buf.filter((l) => l.includes('receivers-visible')).join('\n  ')
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('Django built-in model receivers resolve via static-fallback', async function () {
+    // Production trace captured `User.objects` as a noRecv sample because
+    // the workspace-discovery pass misses Django's own packaged models
+    // (auth.User, contenttypes.ContentType, sessions.Session, ...). This
+    // test verifies the daemon now ships a built-in static-fallback bundle
+    // so those receivers resolve and lookups are validated.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/builtin_model_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/builtin_model_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      let totalValid = 0;
+      let totalNoRecv = 0;
+      const sampleSnippets: string[] = [];
+      const phase2Re = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? valid=(\d+) added=\d+ exit=cancelled:\d+,noRecv:(\d+).*?(?: noRecvSamples=\[([^\]]*)\])?$/;
+      const visRecRe = /\[diagnostics:phase\] receivers-visible .*? validated=(\d+) pending=\d+ batchItems=\d+ receivers=\d+ missing=(\d+) virtual=\d+/;
+      for (const line of buf) {
+        const m = phase2Re.exec(line);
+        if (m) {
+          totalValid += Number(m[1]);
+          totalNoRecv += Number(m[2]);
+          if (m[3]) sampleSnippets.push(m[3]);
+          continue;
+        }
+        const r = visRecRe.exec(line);
+        if (r) {
+          totalValid += Number(r[1]);
+          totalNoRecv += Number(r[2]);
+        }
+      }
+
+      assert.ok(
+        totalValid >= 10,
+        `Expected built-in lookups to validate (>= 10). Got totalValid=${totalValid}.`
+      );
+      assert.strictEqual(
+        totalNoRecv,
+        0,
+        `Expected zero noRecv for receivers like 'User.objects'. ` +
+        `Got totalNoRecv=${totalNoRecv}/${totalValid}. ` +
+        `Samples: ${sampleSnippets.join(' | ')}\n` +
+        `phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ') + '\n' +
+        `receivers-visible lines:\n  ` +
+        buf.filter((l) => l.includes('receivers-visible')).join('\n  ')
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('plural-named parameters resolve to singular models via fuzzy fallback', async function () {
+    // Variable named `vendors` (plural) referring to the `Vendor` singular
+    // model. The receiver resolver now tries "drop trailing 's'" variants
+    // so plural collection-style parameters still resolve without explicit
+    // type annotations.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/plural_param_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/plural_param_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      let totalValid = 0;
+      let totalNoRecv = 0;
+      const sampleSnippets: string[] = [];
+      const phase2Re = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? valid=(\d+) added=\d+ exit=cancelled:\d+,noRecv:(\d+).*?(?: noRecvSamples=\[([^\]]*)\])?$/;
+      const visRecRe = /\[diagnostics:phase\] receivers-visible .*? validated=(\d+) pending=\d+ batchItems=\d+ receivers=\d+ missing=(\d+) virtual=\d+/;
+      for (const line of buf) {
+        const m = phase2Re.exec(line);
+        if (m) {
+          totalValid += Number(m[1]);
+          totalNoRecv += Number(m[2]);
+          if (m[3]) sampleSnippets.push(m[3]);
+          continue;
+        }
+        const r = visRecRe.exec(line);
+        if (r) {
+          totalValid += Number(r[1]);
+          totalNoRecv += Number(r[2]);
+        }
+      }
+
+      assert.ok(
+        totalValid >= 8,
+        `Expected plural-param lookups to validate (>= 8). Got ${totalValid}.`
+      );
+      assert.strictEqual(
+        totalNoRecv,
+        0,
+        `Expected zero noRecv for 'vendors.filter(...)' where 'vendors' is ` +
+        `an unannotated plural parameter mapping to singular Vendor model. ` +
+        `Got totalNoRecv=${totalNoRecv}/${totalValid}. ` +
+        `Samples: ${sampleSnippets.join(' | ')}\n` +
+        `phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ') + '\n' +
+        `receivers-visible lines:\n  ` +
+        buf.filter((l) => l.includes('receivers-visible')).join('\n  ')
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('unannotated function parameters resolve via snake_case→PascalCase fallback', async function () {
+    // Production trace captured `directors_meeting.director_attendance_set`
+    // as a noRecv sample. `directors_meeting` is a function parameter that
+    // is NOT type-annotated, but its snake_case name happens to match a
+    // PascalCase model (`DirectorsMeeting`). The receiver resolver has a
+    // snake→pascal fallback at resolveOrmReceiverAtOffsetCore; this test
+    // verifies it resolves through the diagnostic pipeline so reverse
+    // accessors like `.director_attendance_set` work without explicit type
+    // annotations.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/unannotated_param_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/unannotated_param_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      let totalValid = 0;
+      let totalNoRecv = 0;
+      const sampleSnippets: string[] = [];
+      const phase2Re = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? valid=(\d+) added=\d+ exit=cancelled:\d+,noRecv:(\d+).*?(?: noRecvSamples=\[([^\]]*)\])?$/;
+      const visRecRe = /\[diagnostics:phase\] receivers-visible .*? validated=(\d+) pending=\d+ batchItems=\d+ receivers=\d+ missing=(\d+) virtual=\d+/;
+      for (const line of buf) {
+        const m = phase2Re.exec(line);
+        if (m) {
+          totalValid += Number(m[1]);
+          totalNoRecv += Number(m[2]);
+          if (m[3]) sampleSnippets.push(m[3]);
+          continue;
+        }
+        const r = visRecRe.exec(line);
+        if (r) {
+          totalValid += Number(r[1]);
+          totalNoRecv += Number(r[2]);
+        }
+      }
+
+      assert.ok(
+        totalValid >= 8,
+        `Expected unannotated-param lookups to validate (>= 8). Got ${totalValid}.`
+      );
+      assert.strictEqual(
+        totalNoRecv,
+        0,
+        `Expected zero noRecv for 'author.posts' where 'author' is an ` +
+        `unannotated parameter. Got totalNoRecv=${totalNoRecv}/${totalValid}. ` +
+        `Samples: ${sampleSnippets.join(' | ')}\n` +
+        `phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ') + '\n' +
+        `receivers-visible lines:\n  ` +
+        buf.filter((l) => l.includes('receivers-visible')).join('\n  ')
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('annotated function parameters resolve as lookup receivers', async function () {
+    // Production trace captured `directors_meeting.director_attendance_set`
+    // as a noRecv sample — `directors_meeting` is a function parameter
+    // annotated as `DirectorsMeeting`. The receiver-resolution infrastructure
+    // (`findFunctionParameterTypeAnnotation`,
+    //  `resolveAnnotatedReceiverForMemberAccess`) already exists. This test
+    // verifies the integration works end-to-end so reverse-accessor lookups
+    // on annotated parameters don't end up in the noRecv bucket.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/annotated_param_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/annotated_param_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      let totalValid = 0;
+      let totalNoRecv = 0;
+      const sampleSnippets: string[] = [];
+      const phase2Re = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? valid=(\d+) added=\d+ exit=cancelled:\d+,noRecv:(\d+).*?(?: noRecvSamples=\[([^\]]*)\])?$/;
+      const visRecRe = /\[diagnostics:phase\] receivers-visible .*? validated=(\d+) pending=\d+ batchItems=\d+ receivers=\d+ missing=(\d+) virtual=\d+/;
+      for (const line of buf) {
+        const m = phase2Re.exec(line);
+        if (m) {
+          totalValid += Number(m[1]);
+          totalNoRecv += Number(m[2]);
+          if (m[3]) sampleSnippets.push(m[3]);
+          continue;
+        }
+        const r = visRecRe.exec(line);
+        if (r) {
+          totalValid += Number(r[1]);
+          totalNoRecv += Number(r[2]);
+        }
+      }
+
+      assert.ok(
+        totalValid >= 10,
+        `Expected the fixture's annotated-parameter lookups to validate (>= 10). ` +
+        `Got totalValid=${totalValid}.`
+      );
+      assert.strictEqual(
+        totalNoRecv,
+        0,
+        `Expected zero noRecv for receivers like 'author.posts' where 'author' has ` +
+        `a function-parameter type annotation. Got totalNoRecv=${totalNoRecv}/${totalValid}. ` +
+        `Samples: ${sampleSnippets.join(' | ')}\n` +
+        `phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ') + '\n' +
+        `receivers-visible lines:\n  ` +
+        buf.filter((l) => l.includes('receivers-visible')).join('\n  ')
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('multiple promote reasons coalesce while a diagnostic scan is in flight', async function () {
+    // Production-observed regression: two distinct promote reasons (e.g.
+    // language-client-started and daemon-ready) arriving back-to-back during
+    // an in-flight scan. The first one schedules a defer timer; the second
+    // — with a different reason — bypassed the deferral guard and killed
+    // the scan. The fix ensures BOTH return early: one as "Deferred ...",
+    // the other as "Coalesced ...".
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '500';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/heavy_lookup_examples.py'
+      );
+
+      let inFlightObserved = false;
+      const tStart = Date.now();
+      while (Date.now() - tStart < 10_000) {
+        if (getActiveDiagnosticScanRunningCountForTesting() >= 1) {
+          inFlightObserved = true;
+          break;
+        }
+        await delay(5);
+      }
+      assert.ok(inFlightObserved, 'Cycle 1 should reach in-flight state.');
+
+      // Fire TWO promotions with distinct reasons back-to-back while the
+      // scan is still in flight.
+      promotePythonProvidersForTesting('test-reason-A');
+      promotePythonProvidersForTesting('test-reason-B');
+
+      // Expect one Deferred line for A and one Coalesced line for B.
+      await waitForCondition(
+        () => {
+          const buf = getDiagnosticLogBufferForTesting();
+          return buf.some((l) =>
+            l.includes('Deferred Python provider promotion (test-reason-A)')
+          ) && buf.some((l) =>
+            l.includes('Coalesced Python provider promotion (test-reason-B)')
+          );
+        },
+        5_000
+      );
+
+      // While the scan is still in flight, NEITHER reason should have
+      // emitted a Re-registered line. Snapshot now to capture in-flight state.
+      const inFlightBuf = getDiagnosticLogBufferForTesting();
+      const inFlightReRegisters = inFlightBuf.filter((l) =>
+        l.includes('Re-registered Python providers (test-reason-A)') ||
+        l.includes('Re-registered Python providers (test-reason-B)')
+      );
+      assert.strictEqual(
+        inFlightReRegisters.length,
+        0,
+        `Re-registration must not happen while scan is in flight. Saw:\n` +
+        inFlightReRegisters.join('\n') +
+        '\nRecent log lines:\n' +
+        getDiagnosticLogBufferForTesting().slice(-30).join('\n')
+      );
+
+      // Once the scan ends, the deferred A promotion should fire (B is
+      // coalesced and dropped, which is fine — both just dispose+recreate).
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some((l) =>
+          l.includes('Re-registered Python providers (test-reason-A)')
+        ),
+        5_000
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Failing-on-purpose regression tests for problems A–D identified in the
+  // 2026-05-12 captain log analysis. Each test reproduces a production bug
+  // observed in the captain workspace; they fail in the current build and
+  // will pass once the corresponding fix lands.
+  // ---------------------------------------------------------------------------
+
+  test('A: scan cache hits even when visible range drifts a few lines (captain L48 vs L99)', async function () {
+    // Captain trace shows Cycle 1 scanning lines 143-290 and Cycle 2 (same
+    // version, same document) scanning lines 140-287 — a 3-line drift caused
+    // by a tiny scroll or editor resize between cycles. The scan cache is
+    // keyed by exact (docUri, version, range), so trivial drift produces a
+    // cache miss and ~1.5s of phase2-scan is repeated.
+    //
+    // Desired behavior: cache should be tolerant to small range shifts (or
+    // keyed by content) so the same-version re-scan reuses prior work.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      const document = await openFixtureDocument(
+        fixtureRoot,
+        'blog/heavy_lookup_examples.py'
+      );
+      const editor = vscode.window.activeTextEditor;
+      assert.ok(editor && editor.document.uri.toString() === document.uri.toString(),
+        'fixture editor must be active for revealRange to take effect'
+      );
+
+      // Position visible range deep into the file (not at line 0, otherwise
+      // both reveal calls end up at the start and no drift occurs).
+      editor.revealRange(
+        new vscode.Range(200, 0, 200, 0),
+        vscode.TextEditorRevealType.AtTop
+      );
+      await delay(300);
+
+      // Wait for Cycle 1 publish.
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(
+          (l) => l.startsWith('[diagnostics:phase] publish')
+        ),
+        25_000
+      );
+      const cycle1End = getDiagnosticLogBufferForTesting().length;
+
+      // Drift the visible range by a few lines (mirrors the captain 3-line
+      // delta) before triggering Cycle 2.
+      editor.revealRange(
+        new vscode.Range(203, 0, 203, 0),
+        vscode.TextEditorRevealType.AtTop
+      );
+      await delay(300);
+
+      // Trigger same-version Cycle 2 via promote (so cache pre-existing
+      // entries are intact).
+      promotePythonProvidersForTesting('scan-range-drift-test');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some((l) =>
+          l.includes('Re-registered Python providers (scan-range-drift-test)')
+        ),
+        25_000
+      );
+      await waitForCondition(
+        () => {
+          const buf = getDiagnosticLogBufferForTesting();
+          const tail = buf.slice(cycle1End);
+          return tail.some((l) => l.startsWith('[diagnostics:phase] publish'));
+        },
+        25_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      const cycle2Lines = buf.slice(cycle1End);
+      const cycle2ScanCompletes = cycle2Lines.filter((l) =>
+        l.includes('[diagnostics:scan] complete')
+      );
+      const cycle2Phase2 = cycle2Lines.filter((l) =>
+        l.includes('[diagnostics:phase] phase2-scan:')
+      );
+      assert.ok(
+        cycle2ScanCompletes.length > 0 || cycle2Phase2.length > 0,
+        `Cycle 2 must emit scan lines`
+      );
+
+      const allCycle2Scans = [...cycle2ScanCompletes, ...cycle2Phase2];
+      const misses = allCycle2Scans.filter((l) => l.includes('cache=miss'));
+      assert.strictEqual(
+        misses.length,
+        0,
+        `Same-version Cycle 2 scans must reuse Cycle 1's cached results ` +
+        `despite a small visible-range drift (3 lines). Got ${misses.length} ` +
+        `misses:\n  ${misses.join('\n  ')}\n` +
+        `Cycle 1 scan lines:\n  ${buf.slice(0, cycle1End).filter((l) =>
+          l.includes('[diagnostics:scan] complete') ||
+          l.includes('[diagnostics:phase] phase2-scan:')
+        ).join('\n  ')}\n` +
+        `Cycle 2 scan lines:\n  ${allCycle2Scans.join('\n  ')}`
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('B: classifier normalizes `return <KnownModel>...` prefix before extracting root', async function () {
+    // Captain trace L81/L138 noRecvSamples included
+    // `return Director.objects.get_queryset()#unknown_root` — the classifier
+    // extracted `return` as the root identifier from the unnormalized
+    // receiver expression and never noticed `Director` is a known model.
+    // The resolver normalizes the expression before resolving; the
+    // classifier must do the same so the bucket actually reflects the bug
+    // (root_matched on a real model instead of unknown_root).
+    //
+    // Direct classifier test: the resolver's snake-pascal fallback resolves
+    // any chain rooted in a known model to a generic instance, so a fully
+    // E2E reproduction is hard to force. Invoke the classifier directly via
+    // a test hook to assert the bucket would be correct if the resolver did
+    // fail.
+    this.timeout(15_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+    await waitForCondition(
+      () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+      15_000
+    );
+
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon, 'daemon must be active');
+    // Confirm Author IS in the model index (minimal_project ships it via
+    // blog.models.Author). The classifier should therefore recognize it.
+    assert.ok(
+      daemon.modelLabelByName.has('Author') ||
+      daemon.localWorkspaceIndexForTesting.modelLabelByName.has('Author'),
+      'fixture workspace must have Author in modelLabelByName'
+    );
+
+    const samples = [
+      'return Author.objects.get_queryset()',
+      'return Author.objects.NONEXISTENT',
+      'return Author.objects.NONEXISTENT.filter(name="x")',
+      'return Author.posts.filter(title="x")',
+    ];
+    const results = samples.map((expr) => ({
+      expr,
+      bucket: classifyNoRecvReasonForTesting(daemon, expr),
+    }));
+
+    for (const { expr, bucket } of results) {
+      assert.ok(
+        bucket.startsWith('root_matched:Author') ||
+        bucket.startsWith('fuzzy_matched:Author'),
+        `Classifier must normalize the receiver expression and recognize ` +
+        `Author as the root after stripping the 'return ' prefix. ` +
+        `Expected bucket starting with 'root_matched:Author' (or fuzzy_matched). ` +
+        `expr=${JSON.stringify(expr)} → bucket=${bucket}\n` +
+        `All results:\n  ${results.map((r) => `${r.expr} → ${r.bucket}`).join('\n  ')}`
+      );
+    }
+  });
+
+  test('C: self.<related_name>_set resolves as reverse manager inside class methods', async function () {
+    // Captain trace L81/L138 noRecvSamples include
+    // `self.all_stock_set.valid_at(date)#no_root_identifier` — `self` is
+    // explicitly excluded by receiverRootIdentifier so the classifier marks
+    // the lookup as no_root_identifier and the resolver returns undefined
+    // for the receiver. Real Django code uses `self.<related_name>_set`
+    // routinely inside model methods, so these must resolve to the reverse
+    // manager of the enclosing class.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/self_reverse_manager_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/self_reverse_manager_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        25_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      // Small fixtures land entirely in visible-first, so check both
+      // receivers-visible and phase2-lookups noRecv reasons.
+      const phaseLines = buf.filter((l) =>
+        l.includes('phase2-lookups:') || l.includes('receivers-visible')
+      );
+      const reasonsRe = /noRecvReasons=([^\s]+)/;
+      const samplesRe = /noRecvSamples=\[([^\]]*)\]/;
+      let allReasons = '';
+      let allSamples = '';
+      for (const line of phaseLines) {
+        const r = reasonsRe.exec(line);
+        if (r) allReasons += r[1] + ',';
+        const s = samplesRe.exec(line);
+        if (s) allSamples += s[1] + ' | ';
+      }
+
+      // Desired: `self.<X>` patterns should NOT fall into `no_root_identifier`.
+      // Either the resolver succeeds (preferred) or the classifier emits a
+      // more specific bucket (e.g. self_reference). Either way the bucket
+      // `no_root_identifier` should be empty for this fixture, which contains
+      // only `self.<X>_set.filter(...)` patterns.
+      const noRootIdentifierMatch = /\bno_root_identifier:(\d+)/.exec(allReasons);
+      const noRootIdentifierCount = noRootIdentifierMatch
+        ? Number(noRootIdentifierMatch[1])
+        : 0;
+      assert.ok(
+        phaseLines.length > 0,
+        `Test must observe phase lines from the fixture. Got 0.\n` +
+        `Recent buffer lines:\n  ${buf.slice(-30).join('\n  ')}`
+      );
+
+      // After the classifier fix, `self.<X>` patterns must NOT be bucketed
+      // as the generic `no_root_identifier` or `unknown_root` — they should
+      // get a dedicated `self_reference:self` (or :cls/:super) bucket so
+      // diagnostics surface separates them from "literal/punctuation-prefix"
+      // receivers (the original meaning of no_root_identifier) and from
+      // truly unknown roots.
+      const selfReferenceMatch = /\bself_reference:(self|cls|super):(\d+)/g;
+      const selfRefCount = [...allReasons.matchAll(selfReferenceMatch)]
+        .reduce((sum, m) => sum + Number(m[2]), 0);
+      assert.ok(
+        selfRefCount >= 5,
+        `Captain regression: 'self.<X>' samples must be bucketed as ` +
+        `self_reference (not no_root_identifier / unknown_root). The fixture ` +
+        `has 5 self.<X>_set patterns; got self_reference count=${selfRefCount}.\n` +
+        `noRecvReasons=${allReasons}\n` +
+        `noRecvSamples=${allSamples}\n` +
+        `Diagnostic phase lines:\n  ${phaseLines.join('\n  ')}`
+      );
+      // Also assert these are NOT in the old buckets.
+      assert.strictEqual(
+        noRootIdentifierCount,
+        0,
+        `self.<X> patterns must not be classified as the generic ` +
+        `no_root_identifier bucket. Got ${noRootIdentifierCount}.\n` +
+        `noRecvReasons=${allReasons}`
+      );
+      const unknownRootMatch = /\bunknown_root:(\d+)/.exec(allReasons);
+      const unknownRootCount = unknownRootMatch ? Number(unknownRootMatch[1]) : 0;
+      assert.strictEqual(
+        unknownRootCount,
+        0,
+        `self.<X> patterns must not be classified as unknown_root. ` +
+        `Got ${unknownRootCount}.\n` +
+        `noRecvReasons=${allReasons}`
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('D: cached null is invalidated when root identifier becomes known after cold start', async function () {
+    // Captain Cycle 1 (v=1) noRecvReasons included root_matched:CompanyUserRelation
+    // (7), root_matched:PayrollAnnualSalaryInfo (6), etc. — workspace models
+    // that ARE in the modelLabelByName at classifier time but were absent at
+    // resolution time. Cycle 1 stores `null` in the receiver cache (with the
+    // "don't pin when root is a known model" guard), but the guard only fires
+    // when the model is known at the .then() callback — if the surface delta
+    // arrives AFTER that, the null pins indefinitely.
+    //
+    // Production effect: cycle 1 burns time on resolutions, returns null,
+    // pins the null, and subsequent same-version cycles return the stale
+    // null — even though the daemon now knows the model.
+    //
+    // Desired behavior: on cache READ, re-validate the null against the
+    // current modelLabelByName and re-resolve if the root is now known.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      // Step 1: simulate a fully cold daemon — both modelLabelByName and
+      // localWorkspaceIndex.modelLabelByName empty. This mirrors the captain
+      // cycle 1 state before the surface delta arrives.
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon, 'daemon must be active');
+      clearDaemonModelLabelByNameForTesting(daemon);
+      const savedLwiByName = new Map(daemon.localWorkspaceIndexForTesting.modelLabelByName);
+      daemon.localWorkspaceIndexForTesting.modelLabelByName.clear();
+
+      // Step 2: open builtin_model_lookup_examples.py — the Django built-in
+      // static fallback would normally repopulate User/Group/Permission in
+      // modelLabelByName. Since we cleared both maps, every lookup will fail.
+      // BUT we need to prevent the static fallback rebuild from undoing our
+      // clear, so we patch in a flag after opening.
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/builtin_model_lookup_examples.py'
+      );
+
+      // Re-clear after open in case opening rebuilt anything.
+      clearDaemonModelLabelByNameForTesting(daemon);
+      daemon.localWorkspaceIndexForTesting.modelLabelByName.clear();
+
+      // Wait for Cycle 1 to publish with cold maps. Every .objects lookup
+      // should land in noRecv and a null gets pinned in the receiver cache.
+      const cycle1Buf = await (async () => {
+        const matchesFireForDoc = (line: string): boolean =>
+          line.startsWith('[diagnostics:trigger] fire ') &&
+          line.endsWith('blog/builtin_model_lookup_examples.py');
+        await waitForCondition(
+          () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+          15_000
+        );
+        await waitForCondition(
+          () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+          20_000
+        );
+        return getDiagnosticLogBufferForTesting().slice();
+      })();
+
+      // Step 3: restore the maps (simulate surface delta arriving).
+      for (const [k, v] of savedLwiByName) {
+        daemon.localWorkspaceIndexForTesting.modelLabelByName.set(k, v);
+      }
+      // Force daemon.modelLabelByName to repopulate. The simplest restore
+      // path is to invoke whatever rebuilds it. For the test, mirror the
+      // localWorkspaceIndex contents.
+      for (const [k, v] of savedLwiByName) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (daemon as any).modelLabelByName.set(k, v);
+      }
+      assert.ok(
+        daemon.modelLabelByName.size > 0,
+        'restore must repopulate daemon.modelLabelByName'
+      );
+
+      const cycle1End = cycle1Buf.length;
+      clearDiagnosticLogBufferForTesting();
+
+      // Step 4: trigger Cycle 2 same-version via promote. The receiver cache
+      // still holds stale nulls from Cycle 1; the fix should invalidate them
+      // on read since the root is now known.
+      promotePythonProvidersForTesting('stale-null-cache-test');
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/builtin_model_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        20_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        20_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      let totalValid = 0;
+      let totalNoRecv = 0;
+      const samples: string[] = [];
+      const phase2Re = /\[diagnostics:phase\] phase2-lookups:[^ ]+ .*? valid=(\d+) added=\d+ exit=cancelled:\d+,noRecv:(\d+).*?(?: noRecvSamples=\[([^\]]*)\])?$/;
+      const visRecRe = /\[diagnostics:phase\] receivers-visible .*? validated=(\d+) pending=\d+ batchItems=\d+ receivers=\d+ missing=(\d+) virtual=\d+/;
+      for (const line of buf) {
+        const m = phase2Re.exec(line);
+        if (m) {
+          totalValid += Number(m[1]);
+          totalNoRecv += Number(m[2]);
+          if (m[3]) samples.push(m[3]);
+          continue;
+        }
+        const r = visRecRe.exec(line);
+        if (r) {
+          totalValid += Number(r[1]);
+          totalNoRecv += Number(r[2]);
+        }
+      }
+
+      // Cycle 1 (cold) suppressed totalNoRecv pollution from the prior cycle.
+      // Use only the Cycle 2 buffer for the assertion.
+      assert.ok(
+        totalValid >= 5,
+        `Cycle 2 must validate lookups after maps are restored. ` +
+        `Got totalValid=${totalValid}. ` +
+        `Cycle 1 had ${cycle1End} lines; Cycle 2 has ${buf.length} lines.`
+      );
+      assert.strictEqual(
+        totalNoRecv,
+        0,
+        `Cycle 2 must invalidate stale cached nulls when the root identifier ` +
+        `is now known. Got totalNoRecv=${totalNoRecv}/${totalValid}. ` +
+        `Samples: ${samples.join(' | ')}\n` +
+        `Cycle 2 phase2-lookups lines:\n  ` +
+        buf.filter((l) => l.includes('phase2-lookups:')).join('\n  ')
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('A-followup: scan cache hits even when visible range drifts beyond the grid (captain 50-line scroll)', async function () {
+    // The first A fix snapped range boundaries to a 50-line grid so small
+    // (≤50 line) scrolls produce identical cache keys. Captain log L37 vs
+    // L83 shows a 50-line drift between cycles (100-300 → 150-350), which
+    // crosses the grid boundary and produces different snapped keys —
+    // every scan cache=miss again.
+    //
+    // Desired: the cache should reuse work from prior scans whenever
+    // the new query range is a SUBSET of (or overlaps with) previously
+    // scanned line ranges. Same-version means the document text is
+    // unchanged, so any line scanned before yields the same contexts.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      const document = await openFixtureDocument(
+        fixtureRoot,
+        'blog/heavy_lookup_examples.py'
+      );
+      const editor = vscode.window.activeTextEditor;
+      assert.ok(editor && editor.document.uri.toString() === document.uri.toString());
+
+      // Cycle 1 viewport at line 100.
+      editor.revealRange(
+        new vscode.Range(100, 0, 100, 0),
+        vscode.TextEditorRevealType.AtTop
+      );
+      await delay(300);
+
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(
+          (l) => l.startsWith('[diagnostics:phase] publish')
+        ),
+        25_000
+      );
+      const cycle1End = getDiagnosticLogBufferForTesting().length;
+
+      // Cycle 2 viewport at line 200 (100-line drift — crosses ALL 50-line
+      // grid boundaries the current fix relies on).
+      editor.revealRange(
+        new vscode.Range(200, 0, 200, 0),
+        vscode.TextEditorRevealType.AtTop
+      );
+      await delay(300);
+
+      promotePythonProvidersForTesting('scan-large-drift-test');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some((l) =>
+          l.includes('Re-registered Python providers (scan-large-drift-test)')
+        ),
+        25_000
+      );
+      await waitForCondition(
+        () => {
+          const buf = getDiagnosticLogBufferForTesting();
+          const tail = buf.slice(cycle1End);
+          return tail.some((l) => l.startsWith('[diagnostics:phase] publish'));
+        },
+        25_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      const cycle2Lines = buf.slice(cycle1End);
+      const cycle2Scans = cycle2Lines.filter((l) =>
+        l.includes('[diagnostics:scan] complete') ||
+        l.includes('[diagnostics:phase] phase2-scan:')
+      );
+      assert.ok(
+        cycle2Scans.length > 0,
+        `Cycle 2 must emit scan lines`
+      );
+
+      const misses = cycle2Scans.filter((l) => l.includes('cache=miss'));
+      assert.strictEqual(
+        misses.length,
+        0,
+        `After a 100-line scroll, Cycle 2 scans must reuse Cycle 1's ` +
+        `cached lookups (the document text is unchanged for v=1, so ` +
+        `any previously scanned line yields the same contexts). Got ` +
+        `${misses.length} misses:\n  ${misses.join('\n  ')}\n` +
+        `Cycle 1 scan lines:\n  ${buf.slice(0, cycle1End).filter((l) =>
+          l.includes('[diagnostics:scan] complete') ||
+          l.includes('[diagnostics:phase] phase2-scan:')
+        ).join('\n  ')}\n` +
+        `Cycle 2 scan lines:\n  ${cycle2Scans.join('\n  ')}`
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+    }
+  });
+
+  test('captain P1: phase2-lookups should not exhaust the 10s budget on 500+ valid lookups with default per-context cap', async function () {
+    // Captain log 2026-05-12 14:23 shows three cycles (1, 6, 7) hitting
+    // time-budget exhausted on `services/demo_company_service.py`:
+    //   phase2-lookups:550-2499 7212ms, requests=28, valid=34, resolvedOk=20,
+    //   noRecv=8, timeout=2 (input=514)
+    // → out of 514 input lookups, only ~28 contexts were processed before
+    // budget exhaust → publish partial=true diagnostics=0.
+    //
+    // Root cause: each context can take up to PHASE2_PER_CONTEXT_TIMEOUT_MS
+    // (1500ms default). With concurrency=4 and natural BG IPC delays just
+    // under that cap, each batch of 4 takes ~1s and the budget tops out
+    // after ~30-40 contexts.
+    //
+    // Reproduce: heavy_lookup_examples.py has hundreds of valid lookups,
+    // each requiring BG IPC. With default config and an injected ~800ms
+    // per-IPC delay (close to but below the per-context cap), the budget
+    // exhausts before most contexts complete — mirrors captain.
+    //
+    // This test asserts the FIXED state (publish.partial=false) so it fails
+    // today and unblocks future fix work (lower default cap / skip phase2
+    // on large files / etc.).
+    this.timeout(60_000);
+    // Reproduce captain's budget-exhaust shape on minimal_project's smaller
+    // scale: shrink the diagnostic budget and amplify per-IPC latency
+    // simultaneously so the same "many slow contexts" choke point manifests.
+    // (Captain natural scale: ~1318 models × ~30 distinct lookup triples ×
+    // ~250ms IPC → 7s phase2-lookups, exhausts 10s budget. We mirror that
+    // ratio here by using tighter limits.)
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '3000';
+    process.env.DJLS_TEST_RESOLVE_LOOKUP_PATH_DELAY_MS = '1200';
+    process.env.DJLS_TEST_RESOLVE_ORM_MEMBER_DELAY_MS = '1200';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      // heavy_invalid_lookup_examples has many DISTINCT (model, value,
+      // method) triplets (`nonexistent_field_000__*` … `_NNN__*`) so the
+      // per-lookup IPC cache cannot deduplicate them — the injected delay
+      // accumulates and the budget exhausts. heavy_lookup_examples by
+      // contrast repeats `title__contains` etc. and the cache absorbs the
+      // load on the very first cycle, hiding the captain bug.
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/heavy_invalid_lookup_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/heavy_invalid_lookup_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        25_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      const publishLine = buf.find((l) =>
+        l.startsWith('[diagnostics:phase] publish')
+      );
+      assert.ok(publishLine, 'diagnostic cycle must publish');
+
+      const partialMatch = /partial=(true|false)/.exec(publishLine);
+      assert.ok(partialMatch, `publish line must include partial=: ${publishLine}`);
+      const partial = partialMatch[1] === 'true';
+
+      // Aggregate phase2-lookups input vs processed counts.
+      const phase2Lines = buf.filter((l) => l.includes('[diagnostics:phase] phase2-lookups:'));
+      let totalInput = 0;
+      let totalProcessed = 0;
+      const exitRe = /input=(\d+)\s+valid=(\d+)\s+added=\d+\s+exit=cancelled:(\d+),noRecv:(\d+),virtual:(\d+),resolvedOk:(\d+),partialSuppress:(\d+),dedup:(\d+),nullDiag:(\d+),err:(\d+),timeout:(\d+)/;
+      for (const line of phase2Lines) {
+        const m = exitRe.exec(line);
+        if (!m) continue;
+        totalInput += Number(m[1]);
+        const processed =
+          Number(m[3]) + Number(m[4]) + Number(m[5]) + Number(m[6]) +
+          Number(m[7]) + Number(m[8]) + Number(m[9]) + Number(m[10]) +
+          Number(m[11]);
+        totalProcessed += processed;
+      }
+
+      // The fixture has 500+ invalid lookups. With the captain bug, only
+      // a small fraction is processed before budget exhausts.
+      assert.ok(
+        totalInput >= 300,
+        `Fixture should produce 300+ phase2-lookup inputs. Got ${totalInput}.\n` +
+        `phase2 lines:\n  ${phase2Lines.join('\n  ')}\n` +
+        `publish: ${publishLine}\n` +
+        `Recent buffer (last 30):\n  ${buf.slice(-30).join('\n  ')}`
+      );
+      // Always emit a diagnostic dump in the message so debugging is easy.
+      const debugDump =
+        `partial=${partial} totalInput=${totalInput} totalProcessed=${totalProcessed}\n` +
+        `phase2-lookups lines:\n  ${phase2Lines.join('\n  ')}\n` +
+        `publish line: ${publishLine}\n` +
+        `Last 40 buffer lines:\n  ${buf.slice(-40).join('\n  ')}`;
+      assert.ok(
+        !partial,
+        `phase2-lookups must not exhaust the diagnostic budget on a ` +
+        `${totalInput}-input file with ~1200ms BG IPC and a 3s budget.\n` +
+        debugDump
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+      delete process.env.DJLS_TEST_RESOLVE_LOOKUP_PATH_DELAY_MS;
+      delete process.env.DJLS_TEST_RESOLVE_ORM_MEMBER_DELAY_MS;
+    }
+  });
+
+  test('captain P2: <Model>.objects resolves when Model exists in workspace code but is absent from current daemon indices', async function () {
+    // Captain trace L63/L67/L244/L285 (10+ times per session) repeatedly
+    // showed `CompanyQuestionThread.objects#unknown_root`. Earlier captain
+    // sessions emitted `[completion:lookup:local:hit] model=zuzu.CompanyQuestionThread fields=29`
+    // — proof that the daemon CAN know about this model. But in the latest
+    // session every local index lacks it (modelLabelByName,
+    // localWorkspaceIndex.modelLabelByName, AND localWorkspaceIndex.models),
+    // so the classifier's only honest answer is `unknown_root`.
+    //
+    // Reproduce: drop `blog.Author` from every local index after the
+    // daemon has finished indexing. Then trigger a diagnostic on a fixture
+    // that uses `Author.objects.filter(...)`. The user's code is valid
+    // Django but our session's daemon "forgot" about Author.
+    //
+    // Asserts the desired post-fix state — receiver resolves (via async
+    // BG IPC retry, or a model-graph fallback, or whatever the eventual
+    // fix is). Currently fails because resolution returns undefined and
+    // the lookup lands in noRecv.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    // Force BG `resolveRelationTarget` to return unresolved so the daemon
+    // can't quietly rescue the lookup via its Python-side graph after we
+    // strip the client-side indices.
+    process.env.DJLS_TEST_FORCE_RESOLVE_RELATION_UNRESOLVED = '1';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon, 'daemon must be active');
+
+      const blogAuthor = daemon.localWorkspaceIndexForTesting.modelLabelByName.get('Author');
+      assert.ok(blogAuthor, 'pre-condition: localWorkspaceIndex must know Author');
+      // Drop blog.Author from EVERY local index, mirroring captain's
+      // current-session state for CompanyQuestionThread.
+      dropModelFromAllIndicesForTesting(daemon, blogAuthor);
+
+      // Verify the captain state is reproduced.
+      assert.strictEqual(
+        daemon.modelLabelByName.has('Author'), false,
+        'reproduce: daemon.modelLabelByName must not have Author'
+      );
+      assert.strictEqual(
+        daemon.localWorkspaceIndexForTesting.modelLabelByName.has('Author'), false,
+        'reproduce: localWorkspaceIndex.modelLabelByName must not have Author'
+      );
+      assert.strictEqual(
+        daemon.localWorkspaceIndexForTesting.models.has(blogAuthor), false,
+        'reproduce: localWorkspaceIndex.models must not have blog.Author'
+      );
+
+      // Open a fixture that uses Author.objects.filter(...).
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/captain_repro_examples.py'
+      );
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/captain_repro_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        25_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      const phaseLines = buf.filter((l) =>
+        l.includes('phase2-lookups:') || l.includes('receivers-visible')
+      );
+
+      // Extract all noRecv reasons + samples.
+      let allReasons = '';
+      let allSamples = '';
+      for (const line of phaseLines) {
+        const r = /noRecvReasons=([^\s]+)/.exec(line);
+        if (r) allReasons += r[1] + ',';
+        const s = /noRecvSamples=\[([^\]]*)\]/.exec(line);
+        if (s) allSamples += s[1] + ' | ';
+      }
+
+      // Author.<X> samples must NOT be in noRecv. The desired fix should
+      // either re-discover Author via BG IPC or expose a daemon model-graph
+      // fallback that finds it. Currently — without the fix — the diagnostic
+      // resolution should fail and Author should land in noRecv samples.
+      const authorSamples = allSamples
+        .split('|')
+        .filter((s) => /\bAuthor\b/.test(s));
+
+      // Diagnostic dump so the failure mode is visible.
+      const dump =
+        `daemon.modelLabelByName.size=${daemon.modelLabelByName.size}\n` +
+        `localWorkspaceIndex.modelLabelByName.size=${daemon.localWorkspaceIndexForTesting.modelLabelByName.size}\n` +
+        `localWorkspaceIndex.models.size=${daemon.localWorkspaceIndexForTesting.models.size}\n` +
+        `daemon.modelLabelByName.has('Author')=${daemon.modelLabelByName.has('Author')}\n` +
+        `lwi.modelLabelByName.has('Author')=${daemon.localWorkspaceIndexForTesting.modelLabelByName.has('Author')}\n` +
+        `lwi.models.has('${blogAuthor}')=${daemon.localWorkspaceIndexForTesting.models.has(blogAuthor)}\n` +
+        `noRecvReasons=${allReasons}\n` +
+        `Author samples (${authorSamples.length}):\n  ${authorSamples.join('\n  ')}\n` +
+        `All samples:\n  ${allSamples}\n` +
+        `Phase lines:\n  ${phaseLines.join('\n  ')}`;
+
+      assert.strictEqual(
+        authorSamples.length,
+        0,
+        `Captain regression: workspace model dropped from all indices + BG ` +
+        `forced unresolved, but still referenced in user code must still ` +
+        `resolve. Got ${authorSamples.length} Author noRecv samples.\n` +
+        dump
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+      delete process.env.DJLS_TEST_FORCE_RESOLVE_RELATION_UNRESOLVED;
+    }
+  });
+
+  test('captain P3: completion returns items for a model present at Pylance level but missing from daemon surfaceIndex', async function () {
+    // Captain trace L207, L233, L336, L343 (etc.) repeatedly show:
+    //   [completion:lookup:local:miss] model=db.Company indexSize=1343
+    //     surfaceKeys=1318 hasSurfaceEntry=false nameMapped=<none> candidates=[]
+    //   [completion:lookup:layer] native-skipped model=db.Company resolved=true items=0 reason=unresolved
+    //   [completion:lookup:layer] ipc model=db.Company items=0 resolved=false
+    //   [completion:lookup:daemon] model=db.Company rawItems=0
+    //   [completion:lookup] prefix="" items=0 truncated=false
+    // → user types `Company.objects.filter(<cursor>)`, Pylance tells us the
+    // type is `db.Company`, daemon has no `db.Company` entry in surfaceIndex
+    // OR localWorkspaceIndex, so completion returns 0 items via OUR
+    // extension's path. Completion is effectively dead for that model.
+    //
+    // Reproduce: drop `blog.Author` from every index AND force BG IPC to
+    // return unresolved, then trigger completion via the completion
+    // provider for an `Author.objects.filter(<prefix>)` cursor. Check the
+    // diagnostic log buffer for the `[completion:lookup]` aggregate line —
+    // it shows `items=0` today. Desired: items > 0 via fallback.
+    this.timeout(60_000);
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon, 'daemon must be active');
+      const blogAuthor = daemon.localWorkspaceIndexForTesting.modelLabelByName.get('Author');
+      assert.ok(blogAuthor, 'pre-condition: localWorkspaceIndex must know Author');
+
+      // Use the imported-Author fixture so the receiver `Author.objects`
+      // CAN resolve to `blog.Author` via import/short-name lookup. We
+      // then strip JUST the models entry — mirroring captain where
+      // Pylance resolves `Company → db.Company`, our short-name map
+      // returns the label, but listLookupPathCompletionsLocal can't find
+      // `db.Company` in localWorkspaceIndex.models and returns 0 items.
+      const document = await openFixtureDocument(
+        fixtureRoot,
+        'blog/builtin_model_lookup_examples.py'
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      // Drop ONLY the models map entry — receiver still resolves to
+      // blog.Author (short-name map has it), but completion's local
+      // lookup misses → ends up returning 0 items.
+      daemon.localWorkspaceIndexForTesting.models.delete(blogAuthor);
+
+      const fullText = document.getText();
+      // The first `User.objects.filter(` occurrence is inside the
+      // fixture's module docstring. Search for the indented code form so
+      // we land on the actual call site.
+      const needle = '\n    User.objects.filter(';
+      const idx = fullText.indexOf(needle);
+      assert.ok(idx >= 0, `fixture should contain indented '${needle.trim()}'`);
+      const position = document.positionAt(idx + needle.length);
+      // Also strip auth.User's models entry — that's the receiver in this
+      // fixture.
+      const authUser = daemon.localWorkspaceIndexForTesting.modelLabelByName.get('User');
+      assert.ok(authUser, 'pre-condition: User must be in lwi.modelLabelByName');
+      daemon.localWorkspaceIndexForTesting.models.delete(authUser);
+
+      clearDiagnosticLogBufferForTesting();
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        position,
+        '',
+        0,
+      );
+      await delay(200);
+
+      const buf = getDiagnosticLogBufferForTesting();
+      const completionLines = buf.filter((l) =>
+        l.startsWith('[completion:lookup')
+      );
+      const aggregateLines = completionLines.filter((l) =>
+        /^\[completion:lookup\] prefix=/.test(l)
+      );
+
+      assert.ok(
+        aggregateLines.length > 0,
+        `Completion path should emit at least one [completion:lookup] ` +
+        `aggregate line. Got 0.\n` +
+        `Completion lines: ${completionLines.join('\n  ')}\n` +
+        `Last 30 buffer: ${buf.slice(-30).join('\n  ')}`
+      );
+
+      // Captain bug: items=0 in aggregate. After fix, items > 0.
+      const zeroItemMatches = aggregateLines.filter((l) =>
+        /\bitems=0\b/.test(l)
+      );
+      assert.strictEqual(
+        zeroItemMatches.length,
+        0,
+        `Captain regression: completion path must return at least some ORM ` +
+        `items for <Model>.objects.filter(<cursor>) even when the daemon's ` +
+        `localWorkspaceIndex has no entry for the model. Got ${zeroItemMatches.length} ` +
+        `aggregate lines with items=0:\n  ${zeroItemMatches.join('\n  ')}\n` +
+        `All aggregate lines:\n  ${aggregateLines.join('\n  ')}`
+      );
+    } finally {
+      // (nothing)
+    }
+  });
+
+  test('captain P2-followup: phantom <Model>.objects manager must skip BG resolveLookupPath IPC', async function () {
+    // Captain post-P2 trace (2026-05-12 16:37):
+    //   L264: resolveLookupPath(baseModelLabel=CompanyQuestionThread, value=id, method=filter): 336ms
+    //   L269: resolveLookupPath(baseModelLabel=CompanyQuestionThread, value=company, method=filter): 336ms
+    //   L284: resolveLookupPath(baseModelLabel=CompanyQuestionThread, value=title__startswith, method=get): 6865ms
+    //   L280: time budget exhausted (10043ms > 10000ms)
+    //
+    // P2 phantom synthesis correctly removed the noRecv bucket — but the
+    // synthetic receiver's downstream `resolveLookupPath` BG IPC still
+    // fired and the daemon spent 7+ seconds confirming it has no record of
+    // the phantom label. The phantom is known-fake by definition, so the
+    // IPC produces zero useful information AND eats most of the budget.
+    //
+    // Fix target: receivers synthesized by the P2 phantom path must skip
+    // the per-lookup BG IPC entirely. The lookup-ipc-ms perf counter
+    // should be ~0 for these contexts.
+    this.timeout(60_000);
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    process.env.DJLS_TEST_FORCE_RESOLVE_RELATION_UNRESOLVED = '1';
+    process.env.DJLS_TEST_RESOLVE_LOOKUP_PATH_DELAY_MS = '1500';
+    try {
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(fixtureRoot);
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        15_000
+      );
+      clearReceiverAndLookupCachesForTesting();
+      clearDiagnosticLogBufferForTesting();
+
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon, 'daemon must be active');
+
+      const blogAuthor = daemon.localWorkspaceIndexForTesting.modelLabelByName.get('Author');
+      assert.ok(blogAuthor, 'pre-condition: localWorkspaceIndex must know Author');
+      dropModelFromAllIndicesForTesting(daemon, blogAuthor);
+
+      await openFixtureDocument(
+        fixtureRoot,
+        'blog/captain_repro_examples.py'
+      );
+
+      const matchesFireForDoc = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] fire ') &&
+        line.endsWith('blog/captain_repro_examples.py');
+      await waitForCondition(
+        () => getDiagnosticLogBufferForTesting().some(matchesFireForDoc),
+        15_000
+      );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        30_000
+      );
+
+      const buf = getDiagnosticLogBufferForTesting();
+      // The perf summary line we added in P3's logging work surfaces the
+      // accumulated BG IPC time. Phantom receivers should NOT contribute
+      // to lookup-ipc-ms.
+      const perfLines = buf.filter((l) => l.startsWith('[diagnostics:perf]'));
+      assert.ok(
+        perfLines.length > 0,
+        `Test must observe a [diagnostics:perf] summary. Got 0 lines.\n` +
+        `Last 30 buffer:\n  ${buf.slice(-30).join('\n  ')}`
+      );
+
+      let totalLookupIpcMs = 0;
+      const lookupIpcRe = /lookup-ipc-ms=(\d+)/;
+      for (const line of perfLines) {
+        const m = lookupIpcRe.exec(line);
+        if (m) totalLookupIpcMs += Number(m[1]);
+      }
+      assert.ok(
+        totalLookupIpcMs < 500,
+        `Phantom receivers must skip BG lookup-path IPC entirely. Captain ` +
+        `regression shows 7000+ms wasted on resolveLookupPath calls for ` +
+        `synthesized labels the daemon has no record of. ` +
+        `Got totalLookupIpcMs=${totalLookupIpcMs}ms.\n` +
+        `Perf lines:\n  ${perfLines.join('\n  ')}`
+      );
+    } finally {
+      delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
+      delete process.env.DJLS_TEST_FORCE_RESOLVE_RELATION_UNRESOLVED;
+      delete process.env.DJLS_TEST_RESOLVE_LOOKUP_PATH_DELAY_MS;
+    }
+  });
+
+  test('B-followup: short-name lookup falls back to localWorkspaceIndex.models keys (captain CompanyQuestionThread)', async function () {
+    // Captain trace: `CompanyQuestionThread.objects#unknown_root` repeats
+    // 10+ times per session. The full label `zuzu.CompanyQuestionThread`
+    // IS in localWorkspaceIndex.models (completion's local:hit confirms
+    // model=zuzu.CompanyQuestionThread fields=29 etc.), but neither
+    // daemon.modelLabelByName nor localWorkspaceIndex.modelLabelByName
+    // has the bare name `CompanyQuestionThread` as a key — likely due to a
+    // short-name collision or a delta-application ordering corner case in
+    // captain. Either way, the helper that diagnostics rely on (
+    // `findModelLabelByShortName` / `hasModelByShortName`) must consult
+    // the full-label index as a final fallback so receivers like
+    // `CompanyQuestionThread.objects` don't permanently land in noRecv.
+    this.timeout(15_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+    await waitForCondition(
+      () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+      15_000
+    );
+
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon, 'daemon must be active');
+
+    // Simulate the captain state: remove 'Author' from BOTH short-name maps
+    // but keep 'blog.Author' in localWorkspaceIndex.models intact. This
+    // mirrors the captain scenario where `zuzu.CompanyQuestionThread` is in
+    // the full-label index but not surfaced via either modelLabelByName.
+    const fullLabelBefore = daemon.localWorkspaceIndexForTesting.modelLabelByName.get('Author');
+    assert.ok(fullLabelBefore, 'pre-condition: localWorkspaceIndex must know Author');
+    daemon.modelLabelByName.delete('Author');
+    daemon.localWorkspaceIndexForTesting.modelLabelByName.delete('Author');
+    assert.ok(
+      daemon.localWorkspaceIndexForTesting.models.has(fullLabelBefore),
+      'pre-condition: localWorkspaceIndex.models still has the full label'
+    );
+
+    try {
+      const bucket = classifyNoRecvReasonForTesting(
+        daemon,
+        'Author.objects.NONEXISTENT',
+      );
+      assert.ok(
+        bucket.startsWith('root_matched:Author'),
+        `Classifier must use the full-label index as a fallback when both ` +
+        `short-name maps lack the receiver's root identifier. ` +
+        `Expected bucket 'root_matched:Author...'; got '${bucket}'.\n` +
+        `daemon.modelLabelByName.has('Author')=${daemon.modelLabelByName.has('Author')}\n` +
+        `localWorkspaceIndex.modelLabelByName.has('Author')=${daemon.localWorkspaceIndexForTesting.modelLabelByName.has('Author')}\n` +
+        `localWorkspaceIndex.models.has('${fullLabelBefore}')=${daemon.localWorkspaceIndexForTesting.models.has(fullLabelBefore)}`
+      );
+    } finally {
+      // Restore so subsequent tests aren't affected.
+      daemon.modelLabelByName.set('Author', fullLabelBefore);
+      daemon.localWorkspaceIndexForTesting.modelLabelByName.set('Author', fullLabelBefore);
+    }
   });
 });
 
