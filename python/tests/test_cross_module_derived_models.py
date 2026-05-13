@@ -129,6 +129,52 @@ class CaptainCrossModuleDerivedModelTest(unittest.TestCase):
             f'잡혀야 함. 현재 candidates: {sorted(names)}',
         )
 
+    def test_captain_captable_via_explicit_reexport_init(self) -> None:
+        """captain `zuzu.db.models.captable` 패턴 — `Captable(Company)` 가
+        candidate=no 로 빠지는 진짜 원인 reproduce.
+
+        captain의 `zuzu/db/models/company/__init__.py` 는:
+            from .company import DELETION_DELAY, Company, PartnerType   # explicit, NOT star
+        그리고 `zuzu/db/models/captable.py` 는:
+            from zuzu.db.models.company import Company
+
+        BFS 가 따라갈 import 체인:
+          1. (zuzu.db.models.company.company, Company)   ← seed (Company candidate)
+          2. (zuzu.db.models.company, Company)            ← init.py 의 explicit re-export
+          3. (zuzu.db.models.captable, Company)            ← captable 의 import
+
+        `_expand_model_candidates_via_imports.importers_of` 는 (1)→(2) 의
+        reverse_imports 매핑은 out.extend 로 한 번에 수집하지만, (2) 를
+        stack 에 push 하지 않음 — `star_re_exporters` 만 push 됨. 따라서 (2)
+        에서 (3) 으로 점프하지 못함.
+        """
+        # __init__.py — explicit (non-star) re-export
+        _write_module(
+            self._workspace, 'zuzu.db.models.company.__init__',
+            'from .company import Company\n'
+        )
+        _write_module(
+            self._workspace, 'zuzu.db.models.company.company',
+            'from django.db import models\n'
+            'class Company(models.Model):\n'
+            '    pass\n'
+        )
+        # captable — import via package, not submodule
+        _write_module(
+            self._workspace, 'zuzu.db.models.captable',
+            'from zuzu.db.models.company import Company\n'
+            'class Captable(Company):\n'
+            '    pass\n'
+        )
+
+        names = self._candidates_by_object_name()
+        self.assertIn('Company', names, 'seed candidate')
+        self.assertIn(
+            'Captable', names,
+            f'captain regression: Captable(Company) via explicit re-export '
+            f'init.py 가 expand BFS 에서 잡혀야 함. 현재 candidates: {sorted(names)}',
+        )
+
     def test_multi_hop_event_chain_director_term(self) -> None:
         """captain 의 `DirectorTerm(DirectorAppointmentEvent)` — 3-단계 chain.
 

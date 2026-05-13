@@ -6,6 +6,10 @@ import * as readline from 'readline';
 import * as vscode from 'vscode';
 import { getExtensionSettings } from '../config/settings';
 import {
+  decompressIpcEnvelope,
+  isCompressedEnvelope,
+} from './ipcCompression';
+import {
   hydrateNativeFastPathFromSurface,
   isNativeFastPathReady,
   dropNativeFastPath,
@@ -2553,7 +2557,17 @@ export class AnalysisDaemon implements vscode.Disposable {
           `[daemon stdout trailing noise ignored] ${extracted.trailingText.trim()}`
         );
       }
-      return JSON.parse(candidate) as ServerMessage;
+      const parsed = JSON.parse(candidate);
+      // 옵션 C — daemon 이 gzip+b64 envelope 으로 보낸 메시지 unwrap.
+      // captain initialize 22MB payload 가 ~2MB 로 줄어 stdout pipe write +
+      // JSON.parse 비용 모두 절감.
+      if (isCompressedEnvelope(parsed)) {
+        return decompressIpcEnvelope<ServerMessage>(
+          parsed.data,
+          (msg) => this.log('info', msg),
+        );
+      }
+      return parsed as ServerMessage;
     } catch (error) {
       this.log(
         'info',

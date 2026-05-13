@@ -55,48 +55,90 @@ class CaptainCancelPathPerfMissingTest(unittest.TestCase):
         return None
 
     def test_log_has_cancelled_before_batch_event(self) -> None:
-        """captain 폭주 시나리오가 log.txt 에 실제로 캡처되었는지 sanity."""
+        """captain 폭주 시나리오가 log.txt 에 캡처됐는지 sanity. cancel-before-batch
+        가 없는 로그는 옵션 3-a fix 후 다른 흐름으로 끝나는 정상 케이스 — skipTest."""
         cancelled_lines = [
             i for i, line in enumerate(self.log_lines)
             if 'cancelled-before-batch' in line
         ]
-        self.assertGreater(
-            len(cancelled_lines), 0,
-            'captain log.txt 에 cancelled-before-batch 이벤트가 없으면 '
-            '이 E2E 가 검증할 패턴 자체가 부재. 다른 캡처 필요.',
-        )
+        if not cancelled_lines:
+            self.skipTest(
+                '로그에 cancel-before-batch 이벤트 없음 — 옵션 3-a 후 budget '
+                '소진이 정상 publish 흐름(partial=true)으로 처리되는 패턴. '
+                '이 E2E 가 검증할 sanity 입력 부재.'
+            )
+        self.assertGreater(len(cancelled_lines), 0)
 
-    def test_cancelled_before_batch_is_not_followed_by_diagnostics_perf(
+    def test_cancelled_before_batch_was_not_followed_by_diagnostics_perf_historical(
         self,
     ) -> None:
-        """**버그 재현**: cancel 경로에서 [diagnostics:perf] 라인이 누락됨.
+        """**과거 버그 기록**: 옵션 3-a fix 이전, cancel 경로에서 [diagnostics:perf]
+        라인이 누락되어 recv-timeout 카운터가 captain 분석에 노출되지 않았음.
 
-        recv-timeout=N/1500ms 카운터는 [diagnostics:perf] 에만 노출되므로
-        cancel cycle 에서는 옵션 3 timeout 가드의 효과를 측정 불가능.
+        이 테스트는 옵션 3-a fix 가 적용된 production 빌드의 새 log.txt 가
+        오면 자동으로 무효화 (skipTest) — fix 의 historical marker.
         """
         cancelled_lines = [
             i for i, line in enumerate(self.log_lines)
             if 'cancelled-before-batch' in line
         ]
-        self.assertGreater(len(cancelled_lines), 0)
+        if not cancelled_lines:
+            self.skipTest('cancel-before-batch 라인 없음 (정상 phase 완료된 로그)')
 
-        cancel_perf_missing_count = 0
+        # cancel 다음 perf 라인이 즉시 따라오는 케이스 카운트
+        cancel_with_perf = 0
         for cancel_idx in cancelled_lines:
-            # cancel 후 다음 5라인 안에 diagnostics:perf 가 있는지?
-            perf_idx = self._line_after(
-                cancel_idx, r'\[diagnostics:perf\]', window=5
-            )
-            # 다음 phase 의 perf 가 끼어들면 안 됨 — 같은 cycle 안에서
-            # cancel 직전 phase 의 perf 여야 의미가 있음. 우리는 cancel
-            # 다음에 perf 가 즉시 따라오지 않는 것을 검증.
-            if perf_idx is None:
-                cancel_perf_missing_count += 1
+            # cancel 라인 직전 3라인 안에 perf 가 있는지 (옵션 3-a 는 cancel
+            # 'before' 에 emit 하므로 cancel 라인 직전).
+            for j in range(max(0, cancel_idx - 3), cancel_idx):
+                if '[diagnostics:perf]' in self.log_lines[j]:
+                    cancel_with_perf += 1
+                    break
 
-        self.assertEqual(
-            cancel_perf_missing_count, len(cancelled_lines),
-            f'cancelled-before-batch 경로 {len(cancelled_lines)}회 중 '
-            f'{cancel_perf_missing_count}회만 perf 미emit. 일관성 검증 — '
-            f'옵션 3-a fix 후 모든 cancel 경로에서 perf 가 emit 되어야 함.',
+        if cancel_with_perf == len(cancelled_lines):
+            self.skipTest(
+                f'옵션 3-a fix 가 production 에 반영됨 — cancel 경로 '
+                f'{cancel_with_perf}/{len(cancelled_lines)} 모두 perf 동반. '
+                f'이 historical marker 는 더 이상 의미 없음.'
+            )
+
+        # 아직 fix 가 production 에 반영 안 된 옛 로그 — 갭 노출
+        self.assertLess(
+            cancel_with_perf, len(cancelled_lines),
+            f'옵션 3-a fix 적용 전 캡처: cancelled-before-batch {len(cancelled_lines)}회 중 '
+            f'{cancel_with_perf}회만 perf 동반. 나머지는 추적 사각.',
+        )
+
+    def test_compiled_artifact_emits_perf_before_cancelled_before_batch(
+        self,
+    ) -> None:
+        """옵션 3-a fix 검증: 컴파일된 산출물의 cancel 경로 직전에
+        emitPerfSummary() 호출이 들어 있어야 함.
+        """
+        if not PROVIDERS_JS.exists():
+            self.skipTest('out/ 산출물 없음 — npm run compile 필요')
+        content = PROVIDERS_JS.read_text(encoding='utf-8')
+        self.assertIn(
+            'emitPerfSummary', content,
+            'emitPerfSummary 헬퍼가 산출물에 컴파일되어야 함',
+        )
+        # 실제 emit 호출 위치를 찾기 — `logDiagnosticPhase('cancelled-before-batch'` 패턴
+        # (코멘트 안의 문자열 매칭을 피함).
+        m = re.search(
+            r"logDiagnosticPhase\(\s*['\"]cancelled-before-batch['\"]",
+            content,
+        )
+        self.assertIsNotNone(
+            m, 'logDiagnosticPhase("cancelled-before-batch", ...) 호출이 있어야 함',
+        )
+        emit_idx = m.start()  # type: ignore[union-attr]
+        # 호출 이전 800자 안에 emitPerfSummary() 호출이 있어야 함
+        preceding = content[max(0, emit_idx - 800): emit_idx]
+        self.assertIn(
+            'emitPerfSummary', preceding,
+            'cancel-before-batch logDiagnosticPhase 호출 직전 800자 안에 '
+            'emitPerfSummary() 호출이 있어야 옵션 3-a fix 가 적용된 상태. ' +
+            '발췌:\n' + preceding[-300:],
         )
 
     def test_normal_publish_is_followed_by_diagnostics_perf(self) -> None:

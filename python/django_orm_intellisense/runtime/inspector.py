@@ -4,11 +4,23 @@ import dataclasses
 import importlib.util
 import os
 import sys
+import threading
 from dataclasses import dataclass
 
 _RUNTIME_FIELD_REGISTRY: dict[tuple[str, str], object] = {}
 _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE: str | None = None
 _RUNTIME_FIELD_REGISTRY_READY = False
+# 옵션 A2 — daemon initialize 가 background thread 로 registry pre-warm 을
+# 트리거. main thread 가 IPC 처리 도중 동시 호출 시 중복 build 방지를 위해
+# lock 으로 직렬화. 첫 thread 가 build, 후속 thread 는 ready 까지 wait.
+_RUNTIME_FIELD_REGISTRY_LOCK = threading.Lock()
+# E1+ — captain 의 registry build 가 14초 걸리는 동안 main thread IPC handler
+# 가 lock wait 12.7s 폭주. 자동 fallback timeout 으로 차단. acquire 실패 시
+# caller 가 즉시 fallback path (DEFAULT_LOOKUP_OPERATORS) 진입. build 완료 후
+# 다음 호출부터 ready fast-path 로 자동 회복. env 미설정으로도 작동.
+_RUNTIME_FIELD_REGISTRY_LOCK_TIMEOUT_S = float(
+    os.environ.get('DJLS_RUNTIME_REGISTRY_LOCK_TIMEOUT_S', '1.0') or '1.0'
+)
 
 
 @dataclass(frozen=True)
@@ -484,11 +496,124 @@ def get_runtime_field(
 def _ensure_runtime_field_registry(settings_module: str | None) -> None:
     global _RUNTIME_FIELD_REGISTRY_READY
 
+    # Fast path — lock 없이 ready 체크. 동시 호출 시 중복 build 가능성은
+    # acceptable: 그 다음 lock 안에서 다시 체크해서 false-positive 차단.
     if (
         _RUNTIME_FIELD_REGISTRY_READY
         and _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE == settings_module
     ):
         return
+
+    # E1 — DJLS_RUNTIME_REGISTRY_MODE env 로 build 우회 가능.
+    # 'skip' / 'subprocess' 두 모드 모두 main process 의 _RUNTIME_FIELD_REGISTRY
+    # 는 비어 유지. lookup_paths.py 의 _runtime_lookup_field 가 None 반환 →
+    # _resolve_lookup_chain 의 fallback 진입 (DEFAULT_LOOKUP_OPERATORS only).
+    # 트레이드오프: transform chain (date__year__gte 같은) 인식 안 됨. captain
+    # 의 일반 lookup 들은 단순 operator 라 fallback 으로 충분.
+    mode = os.environ.get('DJLS_RUNTIME_REGISTRY_MODE', 'full').lower()
+    if mode in ('skip', 'subprocess'):
+        with _RUNTIME_FIELD_REGISTRY_LOCK:
+            if (
+                _RUNTIME_FIELD_REGISTRY_READY
+                and _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE == settings_module
+            ):
+                return
+            _mark_registry_skipped(settings_module, mode=mode)
+        return
+
+    # 옵션 A2 — daemon initialize background thread + main thread IPC 가 동시에
+    # 진입할 수 있으므로 lock 으로 직렬화. 첫 진입 thread 만 build, 나머지는
+    # ready 까지 wait. E1+ — captain 의 14초 build 동안 main thread IPC handler
+    # 가 12.7s 폭주하는 것을 timeout 으로 차단. acquire 실패 시 fallback path.
+    acquired = _RUNTIME_FIELD_REGISTRY_LOCK.acquire(
+        timeout=_RUNTIME_FIELD_REGISTRY_LOCK_TIMEOUT_S,
+    )
+    if not acquired:
+        # registry build 가 lock 잡고 진행 중 — wait 포기하고 caller 에 즉시
+        # 제어 반환. lookup_paths 의 _runtime_lookup_field 가 registry 비어
+        # 있으면 None 반환하고 fallback 진입. 정확도 trade-off: transform
+        # chain 미인식 (default lookup operators 만). build 완료 후 다음 호출
+        # 부터 자동 회복.
+        print(
+            f'[runtime:registry-lock-timeout] settings={settings_module or "<unset>"} '
+            f'timeout={_RUNTIME_FIELD_REGISTRY_LOCK_TIMEOUT_S:.1f}s — '
+            f'lookup_paths uses fallback (build still in progress)',
+            file=sys.stderr, flush=True,
+        )
+        return
+    try:
+        if (
+            _RUNTIME_FIELD_REGISTRY_READY
+            and _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE == settings_module
+        ):
+            return
+        _ensure_runtime_field_registry_locked(settings_module)
+    finally:
+        _RUNTIME_FIELD_REGISTRY_LOCK.release()
+
+
+def _mark_registry_skipped(settings_module: str | None, *, mode: str) -> None:
+    """E1 — registry build 우회. main process 의 _RUNTIME_FIELD_REGISTRY 는
+    비어 유지. lookup_paths 가 fallback path 사용.
+
+    'subprocess' 모드는 별도 OS process 에서 django.setup() 시도 (transfer 안 함).
+    GIL 측면에서 main thread 영향 없음. 'skip' 모드는 build 자체 안 함.
+    """
+    global _RUNTIME_FIELD_REGISTRY_READY
+    if mode == 'subprocess' and settings_module:
+        _spawn_registry_build_subprocess(settings_module)
+    _set_runtime_field_registry(settings_module, {})
+    print(
+        f'[runtime:registry-skipped] mode={mode} '
+        f'settings={settings_module or "<unset>"} — '
+        f'main registry empty; lookup_paths uses DEFAULT_LOOKUP_OPERATORS fallback',
+        file=sys.stderr, flush=True,
+    )
+
+
+def _spawn_registry_build_subprocess(settings_module: str) -> None:
+    """별도 process 에서 django.setup() 실행. 결과 transfer 안 함 — 목적은
+    Django module import 의 OS file cache warming (다음 daemon 시작 시 ms 단위).
+    main process 는 즉시 return 하므로 GIL 영향 없음.
+    """
+    import multiprocessing as _mp
+
+    def _worker(sm: str) -> None:
+        try:
+            if importlib.util.find_spec('django') is None:
+                return
+            import django  # type: ignore
+
+            os.environ['DJANGO_SETTINGS_MODULE'] = sm
+            django.setup()
+        except Exception:
+            pass  # subprocess failure 는 main 에 영향 없음
+
+    try:
+        proc = _mp.Process(
+            target=_worker,
+            args=(settings_module,),
+            name='runtime-registry-subprocess',
+            daemon=True,
+        )
+        proc.start()
+    except Exception as error:
+        print(
+            f'[runtime:registry-subprocess] spawn failed: {error}',
+            file=sys.stderr, flush=True,
+        )
+
+
+def _ensure_runtime_field_registry_locked(settings_module: str | None) -> None:
+    """Build runtime field registry. Caller must hold the lock."""
+    global _RUNTIME_FIELD_REGISTRY_READY
+
+    # captain 옵션 6 — 첫 호출 시 django.setup() + 전체 모델 필드 enumeration
+    # 비용을 측정. captain 의 단일 resolveLookupPath 7185ms 폭주가 이 lazy
+    # 빌드가 동기 호출 안에서 일어났는지 검증.
+    import time as _time
+    _started = _time.perf_counter()
+    _stage_ms: dict[str, float] = {}
 
     if importlib.util.find_spec('django') is None or not settings_module:
         _clear_runtime_field_registry()
@@ -498,8 +623,10 @@ def _ensure_runtime_field_registry(settings_module: str | None) -> None:
     try:
         import django  # type: ignore
 
+        _t = _time.perf_counter()
         os.environ['DJANGO_SETTINGS_MODULE'] = settings_module
         django.setup()
+        _stage_ms['django_setup'] = (_time.perf_counter() - _t) * 1000
 
         from django.apps import apps  # type: ignore
     except Exception:
@@ -508,10 +635,15 @@ def _ensure_runtime_field_registry(settings_module: str | None) -> None:
         return
 
     runtime_field_registry: dict[tuple[str, str], object] = {}
+    _t = _time.perf_counter()
+    model_count = 0
+    field_count = 0
     for model in apps.get_models():
+        model_count += 1
         meta = model._meta
         model_label = f'{meta.app_label}.{meta.object_name}'
         for field in meta.get_fields(include_hidden=True):
+            field_count += 1
             if getattr(field, 'auto_created', False) and not getattr(field, 'concrete', True):
                 reverse_name = _relation_name(field)
                 if reverse_name:
@@ -523,8 +655,21 @@ def _ensure_runtime_field_registry(settings_module: str | None) -> None:
                 model_label=model_label,
                 field=field,
             )
+    _stage_ms['enumerate_fields'] = (_time.perf_counter() - _t) * 1000
 
     _set_runtime_field_registry(settings_module, runtime_field_registry)
+
+    total_ms = (_time.perf_counter() - _started) * 1000
+    # 100ms+ 빌드는 captain 분석에서 단일 IPC 폭주 후보. 항상 로그.
+    if total_ms >= 100:
+        stages = ','.join(f'{k}={v:.0f}ms' for k, v in sorted(_stage_ms.items()))
+        print(
+            f'[runtime:registry-build] settings={settings_module} '
+            f'models={model_count} fields={field_count} '
+            f'total={total_ms:.0f}ms stages=[{stages}]',
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _set_runtime_field_registry(

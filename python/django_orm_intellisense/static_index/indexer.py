@@ -406,6 +406,12 @@ class StaticIndex:
 
     def __post_init__(self) -> None:
         self._module_export_cache: dict[str, dict[str, ExportResolution]] = {}
+        # captain 옵션 6+ — resolve_export_origin 의 top-level (module, symbol)
+        # 캐시. 같은 (mod, sym) 페어가 receiver tracer chain 안에서 반복 호출
+        # 되는데 매번 _resolve_module_exports + _resolve_direct_module_attribute
+        # 두 단계 수행. 캡틴 측정: 56건/7480ms (1건 134ms 평균). 페어 캐시로
+        # cache hit 은 dict lookup 비용 (수십 ns) 로 단축.
+        self._export_origin_cache: dict[tuple[str, str], ExportResolution] = {}
         self._field_class_cache: dict[tuple[str, str], bool] = {}
         self._concrete_model_candidates = [
             candidate for candidate in self.model_candidates if not candidate.is_abstract
@@ -514,6 +520,39 @@ class StaticIndex:
         )
 
     def resolve_export_origin(
+        self,
+        module_name: str,
+        symbol: str,
+    ) -> ExportResolution:
+        # captain 옵션 6+ — (module, symbol) 페어 캐시. cache hit 은 dict
+        # lookup 비용. miss 시 builds + measures + emits slow log if >threshold.
+        key = (module_name, symbol)
+        cached = self._export_origin_cache.get(key)
+        if cached is not None:
+            return cached
+
+        import time as _time
+        import os as _os
+        import sys as _sys
+        _slow_threshold_ms = int(
+            _os.environ.get('DJLS_EXPORT_ORIGIN_SLOW_LOG_MS', '50') or '50'
+        )
+        _started = _time.perf_counter()
+
+        result = self._resolve_export_origin_uncached(module_name, symbol)
+        self._export_origin_cache[key] = result
+
+        elapsed_ms = (_time.perf_counter() - _started) * 1000
+        if _slow_threshold_ms > 0 and elapsed_ms >= _slow_threshold_ms:
+            print(
+                f'[export-origin:slow] module={module_name} symbol={symbol} '
+                f'elapsed={elapsed_ms:.0f}ms via={len(result.via_modules)} '
+                f'resolved={result.resolved} kind={result.resolution_kind}',
+                file=_sys.stderr, flush=True,
+            )
+        return result
+
+    def _resolve_export_origin_uncached(
         self,
         module_name: str,
         symbol: str,
@@ -2376,8 +2415,8 @@ def _expand_model_candidates_via_imports(
         seed_module: str, seed_symbol: str
     ) -> list[tuple[str, str]]:
         """seed (origin_module, origin_symbol)을 직접·간접(__init__.py
-        star re-export)으로 import하는 (importing_module, local_alias)
-        목록. 임의 깊이의 star 체인을 따라간다."""
+        star re-export, explicit same-name re-export)으로 import하는
+        (importing_module, local_alias) 목록. 임의 깊이의 chain 추적."""
         out: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
         stack: list[tuple[str, str]] = [(seed_module, seed_symbol)]
@@ -2386,7 +2425,17 @@ def _expand_model_candidates_via_imports(
             if (src_mod, sym) in seen:
                 continue
             seen.add((src_mod, sym))
-            out.extend(reverse_imports.get((src_mod, sym), ()))
+            direct_importers = reverse_imports.get((src_mod, sym), ())
+            out.extend(direct_importers)
+            # Captain regression — `zuzu/db/models/company/__init__.py` 가
+            # `from .company import Company` (explicit, non-star) 로 같은 이름
+            # 재노출 시, 그 패키지 모듈을 다시 import 한 곳까지 BFS 가 도달
+            # 해야 `Captable(Company)` 같은 transitive subclass 가 expand 에서
+            # 잡힘. star 만 push 하던 옛 로직은 explicit re-export chain 을
+            # 끊어버렸음.
+            for importing_module, alias in direct_importers:
+                if alias == sym:
+                    stack.append((importing_module, alias))
             for re_mod in star_re_exporters.get(src_mod, ()):
                 # star-importer는 같은 이름으로 sym을 노출하므로
                 # 그 자체가 importer이고, 이후 체인도 추적한다.

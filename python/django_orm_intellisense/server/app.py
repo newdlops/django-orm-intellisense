@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import contextlib
+import gzip
 import hashlib
 import json
 import multiprocessing
@@ -366,6 +368,12 @@ class DaemonServer:
                 )
                 continue
 
+            # captain 옵션 6+ — daemon-side queue wait 측정. dispatch 진입 시점
+            # 을 박아두면 handler 가 실제 호출되기까지의 GIL/worker starvation
+            # 시간을 분리해서 노출 가능. 모든 resolveModule(typing.ClassVar)
+            # 가 정확히 2627ms 동일 시간에 끝났다는 captain 증거를 검증.
+            request['_dequeued_at'] = time.perf_counter()
+
             if request.get('background'):
                 if self._bg_pool is not None:
                     # Background requests → separate OS processes (no GIL).
@@ -651,7 +659,20 @@ class DaemonServer:
         params = request.get('params') or {}
         background = request.get('background', False)
         source = request.get('source') or 'unknown'
+        # captain 옵션 6+ — queue wait + handler 본체 시간 분리.
+        # _dequeued_at 은 read loop 에서 박힘 (background submit 직전).
+        # handler entry 까지의 시간이 GIL/worker starvation 의 지표.
+        dequeued_at = request.get('_dequeued_at')
         started = time.perf_counter()
+        if isinstance(dequeued_at, (int, float)):
+            queue_wait_ms = (started - dequeued_at) * 1000
+            # 의미있는 wait (>=50ms) 만 emit — production noise 방지.
+            if queue_wait_ms >= 50:
+                print(
+                    f'[ipc:queue-wait] {request_id} method={method} '
+                    f'queue_wait={queue_wait_ms:.0f}ms background={background}',
+                    file=sys.stderr, flush=True,
+                )
         thread = threading.current_thread().name
 
         try:
@@ -949,39 +970,13 @@ class DaemonServer:
             f'elapsed={time.perf_counter() - started_at:.2f}s'
         )
 
-        surface_index = load_cached_surface_index(
-            workspace_root,
-            source_fingerprint=source_snapshot.fingerprint,
-            runtime_fingerprint=runtime_cache_fingerprint,
-        )
-        surface_index_status = 'load_cached'
-        should_prebuild_surface_index = False
-        if surface_index is not None:
-            # Captain regression: with a warm cache the prebuild path never
-            # runs, so its surface-vs-graph gap log never fires either.
-            # Run it explicitly here so cached-load sessions still surface
-            # the diagnostic (`[surface:gap]` etc.) needed to find why
-            # `db.Company` & friends were dropped.
-            from django_orm_intellisense.features.orm_members import log_surface_index_gap
-            log_surface_index_gap(static_index, model_graph, surface_index)
-        if surface_index is None:
-            if static_index.model_candidate_count <= INITIAL_SYNC_SURFACE_INDEX_MODEL_LIMIT:
-                surface_index = prebuild_member_surface_cache(
-                    static_index,
-                    runtime,
-                    model_graph,
-                )
-                save_surface_index(
-                    workspace_root,
-                    source_fingerprint=source_snapshot.fingerprint,
-                    runtime_fingerprint=runtime_cache_fingerprint,
-                    surface_index=surface_index,
-                )
-                surface_index_status = 'prebuild'
-            else:
-                surface_index = {}
-                surface_index_status = 'defer_prebuild'
-                should_prebuild_surface_index = True
+        # 옵션 D — surface_index 캐시 로드(captain 측정 1.68s)를 background 로
+        # 항상 옮김. cache miss 케이스의 prebuild 도 동일 background worker 에서
+        # 처리. main thread initialize 응답은 빈 surface_index 로 즉시 진행하고
+        # notification 으로 채워줌. cold-start ~1.5s 단축.
+        surface_index: dict[str, object] = {}
+        surface_index_status = 'defer_load_or_prebuild'
+        should_prebuild_surface_index = True
 
         if not self._apply_state(
             generation=generation,
@@ -1033,6 +1028,11 @@ class DaemonServer:
                 model_graph=model_graph,
                 model_names=model_names,
             )
+        # 옵션 A2 — runtime field registry 를 background 에서 미리 빌드.
+        # captain 의 첫 resolveLookupPath IPC 2.8s 폭주가 lazy `django.setup()`
+        # 때문 (옵션 6 분석 확정). initialize 응답 직전에 thread 시작 → 사용자가
+        # 첫 IPC 보낼 무렵 ready. 안 ready 면 lock 에서 wait (1회만 손해).
+        self._start_runtime_field_registry_prewarm(runtime)
         _log_initialize_step(
             f'complete elapsed={time.perf_counter() - started_at:.2f}s'
         )
@@ -1137,14 +1137,20 @@ class DaemonServer:
     ) -> None:
         started_at = time.perf_counter()
 
-        def _apply_surface_index(surface_index: dict[str, object]) -> None:
+        def _apply_surface_index(
+            surface_index: dict[str, object],
+            *,
+            from_cache: bool = False,
+        ) -> None:
             surface_fingerprints = fingerprint_surface_index(surface_index)
-            save_surface_index(
-                workspace_root,
-                source_fingerprint=source_snapshot.fingerprint,
-                runtime_fingerprint=_runtime_cache_fingerprint(runtime),
-                surface_index=surface_index,
-            )
+            # 옵션 D — cache 에서 로드한 경우 디스크 재기록 불필요.
+            if not from_cache:
+                save_surface_index(
+                    workspace_root,
+                    source_fingerprint=source_snapshot.fingerprint,
+                    runtime_fingerprint=_runtime_cache_fingerprint(runtime),
+                    surface_index=surface_index,
+                )
             static_fallback = self._build_static_fallback(
                 model_graph=model_graph,
                 surface_index=surface_index,
@@ -1167,8 +1173,9 @@ class DaemonServer:
                 self._last_static_fallback_fingerprint = static_fallback_fingerprint
                 self._last_custom_lookups_fingerprint = custom_lookups_fingerprint
 
+            stage = 'load_cached' if from_cache else 'prebuild'
             _log_initialize_step(
-                'prebuild_surface_index(background) '
+                f'{stage}_surface_index(background) '
                 f'models={len(surface_index)} '
                 f'elapsed={time.perf_counter() - started_at:.2f}s'
             )
@@ -1194,42 +1201,87 @@ class DaemonServer:
                 flush=True,
             )
 
-        if self._bg_pool is not None:
-            future = self._bg_pool.submit(_bg_prebuild_surface_index)
-            self._surface_prebuild_future = future
-
-            def _on_done(f: Any) -> None:
-                try:
-                    surface_index = f.result()
-                    _apply_surface_index(surface_index)
-                except Exception:
-                    _log_failure()
-                finally:
-                    if self._surface_prebuild_future is f:
-                        self._surface_prebuild_future = None
-
-            future.add_done_callback(_on_done)
-            return
-
-        def _fallback_worker() -> None:
+        def _background_worker() -> None:
+            # 옵션 D — cache hit 시도가 main thread 의 1.68s 비용. background
+            # thread 에서 시도하고 hit 면 즉시 apply (prebuild 안 함). miss 면
+            # 기존 prebuild 경로(process pool 또는 inline) 로 fallback.
             try:
-                surface_index = prebuild_member_surface_cache(
-                    static_index,
-                    runtime,
-                    model_graph,
+                cached = load_cached_surface_index(
+                    workspace_root,
+                    source_fingerprint=source_snapshot.fingerprint,
+                    runtime_fingerprint=_runtime_cache_fingerprint(runtime),
                 )
-                _apply_surface_index(surface_index)
+                if cached is not None:
+                    # captain regression: cache hit 케이스도 graph gap 진단
+                    # 으로그를 출력해야 db.Company 같은 누락 가시화.
+                    from django_orm_intellisense.features.orm_members import (
+                        log_surface_index_gap,
+                    )
+                    log_surface_index_gap(static_index, model_graph, cached)
+                    _apply_surface_index(cached, from_cache=True)
+                    return
+
+                # cache miss — prebuild. 기존 pool/fallback 분기 유지.
+                if self._bg_pool is not None:
+                    future = self._bg_pool.submit(_bg_prebuild_surface_index)
+                    surface_index = future.result()
+                else:
+                    surface_index = prebuild_member_surface_cache(
+                        static_index,
+                        runtime,
+                        model_graph,
+                    )
+                _apply_surface_index(surface_index, from_cache=False)
             except Exception:
                 _log_failure()
             finally:
                 self._surface_prebuild_future = None
 
         thread = threading.Thread(
-            target=_fallback_worker,
-            name='surface-index-prebuild',
+            target=_background_worker,
+            name='surface-index-load-or-prebuild',
             daemon=True,
         )
         self._surface_prebuild_future = thread
+        thread.start()
+
+    def _start_runtime_field_registry_prewarm(
+        self,
+        runtime: RuntimeInspection,
+    ) -> None:
+        """daemon initialize 끝에 호출. background thread 가 Django setup +
+        runtime field registry build 를 미리 진행. captain 의 첫 IPC 폭주(2.8s)
+        가 사용자 응답 대기 시간이 아니라 background 시간으로 이동.
+        """
+        if runtime.bootstrap_status != 'ready' or not runtime.settings_module:
+            return
+
+        from ..runtime.inspector import _ensure_runtime_field_registry
+
+        settings_module = runtime.settings_module
+
+        def _bg_prewarm() -> None:
+            started = time.perf_counter()
+            try:
+                _ensure_runtime_field_registry(settings_module)
+            except Exception:
+                print(
+                    '[initialize] runtime_field_registry(background) failed '
+                    f'{traceback.format_exc(limit=6)}',
+                    file=sys.stderr, flush=True,
+                )
+                return
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            _log_initialize_step(
+                f'runtime_field_registry(background) ready '
+                f'elapsed={elapsed_ms:.0f}ms'
+            )
+
+        thread = threading.Thread(
+            target=_bg_prewarm,
+            name='runtime-field-registry-prewarm',
+            daemon=True,
+        )
         thread.start()
 
     def _start_source_snapshot_verification(
@@ -1922,15 +1974,55 @@ class DaemonServer:
         with self._write_lock:
             serialized = json.dumps(payload, sort_keys=True)
             request_id = payload.get('id')
-            size_kb = len(serialized) / 1024
-            if size_kb >= 10:
-                print(
-                    f'[ipc:write] {request_id} payload={size_kb:.1f}KB',
-                    file=sys.stderr,
-                    flush=True,
-                )
-            self._real_stdout.write(serialized + '\n')
+            raw_size_kb = len(serialized) / 1024
+            # 옵션 C — payload 가 임계값을 넘으면 gzip+base64 로 wrap.
+            # captain log.txt 의 initialize 22.8MB 가 한 줄 stdout 송신 +
+            # JSON.parse 비용을 모두 부담함. gzip 으로 ~10x 압축 가능.
+            line, kind = _maybe_compress_ipc_payload(serialized)
+            final_size_kb = len(line) / 1024
+            if raw_size_kb >= 10:
+                if kind == 'gzip+b64':
+                    print(
+                        f'[ipc:write] {request_id} payload={final_size_kb:.1f}KB '
+                        f'(raw={raw_size_kb:.1f}KB enc={kind})',
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f'[ipc:write] {request_id} payload={final_size_kb:.1f}KB',
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            self._real_stdout.write(line + '\n')
             self._real_stdout.flush()
+
+
+# 옵션 C — IPC payload 압축 임계값.
+# captain 의 initialize 22.8MB 같은 케이스에서 gzip ~10x 압축으로 cold-start
+# 단축. env DJLS_IPC_COMPRESS_MIN_KB=0 으로 비활성, =1 같이 매우 낮으면 모든
+# 메시지 압축 (테스트용).
+_IPC_COMPRESS_MIN_KB = int(
+    os.environ.get('DJLS_IPC_COMPRESS_MIN_KB', '256') or '256'
+)
+_IPC_COMPRESS_PREFIX = '{"_enc":"gzip+b64","data":"'
+_IPC_COMPRESS_SUFFIX = '"}'
+
+
+def _maybe_compress_ipc_payload(serialized: str) -> tuple[str, str | None]:
+    """Wrap serialized JSON in gzip+base64 envelope when above threshold.
+
+    Returns (line_to_send, encoding_or_None). 호환성: TS client 가 `_enc`
+    필드 못 보면 fallback 처리되어야 함 — 현재 새 client 빌드만 지원.
+    """
+    if _IPC_COMPRESS_MIN_KB <= 0:
+        return serialized, None
+    if len(serialized) < _IPC_COMPRESS_MIN_KB * 1024:
+        return serialized, None
+    compressed = gzip.compress(serialized.encode('utf-8'), compresslevel=6)
+    b64 = base64.b64encode(compressed).decode('ascii')
+    envelope = _IPC_COMPRESS_PREFIX + b64 + _IPC_COMPRESS_SUFFIX
+    return envelope, 'gzip+b64'
 
 
 def _clean_optional_string(value: Any) -> str | None:

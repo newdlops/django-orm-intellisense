@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import os
+import sys
+import time
+
 from ..runtime.inspector import RuntimeInspection, get_runtime_field
 from ..semantic.graph import ModelGraph
 from ..static_index.indexer import FieldCandidate
+
+# captain 옵션 6 관측 — daemon-side resolve_lookup_path 의 단계별 elapsed.
+# 임계값 초과 시에만 단계 분해 로그 emit (정상 케이스 로그 noise 방지).
+# 0 으로 설정 시 비활성.
+_LOOKUP_PATH_SLOW_LOG_MS = int(
+    os.environ.get('DJLS_LOOKUP_PATH_SLOW_LOG_MS', '500') or '500'
+)
 
 RELATION_ONLY_METHODS = {'select_related', 'prefetch_related'}
 ATTRIBUTE_PATH_METHODS = {'select_related', 'prefetch_related', 'only', 'defer'}
@@ -47,6 +58,12 @@ def resolve_lookup_path(
     path: str,
     method: str,
 ) -> dict[str, object]:
+    # captain 옵션 6 — 단계별 elapsed 누적 후 임계 초과 시 한꺼번에 emit.
+    _started_total = time.perf_counter()
+    _stage_ms: dict[str, float] = {}
+    _lookup_chain_calls = 0
+    _lookup_chain_total_ms = 0.0
+
     normalized_path = _normalize_lookup_path(path, method)
     if not normalized_path:
         return {
@@ -60,20 +77,96 @@ def resolve_lookup_path(
     terminal_field: FieldCandidate | None = None
     lookup_operator: str | None = None
 
-    for index, segment in enumerate(segments):
-        field = _lookup_field_for_method(
+    def _maybe_log_slow() -> None:
+        total_ms = (time.perf_counter() - _started_total) * 1000
+        if total_ms < _LOOKUP_PATH_SLOW_LOG_MS:
+            return
+        stages = ','.join(
+            f'{k}={v:.0f}ms' for k, v in sorted(_stage_ms.items())
+        ) or 'none'
+        chain_part = (
+            f' chain_calls={_lookup_chain_calls} '
+            f'chain_total={_lookup_chain_total_ms:.0f}ms'
+            if _lookup_chain_calls
+            else ''
+        )
+        print(
+            f'[lookup-path:slow] {base_model_label} {path} method={method} '
+            f'segments={len(segments)} total={total_ms:.0f}ms '
+            f'stages=[{stages}]{chain_part}',
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _timed_lookup_field(
+        *, model_label: str, field_name: str,
+    ) -> FieldCandidate | None:
+        nonlocal _stage_ms
+        _t = time.perf_counter()
+        result = _lookup_field_for_method(
             model_graph=model_graph,
+            model_label=model_label,
+            field_name=field_name,
+            method=method,
+        )
+        elapsed = (time.perf_counter() - _t) * 1000
+        _stage_ms['graph_find'] = _stage_ms.get('graph_find', 0.0) + elapsed
+        return result
+
+    def _timed_lookup_chain(
+        *, field: FieldCandidate, segments: list[str],
+    ) -> dict[str, object]:
+        nonlocal _lookup_chain_calls, _lookup_chain_total_ms
+        _t = time.perf_counter()
+        result = _resolve_lookup_chain(
+            runtime=runtime, field=field, segments=segments,
+        )
+        elapsed = (time.perf_counter() - _t) * 1000
+        _lookup_chain_calls += 1
+        _lookup_chain_total_ms += elapsed
+        return result
+
+    try:
+        return _resolve_impl(
+            base_model_label=base_model_label,
+            path=path,
+            method=method,
+            segments=segments,
+            current_model_label=current_model_label,
+            resolved_segments=resolved_segments,
+            terminal_field=terminal_field,
+            lookup_operator=lookup_operator,
+            timed_lookup_field=_timed_lookup_field,
+            timed_lookup_chain=_timed_lookup_chain,
+        )
+    finally:
+        _maybe_log_slow()
+
+
+def _resolve_impl(
+    *,
+    base_model_label: str,
+    path: str,
+    method: str,
+    segments: list[str],
+    current_model_label: str,
+    resolved_segments: list[dict[str, object]],
+    terminal_field: FieldCandidate | None,
+    lookup_operator: str | None,
+    timed_lookup_field,
+    timed_lookup_chain,
+) -> dict[str, object]:
+    for index, segment in enumerate(segments):
+        field = timed_lookup_field(
             model_label=current_model_label,
             field_name=segment,
-            method=method,
         )
         if field is None:
             if (
                 method in FILTER_LOOKUP_METHODS
                 and terminal_field is not None
             ):
-                lookup_resolution = _resolve_lookup_chain(
-                    runtime=runtime,
+                lookup_resolution = timed_lookup_chain(
                     field=terminal_field,
                     segments=segments[index:],
                 )
@@ -102,19 +195,16 @@ def resolve_lookup_path(
 
         next_segment = segments[index + 1]
         if field.is_relation and field.related_model_label:
-            next_field = _lookup_field_for_method(
-                model_graph=model_graph,
+            next_field = timed_lookup_field(
                 model_label=field.related_model_label,
                 field_name=next_segment,
-                method=method,
             )
             if next_field is not None:
                 current_model_label = field.related_model_label
                 continue
 
             if method in FILTER_LOOKUP_METHODS:
-                lookup_resolution = _resolve_lookup_chain(
-                    runtime=runtime,
+                lookup_resolution = timed_lookup_chain(
                     field=field,
                     segments=segments[index + 1:],
                 )
@@ -137,8 +227,7 @@ def resolve_lookup_path(
 
         if not field.is_relation or not field.related_model_label:
             if method in FILTER_LOOKUP_METHODS:
-                lookup_resolution = _resolve_lookup_chain(
-                    runtime=runtime,
+                lookup_resolution = timed_lookup_chain(
                     field=field,
                     segments=segments[index + 1:],
                 )

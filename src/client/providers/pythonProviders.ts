@@ -1286,6 +1286,35 @@ export function registerPythonProviders(
         `[diagnostics:phase] ${phase} ${phaseMs.toFixed(0)}ms total=${totalMs}ms requests=${diagnosticRequestCount}${detail ? ` ${detail}` : ''}`
       );
     };
+    // captain 옵션 3-a — phase 가 cancel-before-batch 로 일찍 끝날 때도
+    // perf summary 가 동일하게 emit 되도록 헬퍼화. 정상 publish 와 같은
+    // 포맷으로 emit 해야 recv-timeout / ipc-by-method 등 카운터가 그 cycle
+    // 에서도 노출됨. captain 의 9171ms cap 우회 진단이 가능해짐.
+    const emitPerfSummary = (): void => {
+      const receiverCacheTotal = perfReceiverCacheHit + perfReceiverCacheMiss;
+      const lookupCacheTotal = perfLookupPathCacheHit + perfLookupPathCacheMiss;
+      const scanCacheTotal = perfScanCacheHit + perfScanCacheMiss;
+      const cycleWallMs = Date.now() - diagnosticStartTime;
+      const ipcDelta = daemon.diffIpcStats(perfIpcBaseline);
+      const ipcBreakdown = ipcDelta.length === 0
+        ? 'none'
+        : ipcDelta
+            .map((e) => `${e.method}=${e.count}/${e.totalMs.toFixed(0)}ms`)
+            .join(',');
+      daemon.logDiagnostic(
+        `[diagnostics:perf] wall=${cycleWallMs}ms ` +
+        `recv-cache=${perfReceiverCacheHit}/${receiverCacheTotal} ` +
+        `recv-stale-invalidate=${perfReceiverCacheStaleInvalidated} ` +
+        `recv-timeout=${perfReceiverTimeoutCount}/${PER_RECEIVER_TIMEOUT_MS}ms ` +
+        `lookup-cache=${perfLookupPathCacheHit}/${lookupCacheTotal} ` +
+        `scan-cache=${perfScanCacheHit}/${scanCacheTotal} ` +
+        `recv-ipc-ms=${perfReceiverIpcMs.toFixed(0)} ` +
+        `lookup-ipc-ms=${perfLookupPathIpcMs.toFixed(0)} ` +
+        `requests=${diagnosticRequestCount} ` +
+        `partial=${diagnosticBudgetLogged} ` +
+        `ipc-by-method=[${ipcBreakdown}]`
+      );
+    };
     const isDiagnosticsCancelled = () => {
       if (diagnosticsDisposed || document.version !== documentVersion) {
         return true;
@@ -1362,7 +1391,7 @@ export function registerPythonProviders(
     } else {
       perfScanCacheMiss++;
       _relationContexts = findRelationDiagnosticContexts(document, visStartLine, visEndLine);
-      _lookupContexts = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, visStartLine, visEndLine);
+      _lookupContexts = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, visStartLine, visEndLine, daemon);
       _scanCache.relations.push(..._relationContexts);
       _scanCache.lookups.push(..._lookupContexts);
       intervalsAdd(_scanCache.scanned, visStartLine, visEndLine);
@@ -1491,13 +1520,18 @@ export function registerPythonProviders(
             }, PER_RECEIVER_TIMEOUT_MS);
           }
         );
+        // captain #1 — receiver tracer 안에서도 deadline 인지하도록 Date.now()
+        // 기반 deadline 전달. Promise.race 의 setTimeout 이 event loop 점유로
+        // 늦게 fire 해도 receiver tracer 가 cooperative 하게 자체 cancel.
+        const deadlineMs = Date.now() + PER_RECEIVER_TIMEOUT_MS;
         try {
           const raced = await Promise.race([
             resolveLookupReceiverInfoForReceiver(
               daemon,
               document,
               context.receiverExpression,
-              context.range.end
+              context.range.end,
+              deadlineMs,
             ),
             timeoutPromise,
           ]);
@@ -1632,53 +1666,67 @@ export function registerPythonProviders(
     const _receiverMissSamples = new Set<string>();
     const _receiverMissReasonCounts = new Map<string, number>();
     const VISIBLE_NO_RECV_SAMPLE_LIMIT = 5;
-    for (const context of _validatedLookupContexts) {
+    // 옵션 3-c — receiver 추적을 phase 안에서 병렬 처리. 시리얼 await loop 은
+    // captain user/app_user.py:141 처럼 6 slow × 1500ms cap = 9s 누적으로 phase
+    // budget 소진. Promise.all 로 동시에 시작하면 worst-case = max(cap, fast) =
+    // 1500ms 한 번. daemon BG fallback worker 가 inflight 18개 동시 처리 부하는
+    // 짧고, captain 측에서 이미 inflight=6/peak=7 관찰 — 안전 범위.
+    const _receiverResolutions = await Promise.all(
+      _validatedLookupContexts.map(async (context) => {
+        if (isDiagnosticsCancelled()) {
+          return { context, receiver: null as OrmReceiverInfo | null };
+        }
+        try {
+          const receiver = await resolveCachedLookupReceiverInfo(context);
+          return { context, receiver };
+        } catch {
+          return { context, receiver: null as OrmReceiverInfo | null };
+        }
+      }),
+    );
+    // 결과 처리는 시리얼 (cache effect / sample collection 일관성 유지). 동시
+    // 시작 → 동기 후처리 패턴.
+    for (const { context, receiver: lookupReceiver } of _receiverResolutions) {
       if (isDiagnosticsCancelled()) break;
-      try {
-        const lookupReceiver = await resolveCachedLookupReceiverInfo(context);
-        if (isDiagnosticsCancelled()) break;
-        if (!lookupReceiver) {
-          _receiverMisses++;
-          const reason = classifyNoRecvReason(daemon, context.receiverExpression || '');
-          _receiverMissReasonCounts.set(reason, (_receiverMissReasonCounts.get(reason) ?? 0) + 1);
-          if (_receiverMissSamples.size < VISIBLE_NO_RECV_SAMPLE_LIMIT) {
-            const raw = (context.receiverExpression || '').replace(/\s+/g, ' ').trim();
-            if (raw) {
-              const truncated = raw.length > 80 ? raw.slice(0, 77) + '...' : raw;
-              _receiverMissSamples.add(`${truncated}#${reason}`);
-            }
+      if (!lookupReceiver) {
+        _receiverMisses++;
+        const reason = classifyNoRecvReason(daemon, context.receiverExpression || '');
+        _receiverMissReasonCounts.set(reason, (_receiverMissReasonCounts.get(reason) ?? 0) + 1);
+        if (_receiverMissSamples.size < VISIBLE_NO_RECV_SAMPLE_LIMIT) {
+          const raw = (context.receiverExpression || '').replace(/\s+/g, ' ').trim();
+          if (raw) {
+            const truncated = raw.length > 80 ? raw.slice(0, 77) + '...' : raw;
+            _receiverMissSamples.add(`${truncated}#${reason}`);
           }
-          continue;
         }
-
-        const virtualRes = resolveVirtualLookupPath(lookupReceiver, context.value, context.method);
-        if (virtualRes?.resolved) {
-          // Virtual lookup resolved successfully — skip daemon
-          _virtualResolved++;
-          continue;
-        }
-        // Phantom receiver short-circuit: same rationale as the phase2
-        // branch — synthesizing a manager with a bare PascalCase label
-        // means the daemon has no record of the model. Calling
-        // resolveLookupPath wastes hundreds of ms per call.
-        if (lookupReceiver.synthetic === 'phantom-objects') {
-          continue;
-        }
-        // virtualRes is null or { resolved: false } — need daemon resolution
-
-        _lookupPending.push({
-          context, receiver: lookupReceiver,
-          baseModelLabel: lookupReceiver.modelLabel,
-          batchIdx: _batchItems.length,
-        });
-        _batchItems.push({
-          baseModelLabel: lookupReceiver.modelLabel,
-          value: context.value,
-          method: context.method,
-        });
-      } catch {
         continue;
       }
+
+      const virtualRes = resolveVirtualLookupPath(lookupReceiver, context.value, context.method);
+      if (virtualRes?.resolved) {
+        // Virtual lookup resolved successfully — skip daemon
+        _virtualResolved++;
+        continue;
+      }
+      // Phantom receiver short-circuit: same rationale as the phase2
+      // branch — synthesizing a manager with a bare PascalCase label
+      // means the daemon has no record of the model. Calling
+      // resolveLookupPath wastes hundreds of ms per call.
+      if (lookupReceiver.synthetic === 'phantom-objects') {
+        continue;
+      }
+      // virtualRes is null or { resolved: false } — need daemon resolution
+
+      _lookupPending.push({
+        context, receiver: lookupReceiver,
+        baseModelLabel: lookupReceiver.modelLabel,
+        batchIdx: _batchItems.length,
+      });
+      _batchItems.push({
+        baseModelLabel: lookupReceiver.modelLabel,
+        value: context.value,
+        method: context.method,
+      });
     }
     const _visibleNoRecvReasonsPart = _receiverMissReasonCounts.size > 0
       ? ` noRecvReasons=${[..._receiverMissReasonCounts.entries()]
@@ -1699,6 +1747,10 @@ export function registerPythonProviders(
 
     // Pass 2: Batch resolve lookup paths
     if (isDiagnosticsCancelled()) {
+      // captain 옵션 3-a — cancel 직전에도 perf summary 를 emit 해서 cap 발동
+      // 카운터가 노출되도록. captain log.txt:144 의 `cancelled-before-batch`
+      // 직후 [diagnostics:perf] 가 없어서 9171ms cap 우회 측정이 불가능했음.
+      emitPerfSummary();
       logDiagnosticPhase('cancelled-before-batch', performance.now(), `diagnostics=${diagnostics.length}`);
       // If the cancellation was caused by budget exhaustion (not by disposal
       // or version change), mark the version so tracked-refresh storms do not
@@ -1854,7 +1906,7 @@ export function registerPythonProviders(
         } else {
           perfScanCacheMiss++;
           extraRelations = findRelationDiagnosticContexts(document, rStart, rEnd);
-          extraLookups = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, rStart, rEnd);
+          extraLookups = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, rStart, rEnd, daemon);
           scanCache.relations.push(...extraRelations);
           scanCache.lookups.push(...extraLookups);
           intervalsAdd(scanCache.scanned, rStart, rEnd);
@@ -2282,35 +2334,9 @@ export function registerPythonProviders(
     // needs to know "where did the budget go" — wall-time alone doesn't
     // distinguish slow IPCs from cache miss explosions. This one-line dump
     // shows cache effectiveness and IPC time consumed in the cycle.
-    const receiverCacheTotal = perfReceiverCacheHit + perfReceiverCacheMiss;
-    const lookupCacheTotal = perfLookupPathCacheHit + perfLookupPathCacheMiss;
-    const scanCacheTotal = perfScanCacheHit + perfScanCacheMiss;
-    const cycleWallMs = Date.now() - diagnosticStartTime;
-    // Per-IPC-method delta for this cycle: receiver-chain analysis needs
-    // to break recv-ipc-ms down into resolveRelationTarget vs
-    // resolveExportOrigin vs resolveModule vs resolveOrmMember. Each of
-    // those is a separate daemon round-trip; the chain calls them serially
-    // inside `resolveLookupReceiverInfoForReceiver`, so the slow one is
-    // the actual bottleneck.
-    const ipcDelta = daemon.diffIpcStats(perfIpcBaseline);
-    const ipcBreakdown = ipcDelta.length === 0
-      ? 'none'
-      : ipcDelta
-          .map((e) => `${e.method}=${e.count}/${e.totalMs.toFixed(0)}ms`)
-          .join(',');
-    daemon.logDiagnostic(
-      `[diagnostics:perf] wall=${cycleWallMs}ms ` +
-      `recv-cache=${perfReceiverCacheHit}/${receiverCacheTotal} ` +
-      `recv-stale-invalidate=${perfReceiverCacheStaleInvalidated} ` +
-      `recv-timeout=${perfReceiverTimeoutCount}/${PER_RECEIVER_TIMEOUT_MS}ms ` +
-      `lookup-cache=${perfLookupPathCacheHit}/${lookupCacheTotal} ` +
-      `scan-cache=${perfScanCacheHit}/${scanCacheTotal} ` +
-      `recv-ipc-ms=${perfReceiverIpcMs.toFixed(0)} ` +
-      `lookup-ipc-ms=${perfLookupPathIpcMs.toFixed(0)} ` +
-      `requests=${diagnosticRequestCount} ` +
-      `partial=${diagnosticBudgetLogged} ` +
-      `ipc-by-method=[${ipcBreakdown}]`
-    );
+    // 헬퍼는 cancel-before-batch 경로에서도 호출되어 옵션 3 cap 발동 여부를
+    // 노출. 정의는 위쪽 closure 에 있음.
+    emitPerfSummary();
 
     diagnosticCollection.set(document.uri, diagnostics);
     logDiagnosticPhase(
@@ -7515,33 +7541,68 @@ async function findLookupDiagnosticContexts(
   document: vscode.TextDocument,
   isCancelled: () => boolean,
   startLine = 0,
-  endLine = document.lineCount
+  endLine = document.lineCount,
+  daemonForLogging?: AnalysisDaemon,
 ): Promise<LookupDiagnosticContext[]> {
   const contexts: LookupDiagnosticContext[] = [];
   const seen = new Set<string>();
-  // Chunk size for cooperative yielding. Bumped from 50 → 250 because the
-  // captain trace showed cold-start phase2-scan inflating from ~500ms to
-  // 4241ms when the daemon was concurrently sending a 22MB surface payload:
-  // each `setTimeout(0)` yield waited for the IPC handler to drain a chunk
-  // of that payload. With 250 lines per chunk we yield ~5× less often, so
-  // the scan no longer interleaves with every daemon write while staying
-  // small enough that cancellation latency stays under ~50ms.
-  const SCAN_CHUNK_LINES = 250;
+  // captain 첫 cycle phase2-scan:350-2498 5.3s 폭주 분석 (log.txt L80):
+  //   2148 lines / chunk=250 → 8 yields × ~600ms = 4.8s
+  //   원인: setTimeout(0) 은 macrotask 라 background daemon IPC drain 과 시리얼
+  //   wait. registry build 등 다른 IPC 가 macrotask 큐 점유.
+  // Fix: (1) chunk 250 → 1000 (yield 횟수 1/4 로 축소)
+  //      (2) setTimeout(0) → Promise.resolve() (microtask 즉시 yield)
+  //   trade-off: cancellation latency 가 ~50ms → ~200ms (1000 lines 처리 후 체크)
+  //   — 사용자 체감 가능 한계 안. microtask burst 가 옵션 3 setTimeout cap 발화
+  //   막을 수 있지만, #1 fix 의 Date.now() deadline 이 우회로 안전.
+  const SCAN_CHUNK_LINES = 1000;
   const lineCount = endLine - startLine;
   const isSmallFile = lineCount < 500;
+
+  // E — captain phase2-scan 5.3s 정체 분석용 timing. 임계 (1초+) 초과 시
+  // [phase2-scan:breakdown] stderr emit. 정상 케이스 영향 없음.
+  // 단순한 단위로 시작 — VSCode API (lineAt/offsetAt) vs regex 본체.
+  const _scanStart = performance.now();
+  let _timeLineAt = 0;        // document.lineAt() VSCode API
+  let _timeOffsetAt = 0;      // document.offsetAt() + new Position
+  let _matchCount = 0;        // 매칭된 lookup 개수
 
   for (let line = startLine; line < endLine; line += 1) {
     // Yield every SCAN_CHUNK_LINES to keep event loop responsive
     // Skip yielding for small files where synchronous scan is fast enough
     if (!isSmallFile && line > 0 && line % SCAN_CHUNK_LINES === 0) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      // microtask yield — macrotask wait 없이 즉시 다음 tick
+      await Promise.resolve();
       if (isCancelled()) { return contexts; }
     }
+    const _tL = performance.now();
     const lineText = document.lineAt(line).text;
+    _timeLineAt += performance.now() - _tL;
+    const _tO = performance.now();
     const lineStartOffset = document.offsetAt(new vscode.Position(line, 0));
+    _timeOffsetAt += performance.now() - _tO;
     const excludedWordRanges: Array<{ start: number; end: number }> = [];
 
-    for (const match of lineText.matchAll(LOOKUP_HOVER_PATTERN)) {
+    // captain 측정 (log L87) — regex_other=2661ms / 2198 lines / matches=0:
+    // matchAll generator iterator 자체가 line 당 0.24ms 누적. lookup method
+    // 이름이 없는 line 은 matchAll skip 가능. lightweight indexOf prefilter.
+    // false-negative 안전: 각 regex 의 mandatory substring 정확히 추출.
+    const hasLookupMethodHint =
+      lineText.indexOf('.values(') >= 0 ||
+      lineText.indexOf('.values_list(') >= 0 ||
+      lineText.indexOf('.order_by(') >= 0 ||
+      lineText.indexOf('.only(') >= 0 ||
+      lineText.indexOf('.defer(') >= 0 ||
+      lineText.indexOf('.select_related(') >= 0 ||
+      lineText.indexOf('.prefetch_related(') >= 0;
+    const hasPrefetchHint = lineText.indexOf('Prefetch(') >= 0;
+    const hasFExpressionHint = lineText.indexOf('F(') >= 0;
+    // captain 다음 측정: DICT_KEY + EXPRESSION_STRING regex 도 quote 필수.
+    // captain 의 코멘트/empty/simple code line 은 quote 없음 → matchAll skip.
+    const hasQuote =
+      lineText.indexOf('"') >= 0 || lineText.indexOf("'") >= 0;
+
+    if (hasLookupMethodHint) for (const match of lineText.matchAll(LOOKUP_HOVER_PATTERN)) {
       const [, method, , value] = match;
       const prefix = match[0];
       const localOffset = prefix.lastIndexOf(value);
@@ -7553,6 +7614,7 @@ async function findLookupDiagnosticContexts(
         continue;
       }
       seen.add(key);
+      _matchCount++;
 
       // Defer expensive querysetStringCallContext to the async processing
       // loop.  The receiver expression is resolved lazily to avoid blocking
@@ -7567,7 +7629,7 @@ async function findLookupDiagnosticContexts(
       } as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number });
     }
 
-    for (const match of lineText.matchAll(PREFETCH_LOOKUP_HOVER_PATTERN)) {
+    if (hasPrefetchHint) for (const match of lineText.matchAll(PREFETCH_LOOKUP_HOVER_PATTERN)) {
       const value = match[2];
       const prefix = match[0];
       const localOffset = prefix.lastIndexOf(value);
@@ -7591,7 +7653,7 @@ async function findLookupDiagnosticContexts(
       } as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number; _isPrefetch?: boolean });
     }
 
-    for (const match of lineText.matchAll(LOOKUP_DICT_KEY_HOVER_PATTERN)) {
+    if (hasQuote) for (const match of lineText.matchAll(LOOKUP_DICT_KEY_HOVER_PATTERN)) {
       const value = match[2];
       const prefix = match[0];
       const localOffset = prefix.lastIndexOf(value);
@@ -7621,7 +7683,7 @@ async function findLookupDiagnosticContexts(
       } as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number; _absoluteEnd?: number; _isDictKey?: boolean });
     }
 
-    for (const match of lineText.matchAll(F_EXPRESSION_HOVER_PATTERN)) {
+    if (hasFExpressionHint) for (const match of lineText.matchAll(F_EXPRESSION_HOVER_PATTERN)) {
       const value = match[2];
       const prefix = match[0];
       const localOffset = prefix.lastIndexOf(value);
@@ -7644,7 +7706,7 @@ async function findLookupDiagnosticContexts(
       } as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number; _isFExpression?: boolean });
     }
 
-    for (const match of lineText.matchAll(EXPRESSION_STRING_HOVER_PATTERN)) {
+    if (hasQuote) for (const match of lineText.matchAll(EXPRESSION_STRING_HOVER_PATTERN)) {
       const value = match[2];
       const start = (match.index ?? 0) + 1;
       const absoluteStart = lineStartOffset + start;
@@ -7667,9 +7729,35 @@ async function findLookupDiagnosticContexts(
       } as LookupDiagnosticContext & { _needsCallContextValidation?: boolean; _absoluteStart?: number; _absoluteEnd?: number; _isExpressionPath?: boolean });
     }
 
-    for (const match of lineText.matchAll(/[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/g)) {
+    // captain 분석: 이 identifier regex 가 매 word 마다 keywordLookupLiteral
+    // 호출 → vscode getWordRangeAtPosition + getText + offsetAt 등 API 다수.
+    // 2198 lines × 10+ identifier = 20000+ vscode API call. 진짜 hotspot.
+    // keyword argument 는 `name=value` 패턴 — line 에 `=` 가 없으면 skip.
+    // false-negative 안전: keyword arg 가 다른 형식으로 표현될 수 없음.
+    const hasEqualsKeyword = lineText.indexOf('=') >= 0;
+    if (hasEqualsKeyword) for (const match of lineText.matchAll(/[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/g)) {
       const start = match.index ?? 0;
       const value = match[0];
+      // captain identifier regex hotspot 차단: keywordLookupLiteral 안의
+      // vscode API 호출 다수 (getWordRangeAtPosition, getText, offsetAt × 2,
+      // querysetKeywordCallContext) — 매 word 마다. captain workspace 측정:
+      // bare-field keyword (filter(name='x'))=4684, __operator (filter(x__lte=1))=1155
+      // 즉 80% 가 bare-field. 단순 `value.includes('__')` prefilter 는 80%
+      // 진단 누락 (regression). 대신 identifier 직후가 `=` (not `==`) 인지
+      // lookahead — keyword arg 형태인지 검증. 일반 identifier (locals, var
+      // 등) 는 직후가 `=` 아님 → skip. captain 의 keywordLookupLiteral 호출
+      // 빈도 ~95%+ 감소 추정.
+      const afterEnd = start + value.length;
+      let lookahead = afterEnd;
+      while (lookahead < lineText.length && lineText[lookahead] === ' ') {
+        lookahead++;
+      }
+      const nextChar = lineText[lookahead];
+      const nextNextChar = lineText[lookahead + 1];
+      // `=` 인데 `==` (비교) 가 아니면 keyword arg 후보.
+      if (nextChar !== '=' || nextNextChar === '=') {
+        continue;
+      }
       if (
         excludedWordRanges.some(
           (range) => start >= range.start && start < range.end
@@ -7697,6 +7785,30 @@ async function findLookupDiagnosticContexts(
         ...context,
         range,
       });
+    }
+  }
+
+  // E — captain phase2-scan 5.3s 정체 분석. 임계 1000ms 초과 시 stderr emit.
+  const _scanTotal = performance.now() - _scanStart;
+  const _SCAN_SLOW_LOG_MS = Number(
+    process.env.DJLS_PHASE2_SCAN_SLOW_LOG_MS ?? 1000
+  ) || 1000;
+  if (_SCAN_SLOW_LOG_MS > 0 && _scanTotal >= _SCAN_SLOW_LOG_MS) {
+    const linesProcessed = endLine - startLine;
+    const regexAndOther = _scanTotal - _timeLineAt - _timeOffsetAt;
+    const breakdownMsg =
+      `[phase2-scan:breakdown] lines=${linesProcessed} matches=${_matchCount} ` +
+      `total=${_scanTotal.toFixed(0)}ms ` +
+      `lineAt=${_timeLineAt.toFixed(0)}ms ` +
+      `offsetAt=${_timeOffsetAt.toFixed(0)}ms ` +
+      `regex_other=${regexAndOther.toFixed(0)}ms`;
+    // captain log.txt 캡처는 daemon.logDiagnostic 으로만 들어감 (vscode OUTPUT
+    // 채널). console.error 는 Developer Console 로 가서 캡처 안 됨.
+    if (daemonForLogging) {
+      daemonForLogging.logDiagnostic(breakdownMsg);
+    } else {
+      // eslint-disable-next-line no-console
+      console.error(breakdownMsg);
     }
   }
 
@@ -9990,19 +10102,158 @@ async function resolveBaseModelLabelForReceiver(
   );
 }
 
+// captain #1 fix — Date.now() 기반 cooperative deadline.
+// setTimeout 콜백은 event loop 점유 / micro-task burst 시 늦게 fire (capBypass
+// E2E 가 확인). Date.now() 비교는 시스템 시계 직접 읽기라 영향 없음. receiver
+// tracer chain 의 각 진입점에서 expired 체크 + 조기 return.
+function isReceiverDeadlineExpired(deadlineMs: number | undefined): boolean {
+  return deadlineMs !== undefined && Date.now() >= deadlineMs;
+}
+
+/**
+ * captain 옵션 C — client-side fast-path receiver kind 인식.
+ *
+ * captain log.txt L104 의 noRecvSamples 분석:
+ *   "Model.objects" (root_matched), "Model.objects.filter(...)" 등 대다수가
+ *   단순 chain. root 가 hasModelByShortName 통과하면 IPC 없이 receiver kind
+ *   즉시 추론 가능. captain 첫 cycle 의 resolveExportOrigin/resolveRelationTarget
+ *   폭주(16s)가 이 fast-path 로 우회됨.
+ *
+ * 지원 패턴:
+ *   `Model`              → model_class
+ *   `Model.objects`      → manager (managerName='objects')
+ *   `Model.objects.filter(...)`, `Model.objects.exclude(...)` → queryset
+ *   `Model.objects.get(...)`, `.create(...)` 등 instance-returning → instance
+ *
+ * 미지원 패턴 (fallback IPC chain) — self.X_set, 임시 변수, transform chain 등.
+ */
+function tryFastPathReceiverKind(
+  daemon: AnalysisDaemon,
+  receiverExpression: string,
+): OrmReceiverInfo | undefined {
+  const normalized = normalizeReceiverExpression(receiverExpression);
+  if (!normalized) return undefined;
+
+  // 단순 dotted chain 만 처리. self/cls/super 는 제외 (receiverRootIdentifier 가 막음).
+  const rootIdentifier = receiverRootIdentifier(normalized);
+  if (!rootIdentifier) return undefined;
+
+  // root 가 알려진 model 인지 확인. snake→Pascal fuzzy 도 시도.
+  let modelLabel = daemon.findModelLabelByShortName(rootIdentifier);
+  if (!modelLabel) {
+    for (const variant of snakeToPascalCaseVariants(rootIdentifier)) {
+      if (variant !== rootIdentifier) {
+        modelLabel = daemon.findModelLabelByShortName(variant);
+        if (modelLabel) break;
+      }
+    }
+  }
+  if (!modelLabel) return undefined;
+
+  // root 뒤의 chain segments 분석. 매우 단순한 dotted chain 만.
+  // `Model.objects` → ['objects']
+  // `Model.objects.filter(...)` → ['objects', 'filter(...)']
+  const remainder = normalized.slice(rootIdentifier.length);
+  if (remainder === '') {
+    return { kind: 'model_class', modelLabel };
+  }
+  if (!remainder.startsWith('.')) return undefined;
+  const segments = remainder.slice(1).split('.');
+  // 모든 segment 가 단순 식별자 또는 `name(...)` 형태인지 확인.
+  // 복잡한 indexing / subscript / 멀티-라인 표현식은 fallback.
+  const segmentPattern = /^[A-Za-z_]\w*(\([^()]*\))?$/;
+  for (const seg of segments) {
+    if (!segmentPattern.test(seg)) return undefined;
+  }
+
+  // segment chain 별 receiver kind 추론.
+  let receiverKind: OrmReceiverInfo['kind'] = 'model_class';
+  let managerName: string | undefined;
+  for (const seg of segments) {
+    const isCall = seg.endsWith(')');
+    const name = isCall ? seg.slice(0, seg.indexOf('(')) : seg;
+
+    if (receiverKind === 'model_class') {
+      // .objects, .somemanager → manager
+      // captain managerName 가장 흔한 'objects' 만 확정. 다른 이름은 fallback.
+      if (name === 'objects') {
+        receiverKind = 'manager';
+        managerName = 'objects';
+      } else {
+        return undefined;  // 알 수 없는 model_class attribute — IPC 로 검증 필요
+      }
+      continue;
+    }
+
+    if (receiverKind === 'manager' || receiverKind === 'queryset') {
+      // QuerySet/Manager builtin methods 의 return kind 매핑.
+      const queryReturn = inferBuiltinManagerOrQuerysetReturnKind(name);
+      if (queryReturn === undefined) {
+        return undefined;  // 알 수 없는 method — IPC fallback
+      }
+      receiverKind = queryReturn;
+      continue;
+    }
+
+    // instance, related_manager 등 chain 후속 — fallback
+    return undefined;
+  }
+
+  return {
+    kind: receiverKind,
+    modelLabel,
+    ...(managerName !== undefined ? { managerName } : {}),
+  };
+}
+
+/**
+ * Manager/QuerySet builtin method 의 return kind 매핑. BUILTIN_QUERYSET_METHODS
+ * 와 BUILTIN_MANAGER_METHODS 에서 확정적으로 알려진 것만. fast-path 안전성
+ * 우선이라 unknown 은 undefined 반환 (IPC fallback).
+ */
+function inferBuiltinManagerOrQuerysetReturnKind(
+  methodName: string,
+): OrmReceiverInfo['kind'] | undefined {
+  // 가장 흔한 lookup-accepting QuerySet methods. captain log 의 대다수 사용.
+  const querysetReturning: ReadonlySet<string> = new Set([
+    'filter', 'exclude', 'all', 'annotate', 'alias', 'order_by',
+    'select_related', 'prefetch_related', 'only', 'defer', 'distinct',
+    'using', 'reverse', 'extra', 'union', 'intersection', 'difference',
+    'none', 'select_for_update',
+  ]);
+  const instanceReturning: ReadonlySet<string> = new Set([
+    'first', 'last', 'get', 'earliest', 'latest', 'create',
+  ]);
+  if (querysetReturning.has(methodName)) return 'queryset';
+  if (instanceReturning.has(methodName)) return 'instance';
+  return undefined;
+}
+
 async function resolveLookupReceiverInfoForReceiver(
   daemon: AnalysisDaemon,
   document: vscode.TextDocument,
   receiverExpression: string,
-  position: vscode.Position
+  position: vscode.Position,
+  deadlineMs?: number,
 ): Promise<OrmReceiverInfo | undefined> {
-  if (daemon.isAborted()) { return undefined; }
+  if (daemon.isAborted() || isReceiverDeadlineExpired(deadlineMs)) {
+    return undefined;
+  }
+  // 옵션 C — fast-path. captain 의 단순 Model.objects.X chain 이 IPC 4번 거치지
+  // 않고 즉시 OrmReceiverInfo 반환. captain L135 ipc-by-method 의
+  // resolveExportOrigin=56/16696ms, resolveRelationTarget=5/16432ms 폭주를
+  // 첫 cycle 부터 우회.
+  const fastPath = tryFastPathReceiverKind(daemon, receiverExpression);
+  if (fastPath) {
+    return fastPath;
+  }
   return resolveLookupReceiverInfoForReceiverAtOffset(
     daemon,
     document,
     receiverExpression,
     document.offsetAt(position),
-    new Set()
+    new Set(),
+    deadlineMs,
   );
 }
 
@@ -10011,9 +10262,12 @@ async function resolveLookupReceiverInfoForReceiverAtOffset(
   document: vscode.TextDocument,
   receiverExpression: string,
   beforeOffset: number,
-  visited: Set<string>
+  visited: Set<string>,
+  deadlineMs?: number,
 ): Promise<OrmReceiverInfo | undefined> {
-  if (daemon.isAborted()) { return undefined; }
+  if (daemon.isAborted() || isReceiverDeadlineExpired(deadlineMs)) {
+    return undefined;
+  }
   const resolvedReceiver = await resolveLookupReceiverAtOffset(
     daemon,
     document,
@@ -10021,6 +10275,11 @@ async function resolveLookupReceiverInfoForReceiverAtOffset(
     beforeOffset,
     visited
   );
+  // captain #1 — 매 await 후 deadline 재체크. 단일 receiver tracer 가 안에서
+  // 다단계 IPC 누적해도 cap 우회 방지.
+  if (isReceiverDeadlineExpired(deadlineMs)) {
+    return undefined;
+  }
   if (resolvedReceiver) {
     return resolvedReceiver;
   }

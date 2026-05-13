@@ -63,7 +63,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     `[extension] activate version=${extensionVersion} ` +
     `recvTimeoutMs=${recvTimeoutMs} ` +
     `disableReceiverStepTrace=${process.env.DJLS_DISABLE_RECEIVER_STEP_TRACE === '1'} ` +
-    `diagnosticTimeBudgetMs=${process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS ?? '(default)'}`
+    `diagnosticTimeBudgetMs=${process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS ?? '(default)'} ` +
+    `registryMode=${process.env.DJLS_RUNTIME_REGISTRY_MODE ?? 'full'}`
   );
   const daemon = new AnalysisDaemon(context, output);
   const statusView = new HealthStatusView();
