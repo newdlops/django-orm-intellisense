@@ -615,9 +615,26 @@ function normalizeModelRelationTargets(
  */
 /**
  * Static fallback data for models missing from runtime inspection.
- * Keys are model labels; values list field and relation names.
+ * Keys are model labels; values list field and relation names. Newer daemon
+ * versions also include fieldDetails so the TS local index can answer lookup
+ * completions while the richer runtime surface is loading in the background.
  */
-export type StaticFallback = Record<string, { fields: string[]; relations: string[] }>;
+interface StaticFallbackFieldDetail {
+  fieldKind?: string | null;
+  isRelation?: boolean | null;
+  relationDirection?: string | null;
+  relatedModelLabel?: string | null;
+}
+
+export type StaticFallback = Record<
+  string,
+  {
+    fields: string[];
+    relations?: string[];
+    reverseRelations?: string[];
+    fieldDetails?: Record<string, StaticFallbackFieldDetail>;
+  }
+>;
 
 export function buildWorkspaceIndex(
   surfaceIndex: SurfaceIndex,
@@ -645,26 +662,95 @@ export function buildWorkspaceIndex(
 
       const objectName = label.includes('.') ? label.split('.').pop()! : label;
       const fields = new Map<string, FieldInfo>();
-      const defaultLookups = getLookupsForField('CharField');
-      const defaultTransforms = getTransformsForField('CharField');
+      const relations = new Map<string, RelationInfo>();
+      const reverseRelations = new Map<string, RelationInfo>();
+      const details = info.fieldDetails ?? {};
+      const addField = (
+        fieldName: string,
+        fallbackKind: string,
+        fallbackIsRelation: boolean,
+      ): FieldInfo => {
+        const detail = details[fieldName];
+        const fieldKind = detail?.fieldKind ?? fallbackKind;
+        const isRelation = detail?.isRelation ?? fallbackIsRelation;
+        let lookups = getLookupsForField(fieldKind);
+        const extraLookups = customLookups?.[fieldKind];
+        if (extraLookups && extraLookups.length > 0) {
+          const lookupSet = new Set(lookups);
+          for (const lookup of extraLookups) {
+            lookupSet.add(lookup);
+          }
+          lookups = [...lookupSet];
+        }
 
-      for (const fieldName of info.fields) {
-        fields.set(fieldName, {
+        const fieldInfo: FieldInfo = {
           name: fieldName,
-          fieldKind: 'CharField',
-          isRelation: false,
-          lookups: defaultLookups,
-          transforms: defaultTransforms,
+          fieldKind,
+          isRelation,
+          lookups,
+          transforms: getTransformsForField(fieldKind),
+        };
+        fields.set(fieldName, fieldInfo);
+        return fieldInfo;
+      };
+
+      for (const fieldName of info.fields ?? []) {
+        addField(fieldName, 'CharField', false);
+      }
+
+      for (const relName of info.relations ?? []) {
+        const fieldInfo = addField(relName, 'ForeignKey', true);
+        const detail = details[relName];
+        relations.set(relName, {
+          name: relName,
+          fieldKind: fieldInfo.fieldKind,
+          targetModelLabel: detail?.relatedModelLabel ?? '',
+          direction: 'forward',
+        });
+        if (
+          (fieldInfo.fieldKind === 'ForeignKey' ||
+            fieldInfo.fieldKind === 'OneToOneField' ||
+            fieldInfo.fieldKind === 'ParentalKey') &&
+          !fields.has(`${relName}_id`)
+        ) {
+          fields.set(`${relName}_id`, {
+            name: `${relName}_id`,
+            fieldKind: 'IntegerField',
+            isRelation: false,
+            lookups: getLookupsForField('IntegerField'),
+            transforms: getTransformsForField('IntegerField'),
+          });
+        }
+      }
+
+      for (const relName of info.reverseRelations ?? []) {
+        const fieldInfo = addField(relName, 'ForeignKey', true);
+        const detail = details[relName];
+        reverseRelations.set(relName, {
+          name: relName,
+          fieldKind: fieldInfo.fieldKind,
+          targetModelLabel: detail?.relatedModelLabel ?? '',
+          direction: 'reverse',
         });
       }
 
-      for (const relName of info.relations) {
-        fields.set(relName, {
-          name: relName,
-          fieldKind: 'ForeignKey',
-          isRelation: true,
-          lookups: getLookupsForField('ForeignKey'),
-          transforms: [],
+      if (!fields.has('pk')) {
+        fields.set('pk', {
+          name: 'pk',
+          fieldKind: 'BigAutoField',
+          isRelation: false,
+          lookups: getLookupsForField('BigAutoField'),
+          transforms: getTransformsForField('BigAutoField'),
+        });
+      }
+
+      if (!fields.has('id')) {
+        fields.set('id', {
+          name: 'id',
+          fieldKind: 'BigAutoField',
+          isRelation: false,
+          lookups: getLookupsForField('BigAutoField'),
+          transforms: getTransformsForField('BigAutoField'),
         });
       }
 
@@ -674,8 +760,8 @@ export function buildWorkspaceIndex(
         module: '',
         filePath: '',
         fields,
-        relations: new Map(),
-        reverseRelations: new Map(),
+        relations,
+        reverseRelations,
         isAbstract: false,
         baseLabels: [],
       });

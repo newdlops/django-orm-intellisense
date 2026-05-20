@@ -74,12 +74,7 @@ const LOCAL_LOOKUP_RELATION_ONLY_METHODS = new Set([
   'select_related',
   'prefetch_related',
 ]);
-const LOCAL_LOOKUP_ALIAS_SENSITIVE_METHODS = new Set([
-  'only',
-  'defer',
-  'select_related',
-  'prefetch_related',
-]);
+const LOCAL_LOOKUP_ALIAS_SENSITIVE_METHODS = new Set<string>();
 const LOCAL_LOOKUP_OPERATOR_METHODS = new Set([
   'filter',
   'exclude',
@@ -88,6 +83,25 @@ const LOCAL_LOOKUP_OPERATOR_METHODS = new Set([
   'update_or_create',
 ]);
 const LOCAL_LOOKUP_CHAIN_DEPTH = 2;
+
+const LOCAL_QUERYSET_RETURNING_METHODS = [
+  'filter', 'exclude', 'all', 'annotate', 'alias', 'order_by', 'only',
+  'defer', 'select_related', 'prefetch_related', 'distinct', 'using',
+  'reverse', 'none', 'select_for_update', 'get_queryset',
+];
+const LOCAL_INSTANCE_RETURNING_METHODS = [
+  'get', 'first', 'last', 'earliest', 'latest', 'create',
+  'get_or_create', 'update_or_create',
+];
+const LOCAL_SCALAR_QUERYSET_METHODS = [
+  'count', 'exists', 'update', 'delete', 'aggregate', 'values', 'values_list',
+  'iterator', 'in_bulk', 'bulk_create', 'bulk_update',
+];
+const LOCAL_INSTANCE_METHODS = [
+  'save', 'delete', 'full_clean', 'clean', 'clean_fields', 'validate_unique',
+  'validate_constraints', 'refresh_from_db', 'serializable_value',
+  'get_deferred_fields', 'asave', 'arefresh_from_db',
+];
 
 type IpcRequestSource =
   | 'completion'
@@ -775,7 +789,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     const native = isNativeFastPathReady()
       ? nativeListRelationTargets(prefix)
       : undefined;
-    if (native) {
+    if (native && (native.items.length > 0 || prefix.trim().length === 0)) {
       return native;
     }
     return this.cachedRequest<RelationTargetsResult>('relationTargets', { prefix });
@@ -1039,6 +1053,12 @@ export class AnalysisDaemon implements vscode.Disposable {
     if (parsed.state === 'error') {
       return undefined;
     }
+    if (
+      completedSegments.length > 0 &&
+      parsed.resolvedPath.length < completedSegments.length
+    ) {
+      return undefined;
+    }
 
     const traversal = this.analyzeLocalLookupTraversal(
       baseModelLabel,
@@ -1062,6 +1082,7 @@ export class AnalysisDaemon implements vscode.Disposable {
         traversal.currentModelLabel,
         parsed,
         currentPartial,
+        method,
       );
       for (const item of directItems) {
         itemsByName.set(item.name, item);
@@ -1130,6 +1151,22 @@ export class AnalysisDaemon implements vscode.Disposable {
     if (isNativeFastPathReady()) {
       const native = nativeResolveLookupPath(baseModelLabel, value, method);
       if (native) {
+        if (
+          native.resolved &&
+          LOCAL_LOOKUP_RELATION_ONLY_METHODS.has(method)
+        ) {
+          const localRelationOnlyCheck = this.resolveLookupPathLocal(
+            baseModelLabel,
+            value,
+            method
+          );
+          if (localRelationOnlyCheck?.reason === 'relation_required') {
+            return localRelationOnlyCheck;
+          }
+          if (native.target && !native.target.isRelation) {
+            return { resolved: false, reason: 'relation_required', baseModelLabel };
+          }
+        }
         // Foreground hover/definition still need precise source locations.
         // Diagnostics only need the boolean resolution outcome, so do not
         // send static lookup-operator hits like `title__startswith` back to
@@ -1225,17 +1262,60 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
 
     if (receiverKind === 'instance') {
-      return this.listLocalInstanceOrmMemberCompletions(modelLabel, prefix);
+      const local = this.listLocalInstanceOrmMemberCompletions(modelLabel, prefix);
+      const builtinItems = this.localBuiltinOrmMemberItems(
+        modelLabel,
+        receiverKind,
+        prefix,
+        managerName
+      );
+      if (!local) {
+        return builtinItems.length > 0
+          ? {
+              resolved: true,
+              items: builtinItems,
+              receiverKind,
+              modelLabel,
+              managerName,
+            }
+          : undefined;
+      }
+      return {
+        ...local,
+        items: this.mergeOrmMemberItems(local.items, builtinItems),
+      };
     }
 
     const modelEntry = this.surfaceIndex[modelLabel];
+    const builtinItems = this.localBuiltinOrmMemberItems(
+      modelLabel,
+      receiverKind,
+      prefix,
+      managerName
+    );
     if (!modelEntry) {
-      return undefined;
+      return builtinItems.length > 0
+        ? {
+            resolved: true,
+            items: builtinItems,
+            receiverKind,
+            modelLabel,
+            managerName,
+          }
+        : undefined;
     }
 
     const kindEntry = modelEntry[receiverKind];
     if (!kindEntry) {
-      return undefined;
+      return builtinItems.length > 0
+        ? {
+            resolved: true,
+            items: builtinItems,
+            receiverKind,
+            modelLabel,
+            managerName,
+          }
+        : undefined;
     }
 
     const normalizedPrefix = prefix.trim();
@@ -1276,11 +1356,88 @@ export class AnalysisDaemon implements vscode.Disposable {
 
     return {
       resolved: true,
-      items,
+      items: this.mergeOrmMemberItems(items, builtinItems),
       receiverKind,
       modelLabel,
       managerName,
     };
+  }
+
+  private mergeOrmMemberItems(
+    primaryItems: OrmMemberItem[],
+    additionalItems: OrmMemberItem[]
+  ): OrmMemberItem[] {
+    if (additionalItems.length === 0) {
+      return primaryItems;
+    }
+
+    const merged = [...primaryItems];
+    const names = new Set(primaryItems.map((item) => item.name));
+    for (const item of additionalItems) {
+      if (names.has(item.name)) {
+        continue;
+      }
+      names.add(item.name);
+      merged.push(item);
+    }
+    return merged;
+  }
+
+  private localBuiltinOrmMemberItems(
+    modelLabel: string,
+    receiverKind: OrmReceiverKind | string,
+    prefix: string,
+    managerName?: string
+  ): OrmMemberItem[] {
+    const normalizedPrefix = prefix.trim();
+    const items: OrmMemberItem[] = [];
+    const addMethod = (
+      name: string,
+      detail: string,
+      returnKind: string,
+      returnModelLabel?: string
+    ) => {
+      if (normalizedPrefix && !name.startsWith(normalizedPrefix)) {
+        return;
+      }
+      items.push({
+        name,
+        memberKind: 'method',
+        modelLabel,
+        receiverKind,
+        detail,
+        source: 'builtin',
+        returnKind,
+        returnModelLabel,
+        managerName,
+        isRelation: false,
+      });
+    };
+
+    if (
+      receiverKind === 'manager' ||
+      receiverKind === 'queryset' ||
+      receiverKind === 'related_manager'
+    ) {
+      for (const name of LOCAL_QUERYSET_RETURNING_METHODS) {
+        addMethod(name, 'Django queryset method', 'queryset', modelLabel);
+      }
+      for (const name of LOCAL_INSTANCE_RETURNING_METHODS) {
+        addMethod(name, 'Django queryset method', 'instance', modelLabel);
+      }
+      for (const name of LOCAL_SCALAR_QUERYSET_METHODS) {
+        addMethod(name, 'Django queryset method', 'scalar');
+      }
+      return items;
+    }
+
+    if (receiverKind === 'instance') {
+      for (const name of LOCAL_INSTANCE_METHODS) {
+        addMethod(name, 'Django model instance method', 'scalar');
+      }
+    }
+
+    return items;
   }
 
   private listLocalInstanceOrmMemberCompletions(
@@ -1325,6 +1482,12 @@ export class AnalysisDaemon implements vscode.Disposable {
         returnKind =
           field.fieldKind === 'ManyToManyField' ? 'related_manager' : 'instance';
         returnModelLabel = relation?.targetModelLabel || undefined;
+      }
+      if (
+        (returnKind === 'instance' || returnKind === 'related_manager') &&
+        !returnModelLabel
+      ) {
+        continue;
       }
 
       addItem({
@@ -1470,6 +1633,28 @@ export class AnalysisDaemon implements vscode.Disposable {
           item.value,
           item.method,
         );
+        if (
+          native?.resolved &&
+          LOCAL_LOOKUP_RELATION_ONLY_METHODS.has(item.method)
+        ) {
+          const localRelationOnlyCheck = this.resolveLookupPathLocal(
+            item.baseModelLabel,
+            item.value,
+            item.method
+          );
+          if (localRelationOnlyCheck?.reason === 'relation_required') {
+            results[index] = localRelationOnlyCheck;
+            continue;
+          }
+          if (native.target && !native.target.isRelation) {
+            results[index] = {
+              resolved: false,
+              reason: 'relation_required',
+              baseModelLabel: item.baseModelLabel,
+            };
+            continue;
+          }
+        }
         if (native?.resolved && native.target) {
           results[index] = native;
           continue;
@@ -1483,6 +1668,17 @@ export class AnalysisDaemon implements vscode.Disposable {
       }
     } else {
       for (const [index, item] of items.entries()) {
+        if (skipPythonForUnresolved) {
+          const local = this.resolveLookupPathLocal(
+            item.baseModelLabel,
+            item.value,
+            item.method
+          );
+          if (local) {
+            results[index] = local;
+            continue;
+          }
+        }
         fallbackIndexes.push(index);
         fallbackItems.push(item);
       }
@@ -1510,9 +1706,102 @@ export class AnalysisDaemon implements vscode.Disposable {
     );
   }
 
+  private resolveLookupPathLocal(
+    baseModelLabel: string,
+    value: string,
+    method: string
+  ): LookupPathResolution | undefined {
+    const normalizedValue =
+      method === 'order_by' && value.trim().startsWith('-')
+        ? value.trim().slice(1)
+        : value.trim();
+    if (!normalizedValue) {
+      return { resolved: false, reason: 'empty', baseModelLabel };
+    }
+    if (!this.localWorkspaceIndex.models.has(baseModelLabel)) {
+      return undefined;
+    }
+    if (LOCAL_LOOKUP_RELATION_ONLY_METHODS.has(method)) {
+      const relationOnly = this.resolveRelationOnlyLookupPathLocal(
+        baseModelLabel,
+        normalizedValue
+      );
+      if (relationOnly) {
+        return relationOnly;
+      }
+    }
+
+    const parsed = parseLookupChain(
+      normalizedValue,
+      baseModelLabel,
+      this.localWorkspaceIndex
+    );
+    const segments = parsed.segments.filter(Boolean);
+    const resolvedCount = parsed.resolvedPath.length;
+    const lastResolved = parsed.resolvedPath.at(-1);
+    const relationOnlyScalarFinalField =
+      LOCAL_LOOKUP_RELATION_ONLY_METHODS.has(method) &&
+      parsed.finalField !== undefined &&
+      !parsed.finalField.isRelation;
+
+    if (parsed.state === 'complete') {
+      if (
+        relationOnlyScalarFinalField ||
+        (
+          LOCAL_LOOKUP_RELATION_ONLY_METHODS.has(method) &&
+          lastResolved &&
+          lastResolved.kind !== 'relation' &&
+          lastResolved.kind !== 'reverse_relation'
+        )
+      ) {
+        return { resolved: false, reason: 'relation_required', baseModelLabel };
+      }
+      return {
+        resolved: true,
+        baseModelLabel,
+        lookupOperator: parsed.finalLookup,
+      };
+    }
+
+    if (
+      parsed.state === 'partial' &&
+      resolvedCount >= segments.length &&
+      lastResolved
+    ) {
+      if (
+        relationOnlyScalarFinalField ||
+        (
+          LOCAL_LOOKUP_RELATION_ONLY_METHODS.has(method) &&
+          lastResolved.kind !== 'relation' &&
+          lastResolved.kind !== 'reverse_relation'
+        )
+      ) {
+        return { resolved: false, reason: 'relation_required', baseModelLabel };
+      }
+      return { resolved: true, baseModelLabel };
+    }
+
+    if (parsed.state === 'partial' || parsed.state === 'error') {
+      const missingSegment =
+        segments[parsed.errorAt ?? resolvedCount] ??
+        segments[resolvedCount] ??
+        normalizedValue;
+      const reason = parsed.finalField
+        ? 'invalid_lookup_operator'
+        : 'segment_not_found';
+      return {
+        resolved: false,
+        reason,
+        missingSegment,
+        baseModelLabel,
+      };
+    }
+
+    return undefined;
+  }
+
   /**
-   * Resolve an ORM member from the local surface index without IPC.
-   * Returns undefined if the member is not in the surface index.
+   * Resolve an ORM member from local indexes without IPC.
    * The returned item has enough fields for chain resolution (returnKind,
    * returnModelLabel, managerName) but NOT for display (detail, filePath).
    */
@@ -1522,26 +1811,96 @@ export class AnalysisDaemon implements vscode.Disposable {
     name: string
   ): OrmMemberResolution | undefined {
     const modelEntry = this.surfaceIndex[modelLabel];
-    if (!modelEntry) return undefined;
-    const kindEntry = modelEntry[receiverKind];
-    if (!kindEntry) return undefined;
-    const member = kindEntry[name];
-    if (!member) return undefined;
-    const [returnKind, returnModelLabel, memberKind, fieldKind] = member;
-    // surfaceIndex member found
+    const kindEntry = modelEntry?.[receiverKind];
+    const member = kindEntry?.[name];
+    if (member) {
+      const [returnKind, returnModelLabel, memberKind, fieldKind] = member;
+      return {
+        resolved: true,
+        item: {
+          name,
+          memberKind: memberKind ?? 'field',
+          modelLabel,
+          receiverKind,
+          detail: fieldKind ?? '',
+          source: 'local',
+          fieldKind: fieldKind ?? undefined,
+          isRelation: returnKind === 'instance' || returnKind === 'related_manager',
+          returnKind,
+          returnModelLabel: returnModelLabel || undefined,
+        },
+      };
+    }
+
+    if (receiverKind !== 'instance') {
+      const builtin = this.localBuiltinOrmMemberItems(
+        modelLabel,
+        receiverKind,
+        name,
+      ).find((item) => item.name === name);
+      return builtin
+        ? {
+            resolved: true,
+            item: builtin,
+          }
+        : undefined;
+    }
+
+    const model = this.localWorkspaceIndex.models.get(modelLabel);
+    const field = model?.fields.get(name);
+    const relation =
+      model?.relations.get(name) ?? model?.reverseRelations.get(name);
+    if (!model || (!field && !relation)) {
+      const builtin = this.localBuiltinOrmMemberItems(
+        modelLabel,
+        receiverKind,
+        name,
+      ).find((item) => item.name === name);
+      return builtin
+        ? {
+            resolved: true,
+            item: builtin,
+          }
+        : undefined;
+    }
+
+    const isReverseRelation = relation?.direction === 'reverse';
+    const isForwardRelation =
+      relation?.direction === 'forward' || (!relation && field?.isRelation);
+    let memberKind = 'field';
+    let returnKind = 'scalar';
+    let returnModelLabel: string | undefined;
+
+    if (isReverseRelation) {
+      memberKind = 'reverse_relation';
+      returnKind = 'related_manager';
+      returnModelLabel = relation?.targetModelLabel || undefined;
+    } else if (isForwardRelation) {
+      memberKind = 'relation';
+      returnKind =
+        field?.fieldKind === 'ManyToManyField' ? 'related_manager' : 'instance';
+      returnModelLabel = relation?.targetModelLabel || undefined;
+    }
+    if (
+      (returnKind === 'instance' || returnKind === 'related_manager') &&
+      !returnModelLabel
+    ) {
+      return undefined;
+    }
+
     return {
       resolved: true,
       item: {
         name,
-        memberKind: memberKind ?? 'field',
+        memberKind,
         modelLabel,
         receiverKind,
-        detail: fieldKind ?? '',
+        detail: field?.fieldKind ?? relation?.fieldKind ?? '',
         source: 'local',
-        fieldKind: fieldKind ?? undefined,
-        isRelation: returnKind === 'instance' || returnKind === 'related_manager',
+        fieldKind: field?.fieldKind ?? relation?.fieldKind,
+        isRelation: field?.isRelation ?? Boolean(relation),
         returnKind,
-        returnModelLabel: returnModelLabel || undefined,
+        returnModelLabel,
       },
     };
   }
@@ -1557,20 +1916,16 @@ export class AnalysisDaemon implements vscode.Disposable {
     let currentKind = receiverKind;
 
     for (const name of chain) {
-      const modelEntry = this.surfaceIndex[currentLabel];
-      if (!modelEntry) {
-        return { resolved: false, reason: 'model_not_found', failedAt: name };
-      }
-      const kindEntry = modelEntry[currentKind];
-      if (!kindEntry) {
-        return { resolved: false, reason: 'kind_not_found', failedAt: name };
-      }
-      const member = kindEntry[name];
-      if (!member) {
+      const resolution = this.resolveOrmMemberLocal(
+        currentLabel,
+        currentKind,
+        name,
+      );
+      if (!resolution?.resolved || !resolution.item) {
         return { resolved: false, reason: 'member_not_found', failedAt: name };
       }
-      currentKind = member[0];
-      currentLabel = member[1] ?? currentLabel;
+      currentKind = resolution.item.returnKind ?? currentKind;
+      currentLabel = resolution.item.returnModelLabel ?? currentLabel;
     }
 
     return {
@@ -1578,6 +1933,77 @@ export class AnalysisDaemon implements vscode.Disposable {
       modelLabel: currentLabel,
       receiverKind: currentKind,
     };
+  }
+
+  private resolveRelationOnlyLookupPathLocal(
+    baseModelLabel: string,
+    normalizedValue: string
+  ): LookupPathResolution | undefined {
+    const segments = normalizedValue.split('__').filter(Boolean);
+    if (segments.length === 0) {
+      return undefined;
+    }
+
+    let currentModelLabel = baseModelLabel;
+    const resolvedSegments: LookupPathItem[] = [];
+
+    for (const [index, segment] of segments.entries()) {
+      const model = this.localWorkspaceIndex.models.get(currentModelLabel);
+      if (!model) {
+        return undefined;
+      }
+
+      const field = model.fields.get(segment);
+      const relation = this.getLocalRelationInfo(currentModelLabel, segment);
+      const item = this.localLookupFieldItem(
+        currentModelLabel,
+        segment,
+        segments.slice(0, index + 1).join('__')
+      );
+      if (item) {
+        resolvedSegments.push(item);
+      }
+
+      const isFinalSegment = index === segments.length - 1;
+      if (relation) {
+        if (isFinalSegment) {
+          return {
+            resolved: true,
+            baseModelLabel,
+            target: item,
+            resolvedSegments,
+          };
+        }
+        if (!relation.targetModelLabel) {
+          return undefined;
+        }
+        currentModelLabel = relation.targetModelLabel;
+        continue;
+      }
+
+      if (field) {
+        if (isFinalSegment) {
+          return {
+            resolved: false,
+            reason: 'relation_required',
+            baseModelLabel,
+            target: item,
+            resolvedSegments,
+          };
+        }
+        return {
+          resolved: false,
+          reason: 'non_relation_intermediate',
+          baseModelLabel,
+          missingSegment: segment,
+          resolvedSegments,
+        };
+      }
+
+      return undefined;
+    }
+
+    return undefined;
   }
 
   private splitLocalLookupPrefix(
@@ -1665,12 +2091,14 @@ export class AnalysisDaemon implements vscode.Disposable {
     currentModelLabel: string,
     parsed: ParsedLookup,
     currentPartial: string,
+    method: string,
   ): LookupPathItem[] {
     const items: LookupPathItem[] = [];
     const candidates = getCompletionCandidates(
       parsed,
       currentPartial,
       this.localWorkspaceIndex,
+      method,
     );
 
     for (const candidate of candidates) {
@@ -1926,11 +2354,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       this.intentionalExitProcessIds.add(child.pid);
     }
 
-    this.disposeProcessHandles(child, stdoutReader);
-
-    if (child && !child.killed) {
-      child.kill();
-    }
+    await this.terminateProcess(child, stdoutReader);
 
     this.updateState({
       phase: 'stopped',
@@ -1952,6 +2376,55 @@ export class AnalysisDaemon implements vscode.Disposable {
     void this.stop();
     this.stateEmitter.dispose();
     dropNativeFastPath();
+  }
+
+  private async terminateProcess(
+    child?: ChildProcessWithoutNullStreams,
+    stdoutReader?: readline.Interface
+  ): Promise<void> {
+    if (!child) {
+      this.disposeProcessHandles(child, stdoutReader);
+      return;
+    }
+
+    const waitForExit = (timeoutMs: number): Promise<boolean> =>
+      new Promise((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve(true);
+          return;
+        }
+        const timeout = setTimeout(() => {
+          child.off('exit', onExit);
+          resolve(false);
+        }, timeoutMs);
+        const onExit = (): void => {
+          clearTimeout(timeout);
+          resolve(true);
+        };
+        child.once('exit', onExit);
+      });
+
+    try {
+      child.stdin.end();
+    } catch {
+      try {
+        child.stdin.destroy();
+      } catch {
+        // Ignore stdio shutdown races during process teardown.
+      }
+    }
+
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill();
+    }
+
+    const exited = await waitForExit(1200);
+    if (!exited && child.exitCode === null && child.signalCode === null) {
+      child.kill(process.platform === 'win32' ? undefined : 'SIGKILL');
+      await waitForExit(800);
+    }
+
+    this.disposeProcessHandles(child, stdoutReader);
   }
 
   private async startProcess(

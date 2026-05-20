@@ -34,6 +34,7 @@ import {
   updateWorkspaceIndexIncremental,
   type SurfaceIndex,
   type SurfaceIndexDiff,
+  type StaticFallback,
 } from './workspaceIndexer.js';
 import { loadSurfaceCache, saveSurfaceCache } from './nativeCache.js';
 import { parseLookupChain, getCompletionCandidates } from './lookupResolver.js';
@@ -95,7 +96,7 @@ const COMPLETION_CACHE_MAX = 256;
 let previousSurfaceIndex: SurfaceIndex | null = null;
 let previousCustomLookups: Record<string, string[]> | undefined;
 let previousCustomLookupsFingerprint: string | undefined;
-let previousStaticFallback: Record<string, { fields: string[]; relations: string[] }> | undefined;
+let previousStaticFallback: StaticFallback | undefined;
 let previousStaticFallbackFingerprint: string | null | undefined;
 const modelVersions = new Map<string, number>();
 const modelFingerprints = new Map<string, string>();
@@ -304,7 +305,7 @@ function replaceWorkspaceIndexFromSurface(params: {
   modelNames?: string[];
   customLookups?: Record<string, string[]>;
   surfaceFingerprints?: Record<string, string>;
-  staticFallback?: Record<string, { fields: string[]; relations: string[] }>;
+  staticFallback?: StaticFallback;
   staticFallbackFingerprint?: string | null;
   customLookupsFingerprint?: string;
 }): number {
@@ -366,7 +367,7 @@ connection.onNotification('django/updateSurfaceIndex', (params: {
   surfaceFingerprints?: Record<string, string>;
   customLookups?: Record<string, string[]>;
   customLookupsFingerprint?: string;
-  staticFallback?: Record<string, { fields: string[]; relations: string[] }>;
+  staticFallback?: StaticFallback;
   staticFallbackFingerprint?: string | null;
 }) => {
   const _t0 = performance.now();
@@ -462,7 +463,7 @@ connection.onNotification('django/updateSurfaceIndexDelta', (params: {
   addedLabels?: string[];
   changedLabels?: string[];
   removedLabels?: string[];
-  staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
+  staticFallback?: StaticFallback | null;
   staticFallbackFingerprint?: string | null;
 }) => {
   if (previousSurfaceIndex === null) {

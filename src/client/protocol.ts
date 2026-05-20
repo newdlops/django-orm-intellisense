@@ -187,6 +187,23 @@ export interface HealthSnapshot {
   semanticGraph?: SemanticGraphSnapshot;
 }
 
+export interface StaticFallbackFieldDetail {
+  fieldKind?: string | null;
+  isRelation?: boolean | null;
+  relationDirection?: string | null;
+  relatedModelLabel?: string | null;
+}
+
+export type StaticFallbackPayload = Record<
+  string,
+  {
+    fields: string[];
+    relations?: string[];
+    reverseRelations?: string[];
+    fieldDetails?: Record<string, StaticFallbackFieldDetail>;
+  }
+>;
+
 export interface InitializeResult {
   serverName: string;
   protocolVersion: string;
@@ -196,7 +213,7 @@ export interface InitializeResult {
   surfaceFingerprints?: Record<string, string>;
   customLookups?: Record<string, string[]>;
   customLookupsFingerprint?: string;
-  staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
+  staticFallback?: StaticFallbackPayload | null;
   staticFallbackFingerprint?: string | null;
 }
 
@@ -205,7 +222,7 @@ export interface ReindexFileResult {
   surfaceIndexDelta?: Record<string, Record<string, Record<string, [string, string | null, string?, (string | null)?]>>>;
   surfaceFingerprints?: Record<string, string>;
   modelNames?: string[];
-  staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
+  staticFallback?: StaticFallbackPayload | null;
   staticFallbackFingerprint?: string | null;
   /** When true, no model changes were detected — surfaceIndex/modelNames are omitted. */
   unchanged?: boolean;
@@ -250,7 +267,7 @@ export interface SurfaceIndexChangedNotificationMessage {
     surfaceFingerprints?: Record<string, string>;
     customLookups?: Record<string, string[]>;
     customLookupsFingerprint?: string;
-    staticFallback?: Record<string, { fields: string[]; relations: string[] }> | null;
+    staticFallback?: StaticFallbackPayload | null;
     staticFallbackFingerprint?: string | null;
   };
 }

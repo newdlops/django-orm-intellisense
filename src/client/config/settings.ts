@@ -10,6 +10,9 @@ export interface ExtensionSettings {
   workspaceRoot?: string;
   logLevel: 'off' | 'info' | 'debug';
   autoStart: boolean;
+  diagnosticsEnabled: boolean;
+  diagnosticsFullDocument: boolean;
+  pylanceAutoApplyStubOverrides: boolean;
 }
 
 export function getExtensionSettings(
@@ -31,7 +34,19 @@ export function getExtensionSettings(
     requestedScope
   );
   const logLevel = configuration.get<'off' | 'info' | 'debug'>('logLevel', 'info');
-  const autoStart = configuration.get<boolean>('autoStart', true);
+  const autoStart = configuration.get<boolean>('autoStart', false);
+  const diagnosticsEnabled = configuration.get<boolean>(
+    'diagnostics.enabled',
+    true
+  );
+  const diagnosticsFullDocument = configuration.get<boolean>(
+    'diagnostics.fullDocument',
+    false
+  );
+  const pylanceAutoApplyStubOverrides = configuration.get<boolean>(
+    'pylance.autoApplyStubOverrides',
+    false
+  );
 
   return {
     pythonInterpreter: pythonInterpreter || undefined,
@@ -39,6 +54,9 @@ export function getExtensionSettings(
     workspaceRoot: workspaceRoot || undefined,
     logLevel,
     autoStart,
+    diagnosticsEnabled,
+    diagnosticsFullDocument,
+    pylanceAutoApplyStubOverrides,
   };
 }
 

@@ -59,11 +59,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const recvTimeoutMs = Number(
     process.env.DJLS_RECEIVER_TRACE_TIMEOUT_MS ?? 1500
   ) || 1500;
+  const startupSettings = getExtensionSettings();
   output.appendLine(
     `[extension] activate version=${extensionVersion} ` +
     `recvTimeoutMs=${recvTimeoutMs} ` +
     `disableReceiverStepTrace=${process.env.DJLS_DISABLE_RECEIVER_STEP_TRACE === '1'} ` +
     `diagnosticTimeBudgetMs=${process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS ?? '(default)'} ` +
+    `autoStart=${startupSettings.autoStart} ` +
+    `ormDiagnostics=${startupSettings.diagnosticsEnabled} ` +
+    `autoStubOverrides=${startupSettings.pylanceAutoApplyStubOverrides} ` +
     `registryMode=${process.env.DJLS_RUNTIME_REGISTRY_MODE ?? 'full'}`
   );
   const daemon = new AnalysisDaemon(context, output);
@@ -104,7 +108,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (pendingReindexFiles.size === 0) {
       return;
     }
-    if (!languageClient || !daemon.isReady()) {
+    if (!daemon.isReady()) {
       reindexTimer = setTimeout(() => {
         void flushPendingReindexFiles();
       }, 300);
@@ -153,15 +157,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     output.appendLine(
       `[ls] sending surfaceIndex delta after reindex: +${addedLabels.size} ~${changedLabels.size} -${removedLabels.size}`
     );
-    void languageClient.sendNotification('django/updateSurfaceIndexDelta', {
-      surfaceIndexDelta,
-      surfaceFingerprints,
-      addedLabels: [...addedLabels],
-      changedLabels: [...changedLabels],
-      removedLabels: [...removedLabels],
-      staticFallback: latestStaticFallback,
-      staticFallbackFingerprint: latestStaticFallbackFingerprint,
-    });
+    if (languageClient) {
+      void languageClient.sendNotification('django/updateSurfaceIndexDelta', {
+        surfaceIndexDelta,
+        surfaceFingerprints,
+        addedLabels: [...addedLabels],
+        changedLabels: [...changedLabels],
+        removedLabels: [...removedLabels],
+        staticFallback: latestStaticFallback,
+        staticFallbackFingerprint: latestStaticFallbackFingerprint,
+      });
+    }
   };
 
   const updatePythonSourceWatcher = (workspaceRoot?: string): void => {
@@ -200,7 +206,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   activeDaemon = daemon;
 
-  if (!isPylanceAvailable()) {
+  if (!startupSettings.diagnosticsEnabled) {
+    output.appendLine(
+      '[extension] ORM diagnostics are disabled by configuration; no diagnostic scans will be scheduled.'
+    );
+  } else if (!isPylanceAvailable()) {
     output.appendLine(
       '[extension] Pylance not detected. ORM diagnostics are disabled to reduce noisy errors and startup cost.'
     );
@@ -249,7 +259,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const promotePythonProviders = (
     reason: string,
     expectedActivePythonProviderFingerprint?: string,
-    deferredCount = 0
+    deferredCount = 0,
+    force = false
   ): void => {
     // Throttle all re-registrations (fingerprinted or not) to avoid
     // disposing in-flight hover/completion requests too aggressively.
@@ -280,6 +291,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // second promote with a DIFFERENT reason bypass the defer and kill
     // the in-flight scan.
     if (
+      !force &&
       isAnyDiagnosticScanInFlight() &&
       deferredCount < PROVIDER_PROMOTE_MAX_DEFERRALS
     ) {
@@ -297,7 +309,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         promotePythonProviders(
           reason,
           expectedActivePythonProviderFingerprint,
-          deferredCount + 1
+          deferredCount + 1,
+          force
         );
       }, PROVIDER_PROMOTE_DEFER_DELAY_MS);
       return;
@@ -325,11 +338,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const schedulePythonProviderPromotion = (
     reason: string,
     delayMs = 75,
-    expectedActivePythonProviderFingerprint?: string
+    expectedActivePythonProviderFingerprint?: string,
+    force = false
   ): void => {
     const timer = setTimeout(() => {
       providerPromotionTimers.delete(timer);
-      promotePythonProviders(reason, expectedActivePythonProviderFingerprint);
+      promotePythonProviders(
+        reason,
+        expectedActivePythonProviderFingerprint,
+        0,
+        force
+      );
     }, delayMs);
     providerPromotionTimers.add(timer);
   };
@@ -348,14 +367,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const schedulePythonProviderPromotionBurst = (
     reason: string,
     delayMsList: number[],
-    expectedActivePythonProviderFingerprint?: string
+    expectedActivePythonProviderFingerprint?: string,
+    force = false
   ): void => {
     clearProviderPromotionTimers();
     for (const delayMs of delayMsList) {
       schedulePythonProviderPromotion(
         reason,
         delayMs,
-        expectedActivePythonProviderFingerprint
+        expectedActivePythonProviderFingerprint,
+        force
       );
     }
   };
@@ -392,6 +413,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       output.appendLine(
         '[extension] Configuration changed. Restarting analysis daemon.'
       );
+      const nextSettings = getExtensionSettings();
+      if (nextSettings.autoStart) {
+        ensureLanguageClientStarted();
+      }
+      schedulePythonProviderPromotionBurst('configuration-changed', [
+        0,
+        250,
+      ], undefined, true);
       void daemon.restart().catch((error) => {
         output.appendLine(`[extension] Failed to restart daemon: ${String(error)}`);
       });
@@ -431,23 +460,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const pylanceExtension = vscode.extensions.getExtension(PYLANCE_EXTENSION_ID);
   if (pylanceExtension) {
-    void Promise.resolve(pylanceExtension.activate())
-      .then(() => {
-        if (didPromoteProvidersAfterPylanceActivation) {
-          return;
-        }
-        didPromoteProvidersAfterPylanceActivation = true;
-        schedulePythonProviderPromotionBurst('pylance-activate-promise', [
-          0,
-          250,
-          1000,
-        ]);
-      })
-      .catch((error: unknown) => {
-        output.appendLine(
-          `[extension] Failed to await Pylance activation: ${String(error)}`
-        );
-      });
+    if (pylanceExtension.isActive) {
+      didPromoteProvidersAfterPylanceActivation = true;
+      schedulePythonProviderPromotionBurst('pylance-already-active', [
+        0,
+        250,
+      ]);
+    }
     context.subscriptions.push(
       vscode.extensions.onDidChange(() => {
         if (didPromoteProvidersAfterPylanceActivation) {
@@ -460,17 +479,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         schedulePythonProviderPromotionBurst('pylance-activated', [
           0,
           250,
-          1000,
         ]);
       })
     );
   }
-
-  void applyStubOverrides(output).catch((error) => {
-    output.appendLine(
-      `[pylance] Failed to apply Django stub overrides: ${String(error)}`
-    );
-  });
+  if (startupSettings.pylanceAutoApplyStubOverrides) {
+    void applyStubOverrides(output).catch((error) => {
+      output.appendLine(
+        `[pylance] Failed to apply Django stub overrides: ${String(error)}`
+      );
+    });
+  }
 
   void normalizePythonInterpreterSettings()
     .then((normalization) => {
@@ -490,48 +509,59 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
     });
 
-  // --- Language Server 시작 ---
-  const serverModule = context.asAbsolutePath(path.join('out', 'server', 'server.js'));
-  const serverOptions: ServerOptions = {
-    run: { module: serverModule, transport: TransportKind.ipc },
-    debug: { module: serverModule, transport: TransportKind.ipc },
-  };
-  const clientOptions: LanguageClientOptions = {
-    documentSelector: [{ scheme: 'file', language: 'python' }],
-    outputChannel: output,
-  };
-  languageClient = new LanguageClient(
-    'djangoOrmLs',
-    'Django ORM Language Server',
-    serverOptions,
-    clientOptions
-  );
-  context.subscriptions.push(languageClient);
-  void languageClient.start().then(() => {
-    output.appendLine('[ls] Language Server started');
-    schedulePythonProviderPromotionBurst('language-client-started', [
-      0,
-      250,
-      1000,
-    ]);
-    // daemon이 ready되면 surfaceIndex를 서버에 전달
-    feedSurfaceIndexToServer(daemon, output);
-    languageClient!.onNotification('django/fileNeedsReindex', (params: { uri: string }) => {
-      const uri = params?.uri;
-      if (!uri) {
-        return;
-      }
-      try {
-        queueReindexFile(vscode.Uri.parse(uri).fsPath);
-      } catch {
-        queueReindexFile(uri);
-      }
+  const ensureLanguageClientStarted = (): void => {
+    if (languageClient) {
+      return;
+    }
+
+    const serverModule = context.asAbsolutePath(
+      path.join('out', 'server', 'server.js')
+    );
+    const serverOptions: ServerOptions = {
+      run: { module: serverModule, transport: TransportKind.ipc },
+      debug: { module: serverModule, transport: TransportKind.ipc },
+    };
+    const clientOptions: LanguageClientOptions = {
+      documentSelector: [{ scheme: 'file', language: 'python' }],
+      outputChannel: output,
+    };
+    languageClient = new LanguageClient(
+      'djangoOrmLs',
+      'Django ORM Language Server',
+      serverOptions,
+      clientOptions
+    );
+    context.subscriptions.push(languageClient);
+    void languageClient.start().then(() => {
+      output.appendLine('[ls] Language Server started');
+      schedulePythonProviderPromotionBurst('language-client-started', [
+        0,
+        250,
+      ]);
+      feedSurfaceIndexToServer(daemon, output);
+      languageClient!.onNotification('django/fileNeedsReindex', (params: { uri: string }) => {
+        const uri = params?.uri;
+        if (!uri) {
+          return;
+        }
+        try {
+          queueReindexFile(vscode.Uri.parse(uri).fsPath);
+        } catch {
+          queueReindexFile(uri);
+        }
+      });
     });
-  });
+  };
 
   const settings = getExtensionSettings();
   const initialEditor = vscode.window.activeTextEditor;
-  if (initialEditor?.document.languageId === 'python') {
+  if (settings.autoStart) {
+    ensureLanguageClientStarted();
+  }
+  if (
+    initialEditor?.document.languageId === 'python' &&
+    settings.autoStart
+  ) {
     schedulePythonProviderPromotionBurst('initial-python-editor', [
       75,
       350,

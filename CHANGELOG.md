@@ -46,7 +46,9 @@ First public release.
 - Cached source snapshots and static indexes for fast restarts
 - File watcher for workspace root reindexing
 - Background process pool with thread fallback
-- Async chunked diagnostic scanning with time budgets
+- Lazy cold start: daemon, language server, Pylance activation, and stub overrides are opt-in or first-use only
+- ORM diagnostics remain enabled by default but start lazily with the daemon
+- Large-file diagnostics default to visible-range scanning; full-document diagnostics are opt-in via `djangoOrmIntellisense.diagnostics.fullDocument`
 - 67 E2E tests covering completion, hover, definition, and diagnostics
 
 ## 0.0.1

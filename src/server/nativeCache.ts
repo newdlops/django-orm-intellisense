@@ -15,7 +15,7 @@
 import * as os from 'os';
 import * as path from 'path';
 import { loadNative } from '../client/native/loader';
-import type { SurfaceIndex } from './workspaceIndexer';
+import type { StaticFallback, SurfaceIndex } from './workspaceIndexer';
 
 const CACHE_FILENAME = 'surface-index-v1.bin';
 
@@ -25,7 +25,7 @@ export interface SurfaceCachePayload {
   surfaceFingerprints?: Record<string, string>;
   customLookups?: Record<string, string[]>;
   customLookupsFingerprint?: string;
-  staticFallback?: Record<string, { fields: string[]; relations: string[] }>;
+  staticFallback?: StaticFallback;
   staticFallbackFingerprint?: string | null;
 }
 

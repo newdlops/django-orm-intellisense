@@ -1,6 +1,6 @@
 # Django ORM Intellisense
 
-Framework-aware autocomplete, hover, go-to-definition, and diagnostics for Django ORM — right inside VS Code.
+Framework-aware autocomplete, hover, go-to-definition, and optional diagnostics for Django ORM — right inside VS Code.
 
 Stop guessing lookup paths like `author__profile__timezone__icontains` or relation strings like `"app_label.ModelName"`. This extension understands your Django project's models, relations, managers, and querysets at runtime, and gives you real-time feedback as you type.
 
@@ -15,7 +15,7 @@ Autocomplete for keyword arguments in `filter()`, `exclude()`, `get()`, `order_b
 Product.objects.filter(author__profile__timezone__icontains="Asia")
 ```
 
-Invalid lookup paths are flagged with diagnostics so you catch typos before they hit production.
+Invalid lookup paths can be flagged with diagnostics when `djangoOrmIntellisense.diagnostics.enabled` is turned on.
 
 ### String Lookup Path Intelligence
 
@@ -82,6 +82,7 @@ Optional suppression of Pylance false positives for dynamic Django ORM attribute
 3. Run **Django ORM: Select Python Interpreter** (`Cmd+Shift+P`) and choose the project's virtualenv.
 4. The extension auto-detects `DJANGO_SETTINGS_MODULE` from `manage.py`. For multi-settings projects, run **Django ORM: Select Settings Module**.
 5. Start typing in a `filter()`, `values()`, or relation field — completions appear automatically.
+6. For eager warm-up instead of lazy first-use startup, set `djangoOrmIntellisense.autoStart` to `true`.
 
 ## Commands
 
@@ -100,7 +101,10 @@ Optional suppression of Pylance false positives for dynamic Django ORM attribute
 | `djangoOrmIntellisense.pythonInterpreter` | `""` | Python interpreter or virtualenv path. Supports directory (`.venv`) or executable (`.venv/bin/python`) paths. |
 | `djangoOrmIntellisense.settingsModule` | `""` | `DJANGO_SETTINGS_MODULE` value. Auto-detected from `manage.py` if empty. |
 | `djangoOrmIntellisense.workspaceRoot` | `""` | Django project root for monorepo setups. |
-| `djangoOrmIntellisense.autoStart` | `true` | Auto-start the analysis daemon when a Python file is opened. |
+| `djangoOrmIntellisense.autoStart` | `false` | Auto-start the analysis daemon when a Python file is opened. Disabled by default so activation stays lightweight; providers start the daemon lazily on first use. |
+| `djangoOrmIntellisense.diagnostics.enabled` | `true` | Enable live Django ORM diagnostics. Diagnostics are lazy by default and run only after the analysis daemon is already started. |
+| `djangoOrmIntellisense.diagnostics.fullDocument` | `false` | Continue large-file diagnostics beyond the visible range to scan the whole document. Disabled by default to keep diagnostic CPU and memory cost low. |
+| `djangoOrmIntellisense.pylance.autoApplyStubOverrides` | `false` | Automatically write Django stub overrides and restart Pylance on activation. Disabled by default; use the configure command to apply overrides manually. |
 | `djangoOrmIntellisense.logLevel` | `"info"` | Daemon log verbosity (`off`, `info`, `debug`). |
 
 ## Architecture

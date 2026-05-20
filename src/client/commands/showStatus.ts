@@ -24,10 +24,8 @@ class StatusReportProvider
   readonly onDidChange = this.onDidChangeEmitter.event;
 
   update(snapshot: HealthSnapshot): StatusReport {
-    const report = buildStatusReport(
-      snapshot,
-      getExtensionSettings(configurationScopeForSnapshot(snapshot)).pythonInterpreter
-    );
+    const settings = getExtensionSettings(configurationScopeForSnapshot(snapshot));
+    const report = buildStatusReport(snapshot, settings);
     this.content = report.markdown;
     this.onDidChangeEmitter.fire(STATUS_REPORT_URI);
     return report;
@@ -62,8 +60,12 @@ function configurationScopeForSnapshot(
 
 function buildStatusReport(
   snapshot: HealthSnapshot,
-  configuredInterpreter: string | undefined
+  settings: ReturnType<typeof getExtensionSettings>
 ): StatusReport {
+  const configuredInterpreter = settings.pythonInterpreter;
+  const ormDiagnosticsStatus = settings.diagnosticsEnabled
+    ? (isPylanceAvailable() ? 'enabled' : 'disabled (Pylance not installed)')
+    : 'disabled';
   const markdownLines = [
     '# Django ORM Intellisense Status',
     '',
@@ -98,6 +100,30 @@ function buildStatusReport(
   );
   plainTextLines.push(
     `djangoOrmIntellisense.pythonInterpreter: ${configuredInterpreter ?? 'Not set'}`
+  );
+  markdownLines.push(
+    `- djangoOrmIntellisense.autoStart: \`${settings.autoStart}\``
+  );
+  plainTextLines.push(
+    `djangoOrmIntellisense.autoStart: ${settings.autoStart}`
+  );
+  markdownLines.push(
+    `- djangoOrmIntellisense.diagnostics.enabled: \`${settings.diagnosticsEnabled}\` (${ormDiagnosticsStatus})`
+  );
+  plainTextLines.push(
+    `djangoOrmIntellisense.diagnostics.enabled: ${settings.diagnosticsEnabled} (${ormDiagnosticsStatus})`
+  );
+  markdownLines.push(
+    `- djangoOrmIntellisense.diagnostics.fullDocument: \`${settings.diagnosticsFullDocument}\``
+  );
+  plainTextLines.push(
+    `djangoOrmIntellisense.diagnostics.fullDocument: ${settings.diagnosticsFullDocument}`
+  );
+  markdownLines.push(
+    `- djangoOrmIntellisense.pylance.autoApplyStubOverrides: \`${settings.pylanceAutoApplyStubOverrides}\``
+  );
+  plainTextLines.push(
+    `djangoOrmIntellisense.pylance.autoApplyStubOverrides: ${settings.pylanceAutoApplyStubOverrides}`
   );
   markdownLines.push(`- Pylance: \`${isPylanceAvailable() ? 'detected' : 'not installed'}\``);
   plainTextLines.push(`Pylance: ${isPylanceAvailable() ? 'detected' : 'not installed'}`);
@@ -169,7 +195,11 @@ function buildStatusReport(
     plainTextLines.push(`Semantic graph: ${semanticGraphSummary}`);
   }
 
-  const recommendations = buildRecommendations(snapshot, configuredInterpreter);
+  const recommendations = buildRecommendations(
+    snapshot,
+    configuredInterpreter,
+    settings.diagnosticsEnabled
+  );
   if (recommendations.length > 0) {
     markdownLines.push('', '## Next Steps', '');
     plainTextLines.push('', 'Next Steps');
@@ -196,7 +226,8 @@ function buildStatusReport(
 
 function buildRecommendations(
   snapshot: HealthSnapshot,
-  configuredInterpreter: string | undefined
+  configuredInterpreter: string | undefined,
+  diagnosticsEnabled: boolean
 ): string[] {
   const recommendations: string[] = [];
   const runtime = snapshot.runtime;
@@ -208,7 +239,11 @@ function buildRecommendations(
     );
   }
 
-  if (!pylanceAvailable) {
+  if (!diagnosticsEnabled) {
+    recommendations.push(
+      'ORM diagnostics are disabled. Set `djangoOrmIntellisense.diagnostics.enabled` to `true` when you need live ORM validation.'
+    );
+  } else if (!pylanceAvailable) {
     recommendations.push(
       'Pylance is not installed, so Django ORM Intellisense disables its ORM diagnostics to avoid noisy false positives and extra background scans.'
     );

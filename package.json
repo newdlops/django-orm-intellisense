@@ -1,8 +1,8 @@
 {
   "name": "django-orm-intellisense",
   "displayName": "Django ORM Intellisense",
-  "description": "Framework-aware autocomplete, hover, go-to-definition, and diagnostics for Django ORM lookup paths, relation strings, and queryset chains.",
-  "version": "0.2.0",
+  "description": "Framework-aware autocomplete, hover, go-to-definition, and optional diagnostics for Django ORM lookup paths, relation strings, and queryset chains.",
+  "version": "0.2.1",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -67,8 +67,26 @@
       "properties": {
         "djangoOrmIntellisense.autoStart": {
           "type": "boolean",
+          "default": false,
+          "description": "Automatically start the analysis daemon when a Python file is opened. Disabled by default so extension activation stays lightweight; providers start the daemon lazily on first use."
+        },
+        "djangoOrmIntellisense.diagnostics.enabled": {
+          "type": "boolean",
           "default": true,
-          "description": "Automatically start the analysis daemon when a Python file is opened. Set to false to require manual restart."
+          "scope": "resource",
+          "description": "Enable Django ORM diagnostics. Diagnostics are lazy by default and run only after the analysis daemon is already started."
+        },
+        "djangoOrmIntellisense.diagnostics.fullDocument": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "When enabled, large-file diagnostics continue beyond the visible range to scan the whole document. Disabled by default to keep diagnostic CPU and memory cost low."
+        },
+        "djangoOrmIntellisense.pylance.autoApplyStubOverrides": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Automatically write Django stub overrides and restart Pylance on activation. Disabled by default to keep cold start lightweight; use the configure command to apply overrides manually."
         },
         "djangoOrmIntellisense.pythonInterpreter": {
           "type": "string",

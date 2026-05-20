@@ -1,4 +1,4 @@
-"""옵션 D reproducing E2E — surface_index cache load 를 background thread 로.
+"""옵션 D reproducing E2E — surface_index cache load 를 idle/on-demand 로.
 
 captain log.txt 측정 (옵션 C 적용 후):
     L17  load_cached_static_index        0.76s
@@ -7,12 +7,12 @@ captain log.txt 측정 (옵션 C 적용 후):
     L32  load_cached_surface_index       1.68s   ← cold-start 의 92% 차지
     L34  initialize complete             1.83s
 
-옵션 D 는 surface_index 로드를 background 로 옮겨 main thread initialize 가
-~350ms (4개 캐시) 안에 끝나도록.
+옵션 D 는 surface_index 로드를 main thread 밖으로 옮긴 뒤, 현재는 idle 또는
+사용자 요청 on-demand 시점까지 미뤄 initialize 직후 작업량을 최소화한다.
 
 이 E2E 는 코드 흐름 변경을 검증:
   1. initialize main thread 가 surface_index={} 로 즉시 진행
-  2. background worker 가 cache hit 시도 → 성공 시 _apply_surface_index(from_cache=True)
+  2. idle/on-demand worker 가 cache hit 시도 → 성공 시 _apply_surface_index(from_cache=True)
   3. cache miss 시 prebuild 로 fallback → _apply_surface_index(from_cache=False)
   4. _apply_surface_index 의 from_cache=True 케이스는 save_surface_index 안 부름
      (디스크에 이미 있음)
@@ -86,6 +86,29 @@ class CaptainSurfaceIndexBackgroundLoadTest(unittest.TestCase):
             '옛 동기 prebuild 분기가 남아 있음',
         )
 
+    def test_initialize_schedules_idle_or_on_demand_surface_load(self) -> None:
+        """initialize 는 즉시 worker 를 시작하지 않고 idle/on-demand 로 지연."""
+        self.assertIn(
+            '_schedule_surface_index_idle_load',
+            APP_SOURCE,
+            'surface_index load 는 initialize 에서 idle scheduler 로 연결되어야 함',
+        )
+        self.assertIn(
+            'defer_surface_index_load',
+            APP_SOURCE,
+            'idle/on-demand 지연 로그 마커가 있어야 cold-start 경로 추적 가능',
+        )
+        self.assertIn(
+            'SURFACE_INDEX_ON_DEMAND_METHODS',
+            APP_SOURCE,
+            'hover/completion 계열 요청에서 on-demand load 를 앞당기는 method set 필요',
+        )
+        self.assertIn(
+            "source != 'diagnostic'",
+            APP_SOURCE,
+            'diagnostic 경로는 surface cache load 를 on-demand 로 깨우면 안 됨',
+        )
+
     def test_apply_surface_index_supports_from_cache_flag(self) -> None:
         """`_apply_surface_index` 가 `from_cache` 키워드를 받고 cache 케이스엔
         save_surface_index 안 부르도록 변경되었는지."""
@@ -106,7 +129,7 @@ class CaptainSurfaceIndexBackgroundLoadTest(unittest.TestCase):
         """background worker 가 cache load 시도 → prebuild fallback 순서."""
         # _background_worker 함수 source 추출
         worker_match = re.search(
-            r'def _background_worker\(\)[^{]*?(?=\n        thread = threading\.Thread)',
+            r'def _background_worker\(\).*?(?=\n        thread = threading\.Thread)',
             APP_SOURCE,
             re.DOTALL,
         )
@@ -117,7 +140,7 @@ class CaptainSurfaceIndexBackgroundLoadTest(unittest.TestCase):
         worker_src = worker_match.group(0)
         # cache load 호출이 prebuild 호출보다 먼저
         cache_idx = worker_src.find('load_cached_surface_index')
-        prebuild_idx = worker_src.find('prebuild_member_surface_cache')
+        prebuild_idx = worker_src.find('_bg_prebuild_surface_index')
         self.assertGreaterEqual(cache_idx, 0, 'cache load 호출 없음')
         self.assertGreaterEqual(prebuild_idx, 0, 'prebuild 호출 없음')
         self.assertLess(

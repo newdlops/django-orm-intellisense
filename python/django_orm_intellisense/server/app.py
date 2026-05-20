@@ -71,6 +71,12 @@ from ..static_index.indexer import StaticIndex, build_static_index, reindex_sing
 
 
 INITIAL_SYNC_SURFACE_INDEX_MODEL_LIMIT = 200
+SURFACE_INDEX_ON_DEMAND_METHODS = {
+    'ormMemberCompletions',
+    'resolveOrmMember',
+    'resolveOrmMemberBatch',
+    'resolveOrmMemberChain',
+}
 
 
 def _inheritance_dependent_labels(
@@ -122,7 +128,7 @@ class _InitializedState:
     surface_fingerprints: dict[str, str]
     custom_lookups: dict[str, list[str]]
     custom_lookups_fingerprint: str
-    static_fallback: dict[str, dict[str, list[str]]] | None
+    static_fallback: dict[str, dict[str, object]] | None
     static_fallback_fingerprint: str | None
 
 
@@ -320,10 +326,7 @@ class DaemonServer:
         self._bg_pool_state_key: tuple[int, int, int] | None = None
         self._bg_pool_prewarm_token = 0
         self._bg_pool_capacity = 0
-        self._fallback_bg_pool = ThreadPoolExecutor(
-            max_workers=min(os.cpu_count() or 2, 3),
-            thread_name_prefix='fallback-bg',
-        )
+        self._fallback_bg_pool: ThreadPoolExecutor | None = None
         self._bg_metrics_lock = threading.Lock()
         self._bg_metrics: dict[str, dict[str, int]] = {
             'pool': {
@@ -344,10 +347,13 @@ class DaemonServer:
         self._last_surface_index: dict[str, object] | None = None
         self._last_surface_fingerprints: dict[str, str] | None = None
         self._last_model_names: list[str] | None = None
-        self._last_static_fallback: dict[str, dict[str, list[str]]] | None = None
+        self._last_static_fallback: dict[str, dict[str, object]] | None = None
         self._last_static_fallback_fingerprint: str | None = None
         self._last_custom_lookups_fingerprint: str | None = None
         self._surface_prebuild_future: Any | None = None
+        self._surface_load_idle_timer: threading.Timer | None = None
+        self._surface_load_lock = threading.Lock()
+        self._surface_load_attempted_generation: int | None = None
 
     def run_stdio(self) -> None:
         threading.current_thread().name = 'main'
@@ -375,6 +381,11 @@ class DaemonServer:
             request['_dequeued_at'] = time.perf_counter()
 
             if request.get('background'):
+                if (
+                    self._bg_pool is None
+                    and os.environ.get('DJLS_BG_PROCESS_POOL') == '1'
+                ):
+                    self._rebuild_bg_pool()
                 if self._bg_pool is not None:
                     # Background requests → separate OS processes (no GIL).
                     self._submit_bg(request)
@@ -387,32 +398,50 @@ class DaemonServer:
                 # → main thread for immediate response.
                 self._handle_request(request)
 
+        self._cancel_surface_index_idle_load()
         if self._bg_pool is not None:
             self._bg_pool.shutdown(wait=False)
-        self._fallback_bg_pool.shutdown(wait=False)
+        if self._fallback_bg_pool is not None:
+            self._fallback_bg_pool.shutdown(wait=False)
 
     # ------------------------------------------------------------------
     # Background process pool
     # ------------------------------------------------------------------
 
-    def _rebuild_bg_pool(self) -> None:
-        """(Re-)create the process pool with the current state snapshot.
+    def _discard_bg_pool(self) -> None:
+        old = self._bg_pool
+        self._bg_pool = None
+        self._bg_pool_state_key = None
+        self._bg_pool_prewarm_token += 1
+        self._bg_pool_capacity = 0
+        if old is not None:
+            old.shutdown(wait=False)
 
-        Called after initialize and reindexFile so workers get fresh data.
+    def _ensure_fallback_bg_pool(self) -> ThreadPoolExecutor:
+        if self._fallback_bg_pool is None:
+            self._fallback_bg_pool = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix='fallback-bg',
+            )
+        return self._fallback_bg_pool
+
+    def _rebuild_bg_pool(self) -> None:
+        """Opt-in process pool for non-interactive background IPC.
+
+        The default path deliberately avoids process workers: spawning Django
+        state snapshots dominates cold start and can keep hundreds of MB alive.
         """
+        if os.environ.get('DJLS_BG_PROCESS_POOL') != '1':
+            self._discard_bg_pool()
+            return
+
         with self._state_lock:
             si = self.static_index
             rt = self.runtime_inspection
             mg = self.model_graph
 
         if si is None or rt is None or mg is None:
-            old = self._bg_pool
-            self._bg_pool = None
-            self._bg_pool_state_key = None
-            self._bg_pool_prewarm_token += 1
-            if old is not None:
-                old.shutdown(wait=False)
-            self._bg_pool_capacity = 0
+            self._discard_bg_pool()
             return
 
         state_key = (id(si), id(rt), id(mg))
@@ -423,12 +452,7 @@ class DaemonServer:
             )
             return
 
-        old = self._bg_pool
-        self._bg_pool = None
-        self._bg_pool_state_key = None
-        self._bg_pool_prewarm_token += 1
-        if old is not None:
-            old.shutdown(wait=False)
+        self._discard_bg_pool()
 
         worker_count = min(os.cpu_count() or 4, 8)
         try:
@@ -444,7 +468,7 @@ class DaemonServer:
                 file=sys.stderr, flush=True,
             )
             warm_count = min(worker_count, 2)
-            if warm_count > 0:
+            if warm_count > 0 and os.environ.get('DJLS_BG_PROCESS_POOL_PREWARM') == '1':
                 self._bg_pool_prewarm_token += 1
                 self._start_bg_pool_prewarm(
                     pool=self._bg_pool,
@@ -457,10 +481,7 @@ class DaemonServer:
                 f'background requests will run on fallback thread',
                 file=sys.stderr, flush=True,
             )
-            self._bg_pool = None
-            self._bg_pool_state_key = None
-            self._bg_pool_prewarm_token += 1
-            self._bg_pool_capacity = 0
+            self._discard_bg_pool()
 
     def _start_bg_pool_prewarm(
         self,
@@ -598,7 +619,8 @@ class DaemonServer:
         method = request.get('method')
         source = request.get('source') or 'unknown'
 
-        future = self._fallback_bg_pool.submit(self._handle_request, request)
+        pool = self._ensure_fallback_bg_pool()
+        future = pool.submit(self._handle_request, request)
         self._record_bg_submit('fallback', request_id, method, source)
 
         def _on_done(f: Any) -> None:
@@ -677,6 +699,13 @@ class DaemonServer:
 
         try:
             with contextlib.redirect_stdout(sys.stderr):
+                if (
+                    method in SURFACE_INDEX_ON_DEMAND_METHODS
+                    and source != 'diagnostic'
+                ):
+                    self._request_surface_index_load(
+                        reason=f'on_demand:{method}',
+                    )
                 if method == 'initialize':
                     result = self._initialize(params)
                 elif method == 'health':
@@ -970,13 +999,12 @@ class DaemonServer:
             f'elapsed={time.perf_counter() - started_at:.2f}s'
         )
 
-        # 옵션 D — surface_index 캐시 로드(captain 측정 1.68s)를 background 로
-        # 항상 옮김. cache miss 케이스의 prebuild 도 동일 background worker 에서
-        # 처리. main thread initialize 응답은 빈 surface_index 로 즉시 진행하고
-        # notification 으로 채워줌. cold-start ~1.5s 단축.
+        # 옵션 D — surface_index 는 main initialize 에서 로드하지 않는다.
+        # cache load/prebuild 는 idle/on-demand 경로로 미뤄 cold-start 작업량을
+        # 거의 0에 가깝게 유지한다.
         surface_index: dict[str, object] = {}
         surface_index_status = 'defer_load_or_prebuild'
-        should_prebuild_surface_index = True
+        should_schedule_surface_index_load = not runtime_deferred
 
         if not self._apply_state(
             generation=generation,
@@ -1016,17 +1044,11 @@ class DaemonServer:
         self._last_static_fallback = static_fallback
         self._last_static_fallback_fingerprint = static_fallback_fingerprint
         self._last_custom_lookups_fingerprint = custom_lookups_fingerprint
-        self._rebuild_bg_pool()
-        if should_prebuild_surface_index:
-            self._start_surface_index_prebuild(
-                generation=generation,
-                workspace_root=workspace_root,
-                source_snapshot=source_snapshot,
-                static_index=static_index,
-                runtime=runtime,
-                health_snapshot=health_snapshot,
-                model_graph=model_graph,
-                model_names=model_names,
+        self._discard_bg_pool()
+        if should_schedule_surface_index_load:
+            self._schedule_surface_index_idle_load(
+                reason='initialize',
+                expected_generation=generation,
             )
         # 옵션 A2 — runtime field registry 를 background 에서 미리 빌드.
         # captain 의 첫 resolveLookupPath IPC 2.8s 폭주가 lazy `django.setup()`
@@ -1096,8 +1118,8 @@ class DaemonServer:
         *,
         model_graph: ModelGraph,
         surface_index: dict[str, object],
-    ) -> dict[str, dict[str, list[str]]] | None:
-        static_fallback: dict[str, dict[str, list[str]]] = {}
+    ) -> dict[str, dict[str, object]] | None:
+        static_fallback: dict[str, dict[str, object]] = {}
         runtime_labels = set(surface_index.keys())
         for node in model_graph.nodes_by_label.values():
             candidate = node.model_candidate
@@ -1106,22 +1128,177 @@ class DaemonServer:
             fields_for = model_graph.fields_for_model(node.label)
             scalar_names: list[str] = []
             relation_names: list[str] = []
+            reverse_relation_names: list[str] = []
+            field_details: dict[str, dict[str, object]] = {}
             for field in fields_for:
+                field_details[field.name] = {
+                    'fieldKind': field.field_kind,
+                    'isRelation': field.is_relation,
+                    'relationDirection': field.relation_direction,
+                    'relatedModelLabel': field.related_model_label,
+                }
                 if field.relation_direction == 'reverse':
-                    continue
-                if field.is_relation:
+                    reverse_relation_names.append(field.name)
+                elif field.is_relation:
                     relation_names.append(field.name)
                 else:
                     scalar_names.append(field.name)
-            if scalar_names or relation_names:
+            if scalar_names or relation_names or reverse_relation_names:
                 static_fallback[node.label] = {
                     'fields': scalar_names,
                     'relations': relation_names,
+                    'reverseRelations': reverse_relation_names,
+                    'fieldDetails': field_details,
                 }
         return static_fallback if static_fallback else None
 
     def _build_model_names(self, model_graph: ModelGraph) -> list[str]:
         return sorted(model_graph.nodes_by_object_name.keys())
+
+    def _surface_cache_load_mode(self) -> str:
+        return (
+            os.environ.get('DJLS_SURFACE_CACHE_LOAD_MODE')
+            or 'idle'
+        ).strip().lower()
+
+    def _surface_cache_idle_delay_seconds(self) -> float:
+        raw_ms = os.environ.get('DJLS_SURFACE_CACHE_IDLE_MS', '2000')
+        try:
+            return max(0.0, float(raw_ms) / 1000.0)
+        except ValueError:
+            return 2.0
+
+    def _cancel_surface_index_idle_load(self) -> None:
+        with self._surface_load_lock:
+            timer = self._surface_load_idle_timer
+            self._surface_load_idle_timer = None
+        if timer is not None and timer is not threading.current_thread():
+            timer.cancel()
+
+    def _schedule_surface_index_idle_load(
+        self,
+        *,
+        reason: str,
+        expected_generation: int,
+    ) -> None:
+        mode = self._surface_cache_load_mode()
+        if mode in {'0', 'off', 'false', 'disabled', 'none'}:
+            _log_initialize_step(
+                f'defer_surface_index_load reason={reason} mode=disabled'
+            )
+            return
+        if mode in {'ondemand', 'on_demand', 'on-demand'}:
+            _log_initialize_step(
+                f'defer_surface_index_load reason={reason} mode=on_demand'
+            )
+            return
+        if mode in {'eager', 'immediate'}:
+            self._request_surface_index_load(
+                reason=f'eager:{reason}',
+                expected_generation=expected_generation,
+            )
+            return
+
+        delay_seconds = self._surface_cache_idle_delay_seconds()
+        if delay_seconds <= 0:
+            self._request_surface_index_load(
+                reason=f'idle:{reason}',
+                expected_generation=expected_generation,
+            )
+            return
+
+        with self._surface_load_lock:
+            if self._surface_load_attempted_generation == expected_generation:
+                return
+            if self._surface_prebuild_future is not None:
+                return
+            if self._surface_load_idle_timer is not None:
+                return
+
+            def _idle_load() -> None:
+                try:
+                    self._request_surface_index_load(
+                        reason=f'idle:{reason}',
+                        expected_generation=expected_generation,
+                    )
+                finally:
+                    with self._surface_load_lock:
+                        if self._surface_load_idle_timer is threading.current_thread():
+                            self._surface_load_idle_timer = None
+
+            timer = threading.Timer(delay_seconds, _idle_load)
+            timer.name = 'surface-index-idle-load-timer'
+            timer.daemon = True
+            self._surface_load_idle_timer = timer
+            timer.start()
+
+        _log_initialize_step(
+            f'defer_surface_index_load reason={reason} '
+            f'mode=idle delay_ms={delay_seconds * 1000:.0f}'
+        )
+
+    def _request_surface_index_load(
+        self,
+        *,
+        reason: str,
+        expected_generation: int | None = None,
+    ) -> None:
+        with self._state_lock:
+            generation = self._state_generation
+            if expected_generation is not None and generation != expected_generation:
+                return
+
+        self._cancel_surface_index_idle_load()
+        self._start_surface_index_prebuild_for_current_state(
+            reason=reason,
+            expected_generation=expected_generation,
+        )
+
+    def _start_surface_index_prebuild_for_current_state(
+        self,
+        *,
+        reason: str,
+        expected_generation: int | None = None,
+    ) -> None:
+        with self._state_lock:
+            generation = self._state_generation
+            if expected_generation is not None and generation != expected_generation:
+                return
+            workspace_root = self.workspace_root
+            source_snapshot = self.source_snapshot
+            static_index = self.static_index
+            runtime = self.runtime_inspection
+            health_snapshot = self.health_snapshot
+            model_graph = self.model_graph
+            model_names = self._last_model_names
+
+        if (
+            source_snapshot is None
+            or static_index is None
+            or runtime is None
+            or health_snapshot is None
+            or model_graph is None
+        ):
+            return
+        if runtime.bootstrap_status == 'warming_up':
+            _log_initialize_step(
+                f'skip_surface_index_load reason={reason} runtime=warming_up'
+            )
+            return
+        if model_names is None:
+            model_names = self._build_model_names(model_graph)
+
+        self._start_surface_index_prebuild(
+            generation=generation,
+            workspace_root=workspace_root,
+            source_snapshot=source_snapshot,
+            static_index=static_index,
+            runtime=runtime,
+            health_snapshot=health_snapshot,
+            model_graph=model_graph,
+            model_names=model_names,
+            reason=reason,
+        )
 
     def _start_surface_index_prebuild(
         self,
@@ -1134,6 +1311,7 @@ class DaemonServer:
         health_snapshot: dict[str, Any],
         model_graph: ModelGraph,
         model_names: list[str],
+        reason: str,
     ) -> None:
         started_at = time.perf_counter()
 
@@ -1172,10 +1350,13 @@ class DaemonServer:
                 self._last_static_fallback = static_fallback
                 self._last_static_fallback_fingerprint = static_fallback_fingerprint
                 self._last_custom_lookups_fingerprint = custom_lookups_fingerprint
+                with self._surface_load_lock:
+                    self._surface_load_attempted_generation = generation
 
             stage = 'load_cached' if from_cache else 'prebuild'
             _log_initialize_step(
                 f'{stage}_surface_index(background) '
+                f'reason={reason} '
                 f'models={len(surface_index)} '
                 f'elapsed={time.perf_counter() - started_at:.2f}s'
             )
@@ -1221,28 +1402,50 @@ class DaemonServer:
                     _apply_surface_index(cached, from_cache=True)
                     return
 
-                # cache miss — prebuild. 기존 pool/fallback 분기 유지.
+                if os.environ.get('DJLS_SURFACE_PREBUILD_ON_MISS') != '1':
+                    with self._surface_load_lock:
+                        self._surface_load_attempted_generation = generation
+                    _log_initialize_step(
+                        'skip_prebuild_surface_index(background) '
+                        f'reason=cache_miss trigger={reason} '
+                        f'elapsed={time.perf_counter() - started_at:.2f}s'
+                    )
+                    return
+
+                # cache miss — opt-in prebuild off the main daemon process. A
+                # long-lived pool is also opt-in; otherwise use a single
+                # short-lived worker so memory is returned after the cache is
+                # written.
                 if self._bg_pool is not None:
                     future = self._bg_pool.submit(_bg_prebuild_surface_index)
                     surface_index = future.result()
                 else:
-                    surface_index = prebuild_member_surface_cache(
-                        static_index,
-                        runtime,
-                        model_graph,
-                    )
+                    with ProcessPoolExecutor(
+                        max_workers=1,
+                        initializer=_init_bg_worker,
+                        initargs=(static_index, runtime, model_graph),
+                    ) as pool:
+                        future = pool.submit(_bg_prebuild_surface_index)
+                        surface_index = future.result()
                 _apply_surface_index(surface_index, from_cache=False)
             except Exception:
                 _log_failure()
             finally:
-                self._surface_prebuild_future = None
+                with self._surface_load_lock:
+                    if self._surface_prebuild_future is threading.current_thread():
+                        self._surface_prebuild_future = None
 
         thread = threading.Thread(
             target=_background_worker,
             name='surface-index-load-or-prebuild',
             daemon=True,
         )
-        self._surface_prebuild_future = thread
+        with self._surface_load_lock:
+            if self._surface_load_attempted_generation == generation:
+                return
+            if self._surface_prebuild_future is not None:
+                return
+            self._surface_prebuild_future = thread
         thread.start()
 
     def _start_runtime_field_registry_prewarm(
@@ -1483,7 +1686,7 @@ class DaemonServer:
         model_names = self._build_model_names(model_graph)
 
         # Build staticFallback for affected models
-        static_fallback: dict[str, dict[str, list[str]]] = {}
+        static_fallback: dict[str, dict[str, object]] = {}
         if self._last_static_fallback:
             static_fallback = dict(self._last_static_fallback)
         for label in affected_labels:
@@ -1527,8 +1730,9 @@ class DaemonServer:
             else None
         )
 
-        # Refresh background workers with updated state.
-        self._rebuild_bg_pool()
+        # State snapshots changed; drop stale workers instead of spawning
+        # fresh processes during edit-time reindex.
+        self._discard_bg_pool()
 
         elapsed = time.perf_counter() - started
         print(
@@ -1793,6 +1997,9 @@ class DaemonServer:
         workspace_root: Path,
         initialized_at: datetime,
     ) -> int:
+        self._cancel_surface_index_idle_load()
+        with self._surface_load_lock:
+            self._surface_load_attempted_generation = None
         with self._state_lock:
             self._state_generation += 1
             self.workspace_root = workspace_root
@@ -1926,8 +2133,14 @@ class DaemonServer:
             runtime.custom_lookups
         )
 
-        # Runtime warmup produced better state; refresh worker pool.
-        self._rebuild_bg_pool()
+        # Runtime warmup produced better state; drop stale workers. Surface
+        # cache/prebuild stays idle/on-demand so warmup completion does not
+        # immediately spend cache IO or prebuild CPU.
+        self._discard_bg_pool()
+        self._schedule_surface_index_idle_load(
+            reason='runtime_warmup',
+            expected_generation=generation,
+        )
 
         self._write_notification(
             'healthChanged',
