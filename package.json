@@ -2,7 +2,7 @@
   "name": "django-orm-intellisense",
   "displayName": "Django ORM Intellisense",
   "description": "Framework-aware autocomplete, hover, go-to-definition, and optional diagnostics for Django ORM lookup paths, relation strings, and queryset chains.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -87,6 +87,12 @@
           "default": false,
           "scope": "resource",
           "description": "Automatically write Django stub overrides and restart Pylance on activation. Disabled by default to keep cold start lightweight; use the configure command to apply overrides manually."
+        },
+        "djangoOrmIntellisense.inlayHints.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Show inline type hints next to Django ORM lookup keyword arguments (e.g. `field__in=` → `: list[int]`). Type-checkers like Pylance cannot type these dynamic lookup kwargs, so this surfaces the inferred operand/result type inline. Toggle with the built-in `editor.inlayHints.enabled` for global control."
         },
         "djangoOrmIntellisense.pythonInterpreter": {
           "type": "string",

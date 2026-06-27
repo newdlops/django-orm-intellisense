@@ -85,6 +85,118 @@ export const FIELD_TRANSFORMS: Record<string, { outputFieldKind: string; applica
 /** Default lookups for unknown or unrecognized field types. */
 export const DEFAULT_LOOKUPS = ['exact', 'in', 'isnull', 'gt', 'gte', 'lt', 'lte'];
 
+// ============================================================================
+// Field-kind -> Python type mapping
+// ----------------------------------------------------------------------------
+// SINGLE SOURCE OF TRUTH (mirrored verbatim in two other files — keep in sync):
+//   - python/django_orm_intellisense/features/field_types.py  (FIELD_KIND_PYTHON_TYPE)
+//   - crates/core/src/static_index/types.rs                   (FIELD_KIND_PYTHON_TYPE)
+// A parity test (python/tests/test_field_type_table_parity.py) asserts the
+// three copies stay identical. Relation kinds map to 'Any' here; the terminal
+// type of a relation is surfaced via the related model, not this table.
+// ============================================================================
+export const FIELD_KIND_PYTHON_TYPE: Record<string, string> = {
+  // String-like
+  CharField: 'str',
+  TextField: 'str',
+  SlugField: 'str',
+  URLField: 'str',
+  EmailField: 'str',
+  FilePathField: 'str',
+  GenericIPAddressField: 'str',
+  IPAddressField: 'str',
+  CommaSeparatedIntegerField: 'str',
+  FileField: 'str',
+  ImageField: 'str',
+  // Integer-like
+  IntegerField: 'int',
+  BigIntegerField: 'int',
+  SmallIntegerField: 'int',
+  PositiveIntegerField: 'int',
+  PositiveSmallIntegerField: 'int',
+  PositiveBigIntegerField: 'int',
+  AutoField: 'int',
+  BigAutoField: 'int',
+  SmallAutoField: 'int',
+  // Real numbers
+  FloatField: 'float',
+  DecimalField: 'decimal.Decimal',
+  // Boolean
+  BooleanField: 'bool',
+  NullBooleanField: 'bool',
+  // Date/time
+  DateField: 'datetime.date',
+  DateTimeField: 'datetime.datetime',
+  TimeField: 'datetime.time',
+  DurationField: 'datetime.timedelta',
+  // Misc scalars
+  UUIDField: 'uuid.UUID',
+  JSONField: 'dict | list',
+  BinaryField: 'bytes',
+  // Relations — terminal type is the related model, not a scalar python type.
+  ForeignKey: 'Any',
+  OneToOneField: 'Any',
+  ManyToManyField: 'Any',
+};
+
+/**
+ * Map a Django field-class name to its concrete Python type for display.
+ * Falls back to 'Any' for custom or unrecognized field kinds.
+ */
+export function pythonTypeForKind(fieldKind: string): string {
+  return FIELD_KIND_PYTHON_TYPE[fieldKind] ?? 'Any';
+}
+
+/**
+ * Compute the Python type of the OPERAND (the comparison value) for a lookup
+ * operator applied to a field whose python type is `fieldPythonType`.
+ *
+ * Advisory only — surfaced in hover/completion detail, never enforced.
+ */
+export function operandPythonType(
+  lookupOperator: string,
+  fieldPythonType: string
+): string {
+  switch (lookupOperator) {
+    case 'isnull':
+      return 'bool';
+    case 'in':
+      return `list[${fieldPythonType}]`;
+    case 'range':
+      return `tuple[${fieldPythonType}, ${fieldPythonType}]`;
+    case 'contains':
+    case 'icontains':
+    case 'startswith':
+    case 'istartswith':
+    case 'endswith':
+    case 'iendswith':
+    case 'regex':
+    case 'iregex':
+    case 'iexact':
+      return 'str';
+    case 'year':
+    case 'month':
+    case 'day':
+    case 'week':
+    case 'week_day':
+    case 'iso_year':
+    case 'iso_week_day':
+    case 'quarter':
+    case 'hour':
+    case 'minute':
+    case 'second':
+      return 'int';
+    case 'date':
+      return 'datetime.date';
+    case 'time':
+      return 'datetime.time';
+    default:
+      // exact / gt / gte / lt / lte and anything else compare against the
+      // field's own type.
+      return fieldPythonType;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------

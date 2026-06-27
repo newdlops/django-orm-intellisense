@@ -20,7 +20,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::Serialize;
 
 use crate::semantic::ModelGraph;
-use crate::static_index::FieldCandidate;
+use crate::static_index::{python_type_for_kind, FieldCandidate};
 
 pub const RELATION_ONLY_METHODS: &[&str] = &["select_related", "prefetch_related"];
 pub const ATTRIBUTE_PATH_METHODS: &[&str] =
@@ -79,6 +79,96 @@ pub fn is_default_lookup_operator(name: &str) -> bool {
     DEFAULT_LOOKUP_OPERATORS.contains(&name)
 }
 
+/// Built-in transform table: (name, output field kind, applicable input
+/// field kinds). Mirrors FIELD_TRANSFORMS in src/server/fieldLookups.ts and
+/// python/.../features/field_types.py — keep in sync (a parity test enforces
+/// the field-kind/python-type map; this transform table shares that contract).
+pub const FIELD_TRANSFORMS: &[(&str, &str, &[&str])] = &[
+    ("lower", "CharField", &["CharField", "TextField", "SlugField", "URLField", "EmailField"]),
+    ("upper", "CharField", &["CharField", "TextField", "SlugField", "URLField", "EmailField"]),
+    ("length", "IntegerField", &["CharField", "TextField", "SlugField", "URLField", "EmailField"]),
+    ("trim", "CharField", &["CharField", "TextField"]),
+    ("ltrim", "CharField", &["CharField", "TextField"]),
+    ("rtrim", "CharField", &["CharField", "TextField"]),
+    ("year", "IntegerField", &["DateField", "DateTimeField"]),
+    ("month", "IntegerField", &["DateField", "DateTimeField"]),
+    ("day", "IntegerField", &["DateField", "DateTimeField"]),
+    ("hour", "IntegerField", &["TimeField", "DateTimeField"]),
+    ("minute", "IntegerField", &["TimeField", "DateTimeField"]),
+    ("second", "IntegerField", &["TimeField", "DateTimeField"]),
+    ("date", "DateField", &["DateTimeField"]),
+    ("time", "TimeField", &["DateTimeField"]),
+    ("week", "IntegerField", &["DateField", "DateTimeField"]),
+    ("week_day", "IntegerField", &["DateField", "DateTimeField"]),
+    ("quarter", "IntegerField", &["DateField", "DateTimeField"]),
+    ("iso_year", "IntegerField", &["DateField", "DateTimeField"]),
+    ("iso_week_day", "IntegerField", &["DateField", "DateTimeField"]),
+];
+
+/// Static output field kind for a built-in transform applied to `input_kind`.
+/// Returns None when the transform is unknown or not applicable to that input.
+pub fn transform_output_kind(name: &str, input_kind: &str) -> Option<&'static str> {
+    FIELD_TRANSFORMS.iter().find_map(|(t, out, applicable)| {
+        if *t == name && applicable.contains(&input_kind) {
+            Some(*out)
+        } else {
+            None
+        }
+    })
+}
+
+/// Python type of the comparison operand for `op` on a field whose python
+/// type is `field_python_type`. Advisory only (rendered in hover/detail).
+pub fn operand_python_type(op: &str, field_python_type: &str) -> String {
+    match op {
+        "isnull" => "bool".to_string(),
+        "in" => format!("list[{field_python_type}]"),
+        "range" => format!("tuple[{field_python_type}, {field_python_type}]"),
+        "contains" | "icontains" | "startswith" | "istartswith" | "endswith"
+        | "iendswith" | "regex" | "iregex" | "iexact" => "str".to_string(),
+        "year" | "month" | "day" | "week" | "week_day" | "iso_year"
+        | "iso_week_day" | "quarter" | "hour" | "minute" | "second" => "int".to_string(),
+        "date" => "datetime.date".to_string(),
+        "time" => "datetime.time".to_string(),
+        _ => field_python_type.to_string(),
+    }
+}
+
+/// Walk the trailing `__`-separated segments after a terminal field whose kind
+/// is `input_field_kind`, applying built-in transforms (which advance the
+/// output kind) and accepting at most one terminal lookup operator.
+///
+/// Returns `(output_field_kind, is_transformed, lookup_operator)` on success,
+/// or `Err(missing_segment)` when a segment is neither a valid transform for
+/// the running output kind nor a terminal lookup operator.
+fn resolve_trailing_chain(
+    segments: &[&str],
+    input_field_kind: &str,
+) -> Result<(String, bool, Option<String>), String> {
+    let mut output_kind = input_field_kind.to_string();
+    let mut is_transformed = false;
+    let mut operator: Option<String> = None;
+
+    for (i, seg) in segments.iter().enumerate() {
+        if let Some(out) = transform_output_kind(seg, &output_kind) {
+            output_kind = out.to_string();
+            is_transformed = true;
+            continue;
+        }
+        if is_default_lookup_operator(seg) {
+            // A lookup operator must be the final segment.
+            if i != segments.len() - 1 {
+                return Err((*seg).to_string());
+            }
+            operator = Some((*seg).to_string());
+            break;
+        }
+        return Err((*seg).to_string());
+    }
+
+    Ok((output_kind, is_transformed, operator))
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LookupSegment {
@@ -86,6 +176,23 @@ pub struct LookupSegment {
     pub kind: String,
     pub model_label: Option<String>,
     pub field_kind: Option<String>,
+}
+
+/// Inferred type of a fully-resolved lookup chain (the value `A__B__C[...]`
+/// ultimately denotes). `output_field_kind` is the Django field kind AFTER any
+/// trailing transforms (e.g. IntegerField for `pubdate__year`), and
+/// `python_type` is its concrete Python type. Distinct from the matched
+/// terminal field record (which keeps the PRE-transform kind for go-to-def).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalType {
+    pub output_field_kind: String,
+    pub python_type: String,
+    pub is_transformed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookup_operator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operand_python_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,6 +206,8 @@ pub enum LookupResolution {
         base_model_label: String,
         #[serde(rename = "lookupOperator")]
         lookup_operator: Option<String>,
+        #[serde(rename = "terminalType", skip_serializing_if = "Option::is_none")]
+        terminal_type: Option<TerminalType>,
     },
     Unresolved {
         reason: String,
@@ -136,19 +245,34 @@ pub fn resolve_lookup_path(
     let mut resolved: Vec<LookupSegment> = Vec::new();
     let mut terminal: Option<FieldCandidate> = None;
     let mut lookup_operator: Option<String> = None;
+    // Output field kind AFTER any trailing transforms (e.g. IntegerField for
+    // `pubdate__year`). Starts as the terminal field kind; advanced by
+    // `resolve_trailing_chain`.
+    let mut output_field_kind: Option<String> = None;
+    let mut is_transformed = false;
 
     for (i, segment) in segments.iter().enumerate() {
         let field = graph.find_field(&current_label, segment).cloned();
         let Some(field) = field else {
-            // Terminal-field scalar lookup fallthrough.
-            if is_filter_method(method) && terminal.is_some() {
-                if is_default_lookup_operator(segment) {
-                    // Only accept if remaining segments collapse into a
-                    // single operator — chained transforms require
-                    // runtime knowledge.
-                    if i == segments.len() - 1 {
-                        lookup_operator = Some((*segment).to_string());
-                        break;
+            // Terminal-field transform/lookup fallthrough: the remaining
+            // segments are built-in transforms (which change the result type)
+            // and/or a single terminal lookup operator.
+            if is_filter_method(method) {
+                if let Some(ref term) = terminal {
+                    match resolve_trailing_chain(&segments[i..], &term.field_kind) {
+                        Ok((out_kind, transformed, op)) => {
+                            output_field_kind = Some(out_kind);
+                            is_transformed = transformed;
+                            lookup_operator = op;
+                            break;
+                        }
+                        Err(missing) => {
+                            return LookupResolution::Unresolved {
+                                reason: "segment_not_found".into(),
+                                resolved_segments: Some(resolved),
+                                missing_segment: Some(missing),
+                            };
+                        }
                     }
                 }
             }
@@ -169,6 +293,11 @@ pub fn resolve_lookup_path(
             model_label: Some(current_label.clone()),
             field_kind: Some(field.field_kind.clone()),
         });
+        // A newly matched field resets the running output kind / transform
+        // state (a prior trailing operator cannot have been set yet).
+        output_field_kind = Some(field.field_kind.clone());
+        is_transformed = false;
+        lookup_operator = None;
         terminal = Some(field.clone());
 
         let is_last = i == segments.len() - 1;
@@ -182,18 +311,23 @@ pub fn resolve_lookup_path(
         }
 
         // Scalar mid-path on a filter method: remaining segments are
-        // treated as lookup operators.
+        // transforms and/or a terminal lookup operator.
         if is_filter_method(method) {
-            let remaining: Vec<&str> = segments[i + 1..].to_vec();
-            if remaining.len() == 1 && is_default_lookup_operator(remaining[0]) {
-                lookup_operator = Some(remaining[0].to_string());
-                break;
+            match resolve_trailing_chain(&segments[i + 1..], &field.field_kind) {
+                Ok((out_kind, transformed, op)) => {
+                    output_field_kind = Some(out_kind);
+                    is_transformed = transformed;
+                    lookup_operator = op;
+                    break;
+                }
+                Err(missing) => {
+                    return LookupResolution::Unresolved {
+                        reason: "unknown_lookup".into(),
+                        resolved_segments: Some(resolved),
+                        missing_segment: Some(missing),
+                    };
+                }
             }
-            return LookupResolution::Unresolved {
-                reason: "unknown_lookup".into(),
-                resolved_segments: Some(resolved),
-                missing_segment: remaining.first().map(|s| (*s).to_string()),
-            };
         }
 
         return LookupResolution::Unresolved {
@@ -219,6 +353,26 @@ pub fn resolve_lookup_path(
         };
     }
 
+    // Terminal type descriptor — only for scalar terminals. A relation
+    // terminal's type is the related model, surfaced separately, so we omit
+    // terminalType rather than claim a misleading scalar python type.
+    let terminal_type = if terminal.is_relation {
+        None
+    } else {
+        let out_kind = output_field_kind.unwrap_or_else(|| terminal.field_kind.clone());
+        let python_type = python_type_for_kind(&out_kind).to_string();
+        let operand = lookup_operator
+            .as_deref()
+            .map(|op| operand_python_type(op, &python_type));
+        Some(TerminalType {
+            output_field_kind: out_kind,
+            python_type,
+            is_transformed,
+            lookup_operator: lookup_operator.clone(),
+            operand_python_type: operand,
+        })
+    };
+
     LookupResolution::Resolved {
         target: LookupSegment {
             name: terminal.name.clone(),
@@ -238,6 +392,7 @@ pub fn resolve_lookup_path(
         resolved_segments: resolved,
         base_model_label: base_model_label.to_string(),
         lookup_operator,
+        terminal_type,
     }
 }
 
@@ -981,5 +1136,131 @@ mod tests {
         let r = list_lookup_path_completions(&g, "shop.Order", "bogus__foo", "filter");
         assert!(!r.resolved);
         assert_eq!(r.reason.as_deref(), Some("segment_not_found"));
+    }
+
+    // -- Terminal type inference (P2) -------------------------------------
+
+    fn dated_graph() -> ModelGraph {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("blog")).unwrap();
+        fs::write(
+            root.join("blog/models.py"),
+            "from django.db import models\nclass Entry(models.Model):\n    title = models.CharField(max_length=200)\n    pubdate = models.DateTimeField()\n    author = models.ForeignKey('blog.Author', on_delete=models.CASCADE)\n\nclass Author(models.Model):\n    name = models.CharField(max_length=200)\n    age = models.IntegerField()\n",
+        )
+        .unwrap();
+        let idx = build_static_index_resolved(root, &[root.join("blog/models.py")]);
+        build_model_graph(&idx)
+    }
+
+    fn terminal_type(r: &LookupResolution) -> &TerminalType {
+        match r {
+            LookupResolution::Resolved { terminal_type, .. } => {
+                terminal_type.as_ref().expect("terminal_type present")
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_type_plain_scalar() {
+        let g = dated_graph();
+        let r = resolve_lookup_path(&g, "blog.Entry", "title", "filter");
+        let tt = terminal_type(&r);
+        assert_eq!(tt.output_field_kind, "CharField");
+        assert_eq!(tt.python_type, "str");
+        assert!(!tt.is_transformed);
+    }
+
+    #[test]
+    fn terminal_type_relation_traversal_scalar() {
+        // A__B__C where C is a real scalar field — the user's headline case.
+        let g = dated_graph();
+        let r = resolve_lookup_path(&g, "blog.Entry", "author__age", "filter");
+        let tt = terminal_type(&r);
+        assert_eq!(tt.output_field_kind, "IntegerField");
+        assert_eq!(tt.python_type, "int");
+        assert!(!tt.is_transformed);
+    }
+
+    #[test]
+    fn terminal_type_transform_year() {
+        let g = dated_graph();
+        let r = resolve_lookup_path(&g, "blog.Entry", "pubdate__year", "filter");
+        let tt = terminal_type(&r);
+        assert_eq!(tt.output_field_kind, "IntegerField");
+        assert_eq!(tt.python_type, "int");
+        assert!(tt.is_transformed);
+        // Matched target keeps the pre-transform kind for go-to-definition.
+        if let LookupResolution::Resolved { target, lookup_operator, .. } = &r {
+            assert_eq!(target.field_kind.as_deref(), Some("DateTimeField"));
+            assert_eq!(lookup_operator.as_deref(), None);
+        }
+    }
+
+    #[test]
+    fn terminal_type_transform_then_operator() {
+        let g = dated_graph();
+        let r = resolve_lookup_path(&g, "blog.Entry", "pubdate__year__gte", "filter");
+        let tt = terminal_type(&r);
+        assert_eq!(tt.output_field_kind, "IntegerField");
+        assert!(tt.is_transformed);
+        assert_eq!(tt.lookup_operator.as_deref(), Some("gte"));
+        assert_eq!(tt.operand_python_type.as_deref(), Some("int"));
+    }
+
+    #[test]
+    fn terminal_type_chained_transforms() {
+        let g = dated_graph();
+        let r = resolve_lookup_path(&g, "blog.Entry", "pubdate__date__year", "filter");
+        let tt = terminal_type(&r);
+        assert_eq!(tt.output_field_kind, "IntegerField");
+        assert!(tt.is_transformed);
+    }
+
+    #[test]
+    fn terminal_type_text_operand() {
+        let g = dated_graph();
+        let r = resolve_lookup_path(&g, "blog.Entry", "title__icontains", "filter");
+        let tt = terminal_type(&r);
+        assert_eq!(tt.python_type, "str");
+        assert!(!tt.is_transformed);
+        assert_eq!(tt.lookup_operator.as_deref(), Some("icontains"));
+        assert_eq!(tt.operand_python_type.as_deref(), Some("str"));
+    }
+
+    #[test]
+    fn terminal_type_lower_then_lookup() {
+        let g = dated_graph();
+        let r = resolve_lookup_path(&g, "blog.Entry", "title__lower__icontains", "filter");
+        let tt = terminal_type(&r);
+        assert_eq!(tt.output_field_kind, "CharField");
+        assert_eq!(tt.python_type, "str");
+        assert!(tt.is_transformed);
+        assert_eq!(tt.lookup_operator.as_deref(), Some("icontains"));
+    }
+
+    #[test]
+    fn terminal_type_omitted_for_relation_terminal() {
+        let g = dated_graph();
+        let r = resolve_lookup_path(&g, "blog.Entry", "author", "filter");
+        match r {
+            LookupResolution::Resolved { terminal_type, target, .. } => {
+                assert!(terminal_type.is_none(), "relation terminal has no scalar type");
+                assert!(target.kind == "relation");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn python_type_in_lookup_path_completions_unaffected() {
+        // Sanity: terminal-type work does not change completion listing.
+        clear_descendant_cache();
+        let g = dated_graph();
+        let r = list_lookup_path_completions(&g, "blog.Entry", "pubdate__", "filter");
+        assert!(r.resolved);
+        let names = completion_names(&r.items);
+        assert!(names.iter().any(|n| n == "year"));
     }
 }

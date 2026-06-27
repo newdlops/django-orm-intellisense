@@ -1,8 +1,9 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { getExtensionSettings } from '../config/settings';
+import { getExtensionSettings, CONFIGURATION_SECTION } from '../config/settings';
 import { AnalysisDaemon } from '../daemon/analysisDaemon';
 import { isPylanceAvailable } from '../python/pylance';
+import { pythonTypeForKind } from '../../server/fieldLookups';
 import type {
   ExportOriginResolution,
   LookupPathCompletionsResult,
@@ -1034,6 +1035,107 @@ interface OrmMemberAccessContext {
   receiverExpression: string;
   memberName: string;
   receiver: OrmReceiverInfo;
+}
+
+// ---------------------------------------------------------------------------
+// Lookup inlay hints
+// ---------------------------------------------------------------------------
+
+/** Max lookup kwargs we resolve per inlay-hint pass (one viewport). Keeps the
+ *  viewport-frequent provider bounded on large files. */
+const INLAY_HINT_MAX_CANDIDATES = 60;
+
+/** Matches a Django lookup keyword argument `field__lookup=` (requires at least
+ *  one `__` so plain `field=` equality — whose type is obvious — is skipped).
+ *  The lookbehind avoids attribute access / longer identifiers; `(?!=)` avoids
+ *  `==`. This is only a cheap pre-filter; keywordLookupLiteral validates the
+ *  actual queryset call context. */
+const INLAY_LOOKUP_KWARG_RE =
+  /(?<![.\w])([A-Za-z_]\w*(?:__[A-Za-z_]\w*)+)\s*=(?!=)/g;
+
+function areLookupInlayHintsEnabled(
+  scope?: vscode.ConfigurationScope
+): boolean {
+  return vscode.workspace
+    .getConfiguration(CONFIGURATION_SECTION, scope)
+    .get<boolean>('inlayHints.enabled', true);
+}
+
+interface InlayLookupCandidate {
+  /** A position INSIDE the kwarg token, for keywordLookupLiteral. */
+  probe: vscode.Position;
+  /** End of the kwarg token, where the `: type` hint is anchored. */
+  anchor: vscode.Position;
+}
+
+function collectInlayLookupCandidates(
+  document: vscode.TextDocument,
+  range: vscode.Range
+): InlayLookupCandidate[] {
+  const candidates: InlayLookupCandidate[] = [];
+  const endLine = Math.min(range.end.line, document.lineCount - 1);
+  for (let line = range.start.line; line <= endLine; line++) {
+    const text = document.lineAt(line).text;
+    INLAY_LOOKUP_KWARG_RE.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = INLAY_LOOKUP_KWARG_RE.exec(text)) !== null) {
+      const token = match[1];
+      const startCol = match.index;
+      const endCol = startCol + token.length;
+      candidates.push({
+        probe: new vscode.Position(line, startCol + 1),
+        anchor: new vscode.Position(line, endCol),
+      });
+      if (candidates.length >= INLAY_HINT_MAX_CANDIDATES) {
+        return candidates;
+      }
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Type label to show inline for a resolved lookup. For an operator lookup
+ * (`field__in=`) the OPERAND type (`list[int]`) is most useful — it is the
+ * value the kwarg expects. Falls back to the chain's result type, then to a
+ * client-side mapping of the matched field kind, then the related model for a
+ * relation terminal.
+ */
+function inlayTypeLabelForResolution(
+  resolution: LookupPathResolution
+): string | undefined {
+  if (!resolution.resolved || !resolution.target) {
+    return undefined;
+  }
+  const terminalType = resolution.terminalType;
+  if (terminalType) {
+    if (terminalType.lookupOperator && terminalType.operandPythonType) {
+      return terminalType.operandPythonType;
+    }
+    return terminalType.pythonType;
+  }
+  const target = resolution.target;
+  if (target.isRelation) {
+    return target.relatedModelLabel
+      ? shortModelLabelName(target.relatedModelLabel)
+      : undefined;
+  }
+  if (target.pythonType) {
+    return target.pythonType;
+  }
+  if (
+    target.fieldKind &&
+    target.fieldKind !== 'lookup_operator' &&
+    target.fieldKind !== 'lookup_transform'
+  ) {
+    return pythonTypeForKind(target.fieldKind);
+  }
+  return undefined;
+}
+
+function shortModelLabelName(modelLabel: string): string {
+  const dot = modelLabel.lastIndexOf('.');
+  return dot >= 0 ? modelLabel.slice(dot + 1) : modelLabel;
 }
 
 export function registerPythonProviders(
@@ -3995,6 +4097,93 @@ export function registerPythonProviders(
     }
   );
 
+  const inlayHintsProvider = vscode.languages.registerInlayHintsProvider(
+    pythonSelector,
+    {
+      async provideInlayHints(document, range, token) {
+        if (providersDisposed || token.isCancellationRequested) {
+          return undefined;
+        }
+        if (!areLookupInlayHintsEnabled(document.uri)) {
+          return undefined;
+        }
+        const candidates = collectInlayLookupCandidates(document, range);
+        if (candidates.length === 0) {
+          return [];
+        }
+        const ensureStarted = createEnsureStartedOnce(daemon, document.uri);
+        try {
+          await ensureStarted();
+        } catch {
+          return [];
+        }
+        if (providersDisposed || token.isCancellationRequested) {
+          return [];
+        }
+        // Background, diagnostic-sourced resolution: we never need source
+        // locations for a hint, so the native fast path answers directly
+        // without a Python IPC fallback.
+        return daemon.withRequestSource('diagnostic', async () => {
+          const hints: vscode.InlayHint[] = [];
+          const memo = new Map<string, string | undefined>();
+          for (const candidate of candidates) {
+            if (providersDisposed || token.isCancellationRequested) {
+              break;
+            }
+            const literal = keywordLookupLiteral(document, candidate.probe);
+            if (!literal) {
+              continue;
+            }
+            try {
+              const receiver = await resolveLookupReceiverInfoForReceiver(
+                daemon,
+                document,
+                literal.receiverExpression,
+                candidate.probe
+              );
+              if (!receiver) {
+                continue;
+              }
+              const memoKey = `${receiver.modelLabel}|${literal.method}|${literal.value}`;
+              let label: string | undefined;
+              if (memo.has(memoKey)) {
+                label = memo.get(memoKey);
+              } else {
+                const resolution =
+                  resolveVirtualLookupPath(
+                    receiver,
+                    literal.value,
+                    literal.method
+                  ) ??
+                  (await daemon.resolveLookupPath(
+                    receiver.modelLabel,
+                    literal.value,
+                    literal.method,
+                    true
+                  ));
+                label = inlayTypeLabelForResolution(resolution);
+                memo.set(memoKey, label);
+              }
+              if (!label) {
+                continue;
+              }
+              const hint = new vscode.InlayHint(
+                candidate.anchor,
+                `: ${label}`,
+                vscode.InlayHintKind.Type
+              );
+              hint.paddingLeft = true;
+              hints.push(hint);
+            } catch {
+              // Skip this candidate; never let one failure drop the rest.
+            }
+          }
+          return hints;
+        });
+      },
+    }
+  );
+
   if (canRunDiagnostics()) {
     scheduleTrackedDiagnosticsRefresh();
   }
@@ -4004,6 +4193,7 @@ export function registerPythonProviders(
     signatureHelpProvider,
     hoverProvider,
     definitionProvider,
+    inlayHintsProvider,
     vscode.workspace.onDidOpenTextDocument((document) => {
       if (diagnosticsDisposed) {
         return;
@@ -6852,6 +7042,88 @@ function displayImportFilePath(filePath: string): string {
   return vscode.workspace.asRelativePath(filePath, false);
 }
 
+/**
+ * Append the inferred terminal type of a resolved lookup chain to the hover.
+ *
+ * For `A__B__C` this surfaces C's concrete Python type (e.g. `int`), and for
+ * transform chains like `pubdate__year` the POST-transform type. Prefers the
+ * resolver-provided `terminalType` (the only source that survives transforms,
+ * since the matched `target` keeps the pre-transform field kind); falls back
+ * to mapping the matched field kind client-side so plain chains still get a
+ * type even from older daemon/native builds that predate `terminalType`.
+ *
+ * Relation terminals are skipped — their type is the related model, already
+ * surfaced via the "Related model" line.
+ */
+function appendTerminalTypeMarkdown(
+  markdown: vscode.MarkdownString,
+  resolution: LookupPathResolution
+): void {
+  const target = resolution.target;
+  if (!target) {
+    return;
+  }
+  if (
+    target.fieldKind === 'lookup_operator' ||
+    target.fieldKind === 'lookup_transform'
+  ) {
+    return;
+  }
+  // Relation terminals (e.g. `...__company`) have no scalar python type — the
+  // type is the related model. Surface it here too so every resolved chain
+  // gets a "Resulting type" line, not just scalar ones.
+  if (target.isRelation) {
+    if (target.relatedModelLabel) {
+      const isCollection =
+        target.fieldKind.includes('ManyToMany') ||
+        target.relationDirection === 'reverse';
+      markdown.appendMarkdown(
+        `\n\nResulting type: \`${target.relatedModelLabel}\`${
+          isCollection ? ' (related manager)' : ' (model instance)'
+        }`
+      );
+    }
+    return;
+  }
+
+  const terminalType = resolution.terminalType;
+  let outputFieldKind: string | undefined;
+  let pythonType: string | undefined;
+  let isTransformed = false;
+  if (terminalType) {
+    outputFieldKind = terminalType.outputFieldKind;
+    pythonType = terminalType.pythonType;
+    isTransformed = terminalType.isTransformed;
+  } else if (target.pythonType) {
+    outputFieldKind = target.outputFieldKind ?? target.fieldKind;
+    pythonType = target.pythonType;
+  } else if (target.fieldKind) {
+    outputFieldKind = target.fieldKind;
+    pythonType = pythonTypeForKind(target.fieldKind);
+  }
+
+  if (!pythonType) {
+    return;
+  }
+
+  markdown.appendMarkdown(`\n\nResulting type: \`${pythonType}\``);
+  if (
+    isTransformed &&
+    outputFieldKind &&
+    outputFieldKind !== target.fieldKind
+  ) {
+    markdown.appendMarkdown(
+      ` _(transformed: \`${target.fieldKind}\` → \`${outputFieldKind}\`)_`
+    );
+  }
+
+  if (terminalType?.operandPythonType && terminalType.lookupOperator) {
+    markdown.appendMarkdown(
+      `\n\nOperand type: \`${terminalType.operandPythonType}\` _(for \`${terminalType.lookupOperator}\`)_`
+    );
+  }
+}
+
 function buildLookupHover(
   value: string,
   method: string,
@@ -6872,6 +7144,7 @@ function buildLookupHover(
       `\n\nLookup operator: \`${resolution.lookupOperator}\``
     );
   }
+  appendTerminalTypeMarkdown(markdown, resolution);
   if (resolution.resolvedSegments && resolution.resolvedSegments.length > 0) {
     markdown.appendMarkdown(
       `\n\nResolved path: \`${resolution.resolvedSegments

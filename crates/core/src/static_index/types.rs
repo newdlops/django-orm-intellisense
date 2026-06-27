@@ -62,6 +62,69 @@ pub fn is_django_field_class(name: &str) -> bool {
     DJANGO_FIELD_CLASS_NAMES.contains(&name) || KNOWN_EXTERNAL_FIELD_CLASS_NAMES.contains(&name)
 }
 
+/// Django field-class name -> concrete Python type (display string).
+///
+/// SINGLE SOURCE OF TRUTH (mirrored verbatim in two other files — keep in
+/// sync; a parity test enforces this):
+///   - python/django_orm_intellisense/features/field_types.py (FIELD_KIND_PYTHON_TYPE)
+///   - src/server/fieldLookups.ts                             (FIELD_KIND_PYTHON_TYPE)
+///
+/// Relation kinds map to "Any"; a relation terminal's type is surfaced via
+/// the related model, not this table.
+pub const FIELD_KIND_PYTHON_TYPE: &[(&str, &str)] = &[
+    // String-like
+    ("CharField", "str"),
+    ("TextField", "str"),
+    ("SlugField", "str"),
+    ("URLField", "str"),
+    ("EmailField", "str"),
+    ("FilePathField", "str"),
+    ("GenericIPAddressField", "str"),
+    ("IPAddressField", "str"),
+    ("CommaSeparatedIntegerField", "str"),
+    ("FileField", "str"),
+    ("ImageField", "str"),
+    // Integer-like
+    ("IntegerField", "int"),
+    ("BigIntegerField", "int"),
+    ("SmallIntegerField", "int"),
+    ("PositiveIntegerField", "int"),
+    ("PositiveSmallIntegerField", "int"),
+    ("PositiveBigIntegerField", "int"),
+    ("AutoField", "int"),
+    ("BigAutoField", "int"),
+    ("SmallAutoField", "int"),
+    // Real numbers
+    ("FloatField", "float"),
+    ("DecimalField", "decimal.Decimal"),
+    // Boolean
+    ("BooleanField", "bool"),
+    ("NullBooleanField", "bool"),
+    // Date/time
+    ("DateField", "datetime.date"),
+    ("DateTimeField", "datetime.datetime"),
+    ("TimeField", "datetime.time"),
+    ("DurationField", "datetime.timedelta"),
+    // Misc scalars
+    ("UUIDField", "uuid.UUID"),
+    ("JSONField", "dict | list"),
+    ("BinaryField", "bytes"),
+    // Relations
+    ("ForeignKey", "Any"),
+    ("OneToOneField", "Any"),
+    ("ManyToManyField", "Any"),
+];
+
+/// Map a Django field-class name to its concrete Python display type.
+/// Falls back to "Any" for custom or unrecognized field kinds.
+pub fn python_type_for_kind(field_kind: &str) -> &'static str {
+    FIELD_KIND_PYTHON_TYPE
+        .iter()
+        .find(|(kind, _)| *kind == field_kind)
+        .map(|(_, py)| *py)
+        .unwrap_or("Any")
+}
+
 pub fn is_relation_field_kind(kind: &str) -> bool {
     RELATION_FIELD_KINDS.contains(&kind)
 }

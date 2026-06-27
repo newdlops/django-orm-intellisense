@@ -7,6 +7,11 @@ import time
 from ..runtime.inspector import RuntimeInspection, get_runtime_field
 from ..semantic.graph import ModelGraph
 from ..static_index.indexer import FieldCandidate
+from .field_types import (
+    operand_python_type,
+    python_type_for_kind,
+    transform_output_kind,
+)
 
 # captain 옵션 6 관측 — daemon-side resolve_lookup_path 의 단계별 elapsed.
 # 임계값 초과 시에만 단계 분해 로그 emit (정상 케이스 로그 noise 방지).
@@ -156,6 +161,10 @@ def _resolve_impl(
     timed_lookup_field,
     timed_lookup_chain,
 ) -> dict[str, object]:
+    # Output field kind after a trailing transform chain (e.g. IntegerField
+    # for `pubdate__year`); None when no transform/lookup chain was walked.
+    chain_output_field_kind: str | None = None
+    chain_is_transformed = False
     for index, segment in enumerate(segments):
         field = timed_lookup_field(
             model_label=current_model_label,
@@ -172,6 +181,8 @@ def _resolve_impl(
                 )
                 if lookup_resolution['resolved']:
                     lookup_operator = lookup_resolution.get('lookupOperator')
+                    chain_output_field_kind = lookup_resolution.get('outputFieldKind')
+                    chain_is_transformed = bool(lookup_resolution.get('isTransformed'))
                     break
                 return {
                     'resolved': False,
@@ -210,6 +221,8 @@ def _resolve_impl(
                 )
                 if lookup_resolution['resolved']:
                     lookup_operator = lookup_resolution.get('lookupOperator')
+                    chain_output_field_kind = lookup_resolution.get('outputFieldKind')
+                    chain_is_transformed = bool(lookup_resolution.get('isTransformed'))
                     break
                 return {
                     'resolved': False,
@@ -233,6 +246,8 @@ def _resolve_impl(
                 )
                 if lookup_resolution['resolved']:
                     lookup_operator = lookup_resolution.get('lookupOperator')
+                    chain_output_field_kind = lookup_resolution.get('outputFieldKind')
+                    chain_is_transformed = bool(lookup_resolution.get('isTransformed'))
                     break
                 return {
                     'resolved': False,
@@ -261,12 +276,55 @@ def _resolve_impl(
             'resolvedSegments': resolved_segments,
         }
 
+    target = _lookup_item_dict(terminal_field)
+    terminal_type = _build_terminal_type(
+        terminal_field=terminal_field,
+        chain_output_field_kind=chain_output_field_kind,
+        is_transformed=chain_is_transformed,
+        lookup_operator=lookup_operator,
+    )
+    if terminal_type is not None:
+        # Surface the inferred type on the target item too, so a client that
+        # only reads `target` still sees the python type.
+        target['outputFieldKind'] = terminal_type['outputFieldKind']
+        target['pythonType'] = terminal_type['pythonType']
+
     return {
         'resolved': True,
-        'target': _lookup_item_dict(terminal_field),
+        'target': target,
         'resolvedSegments': resolved_segments,
         'baseModelLabel': base_model_label,
         'lookupOperator': lookup_operator,
+        'terminalType': terminal_type,
+    }
+
+
+def _build_terminal_type(
+    *,
+    terminal_field: FieldCandidate,
+    chain_output_field_kind: str | None,
+    is_transformed: bool,
+    lookup_operator: str | None,
+) -> dict[str, object] | None:
+    """Build the terminal-type descriptor for a resolved chain. Returns None
+    for relation terminals (their type is the related model, surfaced
+    separately, not a scalar python type)."""
+    if terminal_field.is_relation:
+        return None
+
+    output_field_kind = chain_output_field_kind or terminal_field.field_kind
+    python_type = python_type_for_kind(output_field_kind)
+    operand = (
+        operand_python_type(lookup_operator, python_type)
+        if lookup_operator
+        else None
+    )
+    return {
+        'outputFieldKind': output_field_kind,
+        'pythonType': python_type,
+        'isTransformed': is_transformed,
+        'lookupOperator': lookup_operator,
+        'operandPythonType': operand,
     }
 
 
@@ -338,23 +396,25 @@ def _resolve_lookup_chain(
 ) -> dict[str, object]:
     field_object = _runtime_lookup_field(runtime=runtime, field=field)
     if field_object is None:
-        if len(segments) == 1 and _is_lookup_operator(segments[0]):
-            return {
-                'resolved': True,
-                'lookupOperator': segments[0],
-            }
-        return {
-            'resolved': False,
-            'reason': 'invalid_lookup_operator',
-            'missingSegment': segments[0] if segments else None,
-        }
+        # Runtime registry unavailable (not bootstrapped, or build still in
+        # progress under the lock timeout). Fall back to the static transform
+        # / lookup tables so built-in chains like `pubdate__year` still infer
+        # a terminal type without the live Django runtime.
+        return _resolve_lookup_chain_static(
+            input_field_kind=field.field_kind,
+            segments=segments,
+        )
 
     current_field_object = field_object
+    output_field_kind: str = field.field_kind
+    is_transformed = False
     lookup_operator: str | None = None
     for index, segment in enumerate(segments):
         transformed_field = _runtime_transform_output_field(current_field_object, segment)
         if transformed_field is not None:
             current_field_object = transformed_field
+            output_field_kind = type(transformed_field).__name__
+            is_transformed = True
             continue
 
         if _runtime_lookup_exists(current_field_object, segment):
@@ -376,6 +436,53 @@ def _resolve_lookup_chain(
     return {
         'resolved': True,
         'lookupOperator': lookup_operator,
+        'outputFieldKind': output_field_kind,
+        'isTransformed': is_transformed,
+    }
+
+
+def _resolve_lookup_chain_static(
+    *,
+    input_field_kind: str,
+    segments: list[str],
+) -> dict[str, object]:
+    """Resolve a trailing transform/lookup chain using the static
+    FIELD_TRANSFORMS table and DEFAULT_LOOKUP_OPERATORS — no live runtime.
+
+    Built-in transforms advance the output field kind (``pubdate__year`` ->
+    IntegerField); a single terminal lookup operator may follow. Custom
+    runtime lookups are out of scope here (the runtime path covers them)."""
+    output_field_kind = input_field_kind
+    is_transformed = False
+    lookup_operator: str | None = None
+    for index, segment in enumerate(segments):
+        transformed_kind = transform_output_kind(segment, output_field_kind)
+        if transformed_kind is not None:
+            output_field_kind = transformed_kind
+            is_transformed = True
+            continue
+
+        if _is_lookup_operator(segment):
+            if index != len(segments) - 1:
+                return {
+                    'resolved': False,
+                    'reason': 'invalid_lookup_operator',
+                    'missingSegment': segment,
+                }
+            lookup_operator = segment
+            break
+
+        return {
+            'resolved': False,
+            'reason': 'invalid_lookup_operator',
+            'missingSegment': segment,
+        }
+
+    return {
+        'resolved': True,
+        'lookupOperator': lookup_operator,
+        'outputFieldKind': output_field_kind,
+        'isTransformed': is_transformed,
     }
 
 

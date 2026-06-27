@@ -26,6 +26,6 @@ pub mod visitor;
 pub use indexer::{build_static_index, build_static_index_resolved, parse_module};
 pub use resolver::{expand_via_inheritance, resolve_fields, synthesize_reverse_relations};
 pub use types::{
-    DefinitionLocation, FieldCandidate, ImportBinding, ModelCandidate, ModuleIndex,
-    PendingFieldCandidate, ProjectMethod, StaticIndex,
+    python_type_for_kind, DefinitionLocation, FieldCandidate, ImportBinding, ModelCandidate,
+    ModuleIndex, PendingFieldCandidate, ProjectMethod, StaticIndex, FIELD_KIND_PYTHON_TYPE,
 };

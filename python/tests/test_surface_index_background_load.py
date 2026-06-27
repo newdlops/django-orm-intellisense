@@ -157,6 +157,39 @@ class CaptainSurfaceIndexBackgroundLoadTest(unittest.TestCase):
             'process list / ps 에서 즉시 식별 가능',
         )
 
+    def test_cache_miss_builds_surface_by_default(self) -> None:
+        """버그 fix 검증: cache miss 시 기본적으로 surface 를 백그라운드 빌드해야
+        함 (예전엔 DJLS_SURFACE_PREBUILD_ON_MISS != '1' 이면 skip 해서 재시작 후
+        bulk 자동완성이 id/pk 로 붕괴). 이제 명시적 opt-out (== '0') 만 skip."""
+        worker_match = re.search(
+            r'def _background_worker\(\).*?(?=\n        thread = threading\.Thread)',
+            APP_SOURCE,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(worker_match, 'def _background_worker 정의를 찾지 못함')
+        worker_src = worker_match.group(0)
+
+        # The skip branch must be an explicit opt-out, not the default.
+        self.assertIn(
+            "os.environ.get('DJLS_SURFACE_PREBUILD_ON_MISS') == '0'",
+            worker_src,
+            'cache miss 시 기본 빌드 + 명시적 opt-out(== "0") 만 skip 해야 함',
+        )
+        self.assertNotIn(
+            "os.environ.get('DJLS_SURFACE_PREBUILD_ON_MISS') != '1'",
+            worker_src,
+            '예전 opt-in 게이트(!= "1")가 남아 있으면 cache miss 마다 skip 되어 '
+            'db.Company 같은 워크스페이스 모델이 id/pk 로 붕괴',
+        )
+        # On miss (no opt-out) the prebuild path must run.
+        skip_idx = worker_src.find("== '0'")
+        prebuild_idx = worker_src.find('_bg_prebuild_surface_index')
+        self.assertGreaterEqual(prebuild_idx, 0, 'cache miss prebuild 경로 없음')
+        self.assertLess(
+            skip_idx, prebuild_idx,
+            'opt-out skip 분기 이후에 기본 prebuild 경로가 와야 함',
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

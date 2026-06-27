@@ -99,6 +99,22 @@ export interface LookupPathItem {
   relationDirection?: string;
   source: string;
   lookupOperator?: string;
+  /** Django field kind AFTER any trailing transforms (e.g. IntegerField for
+   *  `pubdate__year`). Optional for back-compat with older payloads. */
+  outputFieldKind?: string;
+  /** Concrete Python type of the terminal value (e.g. "int", "str"). */
+  pythonType?: string;
+}
+
+/** Inferred type of a fully-resolved lookup chain. Carries the post-transform
+ *  field kind and its concrete Python type, distinct from the matched terminal
+ *  field record (which keeps the pre-transform kind for go-to-definition). */
+export interface TerminalTypeDescriptor {
+  outputFieldKind: string;
+  pythonType: string;
+  isTransformed: boolean;
+  lookupOperator?: string;
+  operandPythonType?: string;
 }
 
 export interface LookupPathCompletionsResult {
@@ -117,6 +133,9 @@ export interface LookupPathResolution {
   resolvedSegments?: LookupPathItem[];
   baseModelLabel?: string;
   lookupOperator?: string;
+  /** Inferred terminal type of the chain (post-transform). Optional: present
+   *  only from daemon/native builds that compute it. */
+  terminalType?: TerminalTypeDescriptor;
 }
 
 export type OrmReceiverKind =

@@ -2,6 +2,47 @@ import * as vscode from 'vscode';
 import { CONFIGURATION_SECTION } from '../config/settings';
 import { AnalysisDaemon } from '../daemon/analysisDaemon';
 
+/**
+ * Resolve the configuration scope `settingsModule` should be written to, so it
+ * matches the scope `getExtensionSettings` reads from. Prefers the daemon's
+ * active project root (its enclosing workspace folder), then the active
+ * editor's folder, then the first workspace folder. Mirrors
+ * `resolveInterpreterConfigurationScope` in the interpreter command.
+ */
+function resolveSettingsConfigurationScope(
+  daemon: AnalysisDaemon
+): vscode.Uri | undefined {
+  const workspaceRoot = daemon.getState().workspaceRoot;
+  if (workspaceRoot) {
+    const workspaceUri = vscode.Uri.file(workspaceRoot);
+    return vscode.workspace.getWorkspaceFolder(workspaceUri)?.uri ?? workspaceUri;
+  }
+
+  return (
+    vscode.window.activeTextEditor?.document.uri ??
+    vscode.workspace.workspaceFolders?.[0]?.uri
+  );
+}
+
+/**
+ * Pick the configuration target that wins the folder-scoped read in
+ * `getExtensionSettings`. WorkspaceFolder takes precedence over Workspace, so a
+ * value written there is never shadowed by a stray per-folder setting — the
+ * exact "settings gets unset" failure caused by writing at Workspace while
+ * reading at the folder scope.
+ */
+function resolveSettingsConfigurationTarget(
+  scope: vscode.Uri | undefined
+): vscode.ConfigurationTarget {
+  if (scope && vscode.workspace.getWorkspaceFolder(scope)) {
+    return vscode.ConfigurationTarget.WorkspaceFolder;
+  }
+  if (vscode.workspace.workspaceFolders?.length) {
+    return vscode.ConfigurationTarget.Workspace;
+  }
+  return vscode.ConfigurationTarget.Global;
+}
+
 export function registerSelectSettingsModuleCommand(
   daemon: AnalysisDaemon,
   output: vscode.OutputChannel
@@ -46,11 +87,11 @@ export function registerSelectSettingsModuleCommand(
           return;
         }
 
-        const target = vscode.workspace.workspaceFolders?.length
-          ? vscode.ConfigurationTarget.Workspace
-          : vscode.ConfigurationTarget.Global;
+        const scope = resolveSettingsConfigurationScope(daemon);
+        const target = resolveSettingsConfigurationTarget(scope);
         const configuration = vscode.workspace.getConfiguration(
-          CONFIGURATION_SECTION
+          CONFIGURATION_SECTION,
+          scope
         );
 
         await configuration.update(
@@ -59,7 +100,7 @@ export function registerSelectSettingsModuleCommand(
           target
         );
 
-        const nextSnapshot = await daemon.restart();
+        const nextSnapshot = await daemon.restart(scope);
         const message = selection.clear
           ? 'Cleared djangoOrmIntellisense.settingsModule.'
           : `Selected settings module: ${selection.value}.`;

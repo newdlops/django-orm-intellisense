@@ -421,7 +421,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         0,
         250,
       ], undefined, true);
-      void daemon.restart().catch((error) => {
+      // Restart at the active document's scope so createLaunchContext reads the
+      // settings of the project the user is working in, rather than always
+      // re-deriving from workspaceFolders[0] (which made per-folder/per-project
+      // settings appear ignored after any config change).
+      const restartScope = vscode.window.activeTextEditor?.document.uri;
+      void daemon.restart(restartScope).catch((error) => {
         output.appendLine(`[extension] Failed to restart daemon: ${String(error)}`);
       });
     }),

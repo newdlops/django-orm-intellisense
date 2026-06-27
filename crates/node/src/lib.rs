@@ -766,18 +766,37 @@ fn lookup_resolution_to_wire(
             resolved_segments,
             base_model_label,
             lookup_operator,
+            terminal_type,
         } => {
             let segs: Vec<serde_json::Value> = resolved_segments
                 .iter()
                 .map(|s| enrich_lookup_segment(state, s, None))
                 .collect();
-            let enriched_target = enrich_lookup_segment(state, target, lookup_operator.as_deref());
+            let mut enriched_target =
+                enrich_lookup_segment(state, target, lookup_operator.as_deref());
+            // Surface the inferred terminal type on the target item too, so a
+            // client that only reads `target` still sees the python type.
+            if let (Some(tt), Some(obj)) = (terminal_type, enriched_target.as_object_mut()) {
+                obj.insert(
+                    "outputFieldKind".into(),
+                    serde_json::Value::String(tt.output_field_kind.clone()),
+                );
+                obj.insert(
+                    "pythonType".into(),
+                    serde_json::Value::String(tt.python_type.clone()),
+                );
+            }
+            let terminal_type_json = terminal_type
+                .as_ref()
+                .and_then(|tt| serde_json::to_value(tt).ok())
+                .unwrap_or(serde_json::Value::Null);
             json!({
                 "resolved": true,
                 "target": enriched_target,
                 "resolvedSegments": segs,
                 "baseModelLabel": base_model_label,
                 "lookupOperator": lookup_operator,
+                "terminalType": terminal_type_json,
             })
         }
         features::LookupResolution::Unresolved {

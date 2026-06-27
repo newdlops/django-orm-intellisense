@@ -356,6 +356,30 @@ suite('Django ORM Intellisense UI', () => {
       hoverText.includes('Field kind: `CharField`'),
       `Expected lookup hover to mention the field kind. Received: ${hoverText}`
     );
+    // P2: the inferred terminal Python type of the `A__B__C` chain (C is a
+    // CharField, so `str`) is surfaced alongside the Django field kind.
+    assert.ok(
+      hoverText.includes('Resulting type: `str`'),
+      `Expected lookup hover to mention the inferred terminal python type. Received: ${hoverText}`
+    );
+
+    // #1: inlay hints surface the inferred lookup type inline at the kwarg.
+    // query_examples.py line ~39: filter(author__profile__timezone='Asia/Seoul')
+    // resolves to a CharField terminal, so a `: str` type hint appears.
+    const inlayHints = await vscode.commands.executeCommand<vscode.InlayHint[]>(
+      'vscode.executeInlayHintProvider',
+      document.uri,
+      new vscode.Range(0, 0, document.lineCount, 0)
+    );
+    const inlayLabels = (inlayHints ?? []).map((hint) =>
+      typeof hint.label === 'string'
+        ? hint.label
+        : hint.label.map((part) => part.value).join('')
+    );
+    assert.ok(
+      inlayLabels.some((label) => label.includes('str')),
+      `Expected an inlay hint with the inferred lookup type (e.g. ': str'). Received: ${JSON.stringify(inlayLabels)}`
+    );
 
     const directPkHoverPosition = positionInsideText(
       document,

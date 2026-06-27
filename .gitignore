@@ -15,3 +15,6 @@ target/
 native/*/index.node
 .zoek-rs
 .lh
+/.claude/
+/.lh/
+/log.txt

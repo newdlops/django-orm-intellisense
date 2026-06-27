@@ -1402,20 +1402,32 @@ class DaemonServer:
                     _apply_surface_index(cached, from_cache=True)
                     return
 
-                if os.environ.get('DJLS_SURFACE_PREBUILD_ON_MISS') != '1':
+                # cache miss — build the surface index off the main daemon
+                # process so bulk lookup/member completions recover after a
+                # restart WITHOUT a manual "Clear Cache & Reindex". Otherwise a
+                # cache miss (e.g. after editing source, which invalidates the
+                # source fingerprint) leaves surfaceIndex empty and workspace
+                # models collapse to id/pk-only completions until the next
+                # manual reindex. Set DJLS_SURFACE_PREBUILD_ON_MISS=0 to restore
+                # the old lightweight skip-on-miss cold start.
+                if os.environ.get('DJLS_SURFACE_PREBUILD_ON_MISS') == '0':
                     with self._surface_load_lock:
                         self._surface_load_attempted_generation = generation
                     _log_initialize_step(
                         'skip_prebuild_surface_index(background) '
-                        f'reason=cache_miss trigger={reason} '
+                        f'reason=cache_miss_optout trigger={reason} '
                         f'elapsed={time.perf_counter() - started_at:.2f}s'
                     )
                     return
 
-                # cache miss — opt-in prebuild off the main daemon process. A
-                # long-lived pool is also opt-in; otherwise use a single
-                # short-lived worker so memory is returned after the cache is
-                # written.
+                # Build off the main daemon process. A long-lived pool is
+                # opt-in; otherwise use a single short-lived worker so memory is
+                # returned after the cache is written.
+                _log_initialize_step(
+                    'prebuild_surface_index(background) start '
+                    f'reason=cache_miss trigger={reason} '
+                    f'elapsed={time.perf_counter() - started_at:.2f}s'
+                )
                 if self._bg_pool is not None:
                     future = self._bg_pool.submit(_bg_prebuild_surface_index)
                     surface_index = future.result()

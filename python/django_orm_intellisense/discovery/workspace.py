@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -383,7 +384,26 @@ def discover_workspace(
         )
 
     deduped_settings = list(dict.fromkeys(settings_candidates))
-    inferred_settings = _choose_default_settings_module(deduped_settings)
+
+    # The project's own declared default — `os.environ.setdefault(
+    # 'DJANGO_SETTINGS_MODULE', '<module>')` in manage.py (or wsgi/asgi) — is
+    # the authoritative choice. It works for monorepos and for base/dev/prod
+    # layouts where simple candidate-counting yields None (the case the old
+    # `_choose_default_settings_module` could not resolve).
+    declared_default = (
+        _settings_module_from_entrypoints(root)
+        if manage_py_path is not None
+        else None
+    )
+    if declared_default and declared_default not in deduped_settings:
+        # Surface it in the picker even when file-name discovery missed it
+        # (e.g. settings in a non-standard location).
+        deduped_settings.append(declared_default)
+
+    inferred_settings = (
+        declared_default
+        or _choose_default_settings_module(deduped_settings)
+    )
 
     return WorkspaceProfile(
         root=str(root),
@@ -392,6 +412,52 @@ def discover_workspace(
         settings_module=settings_override or inferred_settings,
         settings_candidates=deduped_settings,
     )
+
+
+# `os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'proj.settings')` —
+# tolerant of single/double quotes and whitespace.
+_SETTINGS_SETDEFAULT_RE = re.compile(
+    r"""setdefault\(\s*['"]DJANGO_SETTINGS_MODULE['"]\s*,\s*['"]([\w.]+)['"]""",
+)
+
+
+def _settings_module_from_entrypoints(root: Path) -> str | None:
+    """Extract the declared DJANGO_SETTINGS_MODULE from the project's standard
+    entrypoints. manage.py is authoritative; wsgi.py / asgi.py are consulted as
+    a fallback. Returns None if no entrypoint declares one."""
+    candidates = [root / 'manage.py']
+    # wsgi/asgi usually live in the settings package (one level down); scan the
+    # immediate subdirectories for them without a full tree walk.
+    for child in _safe_iterdir(root):
+        if child.is_dir():
+            candidates.append(child / 'wsgi.py')
+            candidates.append(child / 'asgi.py')
+
+    for candidate in candidates:
+        module = _read_settings_setdefault(candidate)
+        if module:
+            return module
+    return None
+
+
+def _read_settings_setdefault(file_path: Path) -> str | None:
+    try:
+        text = file_path.read_text(encoding='utf-8')
+    except OSError:
+        return None
+    match = _SETTINGS_SETDEFAULT_RE.search(text)
+    return match.group(1) if match else None
+
+
+def _safe_iterdir(root: Path) -> list[Path]:
+    try:
+        return [
+            child
+            for child in root.iterdir()
+            if child.name not in SKIP_DIRS and not child.name.startswith('.')
+        ]
+    except OSError:
+        return []
 
 
 def _discover_settings_candidates(
