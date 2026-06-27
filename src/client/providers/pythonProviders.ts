@@ -4126,6 +4126,14 @@ export function registerPythonProviders(
         return daemon.withRequestSource('diagnostic', async () => {
           const hints: vscode.InlayHint[] = [];
           const memo = new Map<string, string | undefined>();
+          // Receiver resolution is the expensive step (backward expression /
+          // binding scans). Many lookups in a viewport share the same receiver
+          // expression (e.g. the same queryset), so memoize per expression to
+          // avoid re-resolving it dozens of times per inlay pass.
+          const receiverMemo = new Map<
+            string,
+            OrmReceiverInfo | undefined
+          >();
           for (const candidate of candidates) {
             if (providersDisposed || token.isCancellationRequested) {
               break;
@@ -4135,12 +4143,18 @@ export function registerPythonProviders(
               continue;
             }
             try {
-              const receiver = await resolveLookupReceiverInfoForReceiver(
-                daemon,
-                document,
-                literal.receiverExpression,
-                candidate.probe
-              );
+              let receiver: OrmReceiverInfo | undefined;
+              if (receiverMemo.has(literal.receiverExpression)) {
+                receiver = receiverMemo.get(literal.receiverExpression);
+              } else {
+                receiver = await resolveLookupReceiverInfoForReceiver(
+                  daemon,
+                  document,
+                  literal.receiverExpression,
+                  candidate.probe
+                );
+                receiverMemo.set(literal.receiverExpression, receiver);
+              }
               if (!receiver) {
                 continue;
               }
@@ -7069,9 +7083,26 @@ function appendTerminalTypeMarkdown(
   ) {
     return;
   }
-  // Relation terminals (e.g. `...__company`) have no scalar python type — the
-  // type is the related model. Surface it here too so every resolved chain
-  // gets a "Resulting type" line, not just scalar ones.
+
+  const terminalType = resolution.terminalType;
+
+  // A chain ending in a comparison lookup (filter/exclude/Q: `__contains`,
+  // `__in`, `__isnull`, `__gte`, …) is a BOOLEAN PREDICATE — the condition
+  // evaluates to `bool`, and only the value you pass (the operand) carries a
+  // field-determined type. Surface both, rather than the terminal field type,
+  // which would be misleading for a predicate.
+  if (terminalType?.lookupOperator) {
+    markdown.appendMarkdown('\n\nPredicate: `bool`');
+    if (terminalType.operandPythonType) {
+      markdown.appendMarkdown(
+        `\n\nOperand type: \`${terminalType.operandPythonType}\``
+      );
+    }
+    return;
+  }
+
+  // No comparison operator: the chain denotes a VALUE. For a relation terminal
+  // (e.g. `...__company`) that value is the related model.
   if (target.isRelation) {
     if (target.relatedModelLabel) {
       const isCollection =
@@ -7086,7 +7117,8 @@ function appendTerminalTypeMarkdown(
     return;
   }
 
-  const terminalType = resolution.terminalType;
+  // Scalar terminal (field C, or a transform output like `__year` used in
+  // values()/annotate()): surface its concrete python type.
   let outputFieldKind: string | undefined;
   let pythonType: string | undefined;
   let isTransformed = false;
@@ -7114,12 +7146,6 @@ function appendTerminalTypeMarkdown(
   ) {
     markdown.appendMarkdown(
       ` _(transformed: \`${target.fieldKind}\` → \`${outputFieldKind}\`)_`
-    );
-  }
-
-  if (terminalType?.operandPythonType && terminalType.lookupOperator) {
-    markdown.appendMarkdown(
-      `\n\nOperand type: \`${terminalType.operandPythonType}\` _(for \`${terminalType.lookupOperator}\`)_`
     );
   }
 }
@@ -14409,14 +14435,23 @@ function receiverRootIdentifier(receiverExpression: string): string | undefined 
   return identifier;
 }
 
+// A name's binding (assignment / annotation / loop / comprehension) is, in
+// practice, a bounded distance above its use. Scanning to the start of a
+// multi-thousand-line file on every receiver resolution (hover / diagnostics /
+// inlay) was a profiled 100%-CPU hot path. Bound the backward search; a binding
+// farther than this is not worth the per-keystroke cost.
+const MAX_BINDING_BACKSCAN_LINES = 600;
+const MAX_COMPREHENSION_BACKSCAN_CHARS = 24000;
+
 function findNearestLoopIterableExpression(
   document: vscode.TextDocument,
   variableName: string,
   beforeOffset: number
 ): { expression: string; offset: number } | undefined {
   const beforePosition = document.positionAt(beforeOffset);
+  const minLine = Math.max(0, beforePosition.line - MAX_BINDING_BACKSCAN_LINES);
 
-  for (let line = beforePosition.line; line >= 0; line -= 1) {
+  for (let line = beforePosition.line; line >= minLine; line -= 1) {
     const parsedLoop = parseForLoopHeader(document.lineAt(line).text);
     if (!parsedLoop || !loopTargetContainsIdentifier(parsedLoop.target, variableName)) {
       continue;
@@ -14457,25 +14492,40 @@ function findNearestComprehensionIterableExpression(
   beforeOffset: number
 ): { expression: string; offset: number } | undefined {
   const fullText = getDocumentText(document);
+  const minIndex = Math.max(0, beforeOffset - MAX_COMPREHENSION_BACKSCAN_CHARS);
 
-  for (let index = beforeOffset - 1; index >= 0; index -= 1) {
-    const openingDelimiter = fullText[index];
-    const closingDelimiter =
-      openingDelimiter === '(' ? ')'
-      : openingDelimiter === '[' ? ']'
-      : openingDelimiter === '{' ? '}'
-      : undefined;
-    if (!closingDelimiter) {
+  // Walk backward tracking bracket depth so we only run the O(n) forward
+  // delimiter match for brackets that actually ENCLOSE beforeOffset (the few
+  // unmatched openers at the cursor's nesting depth), instead of for every
+  // opener before the cursor — which made this O(n²) and a GC hot path.
+  let depth = 0;
+  for (let index = beforeOffset - 1; index >= minIndex; index -= 1) {
+    const char = fullText[index];
+    if (char === ')' || char === ']' || char === '}') {
+      depth += 1;
+      continue;
+    }
+    if (char !== '(' && char !== '[' && char !== '{') {
+      continue;
+    }
+    // `char` is an opening delimiter.
+    if (depth > 0) {
+      // Matches a closer we already passed — a sibling sub-expression, not an
+      // enclosing bracket.
+      depth -= 1;
       continue;
     }
 
+    // depth === 0 → this opener encloses beforeOffset.
+    const closingDelimiter = char === '(' ? ')' : char === '[' ? ']' : '}';
     const closingIndex = findMatchingClosingDelimiter(
       fullText,
       index,
-      openingDelimiter,
+      char,
       closingDelimiter
     );
     if (closingIndex === undefined || closingIndex < beforeOffset) {
+      // Defensive — keep scanning outward for an enclosing comprehension.
       continue;
     }
 
@@ -14484,25 +14534,21 @@ function findNearestComprehensionIterableExpression(
     const clauses = parseComprehensionClauses(body).filter((clause) =>
       loopTargetContainsIdentifier(clause.target, variableName)
     );
-    if (clauses.length === 0) {
-      continue;
+    if (clauses.length > 0) {
+      const relativeOffset = beforeOffset - bodyStartOffset;
+      const inScopeClauses = clauses.filter(
+        (clause) => clause.clauseStart <= relativeOffset
+      );
+      const matchedClause = inScopeClauses.at(-1) ?? clauses.at(-1);
+      if (matchedClause) {
+        return {
+          expression: matchedClause.iterable,
+          offset: bodyStartOffset + matchedClause.iterableStart,
+        };
+      }
     }
-
-    const relativeOffset = beforeOffset - bodyStartOffset;
-    const inScopeClauses = clauses.filter(
-      (clause) => clause.clauseStart <= relativeOffset
-    );
-    const matchedClause =
-      inScopeClauses.at(-1) ??
-      clauses.at(-1);
-    if (!matchedClause) {
-      continue;
-    }
-
-    return {
-      expression: matchedClause.iterable,
-      offset: bodyStartOffset + matchedClause.iterableStart,
-    };
+    // Not a matching comprehension; keep scanning outward (depth stays 0 — we
+    // have consumed this opener as the current enclosing bracket).
   }
 
   return undefined;
@@ -14517,8 +14563,9 @@ function findNearestAssignedExpression(
     String.raw`^\s*${escapeRegExp(variableName)}(?:\s*:\s*[^=]+)?\s*=\s*(.+)$`
   );
   const beforePosition = document.positionAt(beforeOffset);
+  const minLine = Math.max(0, beforePosition.line - MAX_BINDING_BACKSCAN_LINES);
 
-  for (let line = beforePosition.line; line >= 0; line -= 1) {
+  for (let line = beforePosition.line; line >= minLine; line -= 1) {
     const lineText = document.lineAt(line).text;
     const match = lineText.match(assignmentPattern);
     if (!match) {
@@ -14970,8 +15017,9 @@ function findNearestAnnotatedAssignment(
     String.raw`^\s*${escapeRegExp(variableName)}\s*:\s*(.+)$`
   );
   const beforePosition = document.positionAt(beforeOffset);
+  const minLine = Math.max(0, beforePosition.line - MAX_BINDING_BACKSCAN_LINES);
 
-  for (let line = beforePosition.line; line >= 0; line -= 1) {
+  for (let line = beforePosition.line; line >= minLine; line -= 1) {
     const lineText = document.lineAt(line).text;
     const match = lineText.match(annotationPattern);
     if (!match) {

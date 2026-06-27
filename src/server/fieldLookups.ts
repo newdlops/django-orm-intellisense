@@ -60,13 +60,13 @@ export const FIELD_LOOKUPS: Record<string, string[]> = {
  * Each transform converts a field into an output field kind, and is only
  * applicable to certain input field kinds.
  */
+// Only DATE/TIME extract transforms are Django built-ins. String transforms
+// (lower/upper/length/trim/...) are NOT registered by default — they exist only
+// as Func expressions or after an explicit Field.register_lookup(...). Listing
+// them made the static fast path FALSELY resolve `name__lower__icontains` etc.
+// that real Django rejects with FieldError. Custom-registered ones flow through
+// the runtime path instead. (Verified vs Django 5.2.)
 export const FIELD_TRANSFORMS: Record<string, { outputFieldKind: string; applicableFieldKinds: string[] }> = {
-  'lower': { outputFieldKind: 'CharField', applicableFieldKinds: ['CharField', 'TextField', 'SlugField', 'URLField', 'EmailField'] },
-  'upper': { outputFieldKind: 'CharField', applicableFieldKinds: ['CharField', 'TextField', 'SlugField', 'URLField', 'EmailField'] },
-  'length': { outputFieldKind: 'IntegerField', applicableFieldKinds: ['CharField', 'TextField', 'SlugField', 'URLField', 'EmailField'] },
-  'trim': { outputFieldKind: 'CharField', applicableFieldKinds: ['CharField', 'TextField'] },
-  'ltrim': { outputFieldKind: 'CharField', applicableFieldKinds: ['CharField', 'TextField'] },
-  'rtrim': { outputFieldKind: 'CharField', applicableFieldKinds: ['CharField', 'TextField'] },
   'year': { outputFieldKind: 'IntegerField', applicableFieldKinds: ['DateField', 'DateTimeField'] },
   'month': { outputFieldKind: 'IntegerField', applicableFieldKinds: ['DateField', 'DateTimeField'] },
   'day': { outputFieldKind: 'IntegerField', applicableFieldKinds: ['DateField', 'DateTimeField'] },
@@ -131,8 +131,10 @@ export const FIELD_KIND_PYTHON_TYPE: Record<string, string> = {
   DurationField: 'datetime.timedelta',
   // Misc scalars
   UUIDField: 'uuid.UUID',
-  JSONField: 'dict | list',
+  JSONField: 'Any',
   BinaryField: 'bytes',
+  // Computed — value type is the output_field, not statically knowable.
+  GeneratedField: 'Any',
   // Relations — terminal type is the related model, not a scalar python type.
   ForeignKey: 'Any',
   OneToOneField: 'Any',
@@ -164,6 +166,12 @@ export function operandPythonType(
       return `list[${fieldPythonType}]`;
     case 'range':
       return `tuple[${fieldPythonType}, ${fieldPythonType}]`;
+    // JSONField key lookups: operand is the key name(s), not the value type.
+    case 'has_key':
+      return 'str';
+    case 'has_keys':
+    case 'has_any_keys':
+      return 'list[str]';
     case 'contains':
     case 'icontains':
     case 'startswith':
@@ -172,7 +180,8 @@ export function operandPythonType(
     case 'iendswith':
     case 'regex':
     case 'iregex':
-    case 'iexact':
+      // NOTE: iexact is intentionally omitted — it is registered on non-text
+      // fields too, so its operand is the field's own type (falls through).
       return 'str';
     case 'year':
     case 'month':

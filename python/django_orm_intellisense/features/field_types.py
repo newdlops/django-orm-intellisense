@@ -57,8 +57,10 @@ FIELD_KIND_PYTHON_TYPE: dict[str, str] = {
     'DurationField': 'datetime.timedelta',
     # Misc scalars
     'UUIDField': 'uuid.UUID',
-    'JSONField': 'dict | list',
+    'JSONField': 'Any',
     'BinaryField': 'bytes',
+    # Computed — value type is the output_field, not statically knowable.
+    'GeneratedField': 'Any',
     # Relations
     'ForeignKey': 'Any',
     'OneToOneField': 'Any',
@@ -67,13 +69,15 @@ FIELD_KIND_PYTHON_TYPE: dict[str, str] = {
 
 # Built-in transform name -> {output field kind, applicable input field kinds}.
 # Mirrors FIELD_TRANSFORMS in src/server/fieldLookups.ts verbatim.
+#
+# Only DATE/TIME extract transforms are Django built-ins. String transforms
+# (lower/upper/length/trim/...) are NOT registered by default — they exist only
+# as Func expressions (functions.Lower/Upper/Length) or after an explicit
+# Field.register_lookup(...). Listing them here made the static fast path
+# FALSELY resolve chains like `name__lower__icontains` that real Django rejects
+# with FieldError (verified: CharField().get_transform('lower') is None on
+# Django 5.2). Custom-registered ones flow through the runtime path instead.
 FIELD_TRANSFORMS: dict[str, dict[str, object]] = {
-    'lower': {'outputFieldKind': 'CharField', 'applicableFieldKinds': ['CharField', 'TextField', 'SlugField', 'URLField', 'EmailField']},
-    'upper': {'outputFieldKind': 'CharField', 'applicableFieldKinds': ['CharField', 'TextField', 'SlugField', 'URLField', 'EmailField']},
-    'length': {'outputFieldKind': 'IntegerField', 'applicableFieldKinds': ['CharField', 'TextField', 'SlugField', 'URLField', 'EmailField']},
-    'trim': {'outputFieldKind': 'CharField', 'applicableFieldKinds': ['CharField', 'TextField']},
-    'ltrim': {'outputFieldKind': 'CharField', 'applicableFieldKinds': ['CharField', 'TextField']},
-    'rtrim': {'outputFieldKind': 'CharField', 'applicableFieldKinds': ['CharField', 'TextField']},
     'year': {'outputFieldKind': 'IntegerField', 'applicableFieldKinds': ['DateField', 'DateTimeField']},
     'month': {'outputFieldKind': 'IntegerField', 'applicableFieldKinds': ['DateField', 'DateTimeField']},
     'day': {'outputFieldKind': 'IntegerField', 'applicableFieldKinds': ['DateField', 'DateTimeField']},
@@ -91,7 +95,10 @@ FIELD_TRANSFORMS: dict[str, dict[str, object]] = {
 
 _TEXT_OPERAND_LOOKUPS = {
     'contains', 'icontains', 'startswith', 'istartswith',
-    'endswith', 'iendswith', 'regex', 'iregex', 'iexact',
+    'endswith', 'iendswith', 'regex', 'iregex',
+    # NOTE: iexact is intentionally NOT here — it is registered on non-text
+    # fields too (IntegerField/UUIDField/DecimalField/DateField/...), so its
+    # operand is the field's own type, not always str. It falls through.
 }
 _INT_OPERAND_LOOKUPS = {
     'year', 'month', 'day', 'week', 'week_day', 'iso_year',
@@ -129,6 +136,12 @@ def operand_python_type(lookup_operator: str, field_python_type: str) -> str:
         return f'list[{field_python_type}]'
     if lookup_operator == 'range':
         return f'tuple[{field_python_type}, {field_python_type}]'
+    # JSONField key lookups: operand is the key name(s), independent of the
+    # field's value type.
+    if lookup_operator == 'has_key':
+        return 'str'
+    if lookup_operator in {'has_keys', 'has_any_keys'}:
+        return 'list[str]'
     if lookup_operator in _TEXT_OPERAND_LOOKUPS:
         return 'str'
     if lookup_operator in _INT_OPERAND_LOOKUPS:

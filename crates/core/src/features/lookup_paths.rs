@@ -83,13 +83,14 @@ pub fn is_default_lookup_operator(name: &str) -> bool {
 /// field kinds). Mirrors FIELD_TRANSFORMS in src/server/fieldLookups.ts and
 /// python/.../features/field_types.py — keep in sync (a parity test enforces
 /// the field-kind/python-type map; this transform table shares that contract).
+//
+// Only DATE/TIME extract transforms are Django built-ins. String transforms
+// (lower/upper/length/trim/...) are NOT registered by default (they exist only
+// as Func expressions or after Field.register_lookup), so listing them made the
+// static fast path FALSELY resolve `name__lower__icontains` etc. that real
+// Django rejects with FieldError. Custom-registered ones flow through the
+// runtime path instead. (Verified vs Django 5.2.)
 pub const FIELD_TRANSFORMS: &[(&str, &str, &[&str])] = &[
-    ("lower", "CharField", &["CharField", "TextField", "SlugField", "URLField", "EmailField"]),
-    ("upper", "CharField", &["CharField", "TextField", "SlugField", "URLField", "EmailField"]),
-    ("length", "IntegerField", &["CharField", "TextField", "SlugField", "URLField", "EmailField"]),
-    ("trim", "CharField", &["CharField", "TextField"]),
-    ("ltrim", "CharField", &["CharField", "TextField"]),
-    ("rtrim", "CharField", &["CharField", "TextField"]),
     ("year", "IntegerField", &["DateField", "DateTimeField"]),
     ("month", "IntegerField", &["DateField", "DateTimeField"]),
     ("day", "IntegerField", &["DateField", "DateTimeField"]),
@@ -124,8 +125,13 @@ pub fn operand_python_type(op: &str, field_python_type: &str) -> String {
         "isnull" => "bool".to_string(),
         "in" => format!("list[{field_python_type}]"),
         "range" => format!("tuple[{field_python_type}, {field_python_type}]"),
+        // JSONField key lookups: operand is the key name(s), not the value type.
+        "has_key" => "str".to_string(),
+        "has_keys" | "has_any_keys" => "list[str]".to_string(),
+        // NOTE: iexact is intentionally NOT here — registered on non-text
+        // fields too, so its operand is the field's own type (falls through).
         "contains" | "icontains" | "startswith" | "istartswith" | "endswith"
-        | "iendswith" | "regex" | "iregex" | "iexact" => "str".to_string(),
+        | "iendswith" | "regex" | "iregex" => "str".to_string(),
         "year" | "month" | "day" | "week" | "week_day" | "iso_year"
         | "iso_week_day" | "quarter" | "hour" | "minute" | "second" => "int".to_string(),
         "date" => "datetime.date".to_string(),
@@ -1230,14 +1236,30 @@ mod tests {
     }
 
     #[test]
-    fn terminal_type_lower_then_lookup() {
+    fn string_transforms_are_not_builtins() {
+        // `lower`/`upper`/`length`/... are NOT Django built-in transforms (they
+        // are Func expressions or require register_lookup). The static fast path
+        // must NOT falsely resolve them, or it disagrees with real Django
+        // (FieldError) and the runtime path (get_transform -> None).
         let g = dated_graph();
-        let r = resolve_lookup_path(&g, "blog.Entry", "title__lower__icontains", "filter");
+        for chain in ["title__lower", "title__upper", "title__length__gt", "title__lower__icontains"] {
+            let r = resolve_lookup_path(&g, "blog.Entry", chain, "filter");
+            assert!(
+                matches!(r, LookupResolution::Unresolved { .. }),
+                "expected `{chain}` to be unresolved (not a built-in transform), got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn iexact_operand_is_field_type_not_str() {
+        // iexact is registered on non-text fields too, so the operand is the
+        // field's own type (here int), not unconditionally str.
+        let g = dated_graph();
+        let r = resolve_lookup_path(&g, "blog.Entry", "author__age__iexact", "filter");
         let tt = terminal_type(&r);
-        assert_eq!(tt.output_field_kind, "CharField");
-        assert_eq!(tt.python_type, "str");
-        assert!(tt.is_transformed);
-        assert_eq!(tt.lookup_operator.as_deref(), Some("icontains"));
+        assert_eq!(tt.lookup_operator.as_deref(), Some("iexact"));
+        assert_eq!(tt.operand_python_type.as_deref(), Some("int"));
     }
 
     #[test]

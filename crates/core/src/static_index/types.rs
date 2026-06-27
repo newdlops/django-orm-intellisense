@@ -107,8 +107,10 @@ pub const FIELD_KIND_PYTHON_TYPE: &[(&str, &str)] = &[
     ("DurationField", "datetime.timedelta"),
     // Misc scalars
     ("UUIDField", "uuid.UUID"),
-    ("JSONField", "dict | list"),
+    ("JSONField", "Any"),
     ("BinaryField", "bytes"),
+    // Computed — value type is the output_field, not statically knowable.
+    ("GeneratedField", "Any"),
     // Relations
     ("ForeignKey", "Any"),
     ("OneToOneField", "Any"),

@@ -203,12 +203,21 @@ class FieldTypeHelpersTest(unittest.TestCase):
         self.assertEqual(python_type_for_kind('DecimalField'), 'decimal.Decimal')
         self.assertEqual(python_type_for_kind('MoneyField'), 'Any')  # custom -> Any
         self.assertEqual(python_type_for_kind(None), 'Any')
+        # Audit corrections (vs Django 5.2):
+        self.assertEqual(python_type_for_kind('JSONField'), 'Any')  # any JSON value
+        self.assertEqual(python_type_for_kind('GeneratedField'), 'Any')
 
     def test_transform_output_kind_applicability(self) -> None:
         self.assertEqual(transform_output_kind('year', 'DateTimeField'), 'IntegerField')
         self.assertEqual(transform_output_kind('date', 'DateTimeField'), 'DateField')
         self.assertIsNone(transform_output_kind('year', 'CharField'))  # not applicable
         self.assertIsNone(transform_output_kind('bogus', 'DateField'))  # unknown
+        # String transforms are NOT Django built-ins — must not resolve.
+        for name in ('lower', 'upper', 'length', 'trim', 'ltrim', 'rtrim'):
+            self.assertIsNone(
+                transform_output_kind(name, 'CharField'),
+                f'{name} is not a built-in transform',
+            )
 
     def test_operand_python_type(self) -> None:
         self.assertEqual(operand_python_type('isnull', 'int'), 'bool')
@@ -216,6 +225,14 @@ class FieldTypeHelpersTest(unittest.TestCase):
         self.assertEqual(operand_python_type('range', 'datetime.date'), 'tuple[datetime.date, datetime.date]')
         self.assertEqual(operand_python_type('icontains', 'str'), 'str')
         self.assertEqual(operand_python_type('gte', 'int'), 'int')
+        # Audit corrections (vs Django 5.2):
+        # iexact is registered on non-text fields too -> operand is field type.
+        self.assertEqual(operand_python_type('iexact', 'int'), 'int')
+        self.assertEqual(operand_python_type('iexact', 'str'), 'str')
+        # JSONField key lookups -> key name(s).
+        self.assertEqual(operand_python_type('has_key', 'Any'), 'str')
+        self.assertEqual(operand_python_type('has_keys', 'Any'), 'list[str]')
+        self.assertEqual(operand_python_type('has_any_keys', 'Any'), 'list[str]')
 
 
 if __name__ == '__main__':
