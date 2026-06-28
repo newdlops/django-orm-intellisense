@@ -30,6 +30,7 @@ _MANAGE_PY = (
 
 
 def _make_project(root: Path, default: str, settings_files: list[str]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
     (root / 'manage.py').write_text(_MANAGE_PY.format(default=default), encoding='utf-8')
     for rel in settings_files:
         path = root / rel
@@ -85,6 +86,65 @@ class ManagePyInferenceTest(unittest.TestCase):
             (root / 'proj' / 'settings.py').write_text('SECRET_KEY="x"\n', encoding='utf-8')
             profile = discover_workspace(root)
             self.assertEqual(profile.settings_module, 'proj.settings')
+
+
+class MonorepoNestedManagePyTest(unittest.TestCase):
+    """A monorepo root has no manage.py; each service lives in a subdirectory
+    with its own manage.py + settings. Candidate discovery must still run so the
+    settings modules surface (for the picker / single-candidate inference)."""
+
+    def test_nested_service_surfaces_settings_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # No root manage.py — only a nested service has one.
+            _make_project(
+                root / 'services' / 'payroll',
+                default='core.settings',
+                settings_files=['core/settings.py'],
+            )
+            profile = discover_workspace(root)
+            self.assertIsNone(profile.manage_py_path)
+            # The nested settings module is surfaced (root-relative) instead of
+            # being silently dropped.
+            self.assertIn(
+                'services.payroll.core.settings', profile.settings_candidates
+            )
+            # Exactly one candidate => inferred automatically.
+            self.assertEqual(
+                profile.settings_module, 'services.payroll.core.settings'
+            )
+
+    def test_multiple_nested_services_offer_all_without_auto_pick(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_project(
+                root / 'services' / 'payroll',
+                default='core.settings',
+                settings_files=['core/settings.py'],
+            )
+            _make_project(
+                root / 'services' / 'billing',
+                default='core.settings',
+                settings_files=['core/settings.py'],
+            )
+            profile = discover_workspace(root)
+            self.assertIn(
+                'services.payroll.core.settings', profile.settings_candidates
+            )
+            self.assertIn(
+                'services.billing.core.settings', profile.settings_candidates
+            )
+            # Ambiguous => no auto-pick; the user selects via the picker.
+            self.assertIsNone(profile.settings_module)
+
+    def test_plain_directory_without_django_stays_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'pkg').mkdir()
+            (root / 'pkg' / 'utils.py').write_text('x = 1\n', encoding='utf-8')
+            profile = discover_workspace(root)
+            self.assertEqual(profile.settings_candidates, [])
+            self.assertIsNone(profile.settings_module)
 
 
 if __name__ == '__main__':

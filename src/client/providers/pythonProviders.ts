@@ -2654,20 +2654,18 @@ export function registerPythonProviders(
               // Reuse only a cached SUCCESS; a cached miss (undefined) is retried.
               lookupReceiver = cachedRecv;
             } else {
-              lookupReceiver =
-                resolveExpressionOrmReceiverLocal(
-                  daemon,
-                  document,
-                  lookupContext.receiverExpression,
-                  document.offsetAt(position),
-                  new Set()
-                ) ??
-                (await resolveLookupReceiverInfoForReceiver(
-                  daemon,
-                  document,
-                  lookupContext.receiverExpression,
-                  position
-                ));
+              // Use resolveLookupReceiverInfoForReceiver (NOT a bare
+              // resolveExpressionOrmReceiverLocal short-circuit): it runs the same
+              // local fast-path internally AND then applies the virtual-field
+              // enrichment (assignment-chain + inline annotate scan). The bare
+              // local resolver returns an un-enriched receiver, which dropped
+              // annotations like a `.values().annotate(_sum=...)` alias.
+              lookupReceiver = await resolveLookupReceiverInfoForReceiver(
+                daemon,
+                document,
+                lookupContext.receiverExpression,
+                position
+              );
               // Only cache a successful, NON-aborted resolution; a contention-
               // aborted result (possibly an incomplete model_class with no virtual
               // fields) must be retried — not stuck — on the next completion.
@@ -11699,6 +11697,9 @@ function inferBuiltinManagerOrQuerysetReturnKind(
     'select_related', 'prefetch_related', 'only', 'defer', 'distinct',
     'using', 'reverse', 'extra', 'union', 'intersection', 'difference',
     'none', 'select_for_update',
+    // .values()/.values_list() return a ValuesQuerySet — still a queryset that
+    // accepts a trailing .annotate(_x=...) whose alias must resolve as a lookup.
+    'values', 'values_list',
   ]);
   const instanceReturning: ReadonlySet<string> = new Set([
     'first', 'last', 'get', 'earliest', 'latest', 'create',
@@ -11763,14 +11764,28 @@ async function resolveLookupReceiverInfoForReceiver(
     resolved.modelLabel,
     deadlineMs
   );
-  if (chainVirtualFields.length === 0) {
+  // Also scan the receiver EXPRESSION itself for inline annotate calls — a direct
+  // chain like `Model.objects.values("x").annotate(_sum=Sum(...))` is not a bare
+  // variable, so the assignment-chain collector above sees nothing, yet `_sum`
+  // must still resolve (builtin annotate after .values() otherwise falls to
+  // kind=instance with no virtual fields).
+  const inlineVirtualFields = await extractVirtualFieldsFromChainExpression(
+    daemon,
+    resolved.modelLabel,
+    receiverExpression
+  );
+  const allChainVirtualFields = dedupeVirtualFields([
+    ...chainVirtualFields,
+    ...inlineVirtualFields,
+  ]);
+  if (allChainVirtualFields.length === 0) {
     return resolved;
   }
   return {
     ...resolved,
     virtualFields: dedupeVirtualFields([
       ...(resolved.virtualFields ?? []),
-      ...chainVirtualFields,
+      ...allChainVirtualFields,
     ]),
   };
 }
@@ -17793,12 +17808,48 @@ function resolveRelativeModuleName(
   return resolvedParts.length > 0 ? resolvedParts.join('.') : undefined;
 }
 
+function stripPythonLineComments(text: string): string {
+  // Blank `#...` comments to end-of-line (quote-aware: a `#` inside a string
+  // literal is kept), preserving newlines/length. Without this, collapsing a
+  // multi-line receiver expression that follows a comment line joins the comment
+  // to the code (`# note\nQs.objects` -> `#noteQs.objects`), and the leading `#`
+  // then comments out the whole receiver.
+  const out = text.split('');
+  const n = out.length;
+  let i = 0;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"' || c === "'") {
+      const triple = text[i + 1] === c && text[i + 2] === c;
+      i += triple ? 3 : 1;
+      while (i < n) {
+        if (text[i] === '\\') { i += 2; continue; }
+        if (triple) {
+          if (text[i] === c && text[i + 1] === c && text[i + 2] === c) { i += 3; break; }
+        } else {
+          if (text[i] === c) { i += 1; break; }
+          if (text[i] === '\n') { i += 1; break; }
+        }
+        i += 1;
+      }
+      continue;
+    }
+    if (c === '#') {
+      while (i < n && text[i] !== '\n') { out[i] = ' '; i += 1; }
+      continue;
+    }
+    i += 1;
+  }
+  return out.join('');
+}
+
 function compactPythonExpression(value: string): string {
-  // Collapse all whitespace, but preserve a single space when it sits
-  // between two word characters — otherwise expressions like
-  // `not Foo.objects.filter(...)` collapse into `notFoo.objects.filter(...)`,
-  // making the leading keyword look like part of the receiver identifier.
-  return value.replace(/\s+/g, (match, offset: number, str: string) => {
+  // Strip line comments first (so a receiver following a comment line is not
+  // commented out when newlines are collapsed below), then collapse all
+  // whitespace, preserving a single space between two word characters —
+  // otherwise expressions like `not Foo.objects.filter(...)` collapse into
+  // `notFoo.objects.filter(...)`, making the keyword look like the receiver.
+  return stripPythonLineComments(value).replace(/\s+/g, (match, offset: number, str: string) => {
     const before = str[offset - 1] ?? '';
     const after = str[offset + match.length] ?? '';
     return /\w/.test(before) && /\w/.test(after) ? ' ' : '';

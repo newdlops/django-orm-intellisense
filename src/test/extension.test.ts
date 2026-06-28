@@ -848,6 +848,24 @@ suite('Django ORM Intellisense UI', () => {
       'Expected a builtin .annotate(_builtin_total=...) field to surface as a virtual lookup field.'
     );
 
+    // .values().annotate(_sum=...): a builtin annotate AFTER .values() must still
+    // surface its virtual field in a later filter.
+    const valuesAnnotateCompletionPos = positionAfterTextInContainer(
+      document,
+      'filter(_values_sum__gte=1)',
+      'filter(_values'
+    );
+    const valuesAnnotateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        valuesAnnotateCompletionPos
+      );
+    assert.ok(
+      hasCompletionItemLabel(valuesAnnotateCompletionList?.items ?? [], '_values_sum'),
+      'Expected a builtin annotate after .values() (_values_sum) to surface as a virtual lookup field.'
+    );
+
     const directPkHoverPosition = positionInsideText(
       document,
       'Post.objects.filter(pk=1)',

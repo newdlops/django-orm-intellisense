@@ -246,7 +246,13 @@ pub fn synthesize_reverse_relations(
             file_path: f.file_path.clone(),
             line: f.line,
             column: f.column,
-            field_kind: f.field_kind.clone(),
+            // Tag reverse relations with a `reverse_` prefix (matching the
+            // Python surface builder). The surface return_kind classifier keys
+            // off this: `reverse_OneToOneField` resolves to an instance, while
+            // `reverse_ForeignKey` / `reverse_ManyToManyField` resolve to a
+            // related manager. Copying the bare forward kind here made a reverse
+            // FK look like a forward FK -> mis-classified as `instance`.
+            field_kind: format!("reverse_{}", f.field_kind),
             is_relation: true,
             relation_direction: Some("reverse".into()),
             related_model_label: Some(f.model_label.clone()),

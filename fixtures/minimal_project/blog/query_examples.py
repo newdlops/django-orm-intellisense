@@ -532,9 +532,7 @@ def builtin_annotate_examples():
         _builtin_total__gte=1
     )
     # Builtin annotate AFTER .values() (the subquery shape from the user's log).
-    QuestionThread.objects.values("company_id").annotate(
-        _values_sum=db_models.Count("message")
-    ).filter(_values_sum__gte=1)
+    QuestionThread.objects.values("company_id").annotate(_values_sum=db_models.Count("message")).filter(_values_sum__gte=1)
 
 
 def instance_self_reassign_filter_chain_examples():

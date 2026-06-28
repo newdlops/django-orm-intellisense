@@ -378,7 +378,18 @@ def discover_workspace(
     settings_candidates: list[str] = []
     pyproject_path = root / 'pyproject.toml'
 
-    if manage_py_path is not None or settings_override is not None:
+    # Monorepo support: services frequently live in subdirectories, each with
+    # its own manage.py + settings module, and the workspace root itself has no
+    # manage.py. Without this, candidate discovery below never runs and the
+    # whole tree resolves with zero settings candidates (no runtime, nothing in
+    # the DJANGO_SETTINGS_MODULE picker).
+    has_nested_manage_py = _has_nested_manage_py(root, python_files)
+
+    if (
+        manage_py_path is not None
+        or has_nested_manage_py
+        or settings_override is not None
+    ):
         settings_candidates.extend(
             _discover_settings_candidates(root, python_files=python_files)
         )
@@ -458,6 +469,26 @@ def _safe_iterdir(root: Path) -> list[Path]:
         ]
     except OSError:
         return []
+
+
+def _has_nested_manage_py(
+    root: Path,
+    python_files: list[Path] | tuple[Path, ...] | None = None,
+) -> bool:
+    """Whether any subdirectory (not the root itself) contains a manage.py.
+
+    Reuses the already-snapshotted python file list when available so monorepo
+    detection costs nothing extra; falls back to a tree walk otherwise. A
+    nested manage.py is the signal that this is a multi-service workspace whose
+    Django settings live below the root.
+    """
+    source_files = (
+        list(python_files) if python_files is not None else iter_python_files(root)
+    )
+    return any(
+        python_file.name == 'manage.py' and python_file.parent != root
+        for python_file in source_files
+    )
 
 
 def _discover_settings_candidates(

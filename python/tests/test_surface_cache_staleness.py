@@ -243,11 +243,13 @@ class CaptainStaleSurfaceCacheTest(unittest.TestCase):
         }
         cache_path.write_text(json.dumps(legacy_payload))
 
-        # 현재 코드 (CACHE_SCHEMA_VERSION=16) 로 로드 시도.
-        self.assertEqual(
-            CACHE_SCHEMA_VERSION, 16,
-            '옵션 C 후속 조치로 CACHE_SCHEMA_VERSION 은 16 이어야 함 — '
-            '옛 캐시(15) 자동 무효화 트리거.',
+        # 현재 코드 (CACHE_SCHEMA_VERSION > 15) 로 로드 시도. 버전이 bump 될
+        # 때마다 깨지지 않도록 정확한 숫자 대신 "legacy(15) 보다 큼"을 검증한다 —
+        # 이게 옛 캐시 자동 무효화의 실제 불변식.
+        self.assertGreater(
+            CACHE_SCHEMA_VERSION, 15,
+            'CACHE_SCHEMA_VERSION 은 legacy(15) 보다 커야 옛 캐시가 자동 '
+            '무효화된다.',
         )
         loaded = load_cached_surface_index(
             workspace_root=self._workspace_root,

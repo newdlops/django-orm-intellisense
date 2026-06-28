@@ -132,8 +132,10 @@ class DaemonInitializePrewarmTriggerTest(unittest.TestCase):
         """daemon initialize 가 _start_runtime_field_registry_prewarm 을 호출해야
         captain 의 lazy 2.8s 폭주가 background 로 이동.
         """
+        # 닫는 괄호를 포함하지 않아 인자가 추가돼도(예: health_snapshot) 깨지지
+        # 않는다 — 검증하려는 건 호출의 존재 자체.
         self.assertIn(
-            'self._start_runtime_field_registry_prewarm(runtime)',
+            'self._start_runtime_field_registry_prewarm(runtime',
             APP_SOURCE,
             'initialize 핸들러에 background pre-warm 호출이 있어야 함',
         )
