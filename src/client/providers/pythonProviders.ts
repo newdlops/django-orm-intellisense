@@ -1227,6 +1227,12 @@ export function registerPythonProviders(
   }>();
   const activeDiagnosticScans = new Set<string>();
   let fullDiagnosticsRefreshTimer: NodeJS.Timeout | undefined;
+  // VS Code fires onDidChangeVisibleTextEditors twice for a single tab switch
+  // (the visible set transitions through remove-old then add-new). The refresh
+  // is already coalesced downstream, but the latch collapses the duplicate
+  // same-tick log line + clearTimeout/setTimeout churn so the diagnostics log
+  // stays readable and we don't re-schedule twice per switch.
+  let visibleEditorsRefreshPending = false;
 
   const isVisibleDocument = (document: vscode.TextDocument): boolean =>
     vscode.window.visibleTextEditors.some(
@@ -4344,6 +4350,16 @@ export function registerPythonProviders(
       if (!canRunDiagnostics()) {
         return;
       }
+      // Collapse the duplicate same-tick firing (see visibleEditorsRefreshPending).
+      // The microtask clears the latch before the 500ms refresh fires, so a
+      // genuinely separate later tab switch still schedules normally.
+      if (visibleEditorsRefreshPending) {
+        return;
+      }
+      visibleEditorsRefreshPending = true;
+      queueMicrotask(() => {
+        visibleEditorsRefreshPending = false;
+      });
       // Delay diagnostics refresh on tab switch to let hover requests
       // settle first and avoid flooding the event loop.
       daemon.logDiagnostic('[diagnostics:trigger] tracked-refresh source=visible-editors-changed delay=500ms');
@@ -4357,6 +4373,7 @@ export function registerPythonProviders(
       lastDiagnosedDocumentVersions.delete(key);
       partialDiagnosticResults.delete(key);
       _ormReceiverCacheByDocument.delete(key);
+      _lookupReceiverCacheByDocument.delete(key);
       _scanCacheAcrossRegistrations.delete(key);
       const timer = diagnosticTimers.get(key);
       if (timer) {
@@ -7555,6 +7572,7 @@ function resetProviderResolutionCaches(): void {
   // unresolvable during the cold-start window. (It is already version-keyed
   // for edits; this covers the daemon-readiness transition.)
   _ormReceiverCacheByDocument.clear();
+  _lookupReceiverCacheByDocument.clear();
 }
 
 async function listAllRelationTargets(
@@ -8905,9 +8923,23 @@ function findMetaConstraintLookupDiagnosticContexts(
 ): MetaConstraintLookupDiagnosticContext[] {
   const contexts: MetaConstraintLookupDiagnosticContext[] = [];
   const seen = new Set<string>();
+  // Only scan lines that contain a Q( call to avoid O(words × filesize): a
+  // meta-constraint lookup literal only resolves inside a Q(...) call (enforced
+  // downstream by isQExpressionCall). `/Q\s*\(/` matches `Q(`, `models.Q(`,
+  // `db_models.Q(`, and `Q (`, skipping the per-token backward-paren scan +
+  // compactPythonExpression work on every other visible line (the single most
+  // expensive diagnostic phase: up to ~700ms producing nothing on large files).
+  // Residual miss: a multi-line `Q(\n  field__lookup=...\n)` whose keyword sits
+  // on a continuation line lacking `Q(` is skipped — the same accepted residual
+  // as the sibling findDirectFieldDiagnosticContexts `.create(`/`.update(` guard
+  // (Django CheckConstraint conditions are conventionally written on one line).
+  const Q_CALL_LINE_PATTERN = /Q\s*\(/;
 
   for (let line = startLine; line < endLine; line += 1) {
     const lineText = document.lineAt(line).text;
+    if (!Q_CALL_LINE_PATTERN.test(lineText)) {
+      continue;
+    }
     for (const match of lineText.matchAll(/[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/g)) {
       const value = match[0];
       const start = match.index ?? 0;
@@ -9655,6 +9687,44 @@ function setCachedOrmReceiver(
   docCache.entries.set(expression, result);
 }
 
+// Parallel per-document cache for `resolveLookupReceiverAtOffset` (kept separate
+// from `_ormReceiverCacheByDocument` because the two resolvers walk different
+// paths and can return different receivers for the same expression). Without
+// this memo the walker re-resolved a shared call-expression prefix once per
+// chain that contains it — e.g. `qs.payment()` was resolved 4× in a single
+// diagnostic pass, each paying a ~880ms surface build. Doc+version keyed, so it
+// self-invalidates on edits; `null` from get = "not cached", whereas a cached
+// `undefined` value is a real "resolved to nothing" result.
+const _lookupReceiverCacheByDocument = new Map<string, { version: number; entries: Map<string, OrmReceiverInfo | undefined> }>();
+
+function getCachedLookupReceiver(
+  document: vscode.TextDocument,
+  expression: string
+): OrmReceiverInfo | undefined | null {
+  const docCache = _lookupReceiverCacheByDocument.get(document.uri.toString());
+  if (!docCache || docCache.version !== document.version) {
+    return null;
+  }
+  if (docCache.entries.has(expression)) {
+    return docCache.entries.get(expression)!;
+  }
+  return null;
+}
+
+function setCachedLookupReceiver(
+  document: vscode.TextDocument,
+  expression: string,
+  result: OrmReceiverInfo | undefined
+): void {
+  const docKey = document.uri.toString();
+  let docCache = _lookupReceiverCacheByDocument.get(docKey);
+  if (!docCache || docCache.version !== document.version) {
+    docCache = { version: document.version, entries: new Map() };
+    _lookupReceiverCacheByDocument.set(docKey, docCache);
+  }
+  docCache.entries.set(expression, result);
+}
+
 async function resolveOrmReceiverAtOffset(
   daemon: AnalysisDaemon,
   document: vscode.TextDocument,
@@ -9690,7 +9760,11 @@ async function resolveOrmReceiverAtOffset(
     visited
   );
 
-  setCachedOrmReceiver(document, cacheKey, result);
+  // Don't cache a result produced after an abort — it is a spurious `undefined`
+  // that would pin this expression as unresolvable for the document version.
+  if (!daemon.isAborted()) {
+    setCachedOrmReceiver(document, cacheKey, result);
+  }
   return result;
 }
 
@@ -11989,6 +12063,66 @@ async function timeReceiverStep<T>(
 }
 
 async function resolveLookupReceiverAtOffset(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  receiverExpression: string,
+  beforeOffset: number,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
+  const normalizedExpression = normalizeReceiverExpression(receiverExpression);
+  if (!normalizedExpression) {
+    return undefined;
+  }
+  if (isMalformedReceiverExpression(normalizedExpression)) {
+    return undefined;
+  }
+
+  // Memoize per (expression, offset) for this document version so a shared
+  // call-expression prefix is resolved once per pass instead of once per chain
+  // that contains it (the same `qs.payment()` prefix was resolved 4× per pass).
+  // We DO cache `undefined` — that is what dedupes slow *unresolvable* receivers
+  // (a cross-module `get_emps(hrm)` was re-walked 4× at ~2.7s each). We do NOT
+  // cache results produced after an abort — those are spurious `undefined`.
+  const cacheKey = `${normalizedExpression}@${beforeOffset}`;
+  const cached = getCachedLookupReceiver(document, cacheKey);
+  if (cached !== null) {
+    if (cached !== undefined) {
+      return cached;
+    }
+    // Cached miss. Stale-null re-check (captain regression D): a surface delta
+    // from reindexing ANOTHER file populates a model without firing a daemon
+    // state change or bumping this document's version, so resetProviderResolution-
+    // Caches() never runs. If the receiver's root identifier is now a known
+    // model, drop the cached `undefined` and re-resolve; otherwise keep it.
+    const rootIdentifier = receiverRootIdentifier(normalizedExpression);
+    const rootIsKnownNow = !!rootIdentifier && (
+      daemon.hasModelByShortName(rootIdentifier) ||
+      snakeToPascalCaseVariants(rootIdentifier).some((variant) =>
+        daemon.hasModelByShortName(variant)
+      )
+    );
+    if (!rootIsKnownNow) {
+      return undefined;
+    }
+    // else fall through to a fresh resolution.
+  }
+
+  const result = await resolveLookupReceiverAtOffsetCore(
+    daemon,
+    document,
+    receiverExpression,
+    beforeOffset,
+    visited
+  );
+
+  if (!daemon.isAborted()) {
+    setCachedLookupReceiver(document, cacheKey, result);
+  }
+  return result;
+}
+
+async function resolveLookupReceiverAtOffsetCore(
   daemon: AnalysisDaemon,
   document: vscode.TextDocument,
   receiverExpression: string,

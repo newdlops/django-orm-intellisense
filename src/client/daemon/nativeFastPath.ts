@@ -416,10 +416,13 @@ export function ensureNativeAstModules(
   if (!n) return Promise.resolve(false);
 
   astModulesEnsuring = new Promise<boolean>((resolve) => {
-    setImmediate(() => {
+    setImmediate(async () => {
       const started = performance.now();
       try {
-        const ok = n.nativeEnsureAstModules(workspaceRoot);
+        // Async napi task: the multi-second AST snapshot + index build runs on
+        // the libuv threadpool, so it no longer blocks the Node event loop (which
+        // previously defeated hover hard-timeouts during the post-surface ensure).
+        const ok = await n.nativeEnsureAstModules(workspaceRoot);
         const elapsedMs = performance.now() - started;
         astModulesEnsured = ok;
         log?.(

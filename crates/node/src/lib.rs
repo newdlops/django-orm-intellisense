@@ -1,10 +1,12 @@
 #![deny(clippy::all)]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Instant;
 
-use napi::bindgen_prelude::{Buffer, Error as NapiError, Result as NapiResult, Status};
+use napi::bindgen_prelude::{AsyncTask, Buffer, Error as NapiError, Result as NapiResult, Status};
+use napi::{Env, Task};
 use napi_derive::napi;
 
 use django_orm_core::cache::{self, CacheError, CacheLoad};
@@ -19,11 +21,23 @@ use django_orm_core::static_index::{self, StaticIndex};
 /// explicit cache-bust flag.
 static NATIVE_STATE: RwLock<Option<NativeState>> = RwLock::new(None);
 
+/// Monotonic install counter. Bumped each time a fresh `NativeState` is
+/// installed (native_init / native_init_from_surface). `EnsureAstModulesTask`
+/// captures the epoch of the state it intends to augment and re-checks it after
+/// its off-thread parse, so a concurrent re-init/re-hydrate for the SAME root
+/// cannot be clobbered by the now-stale merge.
+static STATE_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_state_epoch() -> u64 {
+    STATE_EPOCH.fetch_add(1, Ordering::SeqCst)
+}
+
 struct NativeState {
     root: PathBuf,
     static_index: StaticIndex,
     graph: ModelGraph,
     built_at_ms: u128,
+    epoch: u64,
 }
 
 #[napi]
@@ -321,6 +335,7 @@ pub fn native_init(root: String, force_rebuild: Option<bool>) -> NapiResult<Nati
         static_index: idx,
         graph,
         built_at_ms: current_time_ms(),
+        epoch: next_state_epoch(),
     });
     features::clear_descendant_cache();
     features::clear_export_cache();
@@ -582,6 +597,7 @@ pub fn native_init_from_surface(
         static_index,
         graph,
         built_at_ms: current_time_ms(),
+        epoch: next_state_epoch(),
     });
     features::clear_descendant_cache();
     // Silence unused import warning — DefinitionLocation is a type we
@@ -1073,190 +1089,237 @@ pub fn native_resolve_module(module_name: String) -> NapiResult<Option<Buffer>> 
 /// Intended to be called asynchronously after
 /// `native_init_from_surface` so that `resolveExportOrigin` /
 /// `resolveModule` queries become answerable without re-pinging Python.
-#[napi]
-pub fn native_ensure_ast_modules(root: String) -> NapiResult<bool> {
-    let root_path = PathBuf::from(&root);
-    let snap = discovery::snapshot_python_sources(&root_path, &[]);
-    let files: Vec<PathBuf> = snap
-        .entries
-        .iter()
-        .map(|e| root_path.join(&e.relative_path))
-        .collect();
-    // Use the *resolved* static index so inheritance expansion runs —
-    // project-specific abstract base classes like `TimestampedModel(models.Model)`
-    // only surface subclasses once `expand_via_inheritance` has walked
-    // the import graph. Without this, fixtures that chain through a
-    // local base class (Faq(TimestampedModel), FaqLink(...)) miss the
-    // file_path/line merge downstream.
-    let ast_index = static_index::build_static_index_resolved(&root_path, &files);
+/// AsyncTask wrapper for the AST-module ensure. The snapshot + resolved static
+/// index build is multi-second CPU work over the whole workspace; running it
+/// synchronously on the Node main thread blocked the event loop for ~2.2s, which
+/// defeated the hover hard-timeout (its setTimeout could not fire) and let
+/// unresolved hovers run to ~2.7s. `compute()` runs on the libuv threadpool: the
+/// heavy parse is lock-free, and only the brief NATIVE_STATE merge takes the
+/// write lock — so concurrent hover timers fire normally during the parse.
+pub struct EnsureAstModulesTask {
+    root: String,
+    /// Epoch of the NativeState this task intends to augment, captured before
+    /// the off-thread parse. If a concurrent native_init / native_init_from_surface
+    /// installs a new state (same or different root) during the parse, the epoch
+    /// changes and the merge is skipped so it cannot clobber fresher state.
+    epoch: u64,
+}
 
-    let mut guard = NATIVE_STATE.write().map_err(poisoned)?;
-    let Some(state) = guard.as_mut() else {
-        return Ok(false);
-    };
-    if state.root != root_path {
-        return Ok(false);
-    }
-    state.static_index.modules = ast_index.modules;
-    // Project methods are extracted alongside modules. Surface hydrate
-    // does not populate them, so refresh here too.
-    state.static_index.methods = ast_index.methods;
+impl Task for EnsureAstModulesTask {
+    type Output = bool;
+    type JsValue = bool;
 
-    // Merge AST model_candidate metadata (file_path / line / column /
-    // base_class_refs) into the surface-hydrated entries so hovers
-    // that need a definition site ("File: blog/models.py") can be
-    // answered natively. Surface hydrate creates ModelCandidates with
-    // empty file paths, so without this step `resolveRelationTarget`
-    // returns items with no `filePath` / `line` — the hover skips the
-    // "File:" line and the E2E hover assertions that match
-    // `File: fixtures/…/models.py` fail.
-    use std::collections::{HashMap, HashSet};
-    let ast_by_label: HashMap<String, django_orm_core::static_index::ModelCandidate> = ast_index
-        .model_candidates
-        .into_iter()
-        .map(|c| (c.label.clone(), c))
-        .collect();
-    for candidate in state.static_index.model_candidates.iter_mut() {
-        if let Some(ast_candidate) = ast_by_label.get(&candidate.label) {
-            if !ast_candidate.file_path.is_empty() {
-                candidate.file_path = ast_candidate.file_path.clone();
-                candidate.line = ast_candidate.line;
-                candidate.column = ast_candidate.column;
-                candidate.module = ast_candidate.module.clone();
-                candidate.is_abstract = ast_candidate.is_abstract;
-                if !ast_candidate.base_class_refs.is_empty() {
-                    candidate.base_class_refs = ast_candidate.base_class_refs.clone();
+    fn compute(&mut self) -> NapiResult<bool> {
+        let root = self.root.clone();
+        let expected_epoch = self.epoch;
+        let root_path = PathBuf::from(&root);
+        let snap = discovery::snapshot_python_sources(&root_path, &[]);
+        let files: Vec<PathBuf> = snap
+            .entries
+            .iter()
+            .map(|e| root_path.join(&e.relative_path))
+            .collect();
+        // Use the *resolved* static index so inheritance expansion runs —
+        // project-specific abstract base classes like `TimestampedModel(models.Model)`
+        // only surface subclasses once `expand_via_inheritance` has walked
+        // the import graph. Without this, fixtures that chain through a
+        // local base class (Faq(TimestampedModel), FaqLink(...)) miss the
+        // file_path/line merge downstream.
+        let ast_index = static_index::build_static_index_resolved(&root_path, &files);
+
+        let mut guard = NATIVE_STATE.write().map_err(poisoned)?;
+        let Some(state) = guard.as_mut() else {
+            return Ok(false);
+        };
+        // Skip the merge if the state was re-installed (different root, or a
+        // re-init/re-hydrate for the same root) while we parsed off-thread —
+        // otherwise this now-stale parse would clobber the fresher state.
+        if state.root != root_path || state.epoch != expected_epoch {
+            return Ok(false);
+        }
+        state.static_index.modules = ast_index.modules;
+        // Project methods are extracted alongside modules. Surface hydrate
+        // does not populate them, so refresh here too.
+        state.static_index.methods = ast_index.methods;
+
+        // Merge AST model_candidate metadata (file_path / line / column /
+        // base_class_refs) into the surface-hydrated entries so hovers
+        // that need a definition site ("File: blog/models.py") can be
+        // answered natively. Surface hydrate creates ModelCandidates with
+        // empty file paths, so without this step `resolveRelationTarget`
+        // returns items with no `filePath` / `line` — the hover skips the
+        // "File:" line and the E2E hover assertions that match
+        // `File: fixtures/…/models.py` fail.
+        use std::collections::{HashMap, HashSet};
+        let ast_by_label: HashMap<String, django_orm_core::static_index::ModelCandidate> =
+            ast_index
+                .model_candidates
+                .into_iter()
+                .map(|c| (c.label.clone(), c))
+                .collect();
+        for candidate in state.static_index.model_candidates.iter_mut() {
+            if let Some(ast_candidate) = ast_by_label.get(&candidate.label) {
+                if !ast_candidate.file_path.is_empty() {
+                    candidate.file_path = ast_candidate.file_path.clone();
+                    candidate.line = ast_candidate.line;
+                    candidate.column = ast_candidate.column;
+                    candidate.module = ast_candidate.module.clone();
+                    candidate.is_abstract = ast_candidate.is_abstract;
+                    if !ast_candidate.base_class_refs.is_empty() {
+                        candidate.base_class_refs = ast_candidate.base_class_refs.clone();
+                    }
                 }
             }
         }
-    }
 
-    // Merge AST field metadata (file_path / line / column) into the
-    // surface-hydrated field entries. Surface gives us accurate
-    // relation directions + synthesized reverse relations but no
-    // source locations; AST gives us source locations for every
-    // declared field. Take AST location when we have a match on
-    // (model_label, name), preserving surface-only entries (e.g.
-    // runtime-generated fields) as-is.
-    let mut reverse_related_query_aliases: HashSet<(String, String, String)> = HashSet::new();
-    for field in ast_index.fields.iter() {
-        let Some(target_model_label) = field.related_model_label.as_ref() else {
-            continue;
-        };
-        let Some(query_name) = field.related_query_name.as_ref() else {
-            continue;
-        };
-        if query_name.is_empty() {
-            continue;
-        }
-        reverse_related_query_aliases.insert((
-            target_model_label.clone(),
-            field.model_label.clone(),
-            query_name.clone(),
-        ));
-    }
-
-    let mut ast_field_by_key: HashMap<
-        (String, String),
-        django_orm_core::static_index::FieldCandidate,
-    > = HashMap::new();
-    for f in ast_index.fields {
-        ast_field_by_key.insert((f.model_label.clone(), f.name.clone()), f);
-    }
-    // Pre-compute a model-label → (file_path, line, column) lookup so
-    // the field loop below can anchor synthetic fields without
-    // re-borrowing `state.static_index.model_candidates` while holding
-    // a mutable borrow of `fields`.
-    let candidate_location: HashMap<String, (String, u32, u32)> = state
-        .static_index
-        .model_candidates
-        .iter()
-        .filter(|c| !c.file_path.is_empty())
-        .map(|c| (c.label.clone(), (c.file_path.clone(), c.line, c.column)))
-        .collect();
-
-    for field in state.static_index.fields.iter_mut() {
-        if let Some(ast_field) =
-            ast_field_by_key.get(&(field.model_label.clone(), field.name.clone()))
-        {
-            if !ast_field.file_path.is_empty() {
-                field.file_path = ast_field.file_path.clone();
-                field.line = ast_field.line;
-                field.column = ast_field.column;
-            }
-            // Preserve surface-authoritative fields: relation_direction,
-            // related_model_label. AST may not synthesize reverse
-            // relations the same way Python does (runtime vs static),
-            // so don't overwrite those.
-            if field.related_name.is_none() && ast_field.related_name.is_some() {
-                field.related_name = ast_field.related_name.clone();
-            }
-            if field.related_query_name.is_none() && ast_field.related_query_name.is_some() {
-                field.related_query_name = ast_field.related_query_name.clone();
-            }
-        } else if field.file_path.is_empty() {
-            // Runtime / surface alias fields (`pk`, `id`, `<fk>_id`)
-            // don't always exist in the AST under the alias name.
-            // Anchor them to the closest declared source so definition
-            // requests still land on a concrete file location.
-            let alias_location = if field.name == "pk" {
-                ast_field_by_key
-                    .get(&(field.model_label.clone(), "id".to_string()))
-                    .and_then(|ast_field| {
-                        (!ast_field.file_path.is_empty()).then_some((
-                            ast_field.file_path.clone(),
-                            ast_field.line,
-                            ast_field.column,
-                        ))
-                    })
-            } else if let Some(base_name) = field.name.strip_suffix("_id") {
-                ast_field_by_key
-                    .get(&(field.model_label.clone(), base_name.to_string()))
-                    .and_then(|ast_field| {
-                        (!ast_field.file_path.is_empty()).then_some((
-                            ast_field.file_path.clone(),
-                            ast_field.line,
-                            ast_field.column,
-                        ))
-                    })
-            } else {
-                None
+        // Merge AST field metadata (file_path / line / column) into the
+        // surface-hydrated field entries. Surface gives us accurate
+        // relation directions + synthesized reverse relations but no
+        // source locations; AST gives us source locations for every
+        // declared field. Take AST location when we have a match on
+        // (model_label, name), preserving surface-only entries (e.g.
+        // runtime-generated fields) as-is.
+        let mut reverse_related_query_aliases: HashSet<(String, String, String)> = HashSet::new();
+        for field in ast_index.fields.iter() {
+            let Some(target_model_label) = field.related_model_label.as_ref() else {
+                continue;
             };
+            let Some(query_name) = field.related_query_name.as_ref() else {
+                continue;
+            };
+            if query_name.is_empty() {
+                continue;
+            }
+            reverse_related_query_aliases.insert((
+                target_model_label.clone(),
+                field.model_label.clone(),
+                query_name.clone(),
+            ));
+        }
 
-            if let Some((fp, line, column)) = alias_location {
-                field.file_path = fp;
-                field.line = line;
-                field.column = column;
-            } else if matches!(field.name.as_str(), "pk" | "id") || field.name.ends_with("_id") {
-                // Fall back to the model class site when the alias does
-                // not have a matching declared field name (e.g. custom
-                // primary keys exposed as `pk`).
-                if let Some((fp, line, column)) = candidate_location.get(&field.model_label) {
-                    field.file_path = fp.clone();
-                    field.line = *line;
-                    field.column = *column;
+        let mut ast_field_by_key: HashMap<
+            (String, String),
+            django_orm_core::static_index::FieldCandidate,
+        > = HashMap::new();
+        for f in ast_index.fields {
+            ast_field_by_key.insert((f.model_label.clone(), f.name.clone()), f);
+        }
+        // Pre-compute a model-label → (file_path, line, column) lookup so
+        // the field loop below can anchor synthetic fields without
+        // re-borrowing `state.static_index.model_candidates` while holding
+        // a mutable borrow of `fields`.
+        let candidate_location: HashMap<String, (String, u32, u32)> = state
+            .static_index
+            .model_candidates
+            .iter()
+            .filter(|c| !c.file_path.is_empty())
+            .map(|c| (c.label.clone(), (c.file_path.clone(), c.line, c.column)))
+            .collect();
+
+        for field in state.static_index.fields.iter_mut() {
+            if let Some(ast_field) =
+                ast_field_by_key.get(&(field.model_label.clone(), field.name.clone()))
+            {
+                if !ast_field.file_path.is_empty() {
+                    field.file_path = ast_field.file_path.clone();
+                    field.line = ast_field.line;
+                    field.column = ast_field.column;
+                }
+                // Preserve surface-authoritative fields: relation_direction,
+                // related_model_label. AST may not synthesize reverse
+                // relations the same way Python does (runtime vs static),
+                // so don't overwrite those.
+                if field.related_name.is_none() && ast_field.related_name.is_some() {
+                    field.related_name = ast_field.related_name.clone();
+                }
+                if field.related_query_name.is_none() && ast_field.related_query_name.is_some() {
+                    field.related_query_name = ast_field.related_query_name.clone();
+                }
+            } else if field.file_path.is_empty() {
+                // Runtime / surface alias fields (`pk`, `id`, `<fk>_id`)
+                // don't always exist in the AST under the alias name.
+                // Anchor them to the closest declared source so definition
+                // requests still land on a concrete file location.
+                let alias_location = if field.name == "pk" {
+                    ast_field_by_key
+                        .get(&(field.model_label.clone(), "id".to_string()))
+                        .and_then(|ast_field| {
+                            (!ast_field.file_path.is_empty()).then_some((
+                                ast_field.file_path.clone(),
+                                ast_field.line,
+                                ast_field.column,
+                            ))
+                        })
+                } else if let Some(base_name) = field.name.strip_suffix("_id") {
+                    ast_field_by_key
+                        .get(&(field.model_label.clone(), base_name.to_string()))
+                        .and_then(|ast_field| {
+                            (!ast_field.file_path.is_empty()).then_some((
+                                ast_field.file_path.clone(),
+                                ast_field.line,
+                                ast_field.column,
+                            ))
+                        })
+                } else {
+                    None
+                };
+
+                if let Some((fp, line, column)) = alias_location {
+                    field.file_path = fp;
+                    field.line = line;
+                    field.column = column;
+                } else if matches!(field.name.as_str(), "pk" | "id") || field.name.ends_with("_id")
+                {
+                    // Fall back to the model class site when the alias does
+                    // not have a matching declared field name (e.g. custom
+                    // primary keys exposed as `pk`).
+                    if let Some((fp, line, column)) = candidate_location.get(&field.model_label) {
+                        field.file_path = fp.clone();
+                        field.line = *line;
+                        field.column = *column;
+                    }
+                }
+            }
+
+            if field.relation_direction.as_deref() == Some("reverse") {
+                let related_model_label = field.related_model_label.clone().unwrap_or_default();
+                if reverse_related_query_aliases.contains(&(
+                    field.model_label.clone(),
+                    related_model_label,
+                    field.name.clone(),
+                )) {
+                    field.source = "related_query_alias".into();
                 }
             }
         }
 
-        if field.relation_direction.as_deref() == Some("reverse") {
-            let related_model_label = field.related_model_label.clone().unwrap_or_default();
-            if reverse_related_query_aliases.contains(&(
-                field.model_label.clone(),
-                related_model_label,
-                field.name.clone(),
-            )) {
-                field.source = "related_query_alias".into();
-            }
-        }
+        // Rebuild the graph so node file_path / line propagate to
+        // `resolveRelationTarget` results.
+        state.graph = build_model_graph(&state.static_index);
+        features::clear_descendant_cache();
+        features::clear_export_cache();
+        Ok(true)
     }
 
-    // Rebuild the graph so node file_path / line propagate to
-    // `resolveRelationTarget` results.
-    state.graph = build_model_graph(&state.static_index);
-    features::clear_descendant_cache();
-    features::clear_export_cache();
-    Ok(true)
+    fn resolve(&mut self, _env: Env, output: bool) -> NapiResult<bool> {
+        Ok(output)
+    }
+}
+
+/// Populate `modules` on the resident Rust state by running the AST indexer off
+/// the Node event loop. Returns a Promise<boolean> on the JS side. Call once
+/// after the surface hydrate so `resolveExportOrigin` / `resolveModule` queries
+/// can be answered natively.
+#[napi]
+pub fn native_ensure_ast_modules(root: String) -> AsyncTask<EnsureAstModulesTask> {
+    // Capture the epoch of the state we intend to augment (the surface hydrate
+    // that prompted this ensure). Re-checked after the off-thread parse.
+    let epoch = NATIVE_STATE
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|state| state.epoch))
+        .unwrap_or(0);
+    AsyncTask::new(EnsureAstModulesTask { root, epoch })
 }
 
 fn feature_info_to_item(

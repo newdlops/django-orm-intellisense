@@ -93,7 +93,8 @@ export interface NativeBindings {
     symbol: string,
   ): Buffer | null;
   nativeResolveModule(moduleName: string): Buffer | null;
-  nativeEnsureAstModules(root: string): boolean;
+  // Async napi task — resolves to whether the AST modules were ensured.
+  nativeEnsureAstModules(root: string): Promise<boolean>;
 }
 
 let cached: NativeBindings | undefined;

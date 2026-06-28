@@ -10,7 +10,7 @@ function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`assertion failed: ${msg}`);
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const n = loadNative();
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-fastpath-'));
@@ -240,7 +240,7 @@ function main(): void {
 
     // ensureAstModules repopulates modules without wiping model/field
     // state hydrated from the surface.
-    const ensured = n.nativeEnsureAstModules(tmpDir);
+    const ensured = await n.nativeEnsureAstModules(tmpDir);
     assert(ensured === true, 'ensureAstModules returns true');
     const afterEnsureBuf = n.nativeResolveExportOrigin('shop', 'Person');
     const afterEnsure = JSON.parse(afterEnsureBuf!.toString('utf-8'));
@@ -319,4 +319,7 @@ function main(): void {
   }
 }
 
-main();
+main().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
