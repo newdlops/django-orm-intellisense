@@ -544,6 +544,29 @@ const LOOKUP_RECEIVER_KINDS = new Set<OrmReceiverKind>([
   'queryset',
   'related_manager',
 ]);
+
+// Standard QuerySet/Manager methods whose return is NOT a same-model queryset
+// (they return dicts/tuples/instances/scalars). An UNKNOWN method on a
+// queryset-like receiver that is NOT in this set is assumed to be a custom
+// chainable QuerySet method returning Self (same-model queryset) — Django's
+// idiom — instead of making receiver resolution give up. Sourced from the
+// server's QUERYSET_BUILTIN_METHODS return-kind table; keep complete (includes
+// `raw`, `contains`, and the async `a*` variants).
+const TYPE_CHANGING_QUERYSET_METHODS = new Set<string>([
+  // dicts / tuples / raw / iterators (not a same-model field queryset)
+  'values', 'values_list', 'dates', 'datetimes', 'raw', 'iterator',
+  // model instance / tuple
+  'get', 'create', 'get_or_create', 'update_or_create',
+  'first', 'last', 'earliest', 'latest',
+  // scalars / non-queryset
+  'count', 'exists', 'contains', 'explain', 'aggregate', 'in_bulk',
+  'update', 'delete', 'bulk_create', 'bulk_update',
+  // async variants of all of the above
+  'aget', 'acreate', 'aget_or_create', 'aupdate_or_create',
+  'afirst', 'alast', 'aearliest', 'alatest',
+  'acount', 'aexists', 'acontains', 'aaggregate', 'ain_bulk',
+  'aupdate', 'adelete', 'abulk_create', 'abulk_update', 'aiterator',
+]);
 const QUERYSET_ANNOTATION_PRESERVING_METHODS = new Set([
   'all',
   'alias',
@@ -961,6 +984,39 @@ let staticQuerySetClassSourceCache = new WeakMap<
   AnalysisDaemon,
   Map<string, Promise<ClassDefinitionSource | undefined>>
 >();
+// Memoizes the (deterministic, expensive) virtual-field extraction for a custom
+// QuerySet method, keyed by `${modelLabel}::${methodName}`. A deep self-
+// reassignment chain (`x = x.annotate_a().annotate_b()...`) re-resolves the same
+// annotate methods on every lookup and every diagnostic pass — without this memo
+// the chain walk re-opens the QuerySet document and re-scans each method body
+// hundreds of times and blows past the receiver-resolution timeout (observed:
+// 11 methods × ~80 passes = 880 redundant class resolutions, 1.5–4s timeouts).
+let customMethodVirtualFieldsCache = new WeakMap<
+  AnalysisDaemon,
+  Map<string, Promise<VirtualOrmField[]>>
+>();
+// Memoizes the ORM receiver / model label a function RETURNS, keyed by the
+// function's source location AND document version
+// (`${docUri}::${version}::${functionDef.line}`). A function's return type is
+// independent of the call site, so the result is shared across all callers; the
+// body analysis (return-expression resolution + return-annotation fallback) for
+// a helper like `get_emps -> HrmEmpQuerySet` (generic QuerySet[T_co]) costs
+// ~700ms and is otherwise repeated on every chain link / lookup. The cached
+// value is the in-flight PROMISE so concurrent callers share one computation
+// (NOT a sentinel — that would hand a sibling a spurious `undefined`). Including
+// the document version self-invalidates on (even unsaved) edits to the helper.
+// Self/mutual recursion is broken via per-stack function-recursion keys threaded
+// through `visited` (see resolveOrmReceiverFromFunctionSource), so a re-entrant
+// request returns undefined instead of awaiting its own pending promise.
+let functionReceiverCache = new WeakMap<
+  AnalysisDaemon,
+  Map<string, Promise<OrmReceiverInfo | undefined>>
+>();
+let functionModelLabelCache = new WeakMap<
+  AnalysisDaemon,
+  Map<string, Promise<string | undefined>>
+>();
+const FUNCTION_RECURSION_KEY_PREFIX = 'fnrecv:';
 
 interface ClassHoverTarget {
   source: ClassDefinitionSource;
@@ -2585,20 +2641,40 @@ export function registerPythonProviders(
             return cancelledCompletionResult(token);
           }
           if (lookupContext) {
-            const lookupReceiver =
-              resolveExpressionOrmReceiverLocal(
-                daemon,
-                document,
-                lookupContext.receiverExpression,
-                document.offsetAt(position),
-                new Set()
-              ) ??
-              (await resolveLookupReceiverInfoForReceiver(
-                daemon,
-                document,
-                lookupContext.receiverExpression,
-                position
-              ));
+            // Share the hover receiver cache: receiver resolution for a deep,
+            // cross-module chain is expensive and can be aborted under contention
+            // (diagnostics firing on each keystroke). Reusing a prior hover/
+            // completion resolution at the same document version avoids re-running
+            // (and re-failing) it. Version-keyed + daemon-state-cleared.
+            const recvCacheKey =
+              `lookupRecvInfo:${lookupContext.receiverExpression}@L${position.line}`;
+            const cachedRecv = getCachedOrmReceiver(document, recvCacheKey);
+            let lookupReceiver: OrmReceiverInfo | undefined;
+            if (cachedRecv) {
+              // Reuse only a cached SUCCESS; a cached miss (undefined) is retried.
+              lookupReceiver = cachedRecv;
+            } else {
+              lookupReceiver =
+                resolveExpressionOrmReceiverLocal(
+                  daemon,
+                  document,
+                  lookupContext.receiverExpression,
+                  document.offsetAt(position),
+                  new Set()
+                ) ??
+                (await resolveLookupReceiverInfoForReceiver(
+                  daemon,
+                  document,
+                  lookupContext.receiverExpression,
+                  position
+                ));
+              // Only cache a successful, NON-aborted resolution; a contention-
+              // aborted result (possibly an incomplete model_class with no virtual
+              // fields) must be retried — not stuck — on the next completion.
+              if (lookupReceiver && !daemon.isAborted()) {
+                setCachedOrmReceiver(document, recvCacheKey, lookupReceiver);
+              }
+            }
             if (token.isCancellationRequested) {
               return cancelledCompletionResult(token);
             }
@@ -3243,7 +3319,14 @@ export function registerPythonProviders(
         // budget, bail out.  Most successful hovers complete in <200ms; the
         // timeout protects against event-loop starvation when many concurrent
         // hovers / diagnostics contend for CPU.
-        const HOVER_HARD_TIMEOUT_MS = 3_000;
+        // Hover must stay snappy. Receivers that can't be resolved (e.g.
+        // custom-queryset-method / function-call chains like
+        // `get_emps(hrm).annotate_status_at()`) otherwise burn the full budget
+        // every hover and return nothing. 1.2s caps that waste; resolvable
+        // hovers complete in well under 200ms. Repeat hovers are also cached
+        // (see lookupRecvInfo cache below), so the cap only bites the first
+        // hover of an unresolvable expression.
+        const HOVER_HARD_TIMEOUT_MS = 1_200;
         const hoverTimeout = new Promise<undefined>((resolve) => {
           setTimeout(() => resolve(undefined), HOVER_HARD_TIMEOUT_MS);
         });
@@ -3307,6 +3390,7 @@ export function registerPythonProviders(
 
         const lookupLiteral =
           lookupHoverLiteral(document, position) ??
+          valuesStringLookupHoverLiteral(document, position) ??
           prefetchLookupLiteral(document, position) ??
           lookupDictKeyHoverLiteral(document, position) ??
           expressionPathHoverLiteral(document, position) ??
@@ -3326,12 +3410,34 @@ export function registerPythonProviders(
           try {
             await ensureStarted();
             if (isCancelled()) { return undefined; }
-            const lookupReceiver = await resolveLookupReceiverInfoForReceiver(
-              daemon,
-              document,
-              lookupLiteral.receiverExpression,
-              position
-            );
+            // Cache the (often expensive, often unresolvable) receiver lookup
+            // per document-version + expression + line, so hovering repeatedly
+            // around the same line is instant instead of re-running the deep
+            // assignment/function-source analysis every time. Version-keyed and
+            // cleared on daemon-state change, so it self-invalidates on edits
+            // and on warmup->ready.
+            const recvCacheKey =
+              `lookupRecvInfo:${lookupLiteral.receiverExpression}@L${position.line}`;
+            const cachedRecv = getCachedOrmReceiver(document, recvCacheKey);
+            let lookupReceiver: OrmReceiverInfo | undefined;
+            if (cachedRecv !== null) {
+              lookupReceiver = cachedRecv;
+            } else {
+              lookupReceiver = await resolveLookupReceiverInfoForReceiver(
+                daemon,
+                document,
+                lookupLiteral.receiverExpression,
+                position
+              );
+              // Do NOT cache a resolution that was aborted mid-flight (daemon busy
+              // with diagnostics during editing): it may be incomplete — e.g. the
+              // chain/virtual-field walk bailed early, yielding a bare model_class
+              // with no virtual fields — and caching it would persist that failure
+              // (result=none) for the whole document version. Let it retry when idle.
+              if (!daemon.isAborted()) {
+                setCachedOrmReceiver(document, recvCacheKey, lookupReceiver);
+              }
+            }
             if (!lookupReceiver) {
               return undefined;
             }
@@ -3794,6 +3900,7 @@ export function registerPythonProviders(
 
         const lookupLiteral =
           lookupHoverLiteral(document, position) ??
+          valuesStringLookupHoverLiteral(document, position) ??
           prefetchLookupLiteral(document, position) ??
           lookupDictKeyHoverLiteral(document, position) ??
           expressionPathHoverLiteral(document, position) ??
@@ -5194,7 +5301,11 @@ function lookupCompletionContext(
   const match = prefixText.match(LOOKUP_COMPLETION_PATTERN);
 
   if (!match) {
-    return undefined;
+    // Multi-line / wrapped string-lookup call (`pd.DataFrame(qs.values(\n  "a__|`):
+    // the method name is on an earlier line, so LOOKUP_COMPLETION_PATTERN (current
+    // line only) misses it. Detect a bare field-path string under the cursor and
+    // find the enclosing values()/only()/... call across lines.
+    return bareStringLookupCompletionContext(document, position, prefixText);
   }
 
   const [, method, , currentValue] = match;
@@ -5218,6 +5329,42 @@ function lookupCompletionContext(
   return {
     receiverExpression: callContext.receiverExpression,
     method,
+    prefix: currentValue,
+    range,
+  };
+}
+
+function bareStringLookupCompletionContext(
+  document: vscode.TextDocument,
+  position: vscode.Position,
+  prefixText: string
+): LookupContext | undefined {
+  // The cursor must sit just after an open quote + (partial) field path:
+  // `"`, `"tmeta`, `"tmeta__`, `"tmeta__th`, etc.
+  const openMatch = prefixText.match(/(['"])([A-Za-z_]?[\w]*(?:__[\w]*)*)$/);
+  if (!openMatch) {
+    return undefined;
+  }
+  const currentValue = openMatch[2] ?? '';
+  const callContext = querysetStringCallContext(
+    getDocumentText(document),
+    document.offsetAt(position)
+  );
+  if (!callContext || !STRING_LOOKUP_METHODS.has(callContext.method)) {
+    return undefined;
+  }
+
+  const replacementLength = lookupReplacementLength(currentValue);
+  const range = new vscode.Range(
+    position.line,
+    position.character - replacementLength,
+    position.line,
+    position.character
+  );
+
+  return {
+    receiverExpression: callContext.receiverExpression,
+    method: callContext.method,
     prefix: currentValue,
     range,
   };
@@ -5615,6 +5762,60 @@ function bulkUpdateFieldListCompletionContext(
       position.character
     ),
   };
+}
+
+/**
+ * Hover detection for a field-path string that sits on a DIFFERENT line from its
+ * enclosing `.values()/.only()/.defer()/.order_by()/...` call — the multi-line
+ * argument-list case (`qs.values(\n  "salary_account__institution__name",\n ...)`).
+ * `lookupHoverLiteral` only matches `method("value")` on a single line, so it
+ * misses these. Here we extract the quoted field path under the cursor and find
+ * the enclosing string-lookup call via querysetStringCallContext (which walks
+ * backward across lines), so the path resolves like any other lookup.
+ */
+function valuesStringLookupHoverLiteral(
+  document: vscode.TextDocument,
+  position: vscode.Position
+): LookupLiteral | undefined {
+  const lineText = document.lineAt(position.line).text;
+  const literal = quotedFieldPathAtPosition(lineText, position.character);
+  if (!literal) {
+    return undefined;
+  }
+  const lineStartOffset = document.offsetAt(new vscode.Position(position.line, 0));
+  const callContext = querysetStringCallContext(
+    getDocumentText(document),
+    lineStartOffset + literal.start
+  );
+  if (!callContext) {
+    return undefined;
+  }
+  return {
+    receiverExpression: callContext.receiverExpression,
+    method: callContext.method,
+    value: literal.content,
+  };
+}
+
+/**
+ * The quoted ORM-field-path string literal (e.g. "a__b__c") whose content
+ * contains `character`, or undefined. Returns the content (without quotes) and
+ * the in-line start offset of the content.
+ */
+function quotedFieldPathAtPosition(
+  lineText: string,
+  character: number
+): { content: string; start: number } | undefined {
+  const re = /(['"])([A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*)\1/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(lineText)) !== null) {
+    const contentStart = match.index + 1;
+    const contentEnd = contentStart + match[2].length;
+    if (character >= contentStart && character <= contentEnd) {
+      return { content: match[2], start: contentStart };
+    }
+  }
+  return undefined;
 }
 
 function lookupHoverLiteral(
@@ -6598,7 +6799,7 @@ function resolveAssignedOrmReceiverLocal(
   visited: Set<string>
 ): OrmReceiverInfo | undefined {
   const visitKey = `${document.uri.toString()}:fast-assigned:${variableName}@${beforeOffset}`;
-  if (visited.has(visitKey) || visited.size > 8) {
+  if (visited.has(visitKey) || visited.size > 100) {
     return undefined;
   }
   visited.add(visitKey);
@@ -6788,6 +6989,34 @@ function resolveDirectReceiverFromTypeAnnotationLocal(
     }
   }
 
+  // Root-cause fix (custom QuerySet/Manager class in an annotation): a bare
+  // custom class name like `HrmEmpQuerySet` / `HrmEmpManager` (e.g. from
+  // `def get_emps(...) -> HrmEmpQuerySet`) maps by convention to its model
+  // `<Model>`. Gated on the residual resolving to a KNOWN model so a real
+  // model literally named e.g. `FooManager` is not mis-stripped.
+  const bareName = stripStringLiteralQuotes(normalizedAnnotation)
+    .split('.')
+    .at(-1);
+  const suffixMatch = bareName?.match(
+    /^(.+?)(QuerySet|RelatedManager|ManyRelatedManager|BaseManager|Manager)$/
+  );
+  if (suffixMatch && suffixMatch[1]) {
+    const residual = suffixMatch[1];
+    const residualLabel =
+      daemon.findModelLabelByShortName(residual) ??
+      daemon.modelLabelByName.get(residual);
+    if (residualLabel) {
+      const suffix = suffixMatch[2];
+      const kind: OrmReceiverKind =
+        suffix === 'QuerySet'
+          ? 'queryset'
+          : suffix === 'RelatedManager' || suffix === 'ManyRelatedManager'
+          ? 'related_manager'
+          : 'manager';
+      return { kind, modelLabel: residualLabel };
+    }
+  }
+
   const modelLabel = resolveModelLabelFromTypeAnnotationLocal(
     daemon,
     normalizedAnnotation
@@ -6826,6 +7055,21 @@ function resolveModelLabelFromTypeAnnotationLocal(
       daemon.modelLabelByName.get(simpleName);
     if (localLabel) {
       return localLabel;
+    }
+    // Custom QuerySet/Manager class-name convention: `<Model>QuerySet` /
+    // `<Model>Manager` -> `<Model>` (e.g. a `def f(...) -> HrmEmpQuerySet`
+    // annotation maps to the `HrmEmp` model). Gated on the residual resolving
+    // to a known model so a real model named e.g. `FooManager` is not stripped.
+    const suffixMatch = simpleName.match(
+      /^(.+?)(QuerySet|RelatedManager|ManyRelatedManager|BaseManager|Manager)$/
+    );
+    if (suffixMatch && suffixMatch[1]) {
+      const residualLabel =
+        daemon.findModelLabelByShortName(suffixMatch[1]) ??
+        daemon.modelLabelByName.get(suffixMatch[1]);
+      if (residualLabel) {
+        return residualLabel;
+      }
     }
   }
 
@@ -7295,7 +7539,24 @@ function resetProviderResolutionCaches(): void {
     AnalysisDaemon,
     Map<string, Promise<ClassDefinitionSource | undefined>>
   >();
+  customMethodVirtualFieldsCache = new WeakMap<
+    AnalysisDaemon,
+    Map<string, Promise<VirtualOrmField[]>>
+  >();
+  functionReceiverCache = new WeakMap<
+    AnalysisDaemon,
+    Map<string, Promise<OrmReceiverInfo | undefined>>
+  >();
+  functionModelLabelCache = new WeakMap<
+    AnalysisDaemon,
+    Map<string, Promise<string | undefined>>
+  >();
   modelSubclassRelationCache.clear();
+  // Clear the per-document receiver cache too, so a daemon-state change
+  // (e.g. warmup -> ready) re-resolves receivers that were cached as
+  // unresolvable during the cold-start window. (It is already version-keyed
+  // for edits; this covers the daemon-readiness transition.)
+  _ormReceiverCacheByDocument.clear();
 }
 
 async function listAllRelationTargets(
@@ -9451,7 +9712,7 @@ async function resolveOrmReceiverAtOffsetCore(
   if (daemon.isAborted()) { return undefined; }
 
   const visitKey = `${document.uri.toString()}:orm:${normalizedExpression}@${beforeOffset}`;
-  if (visited.has(visitKey) || visited.size > 12) {
+  if (visited.has(visitKey) || visited.size > 100) {
     return undefined;
   }
   visited.add(visitKey);
@@ -9860,7 +10121,7 @@ async function resolveDynamicInstanceReceiverAtOffset(
   if (daemon.isAborted()) { return undefined; }
 
   const visitKey = `${document.uri.toString()}:dynamic-instance:${normalizedExpression}@${beforeOffset}`;
-  if (visited.has(visitKey) || visited.size > 12) {
+  if (visited.has(visitKey) || visited.size > 100) {
     return undefined;
   }
   visited.add(visitKey);
@@ -10029,6 +10290,36 @@ async function resolveOrmReceiverFromCallExpression(
     visited
   );
   if (objectReceiver) {
+    // Fast path for custom annotation methods (`annotate_*` / `with_*`): mirror
+    // the one in resolveLookupReceiverFromCallExpression. This parallel resolver
+    // is invoked alongside the lookup-chain resolver on every assignment/member
+    // step, and without this it falls through to
+    // resolveOrmReceiverFromClassMethodSource which resolves the method's `-> Self`
+    // return annotation (resolveExportOrigin(typing, Self) + class hierarchy
+    // walks) — ~1–2s per deep self-reassignment chain, the dominant remaining
+    // timeout. Such a method is a queryset operation regardless of how the object
+    // receiver was (mis)classified (instance/model_class/queryset), so we only
+    // require a known model and resolve directly as a same-model queryset with
+    // memoized virtual fields. Underscore-gated so the builtin exact `annotate(...)`
+    // is untouched.
+    if (
+      /^(annotate_|with_)/.test(parsedCall.memberName) &&
+      objectReceiver.modelLabel
+    ) {
+      const inherited = objectReceiver.virtualFields ?? [];
+      const added = await resolveVirtualFieldsFromCustomMethod(
+        daemon,
+        objectReceiver,
+        parsedCall.memberName
+      );
+      const virtualFields = dedupeVirtualFields([...inherited, ...added]);
+      return {
+        kind: 'queryset',
+        modelLabel: objectReceiver.modelLabel,
+        virtualFields: virtualFields.length > 0 ? virtualFields : undefined,
+      };
+    }
+
     const virtualResolution = resolveVirtualOrmMember(
       objectReceiver,
       parsedCall.memberName
@@ -10236,6 +10527,86 @@ async function resolveOrmReceiverFromCallChain(
 }
 
 async function resolveOrmReceiverFromFunctionSource(
+  daemon: AnalysisDaemon,
+  functionSource: FunctionDefinitionSource,
+  visited: Set<string>
+): Promise<OrmReceiverInfo | undefined> {
+  if (daemon.isAborted()) { return undefined; }
+  return memoizeFunctionBodyResolution(
+    daemon,
+    functionReceiverCache,
+    functionSource,
+    visited,
+    (bodyVisited) =>
+      resolveOrmReceiverFromFunctionSourceUncached(daemon, functionSource, bodyVisited)
+  );
+}
+
+/**
+ * Shared memo wrapper for the two expensive "what does this function return"
+ * analyses (resolveOrmReceiverFromFunctionSource / resolveModelLabelFromFunctionSource).
+ * A function's return is call-site-independent, so the result is shared across all
+ * callers via a per-daemon, document-version-keyed PROMISE cache (concurrent
+ * callers await one in-flight computation — never a sentinel that would hand a
+ * sibling a spurious `undefined`). Self/mutual recursion is broken WITHOUT
+ * deadlock by threading per-stack function-recursion keys through `visited`: a
+ * re-entrant call sees its own key already present and returns undefined. The
+ * body is analysed under a FRESH visited seeded with only those recursion keys,
+ * so the cached value never depends on how deep the first caller's chain was.
+ */
+async function memoizeFunctionBodyResolution<T>(
+  daemon: AnalysisDaemon,
+  cache: WeakMap<AnalysisDaemon, Map<string, Promise<T | undefined>>>,
+  functionSource: FunctionDefinitionSource,
+  visited: Set<string>,
+  compute: (bodyVisited: Set<string>) => Promise<T | undefined>
+): Promise<T | undefined> {
+  const uri = functionSource.document.uri.toString();
+  const recursionKey = `${FUNCTION_RECURSION_KEY_PREFIX}${uri}::${functionSource.functionDef.line}`;
+  if (visited.has(recursionKey)) {
+    // Self/mutual recursion up the current stack — bail rather than await our
+    // own (or an ancestor's) still-pending promise.
+    return undefined;
+  }
+
+  let perDaemon = cache.get(daemon);
+  if (!perDaemon) {
+    perDaemon = new Map();
+    cache.set(daemon, perDaemon);
+  }
+  const cacheKey = `${uri}::${functionSource.document.version}::${functionSource.functionDef.line}`;
+  const cachedPromise = perDaemon.get(cacheKey);
+  if (cachedPromise) {
+    return cachedPromise;
+  }
+
+  // Fresh body visited: carry forward ONLY the function-recursion keys (so
+  // self/mutual recursion is still detected) and drop the caller's expression
+  // keys (so the result is independent of the caller's chain depth / size cap).
+  const bodyVisited = new Set(
+    [...visited].filter((k) => k.startsWith(FUNCTION_RECURSION_KEY_PREFIX))
+  );
+  bodyVisited.add(recursionKey);
+
+  const computed = compute(bodyVisited);
+  perDaemon.set(cacheKey, computed);
+  try {
+    const result = await computed;
+    if (daemon.isAborted() && perDaemon.get(cacheKey) === computed) {
+      // Don't persist a cancellation-induced miss (would stick later callers on
+      // a model-only fallback until the next reset).
+      perDaemon.delete(cacheKey);
+    }
+    return result;
+  } catch (error) {
+    if (perDaemon.get(cacheKey) === computed) {
+      perDaemon.delete(cacheKey);
+    }
+    throw error;
+  }
+}
+
+async function resolveOrmReceiverFromFunctionSourceUncached(
   daemon: AnalysisDaemon,
   functionSource: FunctionDefinitionSource,
   visited: Set<string>
@@ -10462,6 +10833,344 @@ function dedupeVirtualFields(fields: VirtualOrmField[]): VirtualOrmField[] {
   }
 
   return [...byName.values()];
+}
+
+/**
+ * Extract virtual (annotated) field names that a CUSTOM QuerySet method adds via
+ * `.annotate(...)` / `.alias(...)` in its body, so that `filter(_x__...)` on
+ * those fields resolves. Resolves the model's custom QuerySet/Manager class by
+ * the `<Model>QuerySet` / `<Model>Manager` naming convention — looked up in the
+ * MODEL's own module so cross-file class definitions resolve — finds the method
+ * in its hierarchy, and scans the body. Gated on annotation-adding method names
+ * (`annotate_*` / `with_*`) so ordinary chainable custom methods do not pay for
+ * class/method resolution.
+ */
+async function resolveVirtualFieldsFromCustomMethod(
+  daemon: AnalysisDaemon,
+  objectReceiver: OrmReceiverInfo,
+  methodName: string
+): Promise<VirtualOrmField[]> {
+  if (daemon.isAborted()) {
+    return [];
+  }
+  if (!/^(annotate|with_)/.test(methodName)) {
+    return [];
+  }
+  const modelLabel = objectReceiver.modelLabel;
+  if (!modelLabel) {
+    return [];
+  }
+  // Memoize per (modelLabel, methodName): the extraction is deterministic and
+  // expensive (class resolution + document open + body scan), and a deep self-
+  // reassignment chain re-requests the same methods hundreds of times. The cache
+  // is cleared on daemon-state change via resetProviderResolutionCaches().
+  let perDaemon = customMethodVirtualFieldsCache.get(daemon);
+  if (!perDaemon) {
+    perDaemon = new Map();
+    customMethodVirtualFieldsCache.set(daemon, perDaemon);
+  }
+  const cacheKey = `${modelLabel}::${methodName}`;
+  const cached = perDaemon.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const computed = resolveVirtualFieldsFromCustomMethodUncached(
+    daemon,
+    objectReceiver,
+    methodName,
+    modelLabel
+  );
+  perDaemon.set(cacheKey, computed);
+  try {
+    return await computed;
+  } catch (error) {
+    // Do not poison the cache with a rejected promise.
+    if (perDaemon.get(cacheKey) === computed) {
+      perDaemon.delete(cacheKey);
+    }
+    throw error;
+  }
+}
+
+async function resolveVirtualFieldsFromCustomMethodUncached(
+  daemon: AnalysisDaemon,
+  objectReceiver: OrmReceiverInfo,
+  methodName: string,
+  modelLabel: string
+): Promise<VirtualOrmField[]> {
+  const shortModel = modelLabel.includes('.')
+    ? modelLabel.split('.').at(-1)!
+    : modelLabel;
+
+  const modelClassSource = await resolveClassDefinitionForModelLabel(
+    daemon,
+    modelLabel
+  );
+  if (!modelClassSource || daemon.isAborted()) {
+    return [];
+  }
+
+  // Resolve the custom QuerySet/Manager class IN THE MODEL'S MODULE (where it is
+  // defined/imported), by convention name.
+  let querysetClassSource: ClassDefinitionSource | undefined;
+  for (const className of [`${shortModel}QuerySet`, `${shortModel}Manager`]) {
+    querysetClassSource = await resolveClassDefinitionFromTypeAnnotation(
+      daemon,
+      modelClassSource.document,
+      className,
+      modelClassSource.beforeOffset
+    );
+    if (querysetClassSource || daemon.isAborted()) {
+      break;
+    }
+  }
+  if (!querysetClassSource) {
+    return [];
+  }
+
+  const methodSource = await resolveMethodDefinitionInClassHierarchy(
+    daemon,
+    querysetClassSource,
+    methodName,
+    new Set()
+  );
+  if (!methodSource) {
+    return [];
+  }
+
+  return extractAnnotatedVirtualFieldsFromMethodBody(methodSource);
+}
+
+/**
+ * Replace the CONTENT of Python string literals (single/double/triple-quoted,
+ * honoring backslash escapes) and `#` comments with spaces, preserving length
+ * and every index so downstream regex / paren-matching / offset slicing stay
+ * aligned. The quote and `#` delimiters themselves are kept; only the bytes
+ * inside are neutralized. This stops `.annotate(`-like substrings that live
+ * INSIDE a string literal or comment (e.g. `filter(note=".annotate(evil=1)")`,
+ * `.extra(where=[...])`, RawSQL) from being mis-parsed as real annotate calls.
+ */
+function maskPythonStringsAndComments(text: string): string {
+  const out = text.split('');
+  const n = out.length;
+  let i = 0;
+  while (i < n) {
+    const c = text[i];
+    if (c === '#') {
+      while (i < n && text[i] !== '\n') {
+        out[i] = ' ';
+        i += 1;
+      }
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      const triple = text[i + 1] === c && text[i + 2] === c;
+      const quoteLen = triple ? 3 : 1;
+      i += quoteLen; // keep the opening delimiter(s) as-is
+      while (i < n) {
+        if (text[i] === '\\') {
+          if (i < n) { out[i] = ' '; }
+          if (i + 1 < n) { out[i + 1] = ' '; }
+          i += 2;
+          continue;
+        }
+        if (triple) {
+          if (text[i] === c && text[i + 1] === c && text[i + 2] === c) {
+            i += 3; // keep closing delimiters
+            break;
+          }
+        } else {
+          if (text[i] === c) {
+            i += 1;
+            break;
+          }
+          if (text[i] === '\n') {
+            i += 1; // unterminated single-line literal
+            break;
+          }
+        }
+        out[i] = ' ';
+        i += 1;
+      }
+      continue;
+    }
+    i += 1;
+  }
+  return out.join('');
+}
+
+/**
+ * Scan a method body for `.annotate(...)` / `.alias(...)` calls and return the
+ * virtual fields they define (reusing the same kwarg parser the direct-call
+ * path uses). String literals and comments are masked first so an annotate-like
+ * substring inside a SQL string / docstring / comment is not mistaken for a real
+ * annotation.
+ */
+function extractAnnotatedVirtualFieldsFromMethodBody(
+  source: FunctionDefinitionSource
+): VirtualOrmField[] {
+  const { document, functionDef } = source;
+  const endLine = Math.min(functionDef.endLine, document.lineCount - 1);
+  let body = '';
+  for (let line = functionDef.line; line <= endLine; line += 1) {
+    body += `${document.lineAt(line).text}\n`;
+  }
+  return extractAnnotatedVirtualFieldsFromText(body);
+}
+
+/**
+ * Shared annotate/alias kwarg extractor over a raw code string. Drives the
+ * regex and paren matcher off a string/comment-masked copy (so no match begins
+ * inside a literal), then slices the real kwarg text from the original using the
+ * masked bounds.
+ */
+function extractAnnotatedVirtualFieldsFromText(text: string): VirtualOrmField[] {
+  const masked = maskPythonStringsAndComments(text);
+  const fields: VirtualOrmField[] = [];
+  const callRe = /\.(annotate|alias)\s*\(/g;
+  let match: RegExpExecArray | null;
+  while ((match = callRe.exec(masked)) !== null) {
+    const isAnnotate = match[1] === 'annotate';
+    const openParenIndex = masked.indexOf('(', match.index);
+    if (openParenIndex < 0) {
+      continue;
+    }
+    const closeParenIndex = findMatchingClosingDelimiter(
+      masked,
+      openParenIndex,
+      '(',
+      ')'
+    );
+    if (closeParenIndex === undefined) {
+      continue;
+    }
+    const argsText = text.slice(openParenIndex + 1, closeParenIndex);
+    fields.push(
+      ...parseVirtualFieldsFromAnnotatedCall(
+        `q.${match[1]}(${argsText})`,
+        isAnnotate
+      )
+    );
+  }
+  return dedupeVirtualFields(fields);
+}
+
+/**
+ * Extract every annotated virtual field added by a single chain expression like
+ * `get_emps(hrm).annotate_status_at().filter(...).annotate(_x=Sum(...))`:
+ *  - builtin `.annotate(...)` / `.alias(...)` → parse the kwargs directly;
+ *  - custom `.annotate_*()` / `.with_*()` methods → resolve the method body
+ *    (memoized) for the model.
+ * Used by the path-independent chain collector below so virtual fields survive
+ * regardless of which receiver resolver (instance / model_class / queryset /
+ * daemon member-chain) ultimately produced the receiver.
+ */
+async function extractVirtualFieldsFromChainExpression(
+  daemon: AnalysisDaemon,
+  modelLabel: string,
+  expression: string
+): Promise<VirtualOrmField[]> {
+  if (daemon.isAborted() || !expression) {
+    return [];
+  }
+  // Builtin .annotate(...)/.alias(...) — string/comment-masked so an annotate
+  // substring inside a literal does not mint a phantom field.
+  const fields: VirtualOrmField[] = [
+    ...extractAnnotatedVirtualFieldsFromText(expression),
+  ];
+  // Custom annotate_*/with_* methods — scan the masked text so a method-like name
+  // inside a string literal is not resolved as a real custom method.
+  const masked = maskPythonStringsAndComments(expression);
+  const callRe = /\.(annotate_[A-Za-z0-9_]*|with_[A-Za-z0-9_]*)\s*\(/g;
+  let match: RegExpExecArray | null;
+  while ((match = callRe.exec(masked)) !== null) {
+    if (daemon.isAborted()) {
+      break;
+    }
+    const added = await resolveVirtualFieldsFromCustomMethod(
+      daemon,
+      { kind: 'queryset', modelLabel },
+      match[1]
+    );
+    fields.push(...added);
+  }
+  return fields;
+}
+
+/**
+ * Path-independent virtual-field collector. Walks the FULL assignment history of
+ * a bare variable receiver — `x = get_emps(hrm)`, `x = x.annotate_*()...`,
+ * `x = x.filter(...)` (self-reassignment chains, conditionals, etc.) — and
+ * accumulates every annotated virtual field added along the way.
+ *
+ * Receiver resolution has many code paths (local, IPC member-chain, dynamic
+ * instance, fast-path) and most of them drop client-side virtualFields — e.g. a
+ * helper annotated `-> <Model>QuerySet` (generic `QuerySet[T_co]`) resolves to an
+ * `instance`, and a trailing `.filter()` is resolved via the daemon member-chain
+ * which carries no virtualFields. Rather than thread virtualFields through every
+ * path, we resolve the receiver's MODEL however we can and then attach the
+ * annotated fields here, independent of the path that produced the model.
+ */
+async function collectVirtualFieldsForReceiverExpression(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  receiverExpression: string,
+  beforeOffset: number,
+  modelLabel: string,
+  deadlineMs?: number
+): Promise<VirtualOrmField[]> {
+  if (daemon.isAborted() || isReceiverDeadlineExpired(deadlineMs)) {
+    return [];
+  }
+  let variableName = receiverRootIdentifier(receiverExpression);
+  // Only bare-variable receivers have an assignment history to walk.
+  if (!variableName || variableName !== normalizeReceiverExpression(receiverExpression)) {
+    return [];
+  }
+
+  const collected: VirtualOrmField[] = [];
+  let offset = beforeOffset;
+  const seen = new Set<string>();
+  for (let depth = 0; depth < 48; depth += 1) {
+    if (daemon.isAborted() || isReceiverDeadlineExpired(deadlineMs)) {
+      break;
+    }
+    const assignment = findNearestAssignedExpression(document, variableName, offset);
+    if (!assignment) {
+      break;
+    }
+    const guardKey = `${variableName}@${assignment.offset}`;
+    if (seen.has(guardKey)) {
+      break;
+    }
+    seen.add(guardKey);
+
+    collected.push(
+      ...(await extractVirtualFieldsFromChainExpression(
+        daemon,
+        modelLabel,
+        assignment.expression
+      ))
+    );
+
+    const root = receiverRootIdentifier(assignment.expression);
+    offset = assignment.offset;
+    if (root && root !== variableName) {
+      // The RHS is rooted at a different identifier. If it is another local
+      // variable, keep walking from it; otherwise (a function call / model /
+      // attribute) we have reached the origin binding.
+      if (findNearestAssignedExpression(document, root, assignment.offset)) {
+        variableName = root;
+      } else {
+        break;
+      }
+    }
+    // Self-reassignment (`x = x...`): keep the same variable; offset advanced to
+    // this assignment's line so findNearestAssignedExpression moves strictly
+    // upward (its same-line self-ref guard handles the boundary).
+  }
+
+  return dedupeVirtualFields(collected);
 }
 
 function parseVirtualFieldsFromAnnotatedCall(
@@ -11013,28 +11722,57 @@ async function resolveLookupReceiverInfoForReceiver(
   // 않고 즉시 OrmReceiverInfo 반환. captain L135 ipc-by-method 의
   // resolveExportOrigin=56/16696ms, resolveRelationTarget=5/16432ms 폭주를
   // 첫 cycle 부터 우회.
+  const beforeOffset = document.offsetAt(position);
   const fastPath = tryFastPathReceiverKind(daemon, receiverExpression);
   if (fastPath) {
+    // Simple `Model.objects.X` fast-path receivers have no variable assignment
+    // history, so they need no virtual-field enrichment.
     return fastPath;
   }
   const localReceiver = resolveExpressionOrmReceiverLocal(
     daemon,
     document,
     receiverExpression,
-    document.offsetAt(position),
+    beforeOffset,
     new Set()
   );
-  if (localReceiver) {
-    return localReceiver;
+  const resolved =
+    localReceiver ??
+    (await resolveLookupReceiverInfoForReceiverAtOffset(
+      daemon,
+      document,
+      receiverExpression,
+      beforeOffset,
+      new Set(),
+      deadlineMs,
+    ));
+  if (!resolved || !resolved.modelLabel) {
+    return resolved;
   }
-  return resolveLookupReceiverInfoForReceiverAtOffset(
+  // Path-independent enrichment: whatever path produced the receiver model,
+  // attach the annotated virtual fields collected from the variable's full
+  // assignment chain. This is what makes `x = x.annotate_*()...; x = x.filter()`
+  // resolve `_status`/`_job_role_name`/etc. even when the receiver resolves to an
+  // `instance`/`model_class` (e.g. a generic `-> QuerySet[T_co]` helper) or the
+  // trailing filters were resolved via the daemon member-chain (no virtualFields).
+  const chainVirtualFields = await collectVirtualFieldsForReceiverExpression(
     daemon,
     document,
     receiverExpression,
-    document.offsetAt(position),
-    new Set(),
-    deadlineMs,
+    beforeOffset,
+    resolved.modelLabel,
+    deadlineMs
   );
+  if (chainVirtualFields.length === 0) {
+    return resolved;
+  }
+  return {
+    ...resolved,
+    virtualFields: dedupeVirtualFields([
+      ...(resolved.virtualFields ?? []),
+      ...chainVirtualFields,
+    ]),
+  };
 }
 
 async function resolveLookupReceiverInfoForReceiverAtOffset(
@@ -11095,7 +11833,7 @@ async function resolveBaseModelLabelForReceiverAtOffset(
   }
 
   const visitKey = `${document.uri.toString()}:${normalizedExpression}@${beforeOffset}`;
-  if (visited.has(visitKey) || visited.size > 8) {
+  if (visited.has(visitKey) || visited.size > 100) {
     return undefined;
   }
   visited.add(visitKey);
@@ -11259,7 +11997,7 @@ async function resolveLookupReceiverAtOffset(
   }
 
   const visitKey = `${document.uri.toString()}:lookup:${normalizedExpression}@${beforeOffset}`;
-  if (visited.has(visitKey) || visited.size > 12) {
+  if (visited.has(visitKey) || visited.size > 100) {
     return undefined;
   }
   visited.add(visitKey);
@@ -11278,12 +12016,20 @@ async function resolveLookupReceiverAtOffset(
     );
     const ormObjectReceiver = await timeReceiverStep(
       daemon, 'memberAccess.orm-receiver', normalizedExpression,
+      // Share `visited` (was `new Set()`) so the size cap bounds the WHOLE
+      // member-access tree. Each chain level resolves its object expression up
+      // to 3 ways; with fresh sets those re-explored the entire prefix from
+      // scratch, making deep custom-method chains (e.g.
+      // `M.objects.get_queryset().exclude_deleted().filter(...)`) blow up to
+      // ~3^depth and hammer resolveRelationTarget tens of thousands of times
+      // (10s receiver timeouts, 100% CPU). Sharing visited collapses it to
+      // linear; the visitKey namespace prefixes keep the resolvers distinct.
       () => resolveOrmReceiverAtOffset(
         daemon,
         document,
         memberAccess.objectExpression,
         beforeOffset,
-        new Set(),
+        visited,
       ),
     );
     const objectReceiver = preferLookupChainReceiver(
@@ -11299,7 +12045,7 @@ async function resolveLookupReceiverAtOffset(
           memberAccess.objectExpression,
           memberAccess.memberName,
           beforeOffset,
-          new Set(),
+          visited,
         ),
       )
     );
@@ -11410,20 +12156,35 @@ async function resolveLookupReceiverAtOffset(
   }
 
   if (/^[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?$/.test(normalizedExpression)) {
-    const modelLabel = await timeReceiverStep(
-      daemon, 'modelLabelFromSymbol', normalizedExpression,
-      () => resolveModelLabelFromSymbol(
-        daemon,
-        document,
-        normalizedExpression,
-        beforeOffset,
-      ),
-    );
-    if (modelLabel) {
-      return {
-        kind: 'model_class',
-        modelLabel,
-      };
+    // A bare local variable that has an assignment in scope must be resolved via
+    // its assignment chain (below) — that path carries annotated virtual fields
+    // and queryset transforms. resolveModelLabelFromSymbol would short-circuit to
+    // a bare `model_class` (vfields=0) if the daemon happens to match the variable
+    // NAME to a model/relation (observed: `hrm_emp_qs` resolving to db.HrmEmp via
+    // a 213ms resolveRelationTarget, dropping every annotated field). Skip the
+    // symbol shortcut when a local binding exists; the model_class fallback still
+    // applies at the outer resolveBaseModelLabelForReceiverAtOffset if the chain
+    // walk yields nothing.
+    const hasLocalBinding =
+      !normalizedExpression.includes('.') &&
+      findNearestAssignedExpression(document, normalizedExpression, beforeOffset) !==
+        undefined;
+    if (!hasLocalBinding) {
+      const modelLabel = await timeReceiverStep(
+        daemon, 'modelLabelFromSymbol', normalizedExpression,
+        () => resolveModelLabelFromSymbol(
+          daemon,
+          document,
+          normalizedExpression,
+          beforeOffset,
+        ),
+      );
+      if (modelLabel) {
+        return {
+          kind: 'model_class',
+          modelLabel,
+        };
+      }
     }
   }
 
@@ -11609,6 +12370,37 @@ async function resolveLookupReceiverFromCallExpression(
     visited
   );
   if (objectReceiver) {
+    // Fast path for custom annotation methods (`annotate_*` / `with_*`): these
+    // are essentially always project-defined chainable QuerySet methods the
+    // daemon does not index, so `resolveOrmMember` would spend 40–226ms per call
+    // only to return unresolved — and a deep self-reassignment chain
+    // (`x = x.annotate_a().annotate_b()...`, 10+ links) repeats this for every
+    // link on every lookup, blowing past the receiver-resolution timeout (4s+
+    // observed). Such a method is a queryset operation regardless of how the
+    // object receiver was (mis)classified — a function annotated `-> <Model>QuerySet`
+    // can land as `instance`/`model_class`/`queryset` depending on the path — so
+    // we only require a known model and resolve the result as a same-model
+    // queryset, carrying inherited + body-extracted (memoized) virtual fields.
+    // The underscore is required so the builtin exact `annotate(...)` (handled by
+    // the direct-call annotate parser) is NOT intercepted here.
+    if (
+      /^(annotate_|with_)/.test(parsedCall.memberName) &&
+      objectReceiver.modelLabel
+    ) {
+      const inherited = objectReceiver.virtualFields ?? [];
+      const added = await resolveVirtualFieldsFromCustomMethod(
+        daemon,
+        objectReceiver,
+        parsedCall.memberName
+      );
+      const virtualFields = dedupeVirtualFields([...inherited, ...added]);
+      return {
+        kind: 'queryset',
+        modelLabel: objectReceiver.modelLabel,
+        virtualFields: virtualFields.length > 0 ? virtualFields : undefined,
+      };
+    }
+
     const resolution =
       daemon.resolveOrmMemberLocal(
         objectReceiver.modelLabel,
@@ -11638,6 +12430,49 @@ async function resolveLookupReceiverFromCallExpression(
         )
       );
       return mergeReceiverVirtualFields(resolvedReceiver, sourceResolvedReceiver);
+    }
+
+    // Root-cause fix (custom QuerySet methods): when the object resolves to a
+    // known queryset/manager/related_manager of a model, but the method is an
+    // UNRECOGNIZED chainable one (a project custom QuerySet method like
+    // `exclude_deleted_payroll_statements()` / `annotate_status_at()`, which
+    // returns `Self`), treat the result as a same-model queryset instead of
+    // giving up. Without this, such chains resolve to nothing (root_matched but
+    // unresolved) and the deep fallbacks below burn seconds before timing out.
+    // Standard type-changing methods (values/first/count/raw/contains/...) are
+    // excluded so their distinct return shapes are not misrepresented.
+    if (
+      (objectReceiver.kind === 'queryset' ||
+        objectReceiver.kind === 'manager' ||
+        objectReceiver.kind === 'related_manager' ||
+        // A function annotated `-> <Model>QuerySet` can resolve to a
+        // `model_class` receiver (the QuerySet name maps to its model by
+        // convention). A chainable custom method on it — `.annotate_*()` / any
+        // lowercase non-type-changing method — is still a queryset operation, so
+        // treat the result as a same-model queryset. Real classmethods were
+        // already resolved above via resolveOrmMember; only UNRECOGNIZED methods
+        // reach here, so this only ever recovers an under-classified collection
+        // receiver (e.g. `get_emps(hrm) -> HrmEmpQuerySet`).
+        objectReceiver.kind === 'model_class') &&
+      /^[a-z_][a-z0-9_]*$/.test(parsedCall.memberName) &&
+      !TYPE_CHANGING_QUERYSET_METHODS.has(parsedCall.memberName)
+    ) {
+      // Custom chainable methods preserve any virtual (annotated) fields from
+      // the upstream receiver, and a custom `annotate_*`/`with_*` method may add
+      // its own (extracted from its body). Carry both so `filter(_x__...)` on an
+      // annotated field still resolves.
+      const inherited = objectReceiver.virtualFields ?? [];
+      const added = await resolveVirtualFieldsFromCustomMethod(
+        daemon,
+        objectReceiver,
+        parsedCall.memberName
+      );
+      const virtualFields = dedupeVirtualFields([...inherited, ...added]);
+      return {
+        kind: 'queryset',
+        modelLabel: objectReceiver.modelLabel,
+        virtualFields: virtualFields.length > 0 ? virtualFields : undefined,
+      };
     }
   }
 
@@ -11929,6 +12764,38 @@ async function resolveModelLabelFromFunctionSource(
   visited: Set<string>
 ): Promise<string | undefined> {
   if (daemon.isAborted()) { return undefined; }
+  return memoizeFunctionBodyResolution(
+    daemon,
+    functionModelLabelCache,
+    functionSource,
+    visited,
+    (bodyVisited) =>
+      resolveModelLabelFromFunctionSourceUncached(daemon, functionSource, bodyVisited)
+  );
+}
+
+async function resolveModelLabelFromFunctionSourceUncached(
+  daemon: AnalysisDaemon,
+  functionSource: FunctionDefinitionSource,
+  visited: Set<string>
+): Promise<string | undefined> {
+  if (daemon.isAborted()) { return undefined; }
+
+  // Prefer the explicit return annotation FIRST — for ORM helpers like
+  // `def get_emps(...) -> HrmEmpQuerySet` it is both reliable and cheap. The
+  // whole-body return-expression analysis below previously ran first and cost
+  // ~1.2s per call (recursively resolving every return), then still failed for
+  // custom-QuerySet returns — the dominant remaining hover timeout. Body
+  // inference stays as the fallback for un-annotated / `-> QuerySet` cases.
+  const annotationLabel = await resolveModelLabelFromFunctionReturnAnnotation(
+    daemon,
+    functionSource
+  );
+  if (annotationLabel) {
+    return annotationLabel;
+  }
+  if (daemon.isAborted()) { return undefined; }
+
   const returnExpressions = collectReturnExpressions(
     functionSource.document,
     functionSource.functionDef
@@ -11951,7 +12818,7 @@ async function resolveModelLabelFromFunctionSource(
     return [...resolvedLabels.values()][0];
   }
 
-  return resolveModelLabelFromFunctionReturnAnnotation(daemon, functionSource);
+  return undefined;
 }
 
 async function resolveModelLabelFromClassMethodSource(
@@ -14565,6 +15432,22 @@ function findNearestAssignedExpression(
   const beforePosition = document.positionAt(beforeOffset);
   const minLine = Math.max(0, beforePosition.line - MAX_BINDING_BACKSCAN_LINES);
 
+  // Root-cause fix (self-reassignment chain): a variable rebound in terms of
+  // itself — `x = get_emps(hrm)` then `x = x.annotate_status_at()...` then
+  // `x = x.filter(...)` — must be walked ONE STEP AT A TIME so each rebinding's
+  // transforms (annotate virtual fields, filters) accumulate. We therefore
+  // return the NEAREST assignment, INCLUDING a self-referential one, EXCEPT the
+  // self-referential assignment on `beforePosition.line` itself: that is the very
+  // RHS we are currently resolving, whose inner `x` is bound by the PREVIOUS
+  // assignment, so we keep scanning upward. Because each returned self-referential
+  // assignment is re-entered with its own line as the new beforeOffset, the next
+  // lookup skips that line and moves strictly earlier — the walk is monotonic
+  // (no infinite loop) and reaches the origin binding while preserving every
+  // intermediate `.annotate_*()` that adds virtual fields.
+  //
+  // (The earlier implementation skipped ALL self-referential lines straight to
+  // the origin, which dropped the `x = x.annotate_*()` rebinding entirely and
+  // lost its annotated virtual fields — the real-world `hrm_emp_qs` bug.)
   for (let line = beforePosition.line; line >= minLine; line -= 1) {
     const lineText = document.lineAt(line).text;
     const match = lineText.match(assignmentPattern);
@@ -14575,6 +15458,28 @@ function findNearestAssignedExpression(
     const rawExpression = stripTrailingComment(match[1]).trim();
     if (!rawExpression) {
       continue;
+    }
+
+    if (line === beforePosition.line) {
+      // The nearest assignment is on the very line we started resolving from —
+      // i.e. we are resolving the RHS of THIS assignment, whose inner `x` is
+      // bound by the PREVIOUS assignment. If it is self-referential, keep
+      // scanning upward. Detect self-reference against the FULL (possibly
+      // multi-line) RHS: collecting only up to beforePosition.line truncates a
+      // multi-line RHS to its opening token (e.g. `(`) and would hide the
+      // self-reference, returning that garbage token instead.
+      const fullCollected = collectMultilineExpression(
+        document,
+        line,
+        document.lineCount - 1,
+        rawExpression
+      );
+      if (
+        fullCollected.expression &&
+        receiverRootIdentifier(fullCollected.expression) === variableName
+      ) {
+        continue;
+      }
     }
 
     const collected = collectMultilineExpression(
@@ -14588,10 +15493,7 @@ function findNearestAssignedExpression(
     }
 
     const expressionOffset = document.offsetAt(new vscode.Position(line, 0));
-    return {
-      expression: collected.expression,
-      offset: expressionOffset,
-    };
+    return { expression: collected.expression, offset: expressionOffset };
   }
 
   return undefined;

@@ -1054,7 +1054,7 @@ class DaemonServer:
         # captain 의 첫 resolveLookupPath IPC 2.8s 폭주가 lazy `django.setup()`
         # 때문 (옵션 6 분석 확정). initialize 응답 직전에 thread 시작 → 사용자가
         # 첫 IPC 보낼 무렵 ready. 안 ready 면 lock 에서 wait (1회만 손해).
-        self._start_runtime_field_registry_prewarm(runtime)
+        self._start_runtime_field_registry_prewarm(runtime, health_snapshot)
         _log_initialize_step(
             f'complete elapsed={time.perf_counter() - started_at:.2f}s'
         )
@@ -1463,6 +1463,7 @@ class DaemonServer:
     def _start_runtime_field_registry_prewarm(
         self,
         runtime: RuntimeInspection,
+        health_snapshot: dict[str, Any] | None = None,
     ) -> None:
         """daemon initialize 끝에 호출. background thread 가 Django setup +
         runtime field registry build 를 미리 진행. captain 의 첫 IPC 폭주(2.8s)
@@ -1491,6 +1492,21 @@ class DaemonServer:
                 f'runtime_field_registry(background) ready '
                 f'elapsed={elapsed_ms:.0f}ms'
             )
+            # The runtime field registry builds AFTER the daemon reaches `ready`.
+            # Receivers/lookups resolved in that window were computed WITHOUT the
+            # registry — e.g. a reverse relation addressed by its related_query_name
+            # only becomes resolvable once the registry exists — and got cached on
+            # the client. Push a healthChanged notification so the client drops
+            # those stale caches and re-resolves now that the registry is live.
+            try:
+                snapshot = health_snapshot if health_snapshot is not None else self.health_snapshot
+                if snapshot is not None:
+                    self._write_notification(
+                        'healthChanged',
+                        {'health': snapshot},
+                    )
+            except Exception:
+                pass
 
         thread = threading.Thread(
             target=_bg_prewarm,

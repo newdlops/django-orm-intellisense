@@ -92,6 +92,95 @@ class QuestionThreadQuerySet(models.QuerySet["QuestionThread"]):
     def open_only(self) -> "QuestionThreadQuerySet":
         return self.filter(is_open=True)
 
+    def annotate_message_count(self) -> "QuestionThreadQuerySet":
+        return self.annotate(_message_count=models.Count("message"))
+
+    def annotate_with_sqlish(self) -> "QuestionThreadQuerySet":
+        return self.annotate(_real=models.Count("message"))
+
+    # Extra annotate_* methods so a chain can be long (11+ links) like the real
+    # hrm_emp_qs, to exercise the receiver-resolution visited-cap on deep chains.
+    def annotate_c1(self) -> "QuestionThreadQuerySet":
+        return self.annotate(_c1=models.Value("x"))
+
+    def annotate_c2(self) -> "QuestionThreadQuerySet":
+        return self.annotate(_c2=models.Value("x"))
+
+    def annotate_c3(self) -> "QuestionThreadQuerySet":
+        return self.annotate(_c3=models.Value("x"))
+
+    def annotate_c4(self) -> "QuestionThreadQuerySet":
+        return self.annotate(_c4=models.Value("x"))
+
+    def annotate_c5(self) -> "QuestionThreadQuerySet":
+        return self.annotate(_c5=models.Value("x"))
+
+    def annotate_c6(self) -> "QuestionThreadQuerySet":
+        return self.annotate(_c6=models.Value("x"))
+
+    # #2c repro: a DEEP chain of custom annotate_* methods (mirrors the
+    # real-world `get_emps(hrm).annotate_status_at().annotate_*()...` shape with
+    # 6+ links). Bodies mirror the real ones: a local import + an `if`-guard
+    # before a MULTI-LINE `.annotate(...)` (Subquery/OuterRef), each returning
+    # Self so the model is preserved across the chain.
+    def annotate_status_at(
+        self,
+        base_date=None,
+    ) -> "QuestionThreadQuerySet":
+        from .models import Message
+
+        if base_date is None:
+            base_date = 1
+
+        return self.annotate(
+            _status=models.Subquery(
+                Message.objects.filter(thread_id=models.OuterRef("id"))
+                .order_by("-id")
+                .values("id")[:1]
+            ),
+        )
+
+    def annotate_employment_type_at(
+        self,
+        base_date=None,
+    ) -> "QuestionThreadQuerySet":
+        from .models import Message
+
+        if base_date is None:
+            base_date = 1
+
+        return self.annotate(
+            _employment_type=models.Subquery(
+                Message.objects.filter(thread_id=models.OuterRef("id"))
+                .values("id")[:1]
+            ),
+        )
+
+    def annotate_job_level_name_at(
+        self,
+        base_date=None,
+    ) -> "QuestionThreadQuerySet":
+        return self.annotate(
+            _job_level_name=models.Value("x"),
+        )
+
+    def annotate_job_position_name_at(
+        self,
+        base_date=None,
+    ) -> "QuestionThreadQuerySet":
+        return self.annotate(
+            _job_position_name=models.Value("x"),
+        )
+
+    def annotate_job_role_name_at(
+        self,
+        base_date=None,
+    ) -> "QuestionThreadQuerySet":
+        # Mirrors the user's chaining body: self.<other annotate>().annotate(...)
+        return self.annotate_status_at(base_date).annotate(
+            _job_role_name=models.Value("x"),
+        )
+
 
 class QuestionThreadManager(models.Manager.from_queryset(QuestionThreadQuerySet)):
     pass
@@ -108,6 +197,17 @@ class QuestionThread(models.Model):
 
     objects = QuestionThreadManager()
 
+    @property
+    def is_resolved(self) -> bool:
+        # A computed @property — must surface in instance attribute completion
+        # and hover, but must NOT be offered as a queryable field in
+        # values()/only()/filter() (it is not an ORM field).
+        return not self.is_open
+
+    @property
+    def primary_company(self) -> "Company":
+        return self.company
+
 
 class Message(models.Model):
     question_thread = models.ForeignKey(
@@ -116,6 +216,19 @@ class Message(models.Model):
     )
     content = models.CharField(max_length=255)
     is_visible = models.BooleanField(default=True)
+
+
+class ThreadMeta(models.Model):
+    # Reverse relation whose QUERY name (related_query_name='tmeta') differs from
+    # the instance accessor (related_name='_tmeta'). Django lookups use the query
+    # name: `QuestionThread.objects.values("tmeta__note")` is valid (NOT `_tmeta`).
+    thread = models.OneToOneField(
+        QuestionThread,
+        on_delete=models.CASCADE,
+        related_name="_tmeta",
+        related_query_name="tmeta",
+    )
+    note = models.CharField(max_length=100)
 
 
 class CorporateRegistration(models.Model):

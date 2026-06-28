@@ -313,8 +313,13 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
 
         for field in meta.get_fields(include_hidden=True):
             if getattr(field, 'auto_created', False) and not getattr(field, 'concrete', True):
-                reverse_name = _relation_name(field)
-                if reverse_name:
+                # A reverse relation is addressed by its QUERY name
+                # (related_query_name) in filter()/values()/select_related() —
+                # which can differ from the instance accessor (related_name).
+                # e.g. related_name="_salary_account", related_query_name="salary_account":
+                # `instance._salary_account` but `.values("salary_account__...")`.
+                # Register BOTH so lookups and attribute access both resolve.
+                for reverse_name in _reverse_relation_names(field):
                     runtime_field_registry[(f'{meta.app_label}.{meta.object_name}', reverse_name)] = field
                     reverse_relation_names.append(reverse_name)
                     reverse_relation_count += 1
@@ -714,6 +719,30 @@ def _relation_name(field: object) -> str | None:
 
 def _is_hidden_relation_name(name: str) -> bool:
     return name.endswith('+')
+
+
+def _reverse_relation_names(field: object) -> list[str]:
+    """All names a reverse relation answers to: the instance accessor
+    (related_name / default) AND the query name (related_query_name) used in
+    filter()/values()/select_related(), which Django lets differ. Deduped,
+    hidden names dropped."""
+    names: list[str] = []
+    accessor = _relation_name(field)
+    if accessor:
+        names.append(accessor)
+
+    forward = getattr(field, 'field', None)
+    related_query_name = getattr(forward, 'related_query_name', None)
+    if callable(related_query_name):
+        try:
+            query_name = related_query_name()
+        except Exception:
+            query_name = None
+        if query_name:
+            query_text = str(query_name)
+            if not _is_hidden_relation_name(query_text) and query_text not in names:
+                names.append(query_text)
+    return names
 
 
 def _sanitize_runtime_model_summary(

@@ -381,6 +381,473 @@ suite('Django ORM Intellisense UI', () => {
       `Expected an inlay hint with the inferred lookup type (e.g. ': str'). Received: ${JSON.stringify(inlayLabels)}`
     );
 
+    // Root-cause fix A: a custom QuerySet method (`open_only`, returns Self)
+    // must keep the model so the following filter resolves to QuestionThread
+    // fields (e.g. `title`) instead of failing/timing out.
+    const customMethodCompletionPosition = positionAfterTextInContainer(
+      document,
+      "QuestionThread.objects.open_only().filter(ti='x')",
+      'filter(ti'
+    );
+    const customMethodCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        customMethodCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(customMethodCompletionList?.items ?? [], 'title'),
+      'Expected a custom QuerySet method chain (open_only().filter) to resolve to QuestionThread fields.'
+    );
+
+    // Root-cause fix C: a self-reassigned queryset (`qs = qs.filter(...)`) must
+    // resolve back to its origin (`QuestionThread.objects.all()`).
+    const selfReassignCompletionPosition = positionAfterTextInContainer(
+      document,
+      "qs.filter(ti='x')",
+      'filter(ti'
+    );
+    const selfReassignCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        selfReassignCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(selfReassignCompletionList?.items ?? [], 'title'),
+      'Expected a self-reassigned queryset to resolve back to its origin model (QuestionThread).'
+    );
+
+    // Root-cause fix B: a variable from a function annotated `-> <Model>QuerySet`
+    // must resolve to that model.
+    const returnAnnotationCompletionPosition = positionAfterTextInContainer(
+      document,
+      "threads.filter(ti='x')",
+      'filter(ti'
+    );
+    const returnAnnotationCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        returnAnnotationCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(returnAnnotationCompletionList?.items ?? [], 'title'),
+      'Expected a `-> QuestionThreadQuerySet` return annotation to resolve the variable to QuestionThread.'
+    );
+
+    // #2b: a custom `annotate_*` method that adds `.annotate(_message_count=...)`
+    // must surface `_message_count` as a virtual lookup field.
+    const annotateMethodCompletionPosition = positionAfterTextInContainer(
+      document,
+      'QuestionThread.objects.annotate_message_count().filter(_message_count__gte=1)',
+      'filter(_mess'
+    );
+    const annotateMethodCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        annotateMethodCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(
+        annotateMethodCompletionList?.items ?? [],
+        '_message_count'
+      ),
+      'Expected a custom annotate_* method to surface its annotated virtual field (_message_count).'
+    );
+
+    // #2c: the real-world failing shape — a function-return receiver + custom
+    // annotate_* method stored in a *variable*, then filtered in a *separate
+    // statement*. The annotated virtual field must survive variable resolution.
+    const variableAnnotateCompletionPosition = positionAfterTextInContainer(
+      document,
+      'chained_qs.filter(_message_count__gte=1)',
+      'filter(_mess'
+    );
+    const variableAnnotateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        variableAnnotateCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(
+        variableAnnotateCompletionList?.items ?? [],
+        '_message_count'
+      ),
+      'Expected a variable holding a custom annotate_* chain to surface its annotated virtual field (_message_count).'
+    );
+
+    // #2c (DEEP): a 6+ link custom annotate_* chain stored in a variable. The
+    // deepest annotated field (_job_role_name) must survive deep receiver
+    // resolution. Reproduces the real-world hrm_emp_qs failure where the chain
+    // depth exhausted the visited-set cap and dropped virtual fields.
+    const deepAnnotateCompletionPosition = positionAfterTextInContainer(
+      document,
+      'deep_qs.filter(_job_role_name__icontains="x")',
+      'filter(_job_role'
+    );
+    const deepAnnotateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        deepAnnotateCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(
+        deepAnnotateCompletionList?.items ?? [],
+        '_job_role_name'
+      ),
+      'Expected a DEEP custom annotate_* chain to surface its deepest annotated virtual field (_job_role_name).'
+    );
+
+    // #2c ROOT CAUSE: the exact real-world `hrm_emp_qs` shape — a self-
+    // reassignment chain (`qs = qs.annotate_*()...` then `qs = qs.filter(...)`).
+    // The annotated virtual field must survive the self-reassignment walk so the
+    // final-statement filter resolves it.
+    const selfReassignAnnotateCompletionPosition = positionAfterTextInContainer(
+      document,
+      'qs.filter(_job_role_name__icontains="selfreassign")',
+      'filter(_job_role'
+    );
+    const selfReassignAnnotateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        selfReassignAnnotateCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(
+        selfReassignAnnotateCompletionList?.items ?? [],
+        '_job_role_name'
+      ),
+      'Expected a SELF-REASSIGNMENT annotate_* chain to surface its annotated virtual field (_job_role_name).'
+    );
+
+    // #2c ROOT CAUSE (cross-module + function-local import): the closest mirror
+    // of the real `hrm_emp_qs` failure — receiver from a function-locally
+    // imported, cross-module helper, self-reassigned annotate chain, filters in
+    // `if` blocks. The annotated virtual field must survive.
+    const crossModuleAnnotateCompletionPosition = positionAfterTextInContainer(
+      document,
+      'cmod_qs.filter(_job_role_name__icontains="crossmod")',
+      'filter(_job_role'
+    );
+    const crossModuleAnnotateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        crossModuleAnnotateCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(
+        crossModuleAnnotateCompletionList?.items ?? [],
+        '_job_role_name'
+      ),
+      'Expected a CROSS-MODULE function-local-import annotate_* chain to surface its annotated virtual field (_job_role_name).'
+    );
+
+    // #2c (instance-classified receiver): a function returning a bare model
+    // resolves to an `instance` receiver; a custom annotate_* on it is still a
+    // queryset op and must surface its virtual field. Mirrors the real
+    // `get_emps(hrm) -> HrmEmpQuerySet` (generic QuerySet[T_co]) which the hover
+    // path classifies as `instance`.
+    const instanceAnnotateCompletionPosition = positionAfterTextInContainer(
+      document,
+      'inst_qs.filter(_status__icontains="inst")',
+      'filter(_stat'
+    );
+    const instanceAnnotateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        instanceAnnotateCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(
+        instanceAnnotateCompletionList?.items ?? [],
+        '_status'
+      ),
+      'Expected an INSTANCE-classified receiver annotate_* chain to surface its annotated virtual field (_status).'
+    );
+
+    // @property #1: a computed @property on a model instance must surface in
+    // attribute completion (`thread.is_re|` → is_resolved).
+    const propertyCompletionPosition = positionAfterTextInContainer(
+      document,
+      'thread.is_resolved',
+      'thread.is'
+    );
+    const propertyCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        propertyCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(propertyCompletionList?.items ?? [], 'is_resolved'),
+      'Expected a model @property (is_resolved) to surface in instance attribute completion.'
+    );
+
+    // @property #2: hover on a @property must render it as a property member.
+    const propertyHoverPosition = positionInsideText(
+      document,
+      'thread.is_resolved',
+      'is_resolved'
+    );
+    const propertyHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      propertyHoverPosition
+    );
+    const propertyHoverText = stringifyHovers(propertyHovers);
+    assert.ok(
+      /property/i.test(propertyHoverText),
+      `Expected a @property hover to identify it as a property. Received: ${propertyHoverText}`
+    );
+
+    // @property #3 (semantic guard): a @property is NOT a queryable field, so it
+    // must NOT be offered in values()/only() string args (only real fields).
+    const valuesFieldCompletionPosition = positionAfterTextInContainer(
+      document,
+      'QuestionThread.objects.values("is_open")',
+      'values("is'
+    );
+    const valuesFieldCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        valuesFieldCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(valuesFieldCompletionList?.items ?? [], 'is_open'),
+      'Expected the real field is_open to be offered in values().'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(
+        valuesFieldCompletionList?.items ?? [],
+        'is_resolved'
+      ),
+      'Expected a @property (is_resolved) to be EXCLUDED from values() field completion (it is not an ORM field).'
+    );
+
+    // INSTANCE + interleaved filter chain (the exact real-world get_emps shape):
+    // receiver resolves to an instance, filters resolve via the daemon
+    // member-chain (no virtualFields), yet the annotated fields must survive via
+    // the path-independent assignment-chain collector.
+    const instChainStatusPosition = positionAfterTextInContainer(
+      document,
+      'iq.filter(_status__icontains="instchain")',
+      'filter(_stat'
+    );
+    const instChainStatusList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        instChainStatusPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(instChainStatusList?.items ?? [], '_status'),
+      'Expected _status to survive an instance + interleaved-filter self-reassignment chain.'
+    );
+    const instChainRolePosition = positionAfterTextInContainer(
+      document,
+      'iq.filter(_job_role_name__icontains="instchain2")',
+      'filter(_job_role'
+    );
+    const instChainRoleList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        instChainRolePosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(instChainRoleList?.items ?? [], '_job_role_name'),
+      'Expected _job_role_name (added after a .filter()) to survive the instance filter chain.'
+    );
+
+    // String-literal guard: an annotate-like substring inside a string literal
+    // must NOT mint a phantom virtual field, while the real one (_status) does.
+    const strLitGuardPosition = positionAfterTextInContainer(
+      document,
+      'sq.filter(_status__icontains="strlit")',
+      'filter(_'
+    );
+    const strLitGuardList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        strLitGuardPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(strLitGuardList?.items ?? [], '_status'),
+      'Expected the real annotated field (_status) to resolve alongside a string-literal that contains annotate-like text.'
+    );
+    assert.ok(
+      !hasCompletionItemLabel(strLitGuardList?.items ?? [], 'phantom_field'),
+      'Expected an annotate(...) substring INSIDE a string literal to NOT mint a phantom virtual field (phantom_field).'
+    );
+
+    // related_query_name: a reverse relation addressed by its query name (tmeta,
+    // NOT the _tmeta accessor) must resolve THROUGH to the related model's fields.
+    const relatedQueryNamePosition = positionAfterTextInContainer(
+      document,
+      'QuestionThread.objects.values("tmeta__note")',
+      'values("tmeta__'
+    );
+    const relatedQueryNameList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        relatedQueryNamePosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(relatedQueryNameList?.items ?? [], 'note'),
+      'Expected a reverse relation addressed by related_query_name (tmeta__) to resolve into the related model fields (note).'
+    );
+
+    // Multi-line values(): a field path on a SEPARATE line from `.values(` must
+    // still be detected as a lookup and resolve (completion + hover). This is the
+    // real-world `.values(\n  "tmeta__note",\n ...)` shape.
+    const multilineValuesCompletionPosition = positionAfterTextInContainer(
+      document,
+      '"tmeta__note"',
+      '"tmeta__'
+    );
+    const multilineValuesCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        multilineValuesCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(multilineValuesCompletionList?.items ?? [], 'note'),
+      'Expected a multi-line values() field on its own line to resolve the related_query_name path (tmeta__note → note).'
+    );
+    const multilineValuesHoverPosition = positionInsideText(
+      document,
+      '"tmeta__note"',
+      'tmeta'
+    );
+    const multilineValuesHovers = await vscode.commands.executeCommand<
+      vscode.Hover[]
+    >('vscode.executeHoverProvider', document.uri, multilineValuesHoverPosition);
+    const multilineValuesHoverText = stringifyHovers(multilineValuesHovers);
+    assert.ok(
+      /ThreadMeta|tmeta|note|OneToOne|relation/i.test(multilineValuesHoverText),
+      `Expected a multi-line values() field path (tmeta__note) to produce a lookup hover. Received: ${multilineValuesHoverText}`
+    );
+
+    // User-shaped: variable receiver, .values() WRAPPED in another call, the
+    // related_query_name field deep in a long multi-line list (the real failing
+    // `pd.DataFrame(hrm_emp_qs.values("...", "salary_account__...", ...))` shape).
+    const userShapedValuesHoverPosition = positionInsideText(
+      document,
+      '"tmeta__thread_id"',
+      'tmeta'
+    );
+    const userShapedValuesHovers = await vscode.commands.executeCommand<
+      vscode.Hover[]
+    >('vscode.executeHoverProvider', document.uri, userShapedValuesHoverPosition);
+    const userShapedValuesHoverText = stringifyHovers(userShapedValuesHovers);
+    assert.ok(
+      /ThreadMeta|tmeta|thread|note|OneToOne|relation|model/i.test(
+        userShapedValuesHoverText
+      ),
+      `Expected a deep multi-line values() field in a wrapped call to resolve. Received: ${userShapedValuesHoverText}`
+    );
+    const userShapedValuesCompletionPosition = positionAfterTextInContainer(
+      document,
+      '"tmeta__thread_id"',
+      '"tmeta__'
+    );
+    const userShapedValuesCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        userShapedValuesCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(userShapedValuesCompletionList?.items ?? [], 'note'),
+      'Expected completion inside a deep wrapped multi-line values() to resolve the related_query_name path (tmeta__ → note).'
+    );
+
+    // IF-BLOCK self-reassignment chain (the EXACT real hrm_emp_qs shape):
+    // annotate chain, then if/elif, then a series of `if cond: qs = qs.filter(...)`.
+    // Hover/completion on a LATER if-block field must resolve via the self-
+    // reassignment walk through the intervening `if`/`elif` lines.
+    const ifBlockStatusHoverPos = positionInsideText(
+      document,
+      'ifqs.filter(_status__in=statuses)',
+      '_status'
+    );
+    const ifBlockStatusHovers = await vscode.commands.executeCommand<
+      vscode.Hover[]
+    >('vscode.executeHoverProvider', document.uri, ifBlockStatusHoverPos);
+    assert.ok(
+      /Owner model|HrmEmp|QuestionThread|Field kind|annotat|Resulting/i.test(
+        stringifyHovers(ifBlockStatusHovers)
+      ),
+      `Expected _status in an if-block self-reassignment chain to hover-resolve. Received: ${stringifyHovers(ifBlockStatusHovers)}`
+    );
+    const ifBlockRoleCompletionPos = positionAfterTextInContainer(
+      document,
+      'ifqs.filter(_job_role_name__in=roles)',
+      'filter(_job_role'
+    );
+    const ifBlockRoleCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        ifBlockRoleCompletionPos
+      );
+    assert.ok(
+      hasCompletionItemLabel(ifBlockRoleCompletionList?.items ?? [], '_job_role_name'),
+      'Expected _job_role_name in a LATER if-block to complete via the self-reassignment walk.'
+    );
+
+    // DEEPEST if-block field: many self-reassignment levels deep. The receiver
+    // walk must traverse all of them WITHOUT exceeding the visited-set cap (the
+    // real hrm_emp_qs failure: deep fields resolved to kind=undefined).
+    const deepIfBlockHoverPos = positionInsideText(
+      document,
+      'ifqs.filter(_status__in=["deepstatus"])',
+      '_status'
+    );
+    const deepIfBlockHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      deepIfBlockHoverPos
+    );
+    assert.ok(
+      /Owner model|HrmEmp|QuestionThread|Field kind|annotat|Resulting/i.test(
+        stringifyHovers(deepIfBlockHovers)
+      ),
+      `Expected the DEEPEST if-block field (_status, many levels deep) to hover-resolve. Received: ${stringifyHovers(deepIfBlockHovers)}`
+    );
+
+    // Builtin .annotate(_x=...) directly off objects: _x must resolve as a
+    // virtual lookup field (probe for the general builtin-annotate path).
+    const builtinAnnotateCompletionPosition = positionAfterTextInContainer(
+      document,
+      '_builtin_total__gte=1',
+      '_builtin_tot'
+    );
+    const builtinAnnotateCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        builtinAnnotateCompletionPosition
+      );
+    assert.ok(
+      hasCompletionItemLabel(
+        builtinAnnotateCompletionList?.items ?? [],
+        '_builtin_total'
+      ),
+      'Expected a builtin .annotate(_builtin_total=...) field to surface as a virtual lookup field.'
+    );
+
     const directPkHoverPosition = positionInsideText(
       document,
       'Post.objects.filter(pk=1)',

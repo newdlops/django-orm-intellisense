@@ -394,3 +394,262 @@ def snake_case_variable_name_fallback_examples(context):
     company_for_chain = context.get_company()
     qt = company_for_chain.question_thread_set.get(id=1)
     qt.message_set.filter(co='chain')
+
+
+def custom_queryset_method_chain_examples():
+    # Root-cause fix A: a custom QuerySet method (`open_only` -> Self) must keep
+    # the model, so the following filter resolves to QuestionThread fields.
+    QuestionThread.objects.open_only().filter(ti='x')
+
+    # Root-cause fix C: self-reassignment must reach the origin binding
+    # (`QuestionThread.objects.all()`) instead of looping on the self line.
+    qs = QuestionThread.objects.all()
+    qs = qs.filter(is_open=True)
+    qs.filter(ti='x')
+
+
+def threads_qs() -> "QuestionThreadQuerySet":
+    return QuestionThread.objects.open_only()
+
+
+def function_return_annotation_examples():
+    # Root-cause fix B: a function annotated `-> <Model>QuerySet` must resolve
+    # the variable to that model, so the following filter resolves to
+    # QuestionThread fields.
+    threads = threads_qs()
+    threads.filter(ti='x')
+
+
+def custom_annotate_method_examples():
+    # Root-cause fix #2b: a custom `annotate_*` QuerySet method that adds a
+    # `.annotate(_message_count=...)` field — `_message_count` must be offered as
+    # a (virtual) lookup field even though it is not a static model field.
+    QuestionThread.objects.annotate_message_count().filter(_message_count__gte=1)
+
+
+def annotated_threads_qs() -> "QuestionThreadQuerySet":
+    return QuestionThread.objects.open_only()
+
+
+def variable_annotate_chain_examples():
+    # Root-cause fix #2c: mirror the real-world failing shape — a function-return
+    # receiver, a custom `annotate_*` method, stored in a *variable*, then used in
+    # a *separate statement*. The annotated virtual field (`_message_count`) must
+    # survive variable resolution so the later `filter(_message_count__...)`
+    # resolves it (this is the `hrm_emp_qs = get_emps(hrm).annotate_*()` case).
+    chained_qs = annotated_threads_qs().annotate_message_count()
+    chained_qs.filter(_message_count__gte=1)
+
+
+def deep_variable_annotate_chain_examples():
+    # #2c repro (DEEP): the real-world chain has 6+ annotate_* links. The deepest
+    # field (_job_role_name) must still survive resolution of this long chain.
+    deep_qs = (
+        annotated_threads_qs()
+        .annotate_message_count()
+        .annotate_status_at()
+        .annotate_employment_type_at()
+        .annotate_job_level_name_at()
+        .annotate_job_position_name_at()
+        .annotate_job_role_name_at()
+    )
+    deep_qs.filter(_job_role_name__icontains="x")
+
+
+def self_reassign_annotate_chain_examples():
+    # #2c ROOT CAUSE repro: the EXACT real-world `hrm_emp_qs` shape — a variable
+    # rebound *in terms of itself* across separate statements. The annotate chain
+    # is a self-reassignment (`qs = qs.annotate_*()...`), then further self-
+    # reassigned filters. The annotated virtual fields added by the self-reassign
+    # must survive so the final `filter(_job_role_name__...)` resolves.
+    qs = annotated_threads_qs()
+    qs = (
+        qs.annotate_message_count()
+        .annotate_status_at()
+        .annotate_employment_type_at()
+        .annotate_job_level_name_at()
+        .annotate_job_position_name_at()
+        .annotate_job_role_name_at()
+    )
+    qs = qs.filter(is_open=True)
+    qs = qs.filter(_status__icontains="x")
+    qs.filter(_job_role_name__icontains="selfreassign")
+
+
+def cross_module_self_reassign_examples():
+    # #2c ROOT CAUSE repro (cross-module + function-local import): the EXACT
+    # real-world `hrm_emp_qs` shape. `get_threads` lives in another module and is
+    # imported *inside the function* (like `from ...hrm_emp_service import
+    # get_emps`). The annotate chain is a self-reassignment, the filters are
+    # nested in `if` blocks. The annotated virtual field must still resolve.
+    from blog.thread_source import get_threads
+
+    cmod_qs = get_threads()
+    cmod_qs = (
+        cmod_qs.annotate_message_count()
+        .annotate_status_at()
+        .annotate_employment_type_at()
+        .annotate_job_level_name_at()
+        .annotate_job_position_name_at()
+        .annotate_job_role_name_at()
+    )
+    if cmod_qs:
+        cmod_qs = cmod_qs.filter(is_open=True)
+    if cmod_qs:
+        cmod_qs = cmod_qs.filter(_status__icontains="x")
+    if cmod_qs:
+        cmod_qs.filter(_job_role_name__icontains="crossmod")
+
+
+def thread_like_instance() -> "QuestionThread":
+    return QuestionThread.objects.first()
+
+
+def instance_receiver_annotate_examples():
+    # #2c repro (instance-classified receiver): a function annotated to return a
+    # bare model resolves to an `instance` receiver, NOT a queryset. A custom
+    # `annotate_*` method on it is still a queryset operation and must surface its
+    # virtual field — mirrors the real `get_emps(hrm) -> HrmEmpQuerySet` where the
+    # generic `QuerySet[T_co]` makes the function receiver resolve as an instance.
+    inst_qs = thread_like_instance().annotate_status_at()
+    inst_qs.filter(_status__icontains="inst")
+
+
+def property_member_examples():
+    # @property on a model INSTANCE must surface in attribute completion + hover.
+    thread = QuestionThread.objects.get(id=1)
+    thread.is_resolved
+    # ...but @property must NOT be offered as a queryable field, and filtering by
+    # it is a genuine error (Django rejects it) — so it must stay excluded here.
+    QuestionThread.objects.values("is_open")
+    QuestionThread.objects.filter(is_open=True)
+
+
+def builtin_annotate_examples():
+    # Builtin (non-custom-method) .annotate(_x=...) — _x must resolve as a virtual
+    # lookup field directly off the annotate call.
+    QuestionThread.objects.annotate(_builtin_total=db_models.Count("message")).filter(
+        _builtin_total__gte=1
+    )
+    # Builtin annotate AFTER .values() (the subquery shape from the user's log).
+    QuestionThread.objects.values("company_id").annotate(
+        _values_sum=db_models.Count("message")
+    ).filter(_values_sum__gte=1)
+
+
+def instance_self_reassign_filter_chain_examples():
+    # The exact real-world failure: a receiver that resolves to an `instance`
+    # (like `get_emps(hrm) -> HrmEmpQuerySet` with generic QuerySet[T_co]),
+    # self-reassigned through annotate_* AND interleaved .filter() (which resolves
+    # via the daemon member-chain that carries no virtualFields). The annotated
+    # fields must STILL resolve at the final filter via the path-independent chain
+    # collector.
+    iq = thread_like_instance()
+    iq = iq.annotate_status_at()
+    iq = iq.filter(is_open=True)
+    iq = iq.annotate_job_role_name_at()
+    iq = iq.filter(title="x")
+    iq.filter(_status__icontains="instchain")
+    iq.filter(_job_role_name__icontains="instchain2")
+
+
+def string_literal_annotate_guard_examples():
+    # An annotate-like substring INSIDE a string literal must NOT mint a phantom
+    # virtual field. Only the real custom annotate (_status) should resolve.
+    sq = QuestionThread.objects.filter(title=".annotate(phantom_field=1)")
+    sq = sq.annotate_status_at()
+    sq.filter(_status__icontains="strlit")
+
+
+def method_body_string_guard_examples():
+    # Custom annotate method whose BODY has annotate-like text in a string/comment.
+    QuestionThread.objects.annotate_with_sqlish().filter(_real__gte=1)
+
+
+def related_query_name_examples():
+    # Reverse relation addressed by its related_query_name (NOT the related_name
+    # accessor): valid Django that must resolve through to the related model.
+    QuestionThread.objects.values("tmeta__note")
+    QuestionThread.objects.filter(tmeta__note="x")
+
+
+def multiline_values_related_query_examples():
+    # related_query_name field on a SEPARATE line from .values( — multi-line
+    # argument lists must still resolve the field path (and hover).
+    QuestionThread.objects.values(
+        "title",
+        "tmeta__note",
+        "company__name",
+    )
+
+
+def user_shaped_values_examples():
+    # Mirror the real failing shape: a VARIABLE receiver, the .values() call
+    # WRAPPED in another call (like pd.DataFrame(...)), the related_query_name
+    # field deep in a long argument list on its own line.
+    qs = QuestionThread.objects.all()
+    qs = qs.annotate_message_count()
+    frame = dict(
+        qs.values(
+            "title",
+            "is_open",
+            "_message_count",
+            "company_id",
+            "company__name",
+            "tmeta__note",
+            "tmeta__thread_id",
+        )
+    )
+    return frame
+
+
+def if_block_self_reassign_chain_examples(
+    ids=None, name=None, statuses=None, roles=None, levels=None
+):
+    # EXACT real-world `hrm_emp_qs` shape: annotate chain self-reassign, then an
+    # if/elif, then a SERIES of `if cond: qs = qs.filter(_field__in=...)` blocks.
+    # Hover/completion on the LATER if-block fields must still resolve.
+    from blog.thread_source import get_threads
+    ifqs = get_threads()
+    ifqs = (
+        ifqs.annotate_status_at()
+        .annotate_employment_type_at()
+        .annotate_job_position_name_at()
+        .annotate_job_role_name_at()
+        .annotate_job_level_name_at()
+        .annotate_c1()
+        .annotate_c2()
+        .annotate_c3()
+        .annotate_c4()
+        .annotate_c5()
+        .annotate_c6()
+    )
+    if ids:
+        ifqs = ifqs.filter(id__in=ids)
+    elif name:
+        ifqs = ifqs.filter(
+            db_models.Q(title__icontains=name)
+            | db_models.Q(title__icontains=name)
+        )
+    if statuses:
+        ifqs = ifqs.filter(_status__in=statuses)
+    if roles:
+        ifqs = ifqs.filter(_job_role_name__in=roles)
+    if levels:
+        ifqs = ifqs.filter(_job_level_name__in=levels)
+    # Extra self-reassignment depth (mirrors a long real chain) so the receiver
+    # walk for the DEEPEST field must traverse many reassignment levels — this is
+    # what exceeds the receiver-resolution visited cap in the real hrm_emp_qs.
+    if statuses:
+        ifqs = ifqs.filter(is_open=True)
+    if statuses:
+        ifqs = ifqs.filter(title__icontains="a")
+    if statuses:
+        ifqs = ifqs.filter(title__icontains="b")
+    if statuses:
+        ifqs = ifqs.filter(title__icontains="c")
+    if statuses:
+        ifqs = ifqs.filter(title__icontains="d")
+    if statuses:
+        ifqs = ifqs.filter(_status__in=["deepstatus"])
+    return ifqs

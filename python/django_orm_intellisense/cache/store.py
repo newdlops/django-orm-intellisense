@@ -16,7 +16,10 @@ from ..semantic.graph import ModelGraph, ModelGraphEdge, ModelGraphNode
 from ..static_index.indexer import ModuleIndex, StaticIndex, build_static_index
 from ..static_index.indexer import FieldCandidate, ModelCandidate
 
-CACHE_SCHEMA_VERSION = 16
+# Bumped to 17: reverse relations are now registered under their query name
+# (related_query_name) in addition to the instance accessor, so cached runtime
+# inspections built before this change must be rebuilt to pick up the new names.
+CACHE_SCHEMA_VERSION = 17
 SOURCE_SNAPSHOT_CACHE_NAME = 'source-snapshot.json'
 STATIC_INDEX_CACHE_NAME = 'static-index.json'
 STATIC_INDEX_FULL_CACHE_NAME = 'static-index-full.json'
