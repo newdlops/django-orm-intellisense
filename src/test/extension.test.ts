@@ -2877,6 +2877,180 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
+  test('suppresses automatic ORM parameter hints without disabling manual signature help', async function () {
+    this.timeout(30_000);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+
+    const document = await openFixtureDocument(
+      fixtureRoot,
+      'blog/query_examples.py'
+    );
+    const editor = vscode.window.activeTextEditor;
+    assert.ok(editor, 'Expected the fixture document to be visible.');
+    assert.strictEqual(editor!.document.uri.toString(), document.uri.toString());
+
+    let fallbackCalls = 0;
+    const fallbackSignatureProvider =
+      vscode.languages.registerSignatureHelpProvider(
+        // Register a competing provider after the extension, then explicitly
+        // promote the extension below to reproduce its ordering ahead of
+        // generic Python providers such as Pylance.
+        'python',
+        {
+          provideSignatureHelp() {
+            fallbackCalls++;
+            const fallbackHelp = new vscode.SignatureHelp();
+            fallbackHelp.signatures = [
+              new vscode.SignatureInformation('fallback(*args, **kwargs)'),
+            ];
+            fallbackHelp.activeSignature = 0;
+            fallbackHelp.activeParameter = 0;
+            return fallbackHelp;
+          },
+        },
+        '(',
+        ','
+      );
+
+    try {
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0,
+        10_000
+      );
+      await delay(250);
+      promotePythonProvidersForTesting('signature-overlap-test');
+      await delay(500);
+
+      const filterCall = 'Post.objects.filter()';
+      const openParenPosition = positionAfterTextInContainer(
+        document,
+        filterCall,
+        'Post.objects.filter'
+      );
+      const removeParentheses = new vscode.WorkspaceEdit();
+      removeParentheses.delete(
+        document.uri,
+        new vscode.Range(openParenPosition, openParenPosition.translate(0, 2))
+      );
+      assert.strictEqual(
+        await vscode.workspace.applyEdit(removeParentheses),
+        true,
+        'Expected the fixture call parentheses to be removed before typing.'
+      );
+
+      editor!.selection = new vscode.Selection(
+        openParenPosition,
+        openParenPosition
+      );
+      await vscode.commands.executeCommand(
+        'workbench.action.focusActiveEditorGroup'
+      );
+      await vscode.commands.executeCommand('type', { text: '(' });
+
+      // Signature help is delayed by VS Code before providers are queried.
+      // Give the real ORM provider enough time to resolve and return its empty
+      // automatic result; a missing/undefined result would continue into the
+      // lower-priority fallback provider.
+      await delay(1_500);
+      assert.strictEqual(
+        fallbackCalls,
+        0,
+        'Expected automatic ORM signature help to stop lower-priority providers so no parameter-hints panel can cover autocomplete.'
+      );
+
+      await vscode.commands.executeCommand('closeParameterHints');
+      if (document.isDirty) {
+        await vscode.commands.executeCommand('workbench.action.files.revert');
+      }
+      await delay(300);
+
+      const nonOrmCall = 'Post.objects.filter()';
+      const receiverEnd = positionAfterTextInContainer(
+        document,
+        nonOrmCall,
+        'Post.objects'
+      );
+      const nonOrmEdit = new vscode.WorkspaceEdit();
+      nonOrmEdit.replace(
+        document.uri,
+        new vscode.Range(
+          receiverEnd.translate(0, -'Post.objects'.length),
+          receiverEnd
+        ),
+        'plain_collection'
+      );
+      assert.strictEqual(
+        await vscode.workspace.applyEdit(nonOrmEdit),
+        true,
+        'Expected a temporary non-ORM filter receiver for the control case.'
+      );
+      const nonOrmOpenParen = positionAfterTextInContainer(
+        document,
+        'plain_collection.filter()',
+        'plain_collection.filter'
+      );
+      const removeNonOrmParentheses = new vscode.WorkspaceEdit();
+      removeNonOrmParentheses.delete(
+        document.uri,
+        new vscode.Range(nonOrmOpenParen, nonOrmOpenParen.translate(0, 2))
+      );
+      assert.strictEqual(
+        await vscode.workspace.applyEdit(removeNonOrmParentheses),
+        true,
+        'Expected the control call parentheses to be removed before typing.'
+      );
+      editor!.selection = new vscode.Selection(nonOrmOpenParen, nonOrmOpenParen);
+      await vscode.commands.executeCommand('type', { text: '(' });
+      await delay(1_500);
+      assert.ok(
+        fallbackCalls > 0,
+        'Expected a non-ORM filter() call to fall through to normal Python signature providers.'
+      );
+
+      await vscode.commands.executeCommand('closeParameterHints');
+      if (document.isDirty) {
+        await vscode.commands.executeCommand('workbench.action.files.revert');
+      }
+      fallbackCalls = 0;
+      await delay(300);
+      const manualSignaturePosition = positionAfterTextInContainer(
+        document,
+        "Post.objects.create(ti='draft', author_i=1)",
+        'ti'
+      );
+
+      const manualSignatureHelp =
+        await vscode.commands.executeCommand<vscode.SignatureHelp>(
+          'vscode.executeSignatureHelpProvider',
+          document.uri,
+          manualSignaturePosition
+        );
+
+      assert.ok(
+        manualSignatureHelp?.signatures[0]?.label.includes('create(*,'),
+        `Expected explicit Parameter Hints invocation to keep the rich Django ORM signature. Received: ${manualSignatureHelp?.signatures[0]?.label}`
+      );
+      assert.ok(
+        manualSignatureHelp?.signatures[0]?.label.includes('title: CharField'),
+        `Expected the explicit ORM signature to include model fields. Received: ${manualSignatureHelp?.signatures[0]?.label}`
+      );
+      assert.strictEqual(
+        fallbackCalls,
+        0,
+        'Expected the Django ORM provider to handle explicit signature help before the fallback provider.'
+      );
+    } finally {
+      fallbackSignatureProvider.dispose();
+      await vscode.commands.executeCommand('closeParameterHints');
+      await vscode.window.showTextDocument(document);
+      if (document.isDirty) {
+        await vscode.commands.executeCommand('workbench.action.files.revert');
+      }
+    }
+  });
+
   test('supports create-like field contexts through queryset and instance-related receivers', async function () {
     this.timeout(60_000);
 

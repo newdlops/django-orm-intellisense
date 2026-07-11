@@ -1391,6 +1391,8 @@ class DaemonServer:
                     workspace_root,
                     source_fingerprint=source_snapshot.fingerprint,
                     runtime_fingerprint=_runtime_cache_fingerprint(runtime),
+                    static_index=static_index,
+                    model_graph=model_graph,
                 )
                 if cached is not None:
                     # captain regression: cache hit 케이스도 graph gap 진단

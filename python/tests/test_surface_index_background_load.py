@@ -147,6 +147,16 @@ class CaptainSurfaceIndexBackgroundLoadTest(unittest.TestCase):
             cache_idx, prebuild_idx,
             'cache load 가 prebuild 보다 먼저 시도되어야 옵션 D 의미 있음',
         )
+        self.assertIn(
+            'static_index=static_index',
+            worker_src,
+            'cache hit는 현재 concrete model/field coverage를 검증해야 함',
+        )
+        self.assertIn(
+            'model_graph=model_graph',
+            worker_src,
+            'cache hit는 현재 graph label/field coverage를 검증해야 함',
+        )
 
     def test_thread_name_indicates_load_or_prebuild_pattern(self) -> None:
         """thread name 이 옵션 D 의 두 시나리오를 모두 반영."""

@@ -324,12 +324,32 @@ def load_cached_runtime_inspection(
         return None
 
     try:
-        return RuntimeInspection.from_cache_dict(dict(cached_payload))
+        runtime = RuntimeInspection.from_cache_dict(dict(cached_payload))
     except (KeyError, TypeError, ValueError):
         _unlink_quietly(
             _workspace_cache_dir(workspace_root) / RUNTIME_CACHE_NAME
         )
         return None
+
+    # A failed django.setup() is often transient (an import race, a temporarily
+    # unavailable environment variable, or a dependency that is still being
+    # installed). Persisting that result pins the daemon to an empty runtime
+    # catalog even after the project is healthy again. The static fallback then
+    # has little to work with for dynamic/inherited models and completion
+    # collapses to the synthetic ``id``/``pk`` fields until the user clears the
+    # cache manually.
+    #
+    # Also reject internally inconsistent ``ready`` payloads. Older/partial
+    # cache files can deserialize successfully while carrying fewer models or
+    # fields than their counters advertise; treating them as hits produces the
+    # same permanently truncated completion surface.
+    if not _runtime_inspection_is_cacheable(runtime):
+        _unlink_quietly(
+            _workspace_cache_dir(workspace_root) / RUNTIME_CACHE_NAME
+        )
+        return None
+
+    return runtime
 
 
 def save_runtime_inspection(
@@ -338,8 +358,16 @@ def save_runtime_inspection(
     settings_module: str | None,
     runtime: RuntimeInspection,
 ) -> None:
+    cache_path = _workspace_cache_dir(workspace_root) / RUNTIME_CACHE_NAME
+    if not _runtime_inspection_is_cacheable(runtime):
+        # Remove a previous result for the same workspace as well. Its metadata
+        # may happen to match this launch, and a later restart must retry the
+        # runtime inspection instead of reviving stale/incomplete state.
+        _unlink_quietly(cache_path)
+        return
+
     _write_cache_payload(
-        _workspace_cache_dir(workspace_root) / RUNTIME_CACHE_NAME,
+        cache_path,
         {
             'metadata': {
                 'schemaVersion': CACHE_SCHEMA_VERSION,
@@ -415,6 +443,9 @@ def load_cached_surface_index(
     workspace_root: Path,
     source_fingerprint: str,
     runtime_fingerprint: str,
+    *,
+    static_index: StaticIndex | None = None,
+    model_graph: ModelGraph | None = None,
 ) -> dict[str, object] | None:
     payload = _read_cache_payload(
         _workspace_cache_dir(workspace_root) / SURFACE_INDEX_CACHE_NAME
@@ -438,7 +469,24 @@ def load_cached_surface_index(
     if not isinstance(cached_payload, dict):
         return None
 
-    return dict(cached_payload)
+    surface_index = dict(cached_payload)
+    cache_problem = _surface_index_cache_problem(
+        surface_index,
+        static_index=static_index,
+        model_graph=model_graph,
+    )
+    if cache_problem is not None:
+        print(
+            f'[cache] reject_surface_index workspace={workspace_root.name} '
+            f'reason={cache_problem}',
+            file=sys.stderr,
+        )
+        _unlink_quietly(
+            _workspace_cache_dir(workspace_root) / SURFACE_INDEX_CACHE_NAME
+        )
+        return None
+
+    return surface_index
 
 
 def save_surface_index(
@@ -496,6 +544,123 @@ def _runtime_environment_fingerprint() -> str:
         ]
     )
     return sha256(fingerprint_source.encode('utf-8')).hexdigest()
+
+
+def _runtime_inspection_is_cacheable(runtime: RuntimeInspection) -> bool:
+    """Return whether *runtime* is safe to reuse across daemon launches.
+
+    ``setup_failed`` and ``warming_up`` are session states, not durable project
+    facts. For a ready inspection, the summary counters form a cheap integrity
+    check that catches successfully decoded but truncated catalogs.
+    """
+    if runtime.bootstrap_status in {'setup_failed', 'warming_up'}:
+        return False
+    if runtime.bootstrap_status != 'ready':
+        return True
+
+    if len(runtime.model_catalog) != runtime.model_count:
+        return False
+    if len({model.label for model in runtime.model_catalog}) != runtime.model_count:
+        return False
+
+    field_count = sum(len(model.field_names) for model in runtime.model_catalog)
+    relation_count = sum(
+        len(model.relation_names) for model in runtime.model_catalog
+    )
+    reverse_relation_count = sum(
+        len(model.reverse_relation_names) for model in runtime.model_catalog
+    )
+    manager_count = sum(
+        len(model.manager_names) for model in runtime.model_catalog
+    )
+    if (
+        field_count != runtime.field_count
+        or relation_count != runtime.relation_count
+        or reverse_relation_count != runtime.reverse_relation_count
+        or manager_count != runtime.manager_count
+    ):
+        return False
+
+    for model in runtime.model_catalog:
+        serialized_field_names = {field.name for field in model.fields}
+        expected_field_names = {
+            *model.field_names,
+            *model.reverse_relation_names,
+        }
+        if not expected_field_names.issubset(serialized_field_names):
+            return False
+
+    return True
+
+
+def _surface_index_cache_problem(
+    surface_index: dict[str, object],
+    *,
+    static_index: StaticIndex | None,
+    model_graph: ModelGraph | None,
+) -> str | None:
+    """Describe why a cached completion surface is incomplete, if known.
+
+    Fingerprints protect against source changes, but they cannot identify a
+    cache written by an older buggy/incomplete prebuild with the same metadata.
+    Validate the cheap, user-visible contract: every concrete static model must
+    have a surface entry, and every field known by the current graph/static
+    index must appear in that entry's instance members.
+    """
+    if static_index is None:
+        return None
+
+    graph_node_by_module_and_name: dict[tuple[str, str], ModelGraphNode] = {}
+    if model_graph is not None:
+        for node in model_graph.nodes_by_label.values():
+            if not node.module:
+                continue
+            # Mirror orm_members._build_static_to_graph_label_map: the first
+            # graph node for a module/object pair is the canonical surface key.
+            graph_node_by_module_and_name.setdefault(
+                (node.module, node.object_name),
+                node,
+            )
+
+    missing_models: list[str] = []
+    missing_fields: list[str] = []
+    for candidate in static_index.concrete_model_candidates:
+        graph_node = graph_node_by_module_and_name.get(
+            (candidate.module, candidate.object_name)
+        )
+        surface_label = graph_node.label if graph_node is not None else candidate.label
+        model_entry = surface_index.get(surface_label)
+        if not isinstance(model_entry, dict):
+            missing_models.append(surface_label)
+            continue
+
+        expected_field_names = {
+            field.name for field in static_index.fields_for_model(candidate.label)
+        }
+        if graph_node is not None:
+            expected_field_names.update(graph_node.field_names)
+        if not expected_field_names:
+            continue
+
+        instance_entry = model_entry.get('instance')
+        cached_field_names = (
+            set(instance_entry.keys())
+            if isinstance(instance_entry, dict)
+            else set()
+        )
+        absent = sorted(expected_field_names - cached_field_names)
+        if absent:
+            missing_fields.append(
+                f'{surface_label}:[{",".join(absent[:8])}]'
+            )
+
+    if missing_models:
+        sample = ','.join(sorted(set(missing_models))[:8])
+        return f'missing_models count={len(set(missing_models))} sample={sample}'
+    if missing_fields:
+        sample = ','.join(missing_fields[:8])
+        return f'missing_fields count={len(missing_fields)} sample={sample}'
+    return None
 
 
 def _read_cache_payload(cache_path: Path) -> dict[str, object] | None:

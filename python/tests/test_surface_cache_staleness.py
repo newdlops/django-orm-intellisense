@@ -19,10 +19,13 @@ captain 로그(`log.txt:32`)에서 발견:
   (1) 현재 동작 (`CACHE_SCHEMA_VERSION` 가드만 작동) — schemaVersion이 다르면
       캐시가 None을 반환해 재빌드됨. 단순 dump-then-load 라운드트립으로 확인.
 
-  (2) **현재 잡히지 않는 stale 패턴** — schemaVersion이 같지만 캐시 내용이
+  (2) schemaVersion이 같지만 캐시 내용이
       현재 ModelGraph 라벨과 mismatch (옛 zuzu.* 키만 있고 db.* 키 없음).
-      이 케이스에서 시스템이 mismatch를 감지하고 재빌드/경고하는지 검증.
-      현재는 mismatch가 감지되지 않고 옛 캐시가 그대로 사용됨 — captain 재현.
+      현재 static/graph contract와 대조해 mismatch를 감지하고 재빌드하는지 검증.
+
+  (3) 모델 키는 있지만 instance surface가 id만 가진 partial cache도 reject.
+      이 형태를 신뢰하면 TS가 fallback을 합치지 않고 pk만 추가하므로 사용자는
+      id/pk 두 필드만 보게 된다.
 
 실행:
     PYTHONPATH=python python3 -m unittest python.tests.test_surface_cache_staleness -v
@@ -78,12 +81,16 @@ def _build_captain_inputs() -> tuple[StaticIndex, RuntimeInspection]:
     runtime_model = RuntimeModelSummary(
         label='db.Company',
         module='zuzu.db.models.company.company',
-        field_names=['id'],
+        field_names=['id', 'name'],
         relation_names=[],
         reverse_relation_names=[],
         fields=[
             RuntimeFieldSummary(
                 name='id', field_kind='AutoField',
+                is_relation=False, related_model_label=None, direction=None,
+            ),
+            RuntimeFieldSummary(
+                name='name', field_kind='CharField',
                 is_relation=False, related_model_label=None, direction=None,
             ),
         ],
@@ -97,7 +104,7 @@ def _build_captain_inputs() -> tuple[StaticIndex, RuntimeInspection]:
         bootstrap_status='ready',
         settings_module='zuzu.settings',
         bootstrap_error=None,
-        app_count=1, model_count=1, field_count=1,
+        app_count=1, model_count=1, field_count=2,
         relation_count=0, reverse_relation_count=0, manager_count=1,
         model_catalog=[runtime_model],
         model_preview=[runtime_model],
@@ -166,11 +173,11 @@ class CaptainStaleSurfaceCacheTest(unittest.TestCase):
             '키 의미 변경 시 schemaVersion bump가 안전한 buster.',
         )
 
-    def test_stale_surface_keys_silently_pass_when_fingerprints_match(
+    def test_stale_surface_keys_are_rejected_when_fingerprints_match(
         self,
     ) -> None:
-        """**버그 재현**: source/runtime fingerprint가 동일하면, surface 키가
-        현재 graph 라벨과 mismatch 해도 캐시가 그대로 로드됨.
+        """source/runtime fingerprint가 같아도 현재 graph 라벨과 mismatch한
+        surface cache는 무효화되어야 한다.
 
         captain 시나리오:
           - 옵션 C 이전 빌드가 surface 캐시를 `{zuzu.Company: ...}`로 저장
@@ -179,7 +186,7 @@ class CaptainStaleSurfaceCacheTest(unittest.TestCase):
             옛 캐시가 그대로 hit. 새 코드가 만들었어야 할 `{db.Company: ...}`는
             반영되지 않음.
 
-        이 테스트는 현재 동작을 문서화 — 의도된 버그 노출. 가드 추가가 필요.
+        캐시 로드는 None을 반환하고 background prebuild가 새 surface를 만든다.
         """
         save_surface_index(
             workspace_root=self._workspace_root,
@@ -189,29 +196,70 @@ class CaptainStaleSurfaceCacheTest(unittest.TestCase):
             surface_index={'zuzu.Company': {'model_class': {}}},
         )
 
+        static_index, runtime = _build_captain_inputs()
+        model_graph = build_model_graph(static_index, runtime)
         loaded = load_cached_surface_index(
             workspace_root=self._workspace_root,
             source_fingerprint='src-fp',
             runtime_fingerprint='rt-fp',
+            static_index=static_index,
+            model_graph=model_graph,
         )
-        # 현재 가드 부재 — 옛 키 그대로 로드됨. 이게 captain의 문제.
-        self.assertEqual(
-            loaded, {'zuzu.Company': {'model_class': {}}},
-            'captain 패턴 재현: surface 키가 옛 형식이어도 캐시 가드가 잡지 못함.',
+        self.assertIsNone(
+            loaded,
+            '옛 candidate label surface는 reject되어 자동 prebuild로 넘어가야 함.',
         )
-        # 이 캐시 결과를 현재 ModelGraph와 합쳤을 때 갭이 노출되는지 확인.
-        static_index, runtime = _build_captain_inputs()
-        model_graph = build_model_graph(static_index, runtime)
         # 정상 빌드라면 surface는 'db.Company' 키를 가져야 함.
         expected_fresh = build_surface_index(static_index, runtime, model_graph)
         self.assertIn(
             'db.Company', expected_fresh,
             'sanity: 옵션 C 적용 빌드는 db.Company 키로 surface 생성.',
         )
-        self.assertNotIn(
-            'db.Company', loaded,
-            'captain 증상: 캐시된 surface 는 db.Company 키가 없어서 TS의 '
-            'Pylance 라벨 조회가 영원히 미스.',
+        cache_path = (
+            cache_store._workspace_cache_dir(self._workspace_root)
+            / cache_store.SURFACE_INDEX_CACHE_NAME
+        )
+        self.assertFalse(
+            cache_path.exists(),
+            'reject된 cache 파일을 삭제해야 다음 load도 같은 bad hit를 반복하지 않음.',
+        )
+
+    def test_id_only_surface_is_rejected_before_ts_can_add_only_pk(self) -> None:
+        """모델 키가 있어도 graph의 실제 필드가 빠진 partial cache는 miss.
+
+        TS workspace index는 surface 모델을 static fallback보다 우선하고 id가
+        있으면 pk만 합성한다. 따라서 이 payload를 hit로 취급하면 정확히
+        id/pk-only 자동완성이 고정된다.
+        """
+        static_index, runtime = _build_captain_inputs()
+        model_graph = build_model_graph(static_index, runtime)
+        save_surface_index(
+            workspace_root=self._workspace_root,
+            source_fingerprint='src-fp',
+            runtime_fingerprint='rt-fp',
+            surface_index={
+                'db.Company': {
+                    'instance': {
+                        'id': ['scalar', 'db.Company', 'field', 'AutoField'],
+                    },
+                    'model_class': {
+                        'objects': ['manager', 'db.Company', 'manager', None],
+                    },
+                },
+            },
+        )
+
+        loaded = load_cached_surface_index(
+            workspace_root=self._workspace_root,
+            source_fingerprint='src-fp',
+            runtime_fingerprint='rt-fp',
+            static_index=static_index,
+            model_graph=model_graph,
+        )
+
+        self.assertIsNone(
+            loaded,
+            'graph field name이 빠진 surface는 cache miss로 처리되어야 함.',
         )
 
     def test_pre_option_c_cache_schema_15_is_invalidated_on_load(self) -> None:

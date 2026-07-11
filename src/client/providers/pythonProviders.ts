@@ -1207,6 +1207,42 @@ export function registerPythonProviders(
   let providersDisposed = false;
   let diagnosticsDisposed = false;
   let activeCompletionCount = 0;
+  const parameterHintDismissTimers = new Set<ReturnType<typeof setTimeout>>();
+  const dismissParameterHintsForOrmCompletion = (
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    documentVersion: number
+  ): void => {
+    for (const timer of parameterHintDismissTimers) {
+      clearTimeout(timer);
+    }
+    parameterHintDismissTimers.clear();
+
+    // Signature help is delayed by the editor and other providers can finish
+    // after our local completion fast path. Retry briefly so a late Pylance
+    // widget cannot reopen over the ORM suggestions. Guards keep these timers
+    // scoped to the exact editor state that produced the completion result.
+    for (const delayMs of [0, 160, 360, 700]) {
+      const timer = setTimeout(() => {
+        parameterHintDismissTimers.delete(timer);
+        const editor = vscode.window.activeTextEditor;
+        if (
+          providersDisposed ||
+          !editor ||
+          editor.document.uri.toString() !== document.uri.toString() ||
+          editor.document.version !== documentVersion ||
+          !editor.selection.active.isEqual(position)
+        ) {
+          return;
+        }
+        void vscode.commands.executeCommand('closeParameterHints').then(
+          () => undefined,
+          () => undefined
+        );
+      }, delayMs);
+      parameterHintDismissTimers.add(timer);
+    }
+  };
   // Disposal signal: rejects when providers are disposed, used with Promise.race
   // to immediately abort in-flight hover/completion/definition/signature calls.
   let fireDisposalSignal: (() => void) | undefined;
@@ -2583,11 +2619,40 @@ export function registerPythonProviders(
         const tokenAbort = new Promise<undefined>((resolve) => {
           token.onCancellationRequested(() => resolve(undefined));
         });
+        const documentVersion = document.version;
+        const relationContext = relationCompletionContext(document, position);
+        const lookupContext =
+          lookupCompletionContext(document, position) ??
+          prefetchLookupCompletionContext(document, position) ??
+          lookupDictKeyCompletionContext(document, position) ??
+          expressionPathCompletionContext(document, position) ??
+          fExpressionCompletionContext(document, position) ??
+          keywordLookupCompletionContext(document, position);
+        const directFieldContext = directFieldKeywordCompletionContext(
+          document,
+          position
+        );
+        const metaConstraintLookupContext = metaConstraintLookupCompletionContext(
+          document,
+          position
+        );
+        const schemaFieldContext = schemaFieldCompletionContext(document, position);
+        const bulkUpdateFieldContext = bulkUpdateFieldListCompletionContext(
+          document,
+          position
+        );
+        const shouldDismissParameterHints = Boolean(
+          relationContext ||
+          lookupContext ||
+          directFieldContext ||
+          metaConstraintLookupContext ||
+          schemaFieldContext ||
+          bulkUpdateFieldContext
+        );
         const compResult = await Promise.race([
         daemon.withDeadline(compStart + COMP_TIMEOUT_MS, () =>
         daemon.withAbortSignal(compAbort.signal, () =>
         daemon.withRequestSource('completion', async () => {
-        const relationContext = relationCompletionContext(document, position);
         if (relationContext) {
           try {
             await daemon.ensureStarted(document.uri);
@@ -2619,27 +2684,6 @@ export function registerPythonProviders(
             return undefined;
           }
         }
-
-        const lookupContext =
-          lookupCompletionContext(document, position) ??
-          prefetchLookupCompletionContext(document, position) ??
-          lookupDictKeyCompletionContext(document, position) ??
-          expressionPathCompletionContext(document, position) ??
-          fExpressionCompletionContext(document, position) ??
-          keywordLookupCompletionContext(document, position);
-        const directFieldContext = directFieldKeywordCompletionContext(
-          document,
-          position
-        );
-        const metaConstraintLookupContext = metaConstraintLookupCompletionContext(
-          document,
-          position
-        );
-        const schemaFieldContext = schemaFieldCompletionContext(document, position);
-        const bulkUpdateFieldContext = bulkUpdateFieldListCompletionContext(
-          document,
-          position
-        );
 
         try {
           await daemon.ensureStarted(document.uri);
@@ -3219,6 +3263,16 @@ export function registerPythonProviders(
         ]);
         compAbort.abort();
         clearTimeout(compTimeout);
+        const hasCompletionItems = compResult instanceof vscode.CompletionList
+          ? compResult.items.length > 0
+          : Array.isArray(compResult) && compResult.length > 0;
+        if (shouldDismissParameterHints && hasCompletionItems) {
+          dismissParameterHintsForOrmCompletion(
+            document,
+            position,
+            documentVersion
+          );
+        }
         return compResult;
         } catch (error) {
           daemon.logDiagnostic(`[completion:error] ${error instanceof Error ? error.message : String(error)}`);
@@ -3239,7 +3293,7 @@ export function registerPythonProviders(
   const signatureHelpProvider = vscode.languages.registerSignatureHelpProvider(
     pythonSelector,
     {
-      async provideSignatureHelp(document, position, token) {
+      async provideSignatureHelp(document, position, token, context) {
         if (providersDisposed || token.isCancellationRequested) {
           return undefined;
         }
@@ -3272,6 +3326,22 @@ export function registerPythonProviders(
               return undefined;
             }
 
+            if (
+              context.triggerKind !== vscode.SignatureHelpTriggerKind.Invoke
+            ) {
+              // A trigger character starts signature help and completion in
+              // parallel. Returning an empty (but defined) result stops later
+              // providers such as Pylance from opening a parameter-hints widget
+              // over the ORM field suggestions. VS Code treats zero signatures
+              // as "hide/cancel", while an explicit Parameter Hints command
+              // still takes the rich signature path below.
+              const suppressed = new vscode.SignatureHelp();
+              suppressed.signatures = [];
+              suppressed.activeSignature = 0;
+              suppressed.activeParameter = 0;
+              return suppressed;
+            }
+
             const result = await listLookupPathCompletionsFast(
               daemon,
               baseModelLabel,
@@ -3298,6 +3368,9 @@ export function registerPythonProviders(
       },
     },
     {
+      // Participate in automatic signature dispatch so this provider can
+      // suppress overlapping parameter hints specifically for resolved ORM
+      // calls. Explicit Parameter Hints invocation remains fully supported.
       triggerCharacters: ['(', ','],
       retriggerCharacters: [','],
     }
@@ -4428,6 +4501,10 @@ export function registerPythonProviders(
       lastDiagnosedDocumentVersions.clear();
       partialDiagnosticResults.clear();
       activeDiagnosticScans.clear();
+      for (const timer of parameterHintDismissTimers) {
+        clearTimeout(timer);
+      }
+      parameterHintDismissTimers.clear();
       diagnosticCollection.dispose();
     }),
   ];
