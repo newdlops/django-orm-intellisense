@@ -519,6 +519,13 @@ def _build_fields_by_name(
             model_label=model_label,
             fields_by_name=fields_by_name,
         )
+    else:
+        _add_implicit_primary_key_fields(
+            static_index=static_index,
+            model_label=model_label,
+            static_source_label=static_source_label,
+            fields_by_name=fields_by_name,
+        )
     return fields_by_name
 
 
@@ -632,6 +639,61 @@ def _remap_field_candidate_labels(
 
 def _model_object_name(model_label: str) -> str:
     return model_label.split('.', 1)[1]
+
+
+def _add_implicit_primary_key_fields(
+    *,
+    static_index: StaticIndex,
+    model_label: str,
+    static_source_label: str,
+    fields_by_name: dict[str, FieldCandidate],
+) -> None:
+    """Add Django's default primary key while runtime metadata is unavailable.
+
+    Django adds an ``id`` field to every concrete model that does not declare a
+    primary key, and exposes ``pk`` as an alias for that field.  The static
+    index only sees assignments written in source, so neither name exists
+    during the deferred-runtime window.  Diagnostics run in that window and
+    must not report valid ``id``/``pk`` lookups as unknown.
+
+    Once runtime inspection is ready, its field catalog is authoritative and
+    this fallback is not used.  That preserves models with a custom primary
+    key, which genuinely do not have an ``id`` attribute.
+    """
+    model_candidate = static_index.find_model_candidate(static_source_label)
+    if model_candidate is None:
+        model_candidate = static_index.find_model_candidate(model_label)
+
+    anchor_field = next(iter(fields_by_name.values()), None)
+    if model_candidate is not None:
+        file_path = model_candidate.file_path
+        line = model_candidate.line
+        column = model_candidate.column
+    elif anchor_field is not None:
+        file_path = anchor_field.file_path
+        line = anchor_field.line
+        column = anchor_field.column
+    else:
+        file_path = ''
+        line = 1
+        column = 0
+
+    for field_name in ('id', 'pk'):
+        if field_name in fields_by_name:
+            continue
+        fields_by_name[field_name] = FieldCandidate(
+            model_label=model_label,
+            name=field_name,
+            file_path=file_path,
+            line=line,
+            column=column,
+            field_kind='BigAutoField',
+            is_relation=False,
+            relation_direction=None,
+            related_model_label=None,
+            declared_model_label=model_label,
+            source='synthetic',
+        )
 
 
 def _add_primary_key_alias_field(

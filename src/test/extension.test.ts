@@ -9858,6 +9858,12 @@ suite('Django ORM Intellisense UI', () => {
       diagnostics.every((item) => !item.message.includes('`pk`')),
       `Expected pk lookup aliases to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
     );
+    assert.ok(
+      diagnostics.every((item) =>
+        !item.message.includes('Unknown ORM lookup segment `id`')
+      ),
+      `Expected implicit id fields to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
   });
 
   test('shows hover and definition for package re-export imports', async function () {
