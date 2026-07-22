@@ -841,10 +841,12 @@ interface DirectFieldDiagnosticContext extends DirectFieldKeywordLiteral {
 interface SchemaFieldContext {
   prefix: string;
   range: vscode.Range;
+  allowsDescendingPrefix: boolean;
 }
 
 interface SchemaFieldLiteral {
   value: string;
+  lookupValue: string;
 }
 
 interface SchemaFieldDiagnosticContext extends SchemaFieldLiteral {
@@ -2425,7 +2427,7 @@ export function registerPythonProviders(
 
           const resolution = await daemon.resolveLookupPath(
             baseModelLabel,
-            context.value,
+            context.lookupValue,
             'filter',
             /* background */ true
           );
@@ -2976,7 +2978,10 @@ export function registerPythonProviders(
             const result = await listLookupPathCompletionsFast(
               daemon,
               baseModelLabel,
-              schemaFieldContext.prefix,
+              normalizeSchemaFieldValue(
+                schemaFieldContext.prefix,
+                schemaFieldContext.allowsDescendingPrefix
+              ),
               'filter'
             );
             if (token.isCancellationRequested) {
@@ -2988,13 +2993,17 @@ export function registerPythonProviders(
             const sortedItems = prioritizeLookupCompletionItems(items, 'filter');
 
             return sortedItems.map((item, index) => {
+              const descending =
+                schemaFieldContext.allowsDescendingPrefix &&
+                schemaFieldContext.prefix.startsWith('-');
+              const insertedFieldName = descending ? `-${item.name}` : item.name;
               const completion = new vscode.CompletionItem(
                 lookupCompletionLabel(item),
                 lookupCompletionKind(item)
               );
               completion.detail = lookupCompletionDetail(item);
-              completion.insertText = item.name;
-              completion.filterText = item.name;
+              completion.insertText = insertedFieldName;
+              completion.filterText = insertedFieldName;
               completion.range = schemaFieldContext.range;
               completion.sortText = lookupCompletionSortText(
                 'filter',
@@ -3626,7 +3635,7 @@ export function registerPythonProviders(
 
             const resolution = await daemon.resolveLookupPath(
               baseModelLabel,
-              schemaFieldLiteral.value,
+              schemaFieldLiteral.lookupValue,
               'filter'
             );
             if (isCancelled()) { return undefined; }
@@ -4114,7 +4123,7 @@ export function registerPythonProviders(
 
             const resolution = await daemon.resolveLookupPath(
               baseModelLabel,
-              schemaFieldLiteral.value,
+              schemaFieldLiteral.lookupValue,
               'filter'
             );
             if (isDefCancelled()) { return undefined; }
@@ -4141,7 +4150,7 @@ export function registerPythonProviders(
                 );
                 if (ownerClass) {
                   const fieldPattern = new RegExp(
-                    String.raw`^(\s+)${escapeRegExp(schemaFieldLiteral.value)}\s*=`
+                    String.raw`^(\s+)${escapeRegExp(schemaFieldLiteral.lookupValue)}\s*=`
                   );
                   for (
                     let line = ownerClass.line + 1;
@@ -4150,7 +4159,7 @@ export function registerPythonProviders(
                   ) {
                     const lineText = document.lineAt(line).text;
                     if (fieldPattern.test(lineText)) {
-                      const col = lineText.indexOf(schemaFieldLiteral.value);
+                      const col = lineText.indexOf(schemaFieldLiteral.lookupValue);
                       return new vscode.Location(
                         document.uri,
                         new vscode.Position(line, col)
@@ -5779,13 +5788,19 @@ function schemaFieldCompletionContext(
   }
 
   const currentValue = match[2] ?? '';
+  const range = new vscode.Range(
+    position.line,
+    position.character - currentValue.length,
+    position.line,
+    position.character
+  );
   return {
     prefix: currentValue,
-    range: new vscode.Range(
-      position.line,
-      position.character - currentValue.length,
-      position.line,
-      position.character
+    range,
+    allowsDescendingPrefix: isOrderedIndexFieldsArgument(
+      document,
+      range.start,
+      range.end
     ),
   };
 }
@@ -6252,7 +6267,57 @@ function schemaFieldHoverLiteral(
     return undefined;
   }
 
-  return { value: word };
+  const allowsDescendingPrefix = isOrderedIndexFieldsArgument(
+    document,
+    wordRange.start,
+    wordRange.end
+  );
+  return {
+    value: word,
+    lookupValue: normalizeSchemaFieldValue(word, allowsDescendingPrefix),
+  };
+}
+
+function normalizeSchemaFieldValue(
+  value: string,
+  allowsDescendingPrefix: boolean
+): string {
+  return allowsDescendingPrefix && value.startsWith('-')
+    ? value.slice(1)
+    : value;
+}
+
+/**
+ * Django Index.fields accepts a leading `-` to request a descending column.
+ * Other schema lists handled by this provider (for example `include` and
+ * UniqueConstraint.fields) contain plain field names, so the prefix is only
+ * stripped when the literal is specifically inside an Index `fields=`
+ * argument.
+ */
+function isOrderedIndexFieldsArgument(
+  document: vscode.TextDocument,
+  start: vscode.Position,
+  end: vscode.Position
+): boolean {
+  const text = getDocumentText(document);
+  const startOffset = document.offsetAt(start);
+  const openParenOffset = findEnclosingCallOpenParenOffset(text, startOffset);
+  if (openParenOffset === undefined) {
+    return false;
+  }
+
+  const callName = normalizedEnclosingCallName(text, openParenOffset);
+  if (!callName?.endsWith('Index')) {
+    return false;
+  }
+
+  const argument = describeEnclosingCallArgument(
+    text,
+    openParenOffset,
+    startOffset,
+    document.offsetAt(end)
+  );
+  return argument.keywordName === 'fields';
 }
 
 function metaConstraintLookupLiteral(
@@ -8984,7 +9049,7 @@ function findSchemaFieldDiagnosticContexts(
       }
       seen.add(key);
       contexts.push({
-        value: context.value,
+        ...context,
         range: new vscode.Range(line, start, line, start + context.value.length),
       });
     }

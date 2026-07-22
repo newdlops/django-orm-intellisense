@@ -8,11 +8,13 @@ class SchemaExample(models.Model):
     code = models.CharField(max_length=32)
     author = models.ForeignKey(Author, on_delete=models.CASCADE)
     published = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         indexes = [
             models.Index(fields=['co'], name='schema_example_code_idx'),
             models.Index(fields=['author', 'pub'], name='schema_example_author_published_idx'),
+            models.Index(fields=['-created_at'], name='schema_example_created_desc_idx'),
             models.Index(fields=['bog'], name='schema_example_bog_idx'),
         ]
         constraints = [
@@ -36,3 +38,7 @@ class SchemaExample(models.Model):
                 name='schema_example_author_profile_bogus',
             ),
         ]
+
+
+def newest_schema_examples():
+    return SchemaExample.objects.order_by('-created_at')

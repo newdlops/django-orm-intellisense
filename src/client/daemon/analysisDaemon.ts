@@ -84,6 +84,13 @@ const LOCAL_LOOKUP_OPERATOR_METHODS = new Set([
 ]);
 const LOCAL_LOOKUP_CHAIN_DEPTH = 2;
 
+function normalizeLookupPathValue(value: string, method: string): string {
+  const trimmed = value.trim();
+  return method === 'order_by' && trimmed.startsWith('-')
+    ? trimmed.slice(1)
+    : trimmed;
+}
+
 const LOCAL_QUERYSET_RETURNING_METHODS = [
   'filter', 'exclude', 'all', 'annotate', 'alias', 'order_by', 'only',
   'defer', 'select_related', 'prefetch_related', 'distinct', 'using',
@@ -1142,6 +1149,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     method: string,
     background: boolean = false
   ): Promise<LookupPathResolution> {
+    const normalizedValue = normalizeLookupPathValue(value, method);
     const source = this.currentRequestSource();
     const allowLocationlessNative = background || source === 'diagnostic';
     // Native fast-path: static FSM walk on the resident model graph.
@@ -1149,7 +1157,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     // resolve. Only defer to Python when native can't answer (e.g.
     // custom runtime lookups registered via `register_lookup`).
     if (isNativeFastPathReady()) {
-      const native = nativeResolveLookupPath(baseModelLabel, value, method);
+      const native = nativeResolveLookupPath(baseModelLabel, normalizedValue, method);
       if (native) {
         if (
           native.resolved &&
@@ -1157,7 +1165,7 @@ export class AnalysisDaemon implements vscode.Disposable {
         ) {
           const localRelationOnlyCheck = this.resolveLookupPathLocal(
             baseModelLabel,
-            value,
+            normalizedValue,
             method
           );
           if (localRelationOnlyCheck?.reason === 'relation_required') {
@@ -1208,7 +1216,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
     return this.cachedRequest<LookupPathResolution>('resolveLookupPath', {
       baseModelLabel,
-      value,
+      value: normalizedValue,
       method,
     }, background);
   }
@@ -1615,7 +1623,11 @@ export class AnalysisDaemon implements vscode.Disposable {
   async resolveLookupPathBatch(
     items: Array<{ baseModelLabel: string; value: string; method: string }>
   ): Promise<LookupPathResolution[]> {
-    const results: Array<LookupPathResolution | undefined> = new Array(items.length);
+    const normalizedItems = items.map((item) => ({
+      ...item,
+      value: normalizeLookupPathValue(item.value, item.method),
+    }));
+    const results: Array<LookupPathResolution | undefined> = new Array(normalizedItems.length);
     const fallbackItems: Array<{ baseModelLabel: string; value: string; method: string }> = [];
     const fallbackIndexes: number[] = [];
 
@@ -1627,7 +1639,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       process.env.DJLS_TEST_FORCE_RUNTIME_NOT_READY === '1';
 
     if (isNativeFastPathReady()) {
-      for (const [index, item] of items.entries()) {
+      for (const [index, item] of normalizedItems.entries()) {
         const native = nativeResolveLookupPath(
           item.baseModelLabel,
           item.value,
@@ -1667,7 +1679,7 @@ export class AnalysisDaemon implements vscode.Disposable {
         fallbackItems.push(item);
       }
     } else {
-      for (const [index, item] of items.entries()) {
+      for (const [index, item] of normalizedItems.entries()) {
         if (skipPythonForUnresolved) {
           const local = this.resolveLookupPathLocal(
             item.baseModelLabel,
@@ -1711,10 +1723,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     value: string,
     method: string
   ): LookupPathResolution | undefined {
-    const normalizedValue =
-      method === 'order_by' && value.trim().startsWith('-')
-        ? value.trim().slice(1)
-        : value.trim();
+    const normalizedValue = normalizeLookupPathValue(value, method);
     if (!normalizedValue) {
       return { resolved: false, reason: 'empty', baseModelLabel };
     }
@@ -2010,10 +2019,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     prefix: string,
     method: string,
   ): { completedSegments: string[]; currentPartial: string } {
-    const normalizedPrefix =
-      method === 'order_by' && prefix.trim().startsWith('-')
-        ? prefix.trim().slice(1)
-        : prefix.trim();
+    const normalizedPrefix = normalizeLookupPathValue(prefix, method);
     const endsWithSeparator = normalizedPrefix.endsWith('__');
     const rawSegments = normalizedPrefix.split('__').filter(Boolean);
     const currentPartial = endsWithSeparator

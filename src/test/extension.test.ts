@@ -4306,6 +4306,32 @@ suite('Django ORM Intellisense UI', () => {
       'Expected Meta field-list completion to include `published`.'
     );
 
+    const descendingIndexCompletionPosition = positionAfterTextInContainer(
+      document,
+      "fields=['-created_at']",
+      '-cre'
+    );
+    const descendingIndexCompletionList =
+      await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider',
+        document.uri,
+        descendingIndexCompletionPosition
+      );
+
+    assert.ok(
+      hasCompletionItemLabel(descendingIndexCompletionList?.items, 'created_at'),
+      'Expected descending Meta Index field completion to include `created_at`.'
+    );
+    const descendingIndexCompletionItem = findCompletionItemByLabel(
+      descendingIndexCompletionList?.items,
+      'created_at'
+    );
+    assert.strictEqual(
+      descendingIndexCompletionItem?.insertText,
+      '-created_at',
+      'Expected descending Meta Index completion to preserve the `-` prefix.'
+    );
+
     const hoverPosition = positionInsideText(
       document,
       "fields=['code', 'author']",
@@ -4327,6 +4353,23 @@ suite('Django ORM Intellisense UI', () => {
       `Expected Meta field hover to mention the resolved field kind. Received: ${hoverText}`
     );
 
+    const descendingIndexHoverPosition = positionInsideText(
+      document,
+      "fields=['-created_at']",
+      'created_at'
+    );
+    const descendingIndexHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider',
+      document.uri,
+      descendingIndexHoverPosition
+    );
+    const descendingIndexHoverText = stringifyHovers(descendingIndexHovers);
+
+    assert.ok(
+      descendingIndexHoverText.includes('Owner model: `blog.SchemaExample`'),
+      `Expected descending Meta Index field hover to resolve the owner model. Received: ${descendingIndexHoverText}`
+    );
+
     const definitions = await vscode.commands.executeCommand<
       Array<vscode.Location | vscode.LocationLink>
     >('vscode.executeDefinitionProvider', document.uri, hoverPosition);
@@ -4338,6 +4381,22 @@ suite('Django ORM Intellisense UI', () => {
         path.join('fixtures', 'minimal_project', 'blog', 'schema_examples.py')
       ),
       `Expected Meta field definition to target schema_examples.py. Received: ${definitionTarget!.uri.fsPath}`
+    );
+
+    const descendingIndexDefinitions = await vscode.commands.executeCommand<
+      Array<vscode.Location | vscode.LocationLink>
+    >(
+      'vscode.executeDefinitionProvider',
+      document.uri,
+      descendingIndexHoverPosition
+    );
+    const descendingIndexDefinitionTarget = bestDefinitionForFixture(
+      descendingIndexDefinitions,
+      'schema_examples.py'
+    );
+    assert.ok(
+      descendingIndexDefinitionTarget,
+      'Expected descending Meta Index field to resolve its definition.'
     );
 
     const diagnostics = await waitForDiagnostics(
@@ -4353,6 +4412,12 @@ suite('Django ORM Intellisense UI', () => {
         item.message.includes('Unknown schema field `bog`')
       ),
       `Expected Meta schema diagnostics to flag invalid fields. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
+    assert.ok(
+      diagnostics.every((item) =>
+        !item.message.includes('`-created_at`')
+      ),
+      `Expected descending Index/order_by fields to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
     );
   });
 
