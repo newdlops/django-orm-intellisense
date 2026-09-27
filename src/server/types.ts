@@ -53,6 +53,11 @@ export interface ModelInfo {
   reverseRelations: Map<string, RelationInfo>;
   isAbstract: boolean;
   baseLabels: string[];
+  /**
+   * Known only from runtime inspection (an installed third-party app).
+   * Reachable by exact label; never registered under its short name.
+   */
+  runtimeOnly?: boolean;
 }
 
 export interface FieldInfo {

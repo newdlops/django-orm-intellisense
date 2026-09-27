@@ -329,6 +329,7 @@ export function updateWorkspaceIndexIncremental(
   diff: SurfaceIndexDiff,
   customLookups?: Record<string, string[]>,
   prevCustomLookups?: Record<string, string[]>,
+  staticFallback?: StaticFallback,
 ): void {
   const _t0 = performance.now();
 
@@ -346,7 +347,7 @@ export function updateWorkspaceIndexIncremental(
   for (const label of diff.added) {
     const receivers = surfaceIndex[label];
     if (!receivers) continue;
-    const modelInfo = buildModelInfo(label, receivers, customLookups);
+    const modelInfo = buildSurfaceModelInfo(label, receivers, customLookups, staticFallback);
     index.models.set(label, modelInfo);
     index.modelLabelByName.set(modelInfo.objectName, label);
     // Field trie is NOT built here — lazy on first access
@@ -360,7 +361,7 @@ export function updateWorkspaceIndexIncremental(
     if (oldModel) {
       index.modelLabelByName.delete(oldModel.objectName);
     }
-    const modelInfo = buildModelInfo(label, receivers, customLookups);
+    const modelInfo = buildSurfaceModelInfo(label, receivers, customLookups, staticFallback);
     index.models.set(label, modelInfo);
     index.modelLabelByName.set(modelInfo.objectName, label);
     // Invalidate cached field trie so it's rebuilt lazily
@@ -633,8 +634,220 @@ export type StaticFallback = Record<
     relations?: string[];
     reverseRelations?: string[];
     fieldDetails?: Record<string, StaticFallbackFieldDetail>;
+    /** Model known only from runtime inspection (installed third-party app). */
+    runtimeOnly?: boolean;
+    /** Django contrib model the client ships a built-in entry for. */
+    builtin?: boolean;
   }
 >;
+
+export type ModelNameCollision = 'first' | 'last';
+
+/**
+ * Decide which label owns each bare model name (`Company` → `db.Company`).
+ *
+ * Short names drive receiver inference (`findModelLabelByShortName`, the
+ * snake→Pascal variants), so only models the workspace declares own them:
+ * surface entries and non-runtime-only fallback entries, with `collision`
+ * choosing between workspace models that share a name. Built-in contrib
+ * models claim a name only when no workspace model uses it. Other
+ * runtime-only models (third-party apps) never get one — otherwise
+ * `result.get(...)` would become an ORM receiver for some app's `Result`
+ * model. Those stay reachable by exact label.
+ */
+export function buildModelLabelByName(
+  surfaceLabels: Iterable<string>,
+  staticFallback: StaticFallback | undefined,
+  collision: ModelNameCollision,
+): Map<string, string> {
+  const byName = new Map<string, string>();
+  const register = (label: string): void => {
+    const name = modelObjectName(label);
+    if (collision === 'first' && byName.has(name)) {
+      return;
+    }
+    byName.set(name, label);
+  };
+
+  const surfaceLabelSet = new Set<string>();
+  for (const label of surfaceLabels) {
+    surfaceLabelSet.add(label);
+    register(label);
+  }
+
+  const builtinLabels: string[] = [];
+  for (const [label, info] of Object.entries(staticFallback ?? {})) {
+    if (surfaceLabelSet.has(label)) {
+      continue;
+    }
+    if (info.builtin) {
+      builtinLabels.push(label);
+    } else if (!info.runtimeOnly) {
+      register(label);
+    }
+  }
+  for (const label of builtinLabels) {
+    const name = modelObjectName(label);
+    if (!byName.has(name)) {
+      byName.set(name, label);
+    }
+  }
+  return byName;
+}
+
+function modelObjectName(label: string): string {
+  return label.includes('.') ? label.split('.').pop()! : label;
+}
+
+/**
+ * True when the model carries at least one field besides the `id` / `pk`
+ * names synthesized for every model — i.e. the source actually knew its
+ * fields.
+ */
+function hasDeclaredFields(model: ModelInfo): boolean {
+  for (const name of model.fields.keys()) {
+    if (name !== 'id' && name !== 'pk') {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Build a model from its surface entry, deferring to the static fallback when
+ * the entry has no instance fields. Concrete models stay registered in the
+ * surface even when their `instance` receiver came back empty (inheritance-only
+ * models, or a slice rebuilt against a static-only graph during runtime
+ * warm-up); letting such an entry win collapses lookup completion to the
+ * synthesized `id` / `pk`.
+ */
+function buildSurfaceModelInfo(
+  modelLabel: string,
+  receivers: Record<string, Record<string, SurfaceMemberTuple>>,
+  customLookups?: Record<string, string[]>,
+  staticFallback?: StaticFallback,
+): ModelInfo {
+  const modelInfo = buildModelInfo(modelLabel, receivers, customLookups);
+  const fallback = staticFallback?.[modelLabel];
+  if (!fallback || hasDeclaredFields(modelInfo)) {
+    return modelInfo;
+  }
+  const fallbackInfo = buildStaticFallbackModelInfo(modelLabel, fallback, customLookups);
+  return hasDeclaredFields(fallbackInfo) ? fallbackInfo : modelInfo;
+}
+
+function buildStaticFallbackModelInfo(
+  label: string,
+  info: StaticFallback[string],
+  customLookups?: Record<string, string[]>,
+): ModelInfo {
+  const objectName = label.includes('.') ? label.split('.').pop()! : label;
+  const fields = new Map<string, FieldInfo>();
+  const relations = new Map<string, RelationInfo>();
+  const reverseRelations = new Map<string, RelationInfo>();
+  const details = info.fieldDetails ?? {};
+  const addField = (
+    fieldName: string,
+    fallbackKind: string,
+    fallbackIsRelation: boolean,
+  ): FieldInfo => {
+    const detail = details[fieldName];
+    const fieldKind = detail?.fieldKind ?? fallbackKind;
+    const isRelation = detail?.isRelation ?? fallbackIsRelation;
+    let lookups = getLookupsForField(fieldKind);
+    const extraLookups = customLookups?.[fieldKind];
+    if (extraLookups && extraLookups.length > 0) {
+      const lookupSet = new Set(lookups);
+      for (const lookup of extraLookups) {
+        lookupSet.add(lookup);
+      }
+      lookups = [...lookupSet];
+    }
+
+    const fieldInfo: FieldInfo = {
+      name: fieldName,
+      fieldKind,
+      isRelation,
+      lookups,
+      transforms: getTransformsForField(fieldKind),
+    };
+    fields.set(fieldName, fieldInfo);
+    return fieldInfo;
+  };
+
+  for (const fieldName of info.fields ?? []) {
+    addField(fieldName, 'CharField', false);
+  }
+
+  for (const relName of info.relations ?? []) {
+    const fieldInfo = addField(relName, 'ForeignKey', true);
+    const detail = details[relName];
+    relations.set(relName, {
+      name: relName,
+      fieldKind: fieldInfo.fieldKind,
+      targetModelLabel: detail?.relatedModelLabel ?? '',
+      direction: 'forward',
+    });
+    if (
+      (fieldInfo.fieldKind === 'ForeignKey' ||
+        fieldInfo.fieldKind === 'OneToOneField' ||
+        fieldInfo.fieldKind === 'ParentalKey') &&
+      !fields.has(`${relName}_id`)
+    ) {
+      fields.set(`${relName}_id`, {
+        name: `${relName}_id`,
+        fieldKind: 'IntegerField',
+        isRelation: false,
+        lookups: getLookupsForField('IntegerField'),
+        transforms: getTransformsForField('IntegerField'),
+      });
+    }
+  }
+
+  for (const relName of info.reverseRelations ?? []) {
+    const fieldInfo = addField(relName, 'ForeignKey', true);
+    const detail = details[relName];
+    reverseRelations.set(relName, {
+      name: relName,
+      fieldKind: fieldInfo.fieldKind,
+      targetModelLabel: detail?.relatedModelLabel ?? '',
+      direction: 'reverse',
+    });
+  }
+
+  if (!fields.has('pk')) {
+    fields.set('pk', {
+      name: 'pk',
+      fieldKind: 'BigAutoField',
+      isRelation: false,
+      lookups: getLookupsForField('BigAutoField'),
+      transforms: getTransformsForField('BigAutoField'),
+    });
+  }
+
+  if (!fields.has('id')) {
+    fields.set('id', {
+      name: 'id',
+      fieldKind: 'BigAutoField',
+      isRelation: false,
+      lookups: getLookupsForField('BigAutoField'),
+      transforms: getTransformsForField('BigAutoField'),
+    });
+  }
+
+  return {
+    label,
+    objectName,
+    module: '',
+    filePath: '',
+    fields,
+    relations,
+    reverseRelations,
+    isAbstract: false,
+    baseLabels: [],
+    runtimeOnly: Boolean(info.runtimeOnly) && !info.builtin,
+  };
+}
 
 export function buildWorkspaceIndex(
   surfaceIndex: SurfaceIndex,
@@ -644,130 +857,30 @@ export function buildWorkspaceIndex(
 ): WorkspaceIndex {
   const _t0 = performance.now();
   const models = new Map<string, ModelInfo>();
-  const modelLabelByName = new Map<string, string>();
+  const surfaceLabels: string[] = [];
 
   for (const modelLabel of Object.keys(surfaceIndex)) {
     const receivers = surfaceIndex[modelLabel];
     if (!receivers) continue;
 
-    const modelInfo = buildModelInfo(modelLabel, receivers, customLookups);
+    const modelInfo = buildSurfaceModelInfo(
+      modelLabel,
+      receivers,
+      customLookups,
+      staticFallback,
+    );
     models.set(modelLabel, modelInfo);
-    modelLabelByName.set(modelInfo.objectName, modelLabel);
+    surfaceLabels.push(modelLabel);
   }
 
   // Add fallback models that exist in static index but not in runtime
   if (staticFallback) {
     for (const [label, info] of Object.entries(staticFallback)) {
       if (models.has(label)) continue; // runtime data takes priority
-
-      const objectName = label.includes('.') ? label.split('.').pop()! : label;
-      const fields = new Map<string, FieldInfo>();
-      const relations = new Map<string, RelationInfo>();
-      const reverseRelations = new Map<string, RelationInfo>();
-      const details = info.fieldDetails ?? {};
-      const addField = (
-        fieldName: string,
-        fallbackKind: string,
-        fallbackIsRelation: boolean,
-      ): FieldInfo => {
-        const detail = details[fieldName];
-        const fieldKind = detail?.fieldKind ?? fallbackKind;
-        const isRelation = detail?.isRelation ?? fallbackIsRelation;
-        let lookups = getLookupsForField(fieldKind);
-        const extraLookups = customLookups?.[fieldKind];
-        if (extraLookups && extraLookups.length > 0) {
-          const lookupSet = new Set(lookups);
-          for (const lookup of extraLookups) {
-            lookupSet.add(lookup);
-          }
-          lookups = [...lookupSet];
-        }
-
-        const fieldInfo: FieldInfo = {
-          name: fieldName,
-          fieldKind,
-          isRelation,
-          lookups,
-          transforms: getTransformsForField(fieldKind),
-        };
-        fields.set(fieldName, fieldInfo);
-        return fieldInfo;
-      };
-
-      for (const fieldName of info.fields ?? []) {
-        addField(fieldName, 'CharField', false);
-      }
-
-      for (const relName of info.relations ?? []) {
-        const fieldInfo = addField(relName, 'ForeignKey', true);
-        const detail = details[relName];
-        relations.set(relName, {
-          name: relName,
-          fieldKind: fieldInfo.fieldKind,
-          targetModelLabel: detail?.relatedModelLabel ?? '',
-          direction: 'forward',
-        });
-        if (
-          (fieldInfo.fieldKind === 'ForeignKey' ||
-            fieldInfo.fieldKind === 'OneToOneField' ||
-            fieldInfo.fieldKind === 'ParentalKey') &&
-          !fields.has(`${relName}_id`)
-        ) {
-          fields.set(`${relName}_id`, {
-            name: `${relName}_id`,
-            fieldKind: 'IntegerField',
-            isRelation: false,
-            lookups: getLookupsForField('IntegerField'),
-            transforms: getTransformsForField('IntegerField'),
-          });
-        }
-      }
-
-      for (const relName of info.reverseRelations ?? []) {
-        const fieldInfo = addField(relName, 'ForeignKey', true);
-        const detail = details[relName];
-        reverseRelations.set(relName, {
-          name: relName,
-          fieldKind: fieldInfo.fieldKind,
-          targetModelLabel: detail?.relatedModelLabel ?? '',
-          direction: 'reverse',
-        });
-      }
-
-      if (!fields.has('pk')) {
-        fields.set('pk', {
-          name: 'pk',
-          fieldKind: 'BigAutoField',
-          isRelation: false,
-          lookups: getLookupsForField('BigAutoField'),
-          transforms: getTransformsForField('BigAutoField'),
-        });
-      }
-
-      if (!fields.has('id')) {
-        fields.set('id', {
-          name: 'id',
-          fieldKind: 'BigAutoField',
-          isRelation: false,
-          lookups: getLookupsForField('BigAutoField'),
-          transforms: getTransformsForField('BigAutoField'),
-        });
-      }
-
-      models.set(label, {
-        label,
-        objectName,
-        module: '',
-        filePath: '',
-        fields,
-        relations,
-        reverseRelations,
-        isAbstract: false,
-        baseLabels: [],
-      });
-      modelLabelByName.set(objectName, label);
+      models.set(label, buildStaticFallbackModelInfo(label, info, customLookups));
     }
   }
+  const modelLabelByName = buildModelLabelByName(surfaceLabels, staticFallback, 'last');
 
   normalizeModelRelationTargets(models, modelLabelByName);
 

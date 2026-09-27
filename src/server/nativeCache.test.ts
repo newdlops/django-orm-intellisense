@@ -40,6 +40,9 @@ function main(): void {
       surfaceFingerprints: { 'app0.Model0': 'abc123' },
       customLookups: { 'app.Model0': ['unaccent'] },
       customLookupsFingerprint: 'lookups123',
+      staticFallback: {
+        'authtoken.Token': { fields: ['key'], runtimeOnly: true },
+      },
       staticFallbackFingerprint: 'fallback123',
     };
     const tSave = performance.now();
@@ -57,6 +60,12 @@ function main(): void {
     assert(loaded!.customLookups?.['app.Model0']?.[0] === 'unaccent', 'customLookups preserved');
     assert(loaded!.customLookupsFingerprint === 'lookups123', 'customLookupsFingerprint preserved');
     assert(loaded!.staticFallbackFingerprint === 'fallback123', 'staticFallbackFingerprint preserved');
+    // The LS pre-warms from this snapshot; losing the flag would register
+    // third-party short names for receiver inference.
+    assert(
+      loaded!.staticFallback?.['authtoken.Token']?.runtimeOnly === true,
+      'staticFallback runtimeOnly flag preserved',
+    );
 
     // Different workspace → miss
     const otherLoaded = loadSurfaceCache('/other/workspace');

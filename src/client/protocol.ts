@@ -220,6 +220,8 @@ export type StaticFallbackPayload = Record<
     relations?: string[];
     reverseRelations?: string[];
     fieldDetails?: Record<string, StaticFallbackFieldDetail>;
+    /** Model known only from runtime inspection (installed third-party app). */
+    runtimeOnly?: boolean;
   }
 >;
 

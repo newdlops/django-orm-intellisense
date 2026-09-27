@@ -48,6 +48,7 @@ import type {
   ServerMessage,
 } from '../protocol';
 import {
+  buildModelLabelByName,
   buildWorkspaceIndex,
   diffSurfaceIndex,
   updateWorkspaceIndexIncremental,
@@ -313,6 +314,7 @@ export function dropModelFromAllIndicesForTesting(
 
 export class AnalysisDaemon implements vscode.Disposable {
   private readonly stateEmitter = new vscode.EventEmitter<HealthSnapshot>();
+  private readonly modelsReindexedEmitter = new vscode.EventEmitter<void>();
   private readonly pendingRequests = new Map<string, PendingRequest>();
   private readonly responseCache = new Map<string, { promise: Promise<unknown>; createdAt: number; source?: IpcRequestSource }>();
   private readonly intentionalExitProcessIds = new Set<number>();
@@ -370,6 +372,15 @@ export class AnalysisDaemon implements vscode.Disposable {
 
   get onDidChangeState(): vscode.Event<HealthSnapshot> {
     return this.stateEmitter.event;
+  }
+
+  /**
+   * Fires after a reindex changed model definitions. File-watcher reindexes
+   * (branch switch, external edit) never raise a save event, so this is the
+   * signal to drop resolution caches computed against the old models.
+   */
+  get onDidReindexModels(): vscode.Event<void> {
+    return this.modelsReindexedEmitter.event;
   }
 
   getState(): HealthSnapshot {
@@ -455,12 +466,15 @@ export class AnalysisDaemon implements vscode.Disposable {
       nextSurfaceFingerprints,
     );
 
+    // Same fallback fingerprint on this path, so the current fallback is the
+    // next one; it lets field-less surface entries keep their static fields.
     updateWorkspaceIndexIncremental(
       this.localWorkspaceIndex,
       nextSurfaceIndex,
       diff,
       this.customLookups,
       this.customLookups,
+      this.effectiveStaticFallback(),
     );
     this._shortNameFromFullLabelIndex = null;
     this.surfaceIndex = nextSurfaceIndex;
@@ -478,28 +492,32 @@ export class AnalysisDaemon implements vscode.Disposable {
    * lookups so built-ins receive the same treatment as workspace models.
    */
   private effectiveStaticFallback(): StaticFallback {
-    return {
-      ...DJANGO_BUILTIN_STATIC_FALLBACK,
-      ...(this.staticFallback ?? {}),
-    };
+    const merged: StaticFallback = {};
+    for (const [label, info] of Object.entries(DJANGO_BUILTIN_STATIC_FALLBACK)) {
+      merged[label] = { ...info, builtin: true };
+    }
+    for (const [label, info] of Object.entries(this.staticFallback ?? {})) {
+      // The daemon's runtime entry for a contrib model (`auth.User`) is more
+      // accurate than the built-in one but must keep its built-in name
+      // standing; a bare runtime-only entry never owns a short name.
+      merged[label] = label in DJANGO_BUILTIN_STATIC_FALLBACK
+        ? { ...info, builtin: true }
+        : info;
+    }
+    return merged;
   }
 
   private rebuildModelLabelByName(): void {
-    this.modelLabelByName = new Map();
-    // Workspace-defined surface models come first; effectiveStaticFallback
-    // then fills in any gaps (including Django built-ins) so receivers like
-    // `User.objects.filter(...)` resolve even when the workspace does not
-    // directly subclass them — otherwise every such receiver lands in the
-    // diagnostic noRecv bucket with no lookup-path feedback.
-    for (const label of [
-      ...Object.keys(this.surfaceIndex),
-      ...Object.keys(this.effectiveStaticFallback()),
-    ]) {
-      const name = label.split('.').at(-1);
-      if (name && !this.modelLabelByName.has(name)) {
-        this.modelLabelByName.set(name, label);
-      }
-    }
+    // Workspace-defined models own short names; Django built-ins fill the
+    // gaps so receivers like `User.objects.filter(...)` resolve even when the
+    // workspace does not directly subclass them — otherwise every such
+    // receiver lands in the diagnostic noRecv bucket with no lookup-path
+    // feedback. Third-party runtime-only models are reachable by label only.
+    this.modelLabelByName = buildModelLabelByName(
+      Object.keys(this.surfaceIndex),
+      this.effectiveStaticFallback(),
+      'first',
+    );
   }
 
   private rebuildModelNames(): void {
@@ -534,7 +552,8 @@ export class AnalysisDaemon implements vscode.Disposable {
     // so the first miss costs <1ms and warms the cache.
     if (this._shortNameFromFullLabelIndex === null) {
       const built = new Map<string, string>();
-      for (const fullLabel of this.localWorkspaceIndex.models.keys()) {
+      for (const [fullLabel, model] of this.localWorkspaceIndex.models) {
+        if (model.runtimeOnly) continue;
         const tail = fullLabel.includes('.')
           ? fullLabel.slice(fullLabel.lastIndexOf('.') + 1)
           : fullLabel;
@@ -959,6 +978,7 @@ export class AnalysisDaemon implements vscode.Disposable {
           { added: addedLabels, changed: changedLabels, removed: removedLabels },
           this.customLookups,
           this.customLookups,
+          this.effectiveStaticFallback(),
         );
         this._shortNameFromFullLabelIndex = null;
       }
@@ -977,6 +997,10 @@ export class AnalysisDaemon implements vscode.Disposable {
     this.rebuildModelLabelByName();
     this.rebuildModelNames();
     this.refreshNativeFastPathFromSurface('reindex');
+    // Cached IPC answers (lookup resolutions, receiver chains) were computed
+    // against the old models and would otherwise outlive the edit by the TTL.
+    this.clearResponseCache();
+    this.modelsReindexedEmitter.fire();
     return result;
   }
 
@@ -2381,6 +2405,7 @@ export class AnalysisDaemon implements vscode.Disposable {
   dispose(): void {
     void this.stop();
     this.stateEmitter.dispose();
+    this.modelsReindexedEmitter.dispose();
     dropNativeFastPath();
   }
 

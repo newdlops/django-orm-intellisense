@@ -428,6 +428,7 @@ connection.onNotification('django/updateSurfaceIndex', (params: {
         diff,
         params.customLookups,
         previousCustomLookups,
+        params.staticFallback,
       );
 
       // Bump version for changed/added models (removed ones no longer exist)
@@ -530,6 +531,7 @@ connection.onNotification('django/updateSurfaceIndexDelta', (params: {
     { added, changed, removed },
     previousCustomLookups,
     previousCustomLookups,
+    previousStaticFallback,
   );
 
   for (const label of [...added, ...changed]) {
