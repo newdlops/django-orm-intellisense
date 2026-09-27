@@ -4502,6 +4502,24 @@ export function registerPythonProviders(
       clearLookupResolutionAndReceiverCachesAcrossRegistrations();
       scheduleTrackedDiagnosticsRefresh(0);
     }),
+    daemon.onDidReindexModels(() => {
+      if (diagnosticsDisposed) {
+        return;
+      }
+      // Model definitions changed (a save, or a file-watcher reindex after a
+      // branch switch that raises no save event): results resolved against
+      // the old models are stale, including diagnostics that flagged a
+      // just-added field as unknown.
+      resetProviderResolutionCaches();
+      clearLookupResolutionAndReceiverCachesAcrossRegistrations();
+      if (!diagnosticsEnabled) {
+        return;
+      }
+      daemon.logDiagnostic('[diagnostics:trigger] tracked-refresh source=models-reindexed delay=0ms');
+      lastDiagnosedDocumentVersions.clear();
+      partialDiagnosticResults.clear();
+      scheduleTrackedDiagnosticsRefresh(0);
+    }),
     new vscode.Disposable(() => {
       providersDisposed = true;
       diagnosticsDisposed = true;
