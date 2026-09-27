@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import dataclasses
 import gzip
 import hashlib
 import json
@@ -42,6 +43,7 @@ from ..features.lookup_paths import (
     resolve_lookup_path,
 )
 from ..features.orm_members import (
+    _build_static_to_graph_label_map,
     fingerprint_json_payload,
     fingerprint_surface_index,
     prebuild_member_surface_cache,
@@ -62,6 +64,7 @@ from ..runtime.inspector import (
 )
 from ..semantic.graph import (
     ModelGraph,
+    ModelGraphNode,
     SemanticGraphSummary,
     build_model_graph,
     build_semantic_graph,
@@ -101,6 +104,156 @@ def _inheritance_dependent_labels(
                 changed = True
 
     return affected - seed_labels
+
+
+_SURFACE_FIELD_MEMBER_KINDS = frozenset({'field', 'relation', 'reverse_relation'})
+# Names the client synthesizes for every model; their presence alone does not
+# mean the surface entry knows the model's fields.
+_SYNTHETIC_PRIMARY_KEY_NAMES = frozenset({'id', 'pk'})
+
+
+def _surface_labels_with_instance_fields(
+    surface_index: dict[str, object],
+) -> set[str]:
+    """Labels whose surface entry lists at least one real instance field.
+
+    Concrete models stay registered in the surface index even when their
+    ``instance`` receiver came back empty (inheritance-only models, or a slice
+    rebuilt against a static-only graph during runtime warm-up). Such an entry
+    must not suppress the model's static fallback: the client would then only
+    see the ``id`` / ``pk`` it synthesizes for every model.
+    """
+    labels: set[str] = set()
+    for label, entry in surface_index.items():
+        if not isinstance(entry, dict):
+            continue
+        instance_members = entry.get('instance')
+        if not isinstance(instance_members, dict):
+            continue
+        for name, member in instance_members.items():
+            if name in _SYNTHETIC_PRIMARY_KEY_NAMES:
+                continue
+            member_kind = (
+                member[2]
+                if isinstance(member, (list, tuple)) and len(member) > 2
+                else None
+            )
+            if member_kind in _SURFACE_FIELD_MEMBER_KINDS:
+                labels.add(label)
+                break
+    return labels
+
+
+def _static_fallback_entry(
+    model_graph: ModelGraph,
+    node: ModelGraphNode,
+) -> dict[str, object] | None:
+    candidate = node.model_candidate
+    if candidate is not None and candidate.is_abstract:
+        return None
+    # Models known only from runtime inspection (installed third-party apps)
+    # have no static candidate, so they never get a surface entry. Without a
+    # fallback entry their lookups end in the client's generic `pk` / `id`.
+    runtime_only = candidate is None
+    if runtime_only and node.runtime_model is None:
+        return None
+    scalar_names: list[str] = []
+    relation_names: list[str] = []
+    reverse_relation_names: list[str] = []
+    field_details: dict[str, dict[str, object]] = {}
+    for field in model_graph.fields_for_model(node.label):
+        field_details[field.name] = {
+            'fieldKind': field.field_kind,
+            'isRelation': field.is_relation,
+            'relationDirection': field.relation_direction,
+            'relatedModelLabel': field.related_model_label,
+        }
+        if field.relation_direction == 'reverse':
+            reverse_relation_names.append(field.name)
+        elif field.is_relation:
+            relation_names.append(field.name)
+        else:
+            scalar_names.append(field.name)
+    if not (scalar_names or relation_names or reverse_relation_names):
+        return None
+    entry: dict[str, object] = {
+        'fields': scalar_names,
+        'relations': relation_names,
+        'reverseRelations': reverse_relation_names,
+        'fieldDetails': field_details,
+    }
+    if runtime_only:
+        # The client resolves these by exact label only: their short names
+        # (`Result`, `Token`, `Tag`, ...) must not feed receiver inference.
+        entry['runtimeOnly'] = True
+    return entry
+
+
+def _rebuild_surface_slice(
+    *,
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+    model_graph: ModelGraph,
+    labels: set[str],
+    surface_index: dict[str, object],
+    previous_static_index: StaticIndex | None,
+    previous_model_graph: ModelGraph | None,
+) -> tuple[dict[str, object], set[str]]:
+    """Rebuild the surface entries of ``labels`` (static candidate labels).
+
+    Returns the merged surface and every surface key the labels map to, old
+    and new. Surface keys are graph labels, which differ from candidate labels
+    when ``AppConfig.label`` diverges from the module (candidate ``zuzu.X`` ↔
+    surface ``db.X``); keying a delta by candidate labels reports ``zuzu.X``
+    removed and never ships the rebuilt ``db.X`` entry.
+    """
+    old_label_map = (
+        _build_static_to_graph_label_map(previous_static_index, previous_model_graph)
+        if previous_static_index is not None
+        else {}
+    )
+    new_label_map = _build_static_to_graph_label_map(static_index, model_graph)
+    surface_keys = {old_label_map.get(label, label) for label in labels}
+    surface_keys |= {new_label_map.get(label, label) for label in labels}
+
+    merged = rebuild_surface_for_models(
+        static_index, runtime, model_graph, labels, surface_index,
+    )
+    # `rebuild_surface_for_models` only drops keys under the new label map;
+    # a deleted model's entry may still sit under its old graph label.
+    current_keys = {
+        new_label_map.get(candidate.label, candidate.label)
+        for candidate in static_index.model_candidates
+        if not candidate.is_abstract
+    }
+    for key in surface_keys - current_keys:
+        merged.pop(key, None)
+    return merged, surface_keys
+
+
+_REINDEX_COMMIT_ATTEMPTS = 3
+_WARMUP_APPLY_ATTEMPTS = 3
+_SURFACE_PUBLISH_ATTEMPTS = 3
+
+
+@dataclass
+class _ReindexOutcome:
+    new_static_index: StaticIndex
+    # None when the file touched no model (only the static index changes).
+    affected_labels: set[str] | None = None
+    model_graph: ModelGraph | None = None
+    surface_index: dict[str, object] | None = None
+    surface_index_delta: dict[str, object] = dataclasses.field(default_factory=dict)
+    surface_fingerprints: dict[str, str] = dataclasses.field(default_factory=dict)
+    removed_labels: list[str] = dataclasses.field(default_factory=list)
+    added_labels: list[str] = dataclasses.field(default_factory=list)
+    changed_labels: list[str] = dataclasses.field(default_factory=list)
+    static_fallback: dict[str, dict[str, object]] | None = None
+    model_names: list[str] = dataclasses.field(default_factory=list)
+
+    @property
+    def affected_count(self) -> int:
+        return len(self.affected_labels or ())
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +507,16 @@ class DaemonServer:
         self._surface_load_idle_timer: threading.Timer | None = None
         self._surface_load_lock = threading.Lock()
         self._surface_load_attempted_generation: int | None = None
+        # Model-changing reindexes, so a surface prebuild or runtime warm-up
+        # that started from older state can fold them in instead of
+        # overwriting them. Candidate label → serial of the last reindex that
+        # touched it.
+        self._reindex_serial = 0
+        self._reindexed_labels: dict[str, int] = {}
+        # True once a model-changing reindex moved the static index away from
+        # `source_snapshot`; caches keyed by that snapshot's fingerprint must
+        # then not be written from the current state.
+        self._source_snapshot_dirty = False
 
     def run_stdio(self) -> None:
         threading.current_thread().name = 'main'
@@ -1120,36 +1283,13 @@ class DaemonServer:
         surface_index: dict[str, object],
     ) -> dict[str, dict[str, object]] | None:
         static_fallback: dict[str, dict[str, object]] = {}
-        runtime_labels = set(surface_index.keys())
+        surface_labels = _surface_labels_with_instance_fields(surface_index)
         for node in model_graph.nodes_by_label.values():
-            candidate = node.model_candidate
-            if candidate is None or candidate.is_abstract or node.label in runtime_labels:
+            if node.label in surface_labels:
                 continue
-            fields_for = model_graph.fields_for_model(node.label)
-            scalar_names: list[str] = []
-            relation_names: list[str] = []
-            reverse_relation_names: list[str] = []
-            field_details: dict[str, dict[str, object]] = {}
-            for field in fields_for:
-                field_details[field.name] = {
-                    'fieldKind': field.field_kind,
-                    'isRelation': field.is_relation,
-                    'relationDirection': field.relation_direction,
-                    'relatedModelLabel': field.related_model_label,
-                }
-                if field.relation_direction == 'reverse':
-                    reverse_relation_names.append(field.name)
-                elif field.is_relation:
-                    relation_names.append(field.name)
-                else:
-                    scalar_names.append(field.name)
-            if scalar_names or relation_names or reverse_relation_names:
-                static_fallback[node.label] = {
-                    'fields': scalar_names,
-                    'relations': relation_names,
-                    'reverseRelations': reverse_relation_names,
-                    'fieldDetails': field_details,
-                }
+            entry = _static_fallback_entry(model_graph, node)
+            if entry is not None:
+                static_fallback[node.label] = entry
         return static_fallback if static_fallback else None
 
     def _build_model_names(self, model_graph: ModelGraph) -> list[str]:
@@ -1270,7 +1410,8 @@ class DaemonServer:
             runtime = self.runtime_inspection
             health_snapshot = self.health_snapshot
             model_graph = self.model_graph
-            model_names = self._last_model_names
+            reindex_serial = self._reindex_serial
+            source_dirty = self._source_snapshot_dirty
 
         if (
             source_snapshot is None
@@ -1285,8 +1426,6 @@ class DaemonServer:
                 f'skip_surface_index_load reason={reason} runtime=warming_up'
             )
             return
-        if model_names is None:
-            model_names = self._build_model_names(model_graph)
 
         self._start_surface_index_prebuild(
             generation=generation,
@@ -1294,10 +1433,10 @@ class DaemonServer:
             source_snapshot=source_snapshot,
             static_index=static_index,
             runtime=runtime,
-            health_snapshot=health_snapshot,
             model_graph=model_graph,
-            model_names=model_names,
             reason=reason,
+            reindex_serial=reindex_serial,
+            source_dirty=source_dirty,
         )
 
     def _start_surface_index_prebuild(
@@ -1308,10 +1447,10 @@ class DaemonServer:
         source_snapshot: PythonSourceSnapshot,
         static_index: StaticIndex,
         runtime: RuntimeInspection,
-        health_snapshot: dict[str, Any],
         model_graph: ModelGraph,
-        model_names: list[str],
         reason: str,
+        reindex_serial: int = 0,
+        source_dirty: bool = False,
     ) -> None:
         started_at = time.perf_counter()
 
@@ -1320,59 +1459,60 @@ class DaemonServer:
             *,
             from_cache: bool = False,
         ) -> None:
-            surface_fingerprints = fingerprint_surface_index(surface_index)
-            # 옵션 D — cache 에서 로드한 경우 디스크 재기록 불필요.
-            if not from_cache:
+            # 옵션 D — cache 에서 로드한 경우 디스크 재기록 불필요. The prebuilt
+            # surface only matches `source_snapshot` (the cache key) when no
+            # model edit had been reindexed before the prebuild started.
+            if not from_cache and not source_dirty:
                 save_surface_index(
                     workspace_root,
                     source_fingerprint=source_snapshot.fingerprint,
                     runtime_fingerprint=_runtime_cache_fingerprint(runtime),
                     surface_index=surface_index,
                 )
+            # Fingerprint and derive the fallback outside the state lock; on a
+            # large workspace this is the expensive part and would otherwise
+            # stall foreground requests.
+            surface_fingerprints = fingerprint_surface_index(surface_index)
             static_fallback = self._build_static_fallback(
                 model_graph=model_graph,
                 surface_index=surface_index,
             )
-            static_fallback_fingerprint = (
-                fingerprint_json_payload(static_fallback)
-                if static_fallback
-                else None
-            )
-            custom_lookups_fingerprint = fingerprint_json_payload(
-                runtime.custom_lookups
-            )
-            with self._state_lock:
-                if generation != self._state_generation:
-                    return
-                self._last_surface_index = surface_index
-                self._last_surface_fingerprints = surface_fingerprints
-                self._last_model_names = model_names
-                self._last_static_fallback = static_fallback
-                self._last_static_fallback_fingerprint = static_fallback_fingerprint
-                self._last_custom_lookups_fingerprint = custom_lookups_fingerprint
-                with self._surface_load_lock:
-                    self._surface_load_attempted_generation = generation
-
-            stage = 'load_cached' if from_cache else 'prebuild'
-            _log_initialize_step(
-                f'{stage}_surface_index(background) '
-                f'reason={reason} '
-                f'models={len(surface_index)} '
-                f'elapsed={time.perf_counter() - started_at:.2f}s'
-            )
-            self._write_notification(
-                'surfaceIndexChanged',
-                {
-                    'health': health_snapshot,
-                    'modelNames': model_names,
-                    'surfaceIndex': surface_index,
-                    'surfaceFingerprints': surface_fingerprints,
-                    'customLookups': runtime.custom_lookups,
-                    'customLookupsFingerprint': custom_lookups_fingerprint,
-                    'staticFallback': static_fallback,
-                    'staticFallbackFingerprint': static_fallback_fingerprint,
-                },
-            )
+            published_serial = reindex_serial
+            for attempt in range(_SURFACE_PUBLISH_ATTEMPTS):
+                with self._state_lock:
+                    if generation != self._state_generation:
+                        return
+                    if attempt == 0:
+                        self._commit_loaded_surface_index(
+                            surface_index,
+                            surface_fingerprints=surface_fingerprints,
+                            static_fallback=static_fallback,
+                            built_from_static_index=static_index,
+                            built_from_model_graph=model_graph,
+                            built_at_serial=reindex_serial,
+                        )
+                        with self._surface_load_lock:
+                            self._surface_load_attempted_generation = generation
+                    published_serial = self._reindex_serial
+                    payload = self._surface_index_changed_payload()
+                if attempt == 0:
+                    stage = 'load_cached' if from_cache else 'prebuild'
+                    _log_initialize_step(
+                        f'{stage}_surface_index(background) '
+                        f'reason={reason} '
+                        f'models={len(payload["surfaceIndex"])} '
+                        f'elapsed={time.perf_counter() - started_at:.2f}s'
+                    )
+                self._write_notification('surfaceIndexChanged', payload)
+                # A reindex that committed after our snapshot may have had its
+                # response written before this notification, which would then
+                # roll the client back. Resend the current state in that case.
+                with self._state_lock:
+                    if (
+                        generation != self._state_generation
+                        or self._reindex_serial == published_serial
+                    ):
+                        return
 
         def _log_failure() -> None:
             print(
@@ -1461,6 +1601,88 @@ class DaemonServer:
                 return
             self._surface_prebuild_future = thread
         thread.start()
+
+    def _commit_loaded_surface_index(
+        self,
+        surface_index: dict[str, object],
+        *,
+        surface_fingerprints: dict[str, str],
+        static_fallback: dict[str, dict[str, object]] | None,
+        built_from_static_index: StaticIndex,
+        built_from_model_graph: ModelGraph,
+        built_at_serial: int,
+    ) -> None:
+        """Adopt a loaded/prebuilt surface. Caller holds ``_state_lock``.
+
+        ``surface_fingerprints`` / ``static_fallback`` were derived from the
+        surface and graph the load started from. Models reindexed since then
+        (a save during a long cold prebuild) are rebuilt against the current
+        state first; otherwise the loaded surface would overwrite them and the
+        edit would vanish from completion until the next save.
+        """
+        model_graph = self.model_graph or built_from_model_graph
+        stale_labels = {
+            label
+            for label, serial in self._reindexed_labels.items()
+            if serial > built_at_serial
+        }
+        if (
+            stale_labels
+            and self.static_index is not None
+            and self.runtime_inspection is not None
+        ):
+            surface_index, stale_keys = _rebuild_surface_slice(
+                static_index=self.static_index,
+                runtime=self.runtime_inspection,
+                model_graph=model_graph,
+                labels=stale_labels,
+                surface_index=surface_index,
+                previous_static_index=built_from_static_index,
+                previous_model_graph=built_from_model_graph,
+            )
+            surface_fingerprints = {
+                key: fingerprint
+                for key, fingerprint in surface_fingerprints.items()
+                if key not in stale_keys
+            }
+            surface_fingerprints.update(
+                fingerprint_surface_index(
+                    surface_index,
+                    labels=stale_keys & surface_index.keys(),
+                )
+            )
+        if stale_labels or model_graph is not built_from_model_graph:
+            static_fallback = self._build_static_fallback(
+                model_graph=model_graph,
+                surface_index=surface_index,
+            )
+        self._last_surface_index = surface_index
+        self._last_surface_fingerprints = surface_fingerprints
+        self._last_model_names = self._build_model_names(model_graph)
+        self._last_static_fallback = static_fallback
+        self._last_static_fallback_fingerprint = (
+            fingerprint_json_payload(static_fallback)
+            if static_fallback
+            else None
+        )
+        if self.runtime_inspection is not None:
+            self._last_custom_lookups_fingerprint = fingerprint_json_payload(
+                self.runtime_inspection.custom_lookups
+            )
+
+    def _surface_index_changed_payload(self) -> dict[str, Any]:
+        """Snapshot the published surface state. Caller holds ``_state_lock``."""
+        runtime = self.runtime_inspection
+        return {
+            'health': self.health_snapshot,
+            'modelNames': self._last_model_names or [],
+            'surfaceIndex': self._last_surface_index or {},
+            'surfaceFingerprints': self._last_surface_fingerprints or {},
+            'customLookups': runtime.custom_lookups if runtime is not None else {},
+            'customLookupsFingerprint': self._last_custom_lookups_fingerprint,
+            'staticFallback': self._last_static_fallback,
+            'staticFallbackFingerprint': self._last_static_fallback_fingerprint,
+        }
 
     def _start_runtime_field_registry_prewarm(
         self,
@@ -1617,11 +1839,8 @@ class DaemonServer:
         file_path = Path(str(file_path_str)).resolve()
 
         with self._state_lock:
-            static_index = self.static_index
-            runtime = self.runtime_inspection
-
-        if static_index is None:
-            return {'error': 'not initialized'}
+            if self.static_index is None:
+                return {'error': 'not initialized'}
 
         # Verify file is within workspace
         try:
@@ -1630,6 +1849,73 @@ class DaemonServer:
             return {'error': 'file outside workspace'}
 
         started = time.perf_counter()
+        # Compute from a snapshot, then commit only if the state is still the
+        # one we started from. Runtime warm-up and surface loads replace the
+        # graph/runtime/surface on background threads; committing a result
+        # computed from the pre-warm-up state would put the static-only graph
+        # and pending-runtime surface back. The last attempt holds the lock
+        # throughout so the reindex always lands.
+        for attempt in range(_REINDEX_COMMIT_ATTEMPTS):
+            last_attempt = attempt == _REINDEX_COMMIT_ATTEMPTS - 1
+            with self._state_lock if last_attempt else contextlib.nullcontext():
+                with self._state_lock:
+                    generation = self._state_generation
+                    static_index = self.static_index
+                    runtime = self.runtime_inspection
+                    previous_model_graph = self.model_graph
+                    surface_ref = self._last_surface_index
+                    previous_static_fallback = self._last_static_fallback
+                if static_index is None:
+                    return {'error': 'not initialized'}
+
+                outcome = self._compute_reindex(
+                    file_path=file_path,
+                    static_index=static_index,
+                    runtime=runtime,
+                    previous_model_graph=previous_model_graph,
+                    existing_surface=surface_ref or {},
+                    previous_static_fallback=previous_static_fallback,
+                )
+                with self._state_lock:
+                    if (
+                        generation == self._state_generation
+                        and self.static_index is static_index
+                        and self.runtime_inspection is runtime
+                        and self.model_graph is previous_model_graph
+                        and self._last_surface_index is surface_ref
+                    ) or last_attempt:
+                        result = self._commit_reindex(outcome)
+                        break
+            print(
+                f'[reindexFile] state changed while reindexing; retry '
+                f'attempt={attempt + 2}',
+                file=sys.stderr,
+            )
+
+        elapsed = time.perf_counter() - started
+        if result.get('unchanged'):
+            print(
+                f'[PERF] reindexFile: no changes {elapsed:.3f}s',
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f'[PERF] reindexFile: {outcome.affected_count} affected '
+                f'{elapsed:.3f}s',
+                file=sys.stderr,
+            )
+        return result
+
+    def _compute_reindex(
+        self,
+        *,
+        file_path: Path,
+        static_index: StaticIndex,
+        runtime: RuntimeInspection | None,
+        previous_model_graph: ModelGraph | None,
+        existing_surface: dict[str, object],
+        previous_static_fallback: dict[str, dict[str, object]] | None,
+    ) -> _ReindexOutcome:
         new_static_index, old_labels, new_labels = reindex_single_file(
             root=self.workspace_root,
             file_path=file_path,
@@ -1641,15 +1927,7 @@ class DaemonServer:
             # No model changes — static index structure may be rebuilt but
             # model surfaces are identical. Skip the expensive surface rebuild
             # and return unchanged to avoid sending the 18MB+ payload.
-            if new_static_index is not static_index:
-                with self._state_lock:
-                    self.static_index = new_static_index
-            elapsed = time.perf_counter() - started
-            print(
-                f'[PERF] reindexFile: no changes {elapsed:.3f}s',
-                file=sys.stderr,
-            )
-            return {'unchanged': True}
+            return _ReindexOutcome(new_static_index=new_static_index)
 
         # Inheritance changes propagate beyond the edited module: when an
         # abstract/base model changes, every descendant model that inherits its
@@ -1668,9 +1946,8 @@ class DaemonServer:
                     reverse_affected.add(candidate.label)
         affected_labels = affected_labels | reverse_affected
 
-        # Update static index and refresh only the graph slices touched by this
-        # file and by reverse-relation invalidation.
-        previous_model_graph = self.model_graph
+        # Refresh only the graph slices touched by this file and by
+        # reverse-relation invalidation.
         model_graph = (
             rebuild_model_graph_for_labels(
                 previous_model_graph,
@@ -1682,103 +1959,121 @@ class DaemonServer:
             if previous_model_graph is not None
             else build_model_graph(new_static_index, runtime)
         )
-        with self._state_lock:
-            self.static_index = new_static_index
-            self.model_graph = model_graph
 
         # Rebuild surface for affected models only
-        existing_surface = self._last_surface_index or {}
         if runtime is None:
             runtime = create_pending_runtime_inspection()
 
-        surface_index = rebuild_surface_for_models(
-            new_static_index, runtime, model_graph, affected_labels, existing_surface,
-        )
-        removed_labels = sorted(
-            label for label in affected_labels if label not in surface_index
-        )
-        added_labels = sorted(new_labels - old_labels)
-        changed_labels = sorted(
-            label for label in affected_labels
-            if label in surface_index and label not in new_labels - old_labels
+        surface_index, affected_surface_keys = _rebuild_surface_slice(
+            static_index=new_static_index,
+            runtime=runtime,
+            model_graph=model_graph,
+            labels=affected_labels,
+            surface_index=existing_surface,
+            previous_static_index=static_index,
+            previous_model_graph=previous_model_graph,
         )
         surface_index_delta = {
-            label: surface_index[label]
-            for label in sorted(affected_labels)
-            if label in surface_index
+            key: surface_index[key]
+            for key in sorted(affected_surface_keys)
+            if key in surface_index
         }
+        removed_labels = sorted(
+            key for key in affected_surface_keys
+            if key in existing_surface and key not in surface_index
+        )
+        added_labels = sorted(
+            key for key in surface_index_delta if key not in existing_surface
+        )
+        changed_labels = sorted(
+            key for key in surface_index_delta if key in existing_surface
+        )
         surface_fingerprints = fingerprint_surface_index(
             surface_index,
             labels=set(surface_index_delta),
         )
 
-        # Build model names
-        model_names = self._build_model_names(model_graph)
-
-        # Build staticFallback for affected models
-        static_fallback: dict[str, dict[str, object]] = {}
-        if self._last_static_fallback:
-            static_fallback = dict(self._last_static_fallback)
-        for label in affected_labels:
-            static_fallback.pop(label, None)
-        runtime_labels = set(surface_index.keys())
-        for node in model_graph.nodes_by_label.values():
-            candidate = node.model_candidate
-            if candidate is None or candidate.is_abstract or node.label in runtime_labels:
+        # Build staticFallback for affected models. Use the same entry shape
+        # as a full build (fieldDetails + reverseRelations); otherwise every
+        # reindexed model degrades to CharField lookups with no reverse
+        # relations on the client. `affected_labels` holds static candidate
+        # labels while fallback keys are graph labels.
+        affected_nodes = [
+            node for node in model_graph.nodes_by_label.values()
+            if node.label in affected_labels
+            or (
+                node.model_candidate is not None
+                and node.model_candidate.label in affected_labels
+            )
+        ]
+        static_fallback: dict[str, dict[str, object]] = dict(
+            previous_static_fallback or {}
+        )
+        for key in affected_labels | affected_surface_keys:
+            static_fallback.pop(key, None)
+        surface_labels = _surface_labels_with_instance_fields(surface_index)
+        for node in affected_nodes:
+            if node.label in surface_labels:
                 continue
-            if node.label not in affected_labels:
-                continue
-            fields_for = model_graph.fields_for_model(node.label)
-            scalar_names: list[str] = []
-            relation_names: list[str] = []
-            for f in fields_for:
-                if f.relation_direction == 'reverse':
-                    continue
-                if f.is_relation:
-                    relation_names.append(f.name)
-                else:
-                    scalar_names.append(f.name)
-            if scalar_names or relation_names:
-                static_fallback[node.label] = {
-                    'fields': scalar_names,
-                    'relations': relation_names,
-                }
+            entry = _static_fallback_entry(model_graph, node)
+            if entry is not None:
+                static_fallback[node.label] = entry
 
-        # Cache for next request
-        self._last_surface_index = surface_index
+        return _ReindexOutcome(
+            new_static_index=new_static_index,
+            affected_labels=affected_labels,
+            model_graph=model_graph,
+            surface_index=surface_index,
+            surface_index_delta=surface_index_delta,
+            surface_fingerprints=surface_fingerprints,
+            removed_labels=removed_labels,
+            added_labels=added_labels,
+            changed_labels=changed_labels,
+            static_fallback=static_fallback or None,
+            model_names=self._build_model_names(model_graph),
+        )
+
+    def _commit_reindex(self, outcome: _ReindexOutcome) -> dict[str, Any]:
+        """Publish a reindex result. Caller holds ``_state_lock``."""
+        if outcome.affected_labels is None:
+            self.static_index = outcome.new_static_index
+            return {'unchanged': True}
+
+        assert outcome.model_graph is not None
+        assert outcome.surface_index is not None
+        self.static_index = outcome.new_static_index
+        self.model_graph = outcome.model_graph
+        self._last_surface_index = outcome.surface_index
         self._last_surface_fingerprints = {
             **(self._last_surface_fingerprints or {}),
-            **surface_fingerprints,
+            **outcome.surface_fingerprints,
         }
-        for label in removed_labels:
+        for label in outcome.removed_labels:
             self._last_surface_fingerprints.pop(label, None)
-        self._last_model_names = model_names
-        self._last_static_fallback = static_fallback if static_fallback else None
+        self._last_model_names = outcome.model_names
+        self._last_static_fallback = outcome.static_fallback
         self._last_static_fallback_fingerprint = (
-            fingerprint_json_payload(self._last_static_fallback)
-            if self._last_static_fallback
+            fingerprint_json_payload(outcome.static_fallback)
+            if outcome.static_fallback
             else None
         )
+        self._reindex_serial += 1
+        for label in outcome.affected_labels:
+            self._reindexed_labels[label] = self._reindex_serial
+        self._source_snapshot_dirty = True
 
         # State snapshots changed; drop stale workers instead of spawning
         # fresh processes during edit-time reindex.
         self._discard_bg_pool()
 
-        elapsed = time.perf_counter() - started
-        print(
-            f'[PERF] reindexFile: {len(affected_labels)} affected '
-            f'{elapsed:.3f}s',
-            file=sys.stderr,
-        )
-
         return {
-            'surfaceIndexDelta': surface_index_delta,
-            'surfaceFingerprints': surface_fingerprints,
-            'staticFallback': static_fallback if static_fallback else None,
+            'surfaceIndexDelta': outcome.surface_index_delta,
+            'surfaceFingerprints': outcome.surface_fingerprints,
+            'staticFallback': outcome.static_fallback,
             'staticFallbackFingerprint': self._last_static_fallback_fingerprint,
-            'addedLabels': added_labels,
-            'changedLabels': changed_labels,
-            'removedLabels': removed_labels,
+            'addedLabels': outcome.added_labels,
+            'changedLabels': outcome.changed_labels,
+            'removedLabels': outcome.removed_labels,
         }
 
     def _health(self) -> dict[str, Any]:
@@ -2048,11 +2343,14 @@ class DaemonServer:
         model_graph: ModelGraph,
         semantic_graph: SemanticGraphSummary,
         health_snapshot: dict[str, Any],
+        static_index_matches_snapshot: bool = True,
     ) -> bool:
         with self._state_lock:
             if generation != self._state_generation:
                 return False
 
+            if static_index_matches_snapshot:
+                self._source_snapshot_dirty = False
             self.initialized_at = initialized_at
             self.source_snapshot = source_snapshot
             self.workspace_profile = workspace_profile
@@ -2113,54 +2411,76 @@ class DaemonServer:
             runtime,
         )
         runtime_cache_fingerprint = _runtime_cache_fingerprint(runtime)
-        model_graph = build_model_graph(static_index, runtime)
-        save_model_graph(
-            workspace_root,
-            source_fingerprint=source_snapshot.fingerprint,
-            runtime_fingerprint=runtime_cache_fingerprint,
-            model_graph=model_graph,
-        )
-        semantic_graph = build_semantic_graph(workspace_profile, static_index, runtime)
-        health_snapshot = build_health_snapshot(
-            workspace=workspace_profile,
-            static_index=static_index,
-            runtime=runtime,
-            semantic_graph=semantic_graph,
-            initialized_at=initialized_at,
-        )
+
+        # Build against the *current* static index. A file saved while Django
+        # was importing was reindexed into `self.static_index`; building from
+        # the initialize-time copy and applying it would silently drop that
+        # edit until the file is saved again. Retry when a reindex lands while
+        # we build; the last attempt builds under the lock.
+        for attempt in range(_WARMUP_APPLY_ATTEMPTS):
+            last_attempt = attempt == _WARMUP_APPLY_ATTEMPTS - 1
+            with self._state_lock if last_attempt else contextlib.nullcontext():
+                with self._state_lock:
+                    if generation != self._state_generation:
+                        return
+                    graph_static_index = self.static_index or static_index
+                model_graph = build_model_graph(graph_static_index, runtime)
+                semantic_graph = build_semantic_graph(
+                    workspace_profile, graph_static_index, runtime,
+                )
+                health_snapshot = build_health_snapshot(
+                    workspace=workspace_profile,
+                    static_index=graph_static_index,
+                    runtime=runtime,
+                    semantic_graph=semantic_graph,
+                    initialized_at=initialized_at,
+                )
+                with self._state_lock:
+                    if generation != self._state_generation:
+                        return
+                    if (
+                        self.static_index is not None
+                        and self.static_index is not graph_static_index
+                        and not last_attempt
+                    ):
+                        continue
+                    if not self._apply_state(
+                        generation=generation,
+                        initialized_at=initialized_at,
+                        source_snapshot=source_snapshot,
+                        workspace_profile=workspace_profile,
+                        static_index=graph_static_index,
+                        runtime=runtime,
+                        model_graph=model_graph,
+                        semantic_graph=semantic_graph,
+                        health_snapshot=health_snapshot,
+                        # Warm-up keeps the snapshot; reindexed edits since
+                        # initialize still diverge from it.
+                        static_index_matches_snapshot=False,
+                    ):
+                        return
+                    self._publish_warmed_runtime_state(
+                        runtime=runtime,
+                        model_graph=model_graph,
+                        health_snapshot=health_snapshot,
+                    )
+                    source_dirty = self._source_snapshot_dirty
+                    break
+
+        # The graph cache is keyed by the initialize-time source fingerprint;
+        # only persist it when no model edit moved the static index away.
+        if not source_dirty:
+            save_model_graph(
+                workspace_root,
+                source_fingerprint=source_snapshot.fingerprint,
+                runtime_fingerprint=runtime_cache_fingerprint,
+                model_graph=model_graph,
+            )
         _log_initialize_step(
             'inspect_runtime(background) '
             f'status={runtime.bootstrap_status} '
             f'django_importable={runtime.django_importable} '
             f'elapsed={time.perf_counter() - started_at:.2f}s'
-        )
-
-        if not self._apply_state(
-            generation=generation,
-            initialized_at=initialized_at,
-            source_snapshot=source_snapshot,
-            workspace_profile=workspace_profile,
-            static_index=static_index,
-            runtime=runtime,
-            model_graph=model_graph,
-            semantic_graph=semantic_graph,
-            health_snapshot=health_snapshot,
-        ):
-            return
-
-        self._last_model_names = self._build_model_names(model_graph)
-        if self._last_surface_index is not None:
-            self._last_static_fallback = self._build_static_fallback(
-                model_graph=model_graph,
-                surface_index=self._last_surface_index,
-            )
-            self._last_static_fallback_fingerprint = (
-                fingerprint_json_payload(self._last_static_fallback)
-                if self._last_static_fallback
-                else None
-            )
-        self._last_custom_lookups_fingerprint = fingerprint_json_payload(
-            runtime.custom_lookups
         )
 
         # Runtime warmup produced better state; drop stale workers. Surface
@@ -2172,10 +2492,58 @@ class DaemonServer:
             expected_generation=generation,
         )
 
+    def _publish_warmed_runtime_state(
+        self,
+        *,
+        runtime: RuntimeInspection,
+        model_graph: ModelGraph,
+        health_snapshot: dict[str, Any],
+    ) -> None:
+        """Push the runtime-derived fallback. Caller holds ``_state_lock``.
+
+        Until the idle surface load lands (a cold prebuild can take long, or
+        fail), the client's local index is built from this fallback. The one
+        from initialize came from the static-only graph: models whose fields
+        live on bases the static indexer cannot see had nothing but the
+        synthesized `id` / `pk`, runtime-relabelled models (`zuzu.X` ↔ `db.X`)
+        sat under the static label, and third-party models were missing.
+
+        Written under the state lock so no reindex or surface load can publish
+        newer state between this snapshot and its notification.
+        """
+        # Surface slices rebuilt by reindexes during warm-up were computed
+        # against the pending runtime and static-only graph. Drop them; the
+        # runtime fallback covers those models until the full surface loads.
+        self._last_surface_index = {}
+        self._last_surface_fingerprints = {}
+        model_names = self._build_model_names(model_graph)
+        custom_lookups_fingerprint = fingerprint_json_payload(
+            runtime.custom_lookups
+        )
+        static_fallback = self._build_static_fallback(
+            model_graph=model_graph,
+            surface_index={},
+        )
+        static_fallback_fingerprint = (
+            fingerprint_json_payload(static_fallback)
+            if static_fallback
+            else None
+        )
+        self._last_model_names = model_names
+        self._last_static_fallback = static_fallback
+        self._last_static_fallback_fingerprint = static_fallback_fingerprint
+        self._last_custom_lookups_fingerprint = custom_lookups_fingerprint
         self._write_notification(
-            'healthChanged',
+            'surfaceIndexChanged',
             {
                 'health': health_snapshot,
+                'modelNames': model_names,
+                'surfaceIndex': {},
+                'surfaceFingerprints': {},
+                'customLookups': runtime.custom_lookups,
+                'customLookupsFingerprint': custom_lookups_fingerprint,
+                'staticFallback': static_fallback,
+                'staticFallbackFingerprint': static_fallback_fingerprint,
             },
         )
 
