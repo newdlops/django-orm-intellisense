@@ -100,6 +100,8 @@ export function fixture(providerSource?: string, realTimers = false, stableProvi
     },
   };
   const signalContext = new AsyncLocalStorage<AbortSignal>();
+  const documentContext = new AsyncLocalStorage<string>();
+  const sourceFiles: Array<string | undefined> = [];
   let sourceCalls = 0;
   let body: (callback: () => unknown) => unknown = () => Promise.resolve(undefined);
   let ensureStarted = () => Promise.resolve();
@@ -112,8 +114,11 @@ export function fixture(providerSource?: string, realTimers = false, stableProvi
     onDidChangeState: on('state'), onDidReindexModels: on('models'),
     withDeadline: (_deadline: number, callback: () => unknown) => callback(),
     withAbortSignal: (next: AbortSignal, callback: () => unknown) => signalContext.run(next, callback),
+    withDocumentContext: (file: string, callback: () => unknown) => documentContext.run(file, callback),
+    getRequestProjectKey: () => documentContext.getStore() ?? '',
     withRequestSource: (_source: string, callback: () => unknown) => {
       sourceCalls++;
+      sourceFiles.push(documentContext.getStore());
       signals.push(signalContext.getStore());
       return body(callback);
     },
@@ -167,7 +172,7 @@ export function fixture(providerSource?: string, realTimers = false, stableProvi
     getWordRangeAtPosition: () => undefined,
   };
   return {
-    timers, signals, providers, get sourceCalls() { return sourceCalls; },
+    timers, signals, providers, sourceFiles, get sourceCalls() { return sourceCalls; },
     isAborted: () => daemon.isAborted(),
     createOwner() { return new (load(path.join(__dirname, 'providerRequestLifetime.js')).ProviderRequestOwner)(); },
     setBody(next: () => Promise<unknown>) { body = next; },
@@ -254,6 +259,8 @@ async function main(): Promise<void> {
     const test = fixture(), token = new Token();
     try {
       for (let i = 0; i < 32; i++) await test.invoke(kind, token);
+      assert.ok(test.sourceFiles.every(file => file === '/fixture/query.py'),
+        `${kind}: the real provider callback preserves its source document for project selection`);
       observations.push({ kind, completed: 32, retainedTimers: test.timers.size,
         retainedTokenListeners: token.listeners.size, sourceCalls: test.sourceCalls });
     } finally { test.dispose(); }

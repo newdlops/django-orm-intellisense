@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .server.app import DaemonServer
+from .server.project_daemon import ProjectDaemonServer
 
 
 def main() -> None:
@@ -25,7 +25,7 @@ def main() -> None:
     if not args.stdio:
         parser.error('Only --stdio mode is currently supported.')
 
-    server = DaemonServer(Path(args.workspace).resolve())
+    server = ProjectDaemonServer(Path(args.workspace).resolve())
 
     try:
         server.run_stdio()

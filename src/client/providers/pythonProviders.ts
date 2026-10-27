@@ -1269,7 +1269,7 @@ const documentDefinitionsCache = new WeakMap<
 >();
 let allRelationTargetsCache = new WeakMap<
   AnalysisDaemon,
-  Promise<RelationTargetsResult>
+  Map<string, Promise<RelationTargetsResult>>
 >();
 let staticQuerySetClassSourceCache = new WeakMap<
   AnalysisDaemon,
@@ -1495,6 +1495,16 @@ export function registerPythonProviders(
   daemon: AnalysisDaemon,
   providerOwner?: PythonInteractiveProviderOwner
 ): vscode.Disposable[] {
+  const documentScoped = <T extends object>(provider: T): T => {
+    for (const name of ['provideCompletionItems', 'provideHover', 'provideDefinition', 'provideSignatureHelp', 'provideInlayHints']) {
+      const original = Reflect.get(provider, name) as ((...args: unknown[]) => unknown) | undefined;
+      if (typeof original !== 'function') continue;
+      Reflect.set(provider, name, function(this: unknown, document: vscode.TextDocument, ...args: unknown[]) {
+        return daemon.withDocumentContext(document.uri.fsPath, () => original.call(this, document, ...args));
+      });
+    }
+    return provider;
+  };
   const pythonSelector = buildPythonSelector();
   const diagnosticCollection = vscode.languages.createDiagnosticCollection(
     'djangoOrmIntellisense.orm'
@@ -2873,9 +2883,9 @@ export function registerPythonProviders(
       }
       activeDiagnosticScanRunningCount--;
     }
-  }));
+  }, document.uri.fsPath));
 
-  const completionImplementation: vscode.CompletionItemProvider = {
+  const completionImplementation: vscode.CompletionItemProvider = documentScoped({
       async provideCompletionItems(document, position, token) {
         daemon.logDiagnostic(`[completion:enter] ${document.uri.fsPath.split('/').slice(-2).join('/')}:${position.line}:${position.character}`);
         const trace = process.env.DJLS_TEST_CAPTURE_LOGS === '1' ? {
@@ -2946,14 +2956,14 @@ export function registerPythonProviders(
             return result.items.map((item) => {
               const completion = new vscode.CompletionItem(
                 {
-                  label: item.label,
+                  label: item.djangoLabel ?? item.label,
                   description: 'Django',
                 },
                 vscode.CompletionItemKind.Class
               );
               completion.detail = `${item.module} (${item.source})`;
-              completion.insertText = item.label;
-              completion.filterText = item.label;
+              completion.insertText = item.djangoLabel ?? item.label;
+              completion.filterText = item.djangoLabel ?? item.label;
               completion.sortText = `\u0000django-${item.label}`;
               completion.range = relationContext.range;
               completion.documentation = buildRelationTargetMarkdown(item);
@@ -3589,7 +3599,7 @@ export function registerPythonProviders(
           activeInteractiveRequestCount--;
         }
       },
-    };
+    });
   const completionProvider = providerOwner
     ? new vscode.Disposable(() => {})
     : vscode.languages.registerCompletionItemProvider(
@@ -3598,7 +3608,7 @@ export function registerPythonProviders(
       "'", '"', '.', '_', '(', ','
     );
 
-  const signatureHelpImplementation: vscode.SignatureHelpProvider = {
+  const signatureHelpImplementation: vscode.SignatureHelpProvider = documentScoped({
       async provideSignatureHelp(document, position, token, context) {
         activeInteractiveRequestCount++;
         let requestScope: ProviderRequestScope | undefined;
@@ -3679,7 +3689,7 @@ export function registerPythonProviders(
           activeInteractiveRequestCount--;
         }
       },
-    };
+    });
   const signatureHelpProvider = providerOwner
     ? new vscode.Disposable(() => {})
     : vscode.languages.registerSignatureHelpProvider(
@@ -3694,7 +3704,7 @@ export function registerPythonProviders(
       }
     );
 
-  const hoverImplementation: vscode.HoverProvider = {
+  const hoverImplementation: vscode.HoverProvider = documentScoped({
       async provideHover(document, position, token) {
         const trace: HoverTraceForTesting | undefined = process.env.DJLS_TEST_CAPTURE_LOGS === '1'
           ? { uri: document.uri.toString(), line: position.line, character: position.character,
@@ -4236,6 +4246,18 @@ export function registerPythonProviders(
         const shortPath = document.uri.fsPath.split('/').slice(-2).join('/');
         daemon.logDiagnostic(`[hover] ${shortPath}:${position.line}:${position.character} ${elapsed}ms result=${hoverResult ? 'hover' : 'none'} disposed=${providersDisposed}${timedOut ? ' TIMEOUT' : ''}`);
         if (trace) trace.returnedHover = Boolean(hoverResult);
+        if (hoverResult && daemon.projectContexts?.length) {
+          // Registry namespaces distinguish identical models internally. Show
+          // their original Django labels in inline model descriptions.
+          for (const content of hoverResult.contents) {
+            if (!(content instanceof vscode.MarkdownString)) continue;
+            content.value = content.value.replace(/`([^`\n]+)`/g, (original, label: string) => {
+              const context = daemon.projectContexts.find(project => label.startsWith(project.namespace + '.'));
+              const display = context?.models[label]?.djangoLabel;
+              return display ? '`' + display + '`' : original;
+            });
+          }
+        }
         return hoverResult;
         } catch (error) {
           if (trace) trace.error = error instanceof Error ? error.message : String(error);
@@ -4254,9 +4276,9 @@ export function registerPythonProviders(
           }
         }
       },
-    };
+    });
 
-  const definitionImplementation: vscode.DefinitionProvider = {
+  const definitionImplementation: vscode.DefinitionProvider = documentScoped({
       async provideDefinition(document, position, token) {
         daemon.logDiagnostic(`[definition:enter] ${document.uri.fsPath.split('/').slice(-2).join('/')}:${position.line}:${position.character}`);
         activeInteractiveRequestCount++;
@@ -4601,13 +4623,13 @@ export function registerPythonProviders(
           activeInteractiveRequestCount--;
         }
       },
-    };
+    });
   const definitionProvider = providerOwner
     ? new vscode.Disposable(() => {})
     : vscode.languages.registerDefinitionProvider(pythonSelector, definitionImplementation);
 
   const inlayHintsChanged = new vscode.EventEmitter<void>();
-  const inlayHintsImplementation: vscode.InlayHintsProvider = {
+  const inlayHintsImplementation: vscode.InlayHintsProvider = documentScoped({
       onDidChangeInlayHints: inlayHintsChanged.event,
       async provideInlayHints(document, range, token) {
         activeInteractiveRequestCount++;
@@ -4752,7 +4774,7 @@ export function registerPythonProviders(
           activeInteractiveRequestCount--;
         }
       },
-    };
+    });
   const inlayHintsProvider = providerOwner
     ? new vscode.Disposable(() => {})
     : vscode.languages.registerInlayHintsProvider(pythonSelector, inlayHintsImplementation);
@@ -8132,7 +8154,7 @@ async function runWithConcurrency<T>(
 
 function resetProviderResolutionCaches(): void {
   receiverCacheRevision++;
-  allRelationTargetsCache = new WeakMap<AnalysisDaemon, Promise<RelationTargetsResult>>();
+  allRelationTargetsCache = new WeakMap<AnalysisDaemon, Map<string, Promise<RelationTargetsResult>>>();
   staticQuerySetClassSourceCache = new WeakMap<
     AnalysisDaemon,
     Map<string, Promise<ClassDefinitionSource | undefined>>
@@ -8161,18 +8183,24 @@ function resetProviderResolutionCaches(): void {
 async function listAllRelationTargets(
   daemon: AnalysisDaemon
 ): Promise<RelationTargetsResult> {
-  const cached = allRelationTargetsCache.get(daemon);
+  let cache = allRelationTargetsCache.get(daemon);
+  if (!cache) {
+    cache = new Map();
+    allRelationTargetsCache.set(daemon, cache);
+  }
+  const projectKey = daemon.getRequestProjectKey();
+  const cached = cache.get(projectKey);
   if (cached) {
     return cached;
   }
 
   const request = daemon.listRelationTargets('');
-  allRelationTargetsCache.set(daemon, request);
+  cache.set(projectKey, request);
   try {
     return await request;
   } catch (error) {
-    if (allRelationTargetsCache.get(daemon) === request) {
-      allRelationTargetsCache.delete(daemon);
+    if (cache.get(projectKey) === request) {
+      cache.delete(projectKey);
     }
     throw error;
   }

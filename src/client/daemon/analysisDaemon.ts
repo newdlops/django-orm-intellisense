@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { AsyncLocalStorage } from 'async_hooks';
 import { withKnownNativeMemberReturn } from './ormMemberConfidence';
 import { applyLookupCatalogDelta } from '../../server/lookupCatalog';
+import { attachProjectModelSources, projectForFile, projectWorkspaceView } from '../../server/projectScope';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
@@ -60,6 +61,7 @@ import type {
   RequestMessage,
   ResponseMessage,
   ServerMessage,
+  DjangoProjectContext,
 } from '../protocol';
 import {
   buildModelLabelByName,
@@ -333,6 +335,9 @@ export class AnalysisDaemon implements vscode.Disposable {
   private readonly responseCache = new Map<string, { promise: Promise<unknown>; createdAt: number; source?: IpcRequestSource }>();
   private readonly intentionalExitProcessIds = new Set<number>();
   private readonly requestSourceContext = new AsyncLocalStorage<IpcRequestSource>();
+  private readonly documentContext = new AsyncLocalStorage<string | undefined>();
+  projectContexts: DjangoProjectContext[] = [];
+  private projectViews = new Map<string, WorkspaceIndex>();
   private readonly abortSignalContext = new AsyncLocalStorage<AbortSignal>();
   private readonly deadlineContext = new AsyncLocalStorage<number>();
   private readonly output: vscode.OutputChannel;
@@ -350,8 +355,16 @@ export class AnalysisDaemon implements vscode.Disposable {
   private restartQueued = false;
   private queuedRestartScope?: vscode.ConfigurationScope;
   private stopRequested = false;
-  modelNames: Set<string> = new Set();
-  modelLabelByName: Map<string, string> = new Map();
+  private allModelNames: Set<string> = new Set();
+  private allModelLabels: Map<string, string> = new Map();
+  get modelNames(): Set<string> {
+    return this.projectContexts.length ? new Set(this.getLookupIndex().modelLabelByName.keys()) : this.allModelNames;
+  }
+  set modelNames(value: Set<string>) { this.allModelNames = value; }
+  get modelLabelByName(): Map<string, string> {
+    return this.projectContexts.length ? this.getLookupIndex().modelLabelByName : this.allModelLabels;
+  }
+  set modelLabelByName(value: Map<string, string>) { this.allModelLabels = value; }
   // Lazy inverted index over `localWorkspaceIndex.models.keys()` (full labels).
   // Maps short name -> full label, populated on first miss in
   // `findModelLabelByShortName`, invalidated when the workspace index is
@@ -425,6 +438,8 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   getState(): HealthSnapshot {
+    const project = projectForFile(this.projectContexts, this.documentContext.getStore());
+    if (project?.runtime) return {...this.currentState, runtime: project.runtime};
     return this.currentState;
   }
 
@@ -457,8 +472,25 @@ export class AnalysisDaemon implements vscode.Disposable {
     );
   }
 
-  withRequestSource<T>(source: IpcRequestSource, callback: () => T): T {
-    return this.requestSourceContext.run(source, callback);
+  withRequestSource<T>(source: IpcRequestSource, callback: () => T, sourceFile?: string): T {
+    return this.requestSourceContext.run(source, () => this.documentContext.run(
+      sourceFile ? normalizeSourcePath(sourceFile) : this.documentContext.getStore(), callback));
+  }
+
+  withDocumentContext<T>(sourceFile: string, callback: () => T): T {
+    return this.documentContext.run(normalizeSourcePath(sourceFile), callback);
+  }
+
+  /** Publication always includes the whole repository, regardless of caller. */
+  getAllModelNames(): readonly string[] { return [...this.allModelNames]; }
+
+  getRequestProjectKey(): string {
+    return projectForFile(this.projectContexts, this.documentContext.getStore())?.namespace ?? '';
+  }
+
+  private invalidateProjectViews(): void {
+    this.projectViews.clear();
+    attachProjectModelSources(this.localWorkspaceIndex, this.projectContexts);
   }
 
   withAbortSignal<T>(signal: AbortSignal, callback: () => T): T {
@@ -488,12 +520,13 @@ export class AnalysisDaemon implements vscode.Disposable {
   private rebuildLocalWorkspaceIndex(): void {
     this.localWorkspaceIndex = buildWorkspaceIndex(
       this.surfaceIndex,
-      Array.from(this.modelNames),
+      Array.from(this.allModelNames),
       this.customLookups,
       this.effectiveStaticFallback(),
       this.lookupCatalog,
     );
     this._shortNameFromFullLabelIndex = null;
+    this.invalidateProjectViews();
     this.localModelFingerprints.clear();
     for (const [label, receivers] of Object.entries(this.surfaceIndex)) {
       this.localModelFingerprints.set(
@@ -586,7 +619,7 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   private rebuildModelNames(): void {
-    this.modelNames = new Set(this.modelLabelByName.keys());
+    this.modelNames = new Set(this.allModelLabels.keys());
   }
 
   /**
@@ -607,6 +640,7 @@ export class AnalysisDaemon implements vscode.Disposable {
    * paths.
    */
   findModelLabelByShortName(shortName: string): string | undefined {
+    if (this.projectContexts.length) return this.getLookupIndex().modelLabelByName.get(shortName);
     const direct = this.modelLabelByName.get(shortName);
     if (direct) return direct;
     const lwi = this.localWorkspaceIndex.modelLabelByName.get(shortName);
@@ -960,7 +994,7 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   async listRelationTargets(prefix: string): Promise<RelationTargetsResult> {
-    const native = isNativeFastPathReady()
+    const native = this.projectContexts.length === 0 && isNativeFastPathReady()
       ? nativeListRelationTargets(prefix)
       : undefined;
     if (native && (native.items.length > 0 || prefix.trim().length === 0)) {
@@ -992,7 +1026,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     // Python daemon was measured at 950-3084ms for this call on real
     // projects. Foreground definition/hover still needs source locations,
     // but diagnostics only need the resolution outcome.
-    const native = isNativeFastPathReady()
+    const native = this.projectContexts.length === 0 && isNativeFastPathReady()
       ? nativeResolveRelationTarget(value)
       : undefined;
     if (
@@ -1033,7 +1067,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     // `ensureNativeAstModules` after surface hydrate, so we only hit
     // the fast path once that completes — before then, `native` returns
     // `undefined` and we fall through to Python.
-    const native = nativeResolveExportOrigin(moduleName, symbol);
+    const native = this.projectContexts.length ? undefined : nativeResolveExportOrigin(moduleName, symbol);
     if (
       native?.resolved &&
       (native.originFilePath || allowLocationlessNative)
@@ -1062,7 +1096,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     };
     const source = this.currentRequestSource();
     const allowLocationlessNative = source === 'diagnostic';
-    const native = nativeResolveModule(moduleName);
+    const native = this.projectContexts.length ? undefined : nativeResolveModule(moduleName);
     if (native?.resolved && (native.filePath || allowLocationlessNative)) {
       _track();
       return native;
@@ -1134,6 +1168,8 @@ export class AnalysisDaemon implements vscode.Disposable {
     if (result.error) {
       throw new Error(result.error);
     }
+    if (result.projectContexts) this.projectContexts = result.projectContexts;
+    this.invalidateProjectViews();
 
     if (result.unchanged) {
       // Only a verified source duplicate leaves resolver metadata untouched.
@@ -1213,6 +1249,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     this.staticFallbackFingerprint = nextStaticFallbackFingerprint;
     this.rebuildModelLabelByName();
     this.rebuildModelNames();
+    this.invalidateProjectViews();
     this.refreshNativeFastPathFromSurface('reindex');
     // Cached IPC answers (lookup resolutions, receiver chains) were computed
     // against the old models and would otherwise outlive the edit by the TTL.
@@ -1266,7 +1303,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       return undefined;
     }
 
-    const index = this.localWorkspaceIndex;
+    const index = this.getLookupIndex();
     const model = index.models.get(baseModelLabel);
     if (!model) {
       const objectName = baseModelLabel.includes('.')
@@ -1391,7 +1428,14 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   getLookupIndex(): WorkspaceIndex {
-    return this.localWorkspaceIndex;
+    if (this.projectContexts.length === 0) return this.localWorkspaceIndex;
+    const key = this.getRequestProjectKey();
+    let view = this.projectViews.get(key);
+    if (!view) {
+      view = projectWorkspaceView(this.localWorkspaceIndex, this.projectContexts, this.documentContext.getStore());
+      this.projectViews.set(key, view);
+    }
+    return view;
   }
 
   async resolveLookupPath(
@@ -1792,7 +1836,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     modelLabel: string,
     prefix: string,
   ): OrmMemberCompletionsResult | undefined {
-    const model = this.localWorkspaceIndex.models.get(modelLabel);
+    const model = this.getLookupIndex().models.get(modelLabel);
     if (!model || model.fields.size === 0) {
       return undefined;
     }
@@ -2079,7 +2123,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     if (!normalizedValue) {
       return { resolved: false, reason: 'empty', baseModelLabel };
     }
-    if (!this.localWorkspaceIndex.models.has(baseModelLabel)) {
+    if (!this.getLookupIndex().models.has(baseModelLabel)) {
       return undefined;
     }
     if (LOCAL_LOOKUP_RELATION_ONLY_METHODS.has(method)) {
@@ -2096,7 +2140,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     const parsed = parseLookupChain(
       normalizedValue,
       baseModelLabel,
-      this.localWorkspaceIndex,
+      this.getLookupIndex(),
       method,
     );
     if (parsed.runtimeRequired) return undefined;
@@ -2234,7 +2278,7 @@ export class AnalysisDaemon implements vscode.Disposable {
         : undefined;
     }
 
-    const model = this.localWorkspaceIndex.models.get(modelLabel);
+    const model = this.getLookupIndex().models.get(modelLabel);
     const field = model?.fields.get(name);
     const relation =
       model?.relations.get(name) ?? model?.reverseRelations.get(name);
@@ -2337,7 +2381,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     const resolvedSegments: LookupPathItem[] = [];
 
     for (const [index, segment] of segments.entries()) {
-      const model = this.localWorkspaceIndex.models.get(currentModelLabel);
+      const model = this.getLookupIndex().models.get(currentModelLabel);
       if (!model) {
         return undefined;
       }
@@ -2442,7 +2486,7 @@ export class AnalysisDaemon implements vscode.Disposable {
         return undefined;
       }
 
-      const lookupField = this.localWorkspaceIndex.models
+      const lookupField = this.getLookupIndex().models
         .get(ownerModelLabel)
         ?.fields.get(lastResolved.name);
       if (supportsLookupTransforms(method) && lookupField) {
@@ -2486,7 +2530,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     const candidates = getCompletionCandidates(
       parsed,
       currentPartial,
-      this.localWorkspaceIndex,
+      this.getLookupIndex(),
       method,
     );
 
@@ -2513,7 +2557,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     currentPartial: string,
     method: string,
   ): LookupPathItem[] {
-    const model = this.localWorkspaceIndex.models.get(currentModelLabel);
+    const model = this.getLookupIndex().models.get(currentModelLabel);
     if (!model) {
       return [];
     }
@@ -2580,7 +2624,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       }
 
       for (const field of this.getLocalLookupFieldsForModel(modelLabel)) {
-        const model = this.localWorkspaceIndex.models.get(modelLabel);
+        const model = this.getLookupIndex().models.get(modelLabel);
         const eligibleRelation = this.getLocalRelationInfo(modelLabel, field.name);
         if (model && eligibleRelation && !relationAllowedForMethod(model, eligibleRelation, method)) continue;
         if (relationOnly && (!model || !eligibleRelation || !relationAllowedForMethod(model, eligibleRelation, method))) continue;
@@ -2654,7 +2698,7 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   private getLocalLookupFieldsForModel(modelLabel: string): FieldInfo[] {
-    const model = this.localWorkspaceIndex.models.get(modelLabel);
+    const model = this.getLookupIndex().models.get(modelLabel);
     if (!model) {
       return [];
     }
@@ -2668,7 +2712,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     modelLabel: string,
     fieldName: string,
   ) {
-    const model = this.localWorkspaceIndex.models.get(modelLabel);
+    const model = this.getLookupIndex().models.get(modelLabel);
     return model?.relations.get(fieldName) ?? model?.reverseRelations.get(fieldName);
   }
 
@@ -2688,7 +2732,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     fieldName: string,
     itemName: string = fieldName,
   ): LookupPathItem | undefined {
-    const model = this.localWorkspaceIndex.models.get(ownerModelLabel);
+    const model = this.getLookupIndex().models.get(ownerModelLabel);
     const field = model?.fields.get(fieldName);
     if (!field || this.isHiddenLookupFieldName(field.name)) {
       return undefined;
@@ -3047,6 +3091,7 @@ export class AnalysisDaemon implements vscode.Disposable {
         roots: Object.freeze(roots.map(root => Object.freeze(root)))});
     } else this.sourceObservationContext = undefined;
     this.surfaceIndex = initializeResult.surfaceIndex ?? {};
+    this.projectContexts = initializeResult.projectContexts ?? [];
     this.sourceProvenance = initializeResult.sourceProvenance ?? null;
     this.surfaceFingerprints = initializeResult.surfaceFingerprints ?? {};
     this.customLookups = initializeResult.customLookups ?? {};
@@ -3181,6 +3226,8 @@ export class AnalysisDaemon implements vscode.Disposable {
     params: Record<string, unknown>,
     background: boolean = false
   ): Promise<T> {
+    const sourceFile = this.documentContext.getStore();
+    if (this.projectContexts.length && sourceFile) params = {...params, _sourceFile: sourceFile};
     // Track every cachedRequest invocation (including cache hits) so the
     // per-cycle perf summary's ipc-by-method breakdown captures ALL daemon
     // IPC types, not just the 4 receiver-chain methods we wrapped
@@ -3369,6 +3416,8 @@ export class AnalysisDaemon implements vscode.Disposable {
     this.clearResponseCache();
     dropNativeFastPath();
     if (this.metadataRetired) return;
+    this.projectContexts = [];
+    this.projectViews.clear();
     this.surfaceIndex = {};
     this.surfaceFingerprints = {};
     this.customLookups = {};
@@ -3564,6 +3613,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     this.sourceProvenance = null;
     if (message.params?.surfaceIndex) {
       this.surfaceIndex = message.params.surfaceIndex;
+      this.projectContexts = message.params.projectContexts ?? [];
       this.sourceProvenance = message.params.sourceProvenance ?? null;
       this.surfaceFingerprints = message.params.surfaceFingerprints ?? {};
       this.customLookups = message.params.customLookups ?? {};

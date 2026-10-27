@@ -94,7 +94,7 @@ class _MemberSurfaceCache:
     def _registry_ready(runtime: RuntimeInspection) -> bool:
         # Cached runtime summaries can be ready before this process's Django
         # registry. Availability is a cache epoch, checked without setup/wait.
-        return bool(runtime.bootstrap_status == 'ready' and runtime.settings_module
+        return bool(not runtime.detached and runtime.bootstrap_status == 'ready' and runtime.settings_module
             and runtime_field_registry_is_ready(runtime.settings_module))
 
     def _clean_model_version(self, label: str) -> None:
@@ -1158,6 +1158,9 @@ def capture_runtime_member_surface(static_index: StaticIndex, runtime: RuntimeIn
     """Capture only transferable runtime members from the initialized parent."""
     if runtime.bootstrap_status != 'ready':
         return None
+    if runtime.detached:
+        owned = _owned_runtime_members(static_index, runtime)
+        return dict(owned.items) if owned is not None and not owned.invalidated_labels else None
     # A restored ready catalogue can precede the parent's asynchronous Django
     # setup. Serialize app population with Django's own lock before capturing;
     # an empty capture in that window must not become a complete disk cache.
@@ -1769,6 +1772,8 @@ def _project_manager_method_items(*, static_index, runtime, model_label, manager
     captured = _captured_runtime_items(static_index, runtime, model_label, runtime_receiver_kind, manager_name)
     if captured is not None:
         return captured
+    if runtime.detached:
+        return []
     manager = _runtime_manager(model_label, manager_name) if runtime.bootstrap_status == 'ready' else None
     if manager is None:
         return []
@@ -1833,6 +1838,8 @@ def _project_queryset_method_items(*, static_index, runtime, model_label, manage
     captured = _captured_runtime_items(static_index, runtime, model_label, 'queryset', manager_name)
     if captured is not None:
         return captured
+    if runtime.detached:
+        return []
     manager = _runtime_manager(model_label, manager_name) if runtime.bootstrap_status == 'ready' else None
     if manager is None:
         return []
@@ -2218,7 +2225,7 @@ def _project_model_method_items(
     captured = _captured_runtime_items(static_index, runtime, model_label, receiver_kind, None)
     if captured is not None:
         return captured
-    if runtime.bootstrap_status != 'ready':
+    if runtime.bootstrap_status != 'ready' or runtime.detached:
         return []
     model_class = _runtime_model_class(model_label)
     if model_class is None:

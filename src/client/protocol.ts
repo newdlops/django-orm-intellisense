@@ -51,6 +51,28 @@ export interface RelationTargetItem extends RuntimeModelPreview {
   appLabel: string;
   objectName: string;
   source: string;
+  djangoLabel?: string;
+  projectRoot?: string;
+}
+
+/** Internal IDs are qualified per registry; Django source names stay intact. */
+export interface DjangoProjectContext {
+  root: string;
+  importRoot: string;
+  rootAliases?: string[];
+  namespace: string;
+  settingsModule?: string | null;
+  selector?: string | null;
+  candidates: string[];
+  phase: ServerPhase;
+  error?: string;
+  runtime?: RuntimeInspectionSnapshot;
+  customLookups?: Record<string, string[]>;
+  lookupKinds?: Record<string, string>;
+  models: Record<string, {
+    djangoLabel: string; sourceModule: string; module: string;
+    filePath?: string; line?: number; column?: number;
+  }>;
 }
 
 export interface RelationTargetsResult {
@@ -227,6 +249,7 @@ export type StaticFallbackPayload = Record<
 >;
 
 export interface InitializeResult {
+  projectContexts?: DjangoProjectContext[];
   surfaceTransport?: NonNullable<SurfaceIndexChangedNotificationMessage['params']>['surfaceTransport'];
   sourceObservationContext?: import('./sourceObservation').SourceObservationContext;
   sourceProvenance?: import('./surfaceSourceProvenance').SurfaceSourceProvenance | null;
@@ -250,6 +273,7 @@ export interface DeletedSourceFilesResult {
 }
 
 export interface ReindexFileResult {
+  projectContexts?: DjangoProjectContext[];
   error?: string;
   lookupCatalogDelta?: import('../server/lookupCatalog').LookupCatalogDelta;
   surfaceIndex?: Record<string, Record<string, Record<string, [string, string | null, string?, (string | null)?]>>>;
@@ -299,6 +323,7 @@ export interface HealthChangedNotificationMessage {
 export interface SurfaceIndexChangedNotificationMessage {
   event: 'surfaceIndexChanged';
   params?: {
+    projectContexts?: DjangoProjectContext[];
     sourceProvenance?: import('./surfaceSourceProvenance').SurfaceSourceProvenance | null;
     surfaceTransport?: { version: 1; sequence: number; kind: 'full' | 'delta'; baseSequence?: number };
     surfaceIndexDelta?: Record<string, Record<string, Record<string, [string, string | null, string?, (string | null)?]>>>;

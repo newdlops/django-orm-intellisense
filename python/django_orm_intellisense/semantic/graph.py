@@ -676,7 +676,11 @@ def _build_fields_by_name(
             existing = fields_by_name.get(runtime_field.name)
             related_name = existing.related_name if existing is not None else None
             related_query_name = existing.related_query_name if existing is not None else None
-            if runtime_field.direction == 'reverse':
+            if runtime.detached and runtime.detached_fields:
+                captured = runtime.detached_fields.get(model_label, {}).get(runtime_field.name)
+                if captured is not None:
+                    related_name, related_query_name = captured.related_name, captured.related_query_name
+            if runtime_field.direction == 'reverse' and not runtime.detached:
                 relation = get_runtime_field(runtime.settings_module, model_label=model_label,
                                              field_name=runtime_field.name)
                 if relation is not None:
@@ -964,6 +968,18 @@ def _add_primary_key_alias_field(
     if 'pk' in fields_by_name:
         return
 
+    if runtime.detached:
+        previous = (runtime.detached_fields or {}).get(model_label, {})
+        captured = previous.get('pk')
+        if captured is not None:
+            source_name = next((name for name, field in previous.items() if name != 'pk'
+                and (field.file_path, field.line, field.column, field.field_kind)
+                    == (captured.file_path, captured.line, captured.column, captured.field_kind)), None)
+            source = fields_by_name.get(source_name)
+            if source is not None:
+                fields_by_name['pk'] = replace(source, name='pk')
+        return
+
     runtime_pk_field = get_runtime_field(
         runtime.settings_module,
         model_label=model_label,
@@ -996,7 +1012,7 @@ def _add_relation_attname_alias_fields(
         if not _supports_relation_attname_alias(field):
             continue
 
-        runtime_relation_field = get_runtime_field(
+        runtime_relation_field = None if runtime.detached else get_runtime_field(
             runtime.settings_module,
             model_label=model_label,
             field_name=field.name,
@@ -1005,12 +1021,16 @@ def _add_relation_attname_alias_fields(
         if not alias_name or alias_name in fields_by_name:
             continue
 
-        runtime_attname_field = get_runtime_field(
+        runtime_attname_field = None if runtime.detached else get_runtime_field(
             runtime.settings_module,
             model_label=model_label,
             field_name=alias_name,
         )
         alias_field_kind = _runtime_attname_field_kind(runtime_attname_field) or field.field_kind
+        if runtime.detached:
+            captured = (runtime.detached_fields or {}).get(model_label, {}).get(alias_name)
+            if captured is not None:
+                alias_field_kind = captured.field_kind
         fields_by_name[alias_name] = FieldCandidate(
             model_label=field.model_label,
             name=alias_name,

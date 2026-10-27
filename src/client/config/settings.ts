@@ -117,6 +117,7 @@ function resolveWorkspaceRootSetting(
   }
 
   return (
+    vscode.workspace.getWorkspaceFolder(scopeUri)?.uri.fsPath ??
     inferWorkspaceRootFromFile(scopePath) ??
     normalizedWorkspaceRoot
   );

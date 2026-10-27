@@ -1,0 +1,121 @@
+{
+  "version": "0.2.2029",
+  "date": "2026-10-27",
+  "target": "darwin-arm64",
+  "sourceBase": "c884c8aee8eeacbd824be67ca136ef64ac553afb",
+  "scope": [
+    "Repository-wide settings discovery, including independent nested projects and declared src layouts",
+    "Independent Django registries collected serially in owned short-lived child processes",
+    "Qualified models and lookup type IDs retain all project results without overwrites",
+    "Document-scoped client requests, caches, model maps and LSP completions",
+    "Foreground source updates and background registry refresh with generation/source ownership checks",
+    "Settings roster reconciliation, cancellation, partial failures and existing single-project behavior",
+    "Show original Django model labels in hover descriptions."
+  ],
+  "validation": {
+    "django5Version": "5.2.12",
+    "django6Version": "6.1.2",
+    "pythonChecksPassedPerDjango": 131,
+    "clientNativeLspProgramsPassed": 17,
+    "typeScriptAndNativeBuildPassed": true,
+    "realEditor": {
+      "vscodeVersion": "1.143.1",
+      "djangoVersion": "6.1.2",
+      "pythonExtensionVersion": "2026.10.0",
+      "pylanceVersion": "2026.4.1",
+      "pylanceActive": true,
+      "independentProjects": 2,
+      "actionsPerProject": 8,
+      "passed": 16,
+      "actions": [
+        "lookup completion",
+        "member completion",
+        "hover",
+        "definition",
+        "signature",
+        "inlay hints",
+        "project-specific diagnostics",
+        "save and reindex"
+      ],
+      "renderedHoverObserved": true,
+      "viewport": "1440x900",
+      "failures": 0
+    },
+    "afterHoverCopyChange": [
+      "npm run compile",
+      "node scripts/check-client-project-contexts.cjs",
+      "node out/client/providers/providerRequestLifecycle.test.js",
+      "node out/client/daemon/lookupNativePreparation.test.js",
+      "real editor checks above"
+    ],
+    "unchangedBackendAndOtherSourceFilesSinceRegression": 31,
+    "packageChecks": {
+      "version": "0.2.2029",
+      "target": "darwin-arm64",
+      "members": 376,
+      "pythonSourceFilesMatched": 54,
+      "emittedJsAndNativeFilesMatched": 71,
+      "requiredMultiProjectModulesPresent": true,
+      "testAndPrivateDataExcluded": true,
+      "zipCrcPassed": true,
+      "nativeExecutableModesPassed": true,
+      "packageBytes": 2325757,
+      "packageSha256": "bed8c1a3fab85b098a5dec82794b49df96ceac76130b69156b2d4a94e70b9a89"
+    }
+  },
+  "limits": [
+    "Each project uses the selected Python interpreter, which must have its dependencies.",
+    "Ambiguous settings variants within a project require explicit selection.",
+    "Multi-project startup metadata is session-only; the single-project persistent startup cache is not reused.",
+    "The real-editor run was a targeted two-project Django 6 check; the full historical 168-test suite, IR adapters, Django 5 editor host, Windows host and large-workspace latency were not repeated.",
+    "The temporary Microsoft Python profile displayed an interpreter-validation notification, and Pylance briefly retained a parse diagnostic after a deliberately incomplete editing fixture. The independent Django registries and the actual ORM provider checks completed successfully."
+  ],
+  "memoryAndSystemScope": [
+    "Registry collection is serial in owned short-lived children; field records are shared in scoped views.",
+    "No administrator access, system path, VPN policy, autostart registration or separate resident service.",
+    "Only the user-approved temporary fixture was trusted through the standard VS Code UI; trust checks stayed enabled."
+  ],
+  "sourceSha256": {
+    "README.md": "235974f407afa41dd2d84c8060314a48933748d1b08cb85bf18d6bd855901b54",
+    "python/django_orm_intellisense/__main__.py": "b61de3063f006e3172663724ea8492d9c06c221e937757e9192b63ecba32434a",
+    "python/django_orm_intellisense/_project_runtime_worker.py": "4c15717b82824323e88e6bfde9b1c677bb4444a55169cf69f00d848e717ae37c",
+    "python/django_orm_intellisense/discovery/settings.py": "69deeadfc039971d45996253bd5f3099870be00d597feffd613f07cf256d8570",
+    "python/django_orm_intellisense/discovery/workspace.py": "ce0d68f8752b40bfc48a1e96fad05d3b97570cc328cdb7da29606f222316beed",
+    "python/django_orm_intellisense/features/lookup_paths.py": "0d052866b09c900b4c462184db7ea005643aebd0fbcce7b0aa56a52fc2e864de",
+    "python/django_orm_intellisense/features/orm_members.py": "99261af0981a36ae3a7134ed29ee803ff02edb49f50120217b82ee38eaebe8e1",
+    "python/django_orm_intellisense/runtime/inspector.py": "94b538e7429769157f4916f7efa9a76e8acac31d2c30fe28d77e175669dc3999",
+    "python/django_orm_intellisense/runtime/lookup_catalog.py": "42f46395a291965531b1ee06922840298a66b83433e5968f1b79731312b91298",
+    "python/django_orm_intellisense/runtime/projects.py": "f6c0f248ea093dfe0a448d6ee8b1eb6261091e313fc4a89f7b0f91f0b1e74793",
+    "python/django_orm_intellisense/semantic/graph.py": "cb2c9879123091007797bcc31d098d75a3ab5fe32e3e8b514c7a5ee4604c4bbf",
+    "python/django_orm_intellisense/server/project_daemon.py": "6c23a87d59211088f655194174c8acb256c09c5aa0cd66b2f9d7b1382aa29112",
+    "python/django_orm_intellisense/server/workspace_projects.py": "e485565eceee16a25ea4576e917316dd8f07a541fa1b643ed68c62fcc5c51080",
+    "python/tests/project_settings_fixture.py": "57c55fd3058d75598f89e11c7e1a880feeeb8b11e0135664a10aade231f15944",
+    "python/tests/test_discovery_settings_inventory.py": "e5a9afc46628c48d65bf0e377e5a5f54c4e550e928a326d1fb6de39ad489bb10",
+    "python/tests/test_project_daemon.py": "0f97fb6e655e5813091d04ff523df7dcb2ed181965fce1ac57c3456baaa80681",
+    "python/tests/test_project_runtime_isolation.py": "8083fe446ea6dd755bb4f8d402dae350d4d2062391d982f04859b86aea9441bd",
+    "python/tests/test_workspace_project_union.py": "3c101bd049d2af9d81f9de9ade4f6c552c7abce3d8218a96746aedba686c548a",
+    "scripts/check-client-project-contexts.cjs": "02fc99f8443063a32bc736208cd59abd8947a2168bdadafc78dca4bf2e1a58b0",
+    "scripts/check-integrated-project-settings.cjs": "246eb4027afbb6d77d6d1266b2fede557c9a8174fb2e7aef868d02b0ff1c0aba",
+    "scripts/check-lsp-project-contexts.cjs": "1de73b882408c0cd400267d2d09214fe26877365e0062fa42d675192c8f32d4e",
+    "scripts/check-settings-workspace-scope.cjs": "41b7f87834e01dbfddc04fe709aa1009e151163923228a4cee938cfb9f7d3007",
+    "src/client/config/settings.ts": "20a8ba5ed77eadb624b2daa03e0057e9502c032fbb7a48da024208ced4fe73d9",
+    "src/client/daemon/analysisDaemon.ts": "1d7162f5071cfae4048d45010caa2274defb69c4c596fe317a89e1bccba8f843",
+    "src/client/daemon/lookupNativePreparation.test.ts": "3cd2badb5b0f3dcb58911cf8e3a3dacd2d9e30beb92dcf0221c0a1fc6b8195a2",
+    "src/client/extension.ts": "4d1713ee6ca70b52cab43a2102c9d86cf178496e26c6dad51ffa05abb4651158",
+    "src/client/protocol.ts": "7bfebfcf2b42c92a536fc0b0ec64e09eac79a627f33fc4412b11765762364464",
+    "src/client/providers/providerRequestLifecycle.test.ts": "b36d9a747fa541b38aa4706e59798b66301c8e66fe19c3ae7a615c4c7dd9e48a",
+    "src/client/providers/pythonProviders.ts": "5af523cf8935296760427c251ac66c4adfa640764513fc47f8addeb58c4e8174",
+    "src/server/projectScope.test.ts": "ab403ebff72d61547cc945c5b88e6602b391639af19d8a7e618e323ef54881ee",
+    "src/server/projectScope.ts": "b071f6fcd5df483483dbbdaecf07fd573e42870d84e0bb1b5a8a063d3d157ab7",
+    "src/server/server.ts": "072b65e195de4a9a5fd9ddb649b7d4f7941b8baa6a39a8c0a4d59e02a8fd5250",
+    "CHANGELOG.md": "df3e9cdf6c24e1d27e664cec9d2941fae0a3411874f2d003973ca79ba308db85",
+    "package.json": "0e6327a37ce723bbf9c038a5349a41c877dcb10e0216c1d6b7c3a6081deb5f2e",
+    "package-lock.json": "00c124874577d0514c25b0d3322e736ebc93b5186251c6dc465509b757aad189",
+    "src/test/multiProjectSettingsRunner.ts": "bb09b23c380e073372e1c643ea5e6670946cbea7f76a310c313b23c8d8077989"
+  },
+  "package": {
+    "file": "django-orm-intellisense-0.2.2029-darwin-arm64.vsix",
+    "bytes": 2325757,
+    "sha256": "bed8c1a3fab85b098a5dec82794b49df96ceac76130b69156b2d4a94e70b9a89"
+  }
+}

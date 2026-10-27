@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.2029 — 2026-10-27
+
+- Discover settings across a repository, including independent nested Django
+  projects, WSGI/ASGI declarations and declared `src` layouts. Use the containing
+  VS Code workspace folder as the default analysis root.
+- Analyze each project's registry independently and expose all apps/models
+  together. Keep duplicate model names, custom members and lookup descriptors
+  separate, and route editor requests using their source document.
+- Collect registries serially in owned short-lived children. Preserve other
+  projects when one settings module fails, reconcile new settings directories,
+  and refresh saved fields without configuring Django in the parent process.
+- Validation: 131 relevant Python checks passed on each of Django 5 and 6,
+  plus 17 client/native/LSP check programs. A real VS Code 1.143.1 host with
+  Python and Pylance passed eight editor actions for each of two Django 6
+  projects, including project-specific diagnostics and saved-field refresh.
+  Model descriptions in hover retain their original Django labels.
+- Multi-project metadata remains in the current session rather than using
+  the single-project startup cache. Each project uses the selected Python
+  interpreter, which must contain its dependencies.
+
 ## 0.2.2028 — 2026-10-27
 
 - Release the validated workspace, provider, cache and process-lifecycle

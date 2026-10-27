@@ -128,6 +128,8 @@ def _uses_default_registry_method(expression: object, method: object, default: o
 
 def collect_model_lookup_catalog(model_graph, runtime, model_label: str, *, use_current_registry: bool = False) -> dict[str, object]:
     """Describe one live model; keep the edit payload independent of workspace size."""
+    if runtime.detached and not use_current_registry:
+        return _detached_model_lookup_catalog(model_graph, runtime, model_label)
     from ..features.lookup_paths import _runtime_lookup_field
     from .inspector import get_runtime_field
     registry = {}
@@ -171,6 +173,63 @@ def collect_model_lookup_catalog(model_graph, runtime, model_label: str, *, use_
     catalog.pop('kinds', None)
     catalog['fields'].setdefault(model_label, {})
     return catalog
+
+
+def _detached_model_lookup_catalog(model_graph, runtime, model_label):
+    """Use this project's captured descriptors without configuring parent Django.
+
+    Ordinary scalar edits can use captured class defaults. Parameterized or
+    custom source changes wait for the existing fresh-registry refresh rather
+    than borrowing a descriptor from another project or interpreter.
+    """
+    previous = runtime.lookup_catalog
+    fields, expressions, relations = {}, {}, {}
+    scalar_defaults = frozenset(('CharField', 'TextField', 'IntegerField', 'BigIntegerField',
+        'FloatField', 'DecimalField', 'BooleanField', 'DateField', 'DateTimeField',
+        'TimeField', 'DurationField', 'UUIDField', 'JSONField', 'BinaryField'))
+    for field in model_graph.fields_for_model(model_label):
+        if field.source == 'static_edit':
+            type_id = previous.get('kinds', {}).get(field.field_kind) if field.field_kind in scalar_defaults else None
+        else:
+            type_id = previous.get('fields', {}).get(model_label, {}).get(field.name)
+            expression = previous.get('expressionFields', {}).get(model_label, {}).get(field.name)
+            if expression is not None:
+                expressions[field.name] = expression
+            relation = previous.get('relationPaths', {}).get(model_label, {}).get(field.name)
+            if relation is not None:
+                relations[field.name] = dict(relation)
+        if type_id is not None:
+            fields[field.name] = type_id
+    reachable, pending = {}, list(fields.values()) + list(expressions.values())
+    types = previous.get('types', {})
+    while pending:
+        type_id = pending.pop()
+        if type_id is None or type_id in reachable:
+            continue
+        descriptor = types.get(type_id)
+        if descriptor is None:
+            continue
+        reachable[type_id] = descriptor
+        pending.extend(descriptor.get('transforms', {}).values())
+        dynamic = descriptor.get('dynamicTransform') or {}
+        pending.extend((dynamic.get('outputType'), dynamic.get('sliceType')))
+    # Model chunks receive their own prefix when adopted. Start with local IDs
+    # each time so repeated saves cannot grow nested model:<label>: prefixes.
+    ids = {type_id: str(index) for index, type_id in enumerate(reachable)}
+    remapped = {}
+    for type_id, descriptor in reachable.items():
+        updated = {**descriptor, 'transforms': {name: ids.get(target)
+            for name, target in descriptor.get('transforms', {}).items()}}
+        if descriptor.get('dynamicTransform'):
+            dynamic = dict(descriptor['dynamicTransform'])
+            for key in ('outputType', 'sliceType'):
+                if key in dynamic:
+                    dynamic[key] = ids.get(dynamic[key])
+            updated['dynamicTransform'] = dynamic
+        remapped[ids[type_id]] = updated
+    return {'fields': {model_label: {name: ids[type_id] for name, type_id in fields.items() if type_id in ids}},
+            'expressionFields': {model_label: {name: ids[type_id] for name, type_id in expressions.items() if type_id in ids}},
+            'relationPaths': {model_label: relations}, 'types': remapped}
 
 
 def apply_model_catalog_delta(catalog: dict[str, object], delta: dict[str, dict[str, object] | None]) -> dict[str, object]:

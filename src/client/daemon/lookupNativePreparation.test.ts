@@ -71,6 +71,7 @@ async function fixture(startPreparation = true) {
   Object.assign(daemon, {
     lastLaunchContext: { workspaceRoot }, sessionRevision: 1,
     requestSourceContext: new AsyncLocalStorage<string>(),
+    documentContext: new AsyncLocalStorage<string>(), projectContexts: [],
     abortSignalContext: new AsyncLocalStorage<AbortSignal>(),
     deadlineContext: new AsyncLocalStorage<number>(),
     currentState: { runtime: { bootstrapStatus: 'ready' } },

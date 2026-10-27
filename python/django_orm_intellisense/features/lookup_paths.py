@@ -577,7 +577,7 @@ def _runtime_lookup_field(
     runtime: RuntimeInspection,
     field: FieldCandidate,
 ) -> object | None:
-    if runtime.bootstrap_status != 'ready':
+    if runtime.bootstrap_status != 'ready' or runtime.detached:
         return None
 
     runtime_field = get_runtime_field(

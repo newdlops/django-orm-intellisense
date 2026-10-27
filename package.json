@@ -2,7 +2,7 @@
   "name": "django-orm-intellisense",
   "displayName": "Django ORM Intellisense",
   "description": "Framework-aware autocomplete, hover, go-to-definition, and optional diagnostics for Django ORM lookup paths, relation strings, and queryset chains.",
-  "version": "0.2.2028",
+  "version": "0.2.2029",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -104,13 +104,13 @@
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "DJANGO_SETTINGS_MODULE value. Auto-detected from manage.py if empty. Set explicitly for projects with multiple settings files."
+          "description": "Override an automatically discovered settings variant. Independent Django projects are discovered throughout the analysis root, using their own manage.py, WSGI or ASGI declarations."
         },
         "djangoOrmIntellisense.workspaceRoot": {
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "Django project root path. Use this when your VS Code workspace is a monorepo and the Django project lives in a subdirectory."
+          "description": "Analysis root. Defaults to the containing VS Code workspace folder and includes nested Django projects. Set an explicit path to narrow the analysis scope."
         },
         "djangoOrmIntellisense.logLevel": {
           "type": "string",

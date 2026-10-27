@@ -101,7 +101,7 @@ Optional suppression of Pylance false positives for dynamic Django ORM attribute
 1. Install the extension from the VS Code Marketplace.
 2. Open a Django project in VS Code.
 3. Run **Django ORM: Select Python Interpreter** (`Cmd+Shift+P`) and choose the project's virtualenv.
-4. The extension auto-detects `DJANGO_SETTINGS_MODULE` from `manage.py`. For multi-settings projects, run **Django ORM: Select Settings Module**.
+4. The extension discovers settings throughout the workspace, including nested Django projects and `src` layouts. Each project's declared `manage.py`, WSGI, or ASGI settings are analyzed independently, and their apps and models are available together. For ambiguous settings variants within one project, run **Django ORM: Select Settings Module**.
 5. Start typing in a `filter()`, `values()`, or relation field — completions appear automatically.
 6. For eager warm-up instead of lazy first-use startup, set `djangoOrmIntellisense.autoStart` to `true`.
 
@@ -121,12 +121,14 @@ Optional suppression of Pylance false positives for dynamic Django ORM attribute
 |---------|---------|-------------|
 | `djangoOrmIntellisense.pythonInterpreter` | `""` | Python interpreter or virtualenv path. Supports directory (`.venv`) or executable (`.venv/bin/python`) paths. |
 | `djangoOrmIntellisense.settingsModule` | `""` | `DJANGO_SETTINGS_MODULE` value. Auto-detected from `manage.py` if empty. |
-| `djangoOrmIntellisense.workspaceRoot` | `""` | Django project root for monorepo setups. |
+| `djangoOrmIntellisense.workspaceRoot` | `""` | Analysis root. Defaults to the containing VS Code workspace folder, including all nested Django projects. Set an explicit root to limit the analysis scope. |
 | `djangoOrmIntellisense.autoStart` | `false` | Auto-start the analysis daemon when a Python file is opened. Disabled by default so activation stays lightweight; providers start the daemon lazily on first use. |
 | `djangoOrmIntellisense.diagnostics.enabled` | `true` | Enable live Django ORM diagnostics. Diagnostics are lazy by default and run only after the analysis daemon is already started. |
 | `djangoOrmIntellisense.diagnostics.fullDocument` | `false` | Continue large-file diagnostics beyond the visible range to scan the whole document. Disabled by default to keep diagnostic CPU and memory cost low. |
 | `djangoOrmIntellisense.pylance.autoApplyStubOverrides` | `false` | Automatically write Django stub overrides and restart Pylance on activation. Disabled by default; use the configure command to apply overrides manually. |
 | `djangoOrmIntellisense.logLevel` | `"info"` | Daemon log verbosity (`off`, `info`, `debug`). |
+
+Independent projects keep separate Django registries, so duplicate app/model names and project-specific lookups do not overwrite each other. Runtime collection runs one project at a time in short-lived child processes, using the selected Python interpreter; its environment must contain the dependencies required by the projects. A failing settings module leaves the other projects available. Multi-project metadata stays in the current session rather than using the single-project startup cache.
 
 ## Architecture
 

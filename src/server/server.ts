@@ -44,6 +44,8 @@ import { SurfaceCachePrewarmer } from './surfaceCachePrewarmer.js';
 import { isSurfaceCacheContext, type SurfaceCacheContext, type SurfaceSourceProvenance } from '../client/surfaceSourceProvenance';
 import { SaveReindexTracker } from './saveReindexTracker.js';
 import { applyLookupCatalogDelta, type LookupCatalogDelta } from './lookupCatalog.js';
+import { attachProjectModelSources, projectForFile, projectWorkspaceView } from './projectScope.js';
+import type { DjangoProjectContext } from '../client/protocol.js';
 import { parseLookupChain, getCompletionCandidates } from './lookupResolver.js';
 import { recordTiming, incrementCounter, setGauge, getAllStats, getAllCounters, getAllGauges } from './perfTracker.js';
 import { CompletionItemKind } from 'vscode-languageserver/node';
@@ -85,6 +87,23 @@ const workspaceIndex: WorkspaceIndex = {
   lookupTrie: emptyTrieNode<LookupInfo>(),
   transformTrie: emptyTrieNode<TransformInfo>(),
 };
+
+let projectContexts: DjangoProjectContext[] = [];
+const projectViews = new Map<string, WorkspaceIndex>();
+function refreshProjectViews(): void {
+  projectViews.clear();
+  attachProjectModelSources(workspaceIndex, projectContexts);
+}
+function indexForDocument(uri: string): WorkspaceIndex {
+  if (!projectContexts.length) return workspaceIndex;
+  const key = projectForFile(projectContexts, uri)?.namespace ?? '';
+  let view = projectViews.get(key);
+  if (!view) {
+    view = projectWorkspaceView(workspaceIndex, projectContexts, uri);
+    projectViews.set(key, view);
+  }
+  return view;
+}
 
 function emptyTrieNode<T>(): RadixTrieNode<T> {
   return { children: new Map(), isTerminal: false };
@@ -334,6 +353,7 @@ async function startWorkspaceIndexing(): Promise<void> {
 }
 
 function replaceWorkspaceIndexFromSurface(params: {
+  projectContexts?: DjangoProjectContext[];
   lookupCatalog?: import('./lookupCatalog').LookupCatalogPayload;
   surfaceIndex: SurfaceIndex;
   modelNames?: string[];
@@ -358,6 +378,8 @@ function replaceWorkspaceIndexFromSurface(params: {
   workspaceIndex.transformTrie = built.transformTrie;
   workspaceIndex.lookupCatalog = built.lookupCatalog;
   workspaceIndex.lookupTypes = built.lookupTypes;
+  projectContexts = params.projectContexts ?? [];
+  refreshProjectViews();
   previousSurfaceIndex = params.surfaceIndex;
   previousCustomLookups = params.customLookups;
   previousCustomLookupsFingerprint = params.customLookupsFingerprint;
@@ -419,6 +441,7 @@ connection.onRequest('django/clearSurfaceIndex', () => {
 });
 
 function applySurfaceIndex(params: {
+  projectContexts?: DjangoProjectContext[];
   sourceProvenance?: SurfaceSourceProvenance | null;
   lookupCatalog?: import('./lookupCatalog').LookupCatalogPayload;
   surfaceIndex: SurfaceIndex;
@@ -514,6 +537,8 @@ function applySurfaceIndex(params: {
   previousCustomLookupsFingerprint = params.customLookupsFingerprint;
   previousStaticFallback = params.staticFallback;
   previousStaticFallbackFingerprint = params.staticFallbackFingerprint;
+  projectContexts = params.projectContexts ?? [];
+  refreshProjectViews();
   setGauge('models.total', workspaceIndex.models.size);
   setGauge('tries.built', workspaceIndex.fieldTrieByModel.size);
 
@@ -548,6 +573,7 @@ connection.onNotification('django/updateSurfaceIndex', applySurfaceIndexSafely);
 connection.onRequest('django/updateSurfaceIndex', applySurfaceIndexSafely);
 
 function applySurfaceIndexDelta(params: {
+  projectContexts?: DjangoProjectContext[];
   lookupCatalogDelta?: LookupCatalogDelta;
   surfaceIndexDelta: SurfaceIndex;
   surfaceFingerprints?: Record<string, string>;
@@ -561,6 +587,11 @@ function applySurfaceIndexDelta(params: {
 }): { applied: boolean } {
   nativeCachePrewarmer.invalidate();
   previousSourceProvenance = null;
+  if (params.projectContexts) {
+    projectContexts = params.projectContexts;
+    refreshProjectViews();
+    completionCache.clear();
+  }
   if (previousSurfaceIndex === null) {
     connection.console.warn('[ls] surfaceIndex delta ignored before initial snapshot');
     return { applied: false };
@@ -613,6 +644,7 @@ function applySurfaceIndexDelta(params: {
     previousStaticFallbackFingerprint = nextStaticFallbackFingerprint;
     completionCache.clear();
     const modelCount = replaceWorkspaceIndexFromSurface({
+      projectContexts,
       surfaceIndex: previousSurfaceIndex,
       surfaceFingerprints: Object.fromEntries(modelFingerprints),
       customLookups: previousCustomLookups,
@@ -652,6 +684,7 @@ function applySurfaceIndexDelta(params: {
     previousCustomLookups,
     previousStaticFallback,
   );
+  refreshProjectViews();
 
   for (const label of [...modelDiff.added, ...modelDiff.changed]) {
     modelVersions.set(label, (modelVersions.get(label) ?? 0) + 1);
@@ -715,7 +748,8 @@ connection.onCompletion((params: CompletionParams) => {
   }
 
   const _t1 = performance.now();
-  const context = extractCompletionContext(document, params);
+  const index = indexForDocument(document.uri);
+  const context = extractCompletionContext(document, params, index);
   const _extractMs = performance.now() - _t1;
 
   if (!context) {
@@ -749,7 +783,7 @@ connection.onCompletion((params: CompletionParams) => {
     const candidates = getCompletionCandidates(
       context.parsedLookup,
       context.partialSegment,
-      workspaceIndex,
+      index,
       context.method,
       usageFrequency,
     );
@@ -788,7 +822,7 @@ connection.onCompletion((params: CompletionParams) => {
       return item;
     });
   } else {
-    items = provideCompletions(context, workspaceIndex);
+    items = provideCompletions(context, index);
   }
 
   const _provideMs = performance.now() - _t2;
@@ -851,6 +885,7 @@ function relationCompletionLabelDetails(
 function extractCompletionContext(
   document: TextDocument,
   params: CompletionParams,
+  index: WorkspaceIndex,
 ): CompletionContext | undefined {
   const position = params.position;
   const lineText = document.getText({
@@ -869,7 +904,7 @@ function extractCompletionContext(
   const segments = rawLookup.split('__');
   const partialSegment = segments[segments.length - 1];
 
-  const currentModel = detectModelFromLine(lineText);
+  const currentModel = detectModelFromLine(lineText, index);
   if (!currentModel) {
     return undefined;
   }
@@ -884,7 +919,7 @@ function extractCompletionContext(
   let parsedLookup: ParsedLookup;
   if (segments.length > 1) {
     // Multiple segments: resolve all but the last, keep last as partial
-    parsedLookup = parseLookupChain(`${resolvedExpression}__`, currentModel, workspaceIndex, detectCompletionMethod(lineText));
+    parsedLookup = parseLookupChain(`${resolvedExpression}__`, currentModel, index, detectCompletionMethod(lineText));
   } else {
     // Single segment: nothing to resolve yet, FSM starts from model
     parsedLookup = {
@@ -928,12 +963,12 @@ const LOOKUP_CONTINUATION_METHODS = new Set(['filter', 'exclude', 'get']);
  *   - qs.filter(field__  (where qs = Model.objects...)
  *   - .filter(field__  (standalone queryset method call)
  */
-function detectModelFromLine(lineText: string): string | undefined {
+function detectModelFromLine(lineText: string, index: WorkspaceIndex): string | undefined {
   // Pattern 1: Model.objects[.method(...)...].method(
   const objMatch = lineText.match(/(\w+)\.objects\b/);
   if (objMatch) {
     const className = objMatch[1];
-    const label = workspaceIndex.modelLabelByName.get(className);
+    const label = index.modelLabelByName.get(className);
     if (label) return label;
   }
 
@@ -951,7 +986,7 @@ function detectModelFromLine(lineText: string): string | undefined {
       // Try to find Model.objects in the receiver chain
       const receiverObjMatch = beforeMethod.match(/(\w+)\.objects\b/);
       if (receiverObjMatch) {
-        const label = workspaceIndex.modelLabelByName.get(receiverObjMatch[1]);
+        const label = index.modelLabelByName.get(receiverObjMatch[1]);
         if (label) return label;
       }
 
@@ -961,7 +996,7 @@ function detectModelFromLine(lineText: string): string | undefined {
       const lastSegmentMatch = beforeMethod.match(/\.(\w+)\s*$/);
       if (lastSegmentMatch) {
         const possibleRelName = lastSegmentMatch[1];
-        for (const [, modelInfo] of workspaceIndex.models) {
+        for (const [, modelInfo] of index.models) {
           const reverseRel = modelInfo.reverseRelations.get(possibleRelName);
           if (reverseRel) {
             return reverseRel.targetModelLabel;

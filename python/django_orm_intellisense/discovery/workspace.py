@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
+from .settings import SettingsSource, discover_settings_sources, read_declared_settings
+
 SKIP_DIRS = {
     '.git',
     '.hg',
@@ -210,14 +212,16 @@ class WorkspaceProfile:
     pyproject_path: str | None
     settings_module: str | None
     settings_candidates: list[str]
+    settings_sources: tuple[SettingsSource, ...] = ()
 
-    def to_dict(self) -> dict[str, str | None | list[str]]:
+    def to_dict(self) -> dict[str, object]:
         return {
             'root': self.root,
             'managePyPath': self.manage_py_path,
             'pyprojectPath': self.pyproject_path,
             'settingsModule': self.settings_module,
             'settingsCandidates': list(self.settings_candidates),
+            'settingsSources': [source.to_dict() for source in self.settings_sources],
         }
 
 
@@ -634,37 +638,21 @@ def discover_workspace(
 ) -> WorkspaceProfile:
     manage_py_file = root / 'manage.py'
     manage_py_path = str(manage_py_file) if manage_py_file.exists() else None
-    settings_candidates: list[str] = []
     pyproject_path = root / 'pyproject.toml'
-
-    # Monorepo support: services frequently live in subdirectories, each with
-    # its own manage.py + settings module, and the workspace root itself has no
-    # manage.py. Without this, candidate discovery below never runs and the
-    # whole tree resolves with zero settings candidates (no runtime, nothing in
-    # the DJANGO_SETTINGS_MODULE picker).
-    has_nested_manage_py = _has_nested_manage_py(root, python_files)
-
-    if (
-        manage_py_path is not None
-        or has_nested_manage_py
-        or settings_override is not None
-    ):
-        settings_candidates.extend(
-            _discover_settings_candidates(root, python_files=python_files)
-        )
-
-    deduped_settings = list(dict.fromkeys(settings_candidates))
+    source_files = python_files if python_files is not None else iter_python_files(root)
+    settings_sources = discover_settings_sources(root, source_files)
+    deduped_settings = [source.selector for source in settings_sources]
 
     # The project's own declared default — `os.environ.setdefault(
     # 'DJANGO_SETTINGS_MODULE', '<module>')` in manage.py (or wsgi/asgi) — is
     # the authoritative choice. It works for monorepos and for base/dev/prod
     # layouts where simple candidate-counting yields None (the case the old
     # `_choose_default_settings_module` could not resolve).
-    declared_default = (
-        _settings_module_from_entrypoints(root)
-        if manage_py_path is not None
-        else None
-    )
+    declared_default = next((source.selector for source in settings_sources
+        if str(manage_py_file) in source.entrypoints), None)
+    if declared_default is None:
+        declared_default = next((source.selector for source in settings_sources
+            if source.project_root == str(root) and source.entrypoints), None)
     if declared_default and declared_default not in deduped_settings:
         # Surface it in the picker even when file-name discovery missed it
         # (e.g. settings in a non-standard location).
@@ -681,6 +669,7 @@ def discover_workspace(
         pyproject_path=str(pyproject_path) if pyproject_path.exists() else None,
         settings_module=settings_override or inferred_settings,
         settings_candidates=deduped_settings,
+        settings_sources=settings_sources,
     )
 
 
@@ -711,12 +700,8 @@ def _settings_module_from_entrypoints(root: Path) -> str | None:
 
 
 def _read_settings_setdefault(file_path: Path) -> str | None:
-    try:
-        text = file_path.read_text(encoding='utf-8')
-    except OSError:
-        return None
-    match = _SETTINGS_SETDEFAULT_RE.search(text)
-    return match.group(1) if match else None
+    modules = read_declared_settings(file_path)
+    return modules[0] if modules else None
 
 
 def _safe_iterdir(root: Path) -> list[Path]:

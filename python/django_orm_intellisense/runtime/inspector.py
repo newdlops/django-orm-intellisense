@@ -245,6 +245,10 @@ class RuntimeInspection:
     model_preview: list[RuntimeModelSummary]
     custom_lookups: dict[str, list[str]] = dataclasses.field(default_factory=dict)
     lookup_catalog: dict[str, object] = dataclasses.field(default_factory=dict)
+    # Independent project registries are collected in children. Their pure
+    # records remain usable without configuring this process's global Django.
+    detached: bool = dataclasses.field(default=False, compare=False, repr=False)
+    detached_fields: object = dataclasses.field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         # Membership and frozen model labels/modules form the graph-map key.

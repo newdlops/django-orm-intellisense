@@ -184,8 +184,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     snapshotTransportEnabled: () => languageClient?.initializeResult?.capabilities.experimental?.djangoSurfaceSnapshotTransport === 1,
     snapshot: () => ({
       sourceProvenance: daemon.sourceProvenance,
+      projectContexts: daemon.projectContexts,
       surfaceIndex: daemon.surfaceIndex,
-      modelNames: [...daemon.modelNames],
+      modelNames: [...daemon.getAllModelNames()],
       surfaceFingerprints: daemon.surfaceFingerprints,
       customLookups: daemon.customLookups,
       lookupCatalog: daemon.lookupCatalog,
@@ -700,6 +701,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const scope = publicationScope();
       if (scope !== undefined) {
         const applied = await surfacePublisher.publishDelta({
+          projectContexts: daemon.projectContexts,
           surfaceIndexDelta,
           surfaceFingerprints,
           addedLabels: [...addedLabels],
