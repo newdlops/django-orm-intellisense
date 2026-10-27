@@ -10,6 +10,7 @@
 //! lookup methods are available.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,13 +43,33 @@ pub struct ModelGraphEdge {
     pub field_kinds: Vec<String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ModelGraph {
+    #[serde(skip, default = "next_cache_generation")]
+    pub cache_generation: u64,
     pub fields_by_model_label: BTreeMap<String, Vec<FieldCandidate>>,
     pub nodes_by_label: BTreeMap<String, ModelGraphNode>,
     pub nodes_by_object_name: BTreeMap<String, Vec<String>>,
     pub node_by_import_path: BTreeMap<String, String>,
     pub edges_by_source_label: BTreeMap<String, Vec<ModelGraphEdge>>,
+}
+
+fn next_cache_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Default for ModelGraph {
+    fn default() -> Self {
+        Self {
+            cache_generation: next_cache_generation(),
+            fields_by_model_label: BTreeMap::new(),
+            nodes_by_label: BTreeMap::new(),
+            nodes_by_object_name: BTreeMap::new(),
+            node_by_import_path: BTreeMap::new(),
+            edges_by_source_label: BTreeMap::new(),
+        }
+    }
 }
 
 impl ModelGraph {
@@ -208,6 +229,7 @@ pub fn build_model_graph(static_index: &StaticIndex) -> ModelGraph {
         fields_by_label.into_iter().collect();
 
     ModelGraph {
+        cache_generation: next_cache_generation(),
         fields_by_model_label,
         nodes_by_label,
         nodes_by_object_name,

@@ -129,6 +129,7 @@ export interface LookupPathResolution {
   resolved: boolean;
   reason?: string;
   missingSegment?: string;
+  /** Optional display/source metadata; local diagnostic resolutions can omit it. */
   target?: LookupPathItem;
   resolvedSegments?: LookupPathItem[];
   baseModelLabel?: string;
@@ -226,6 +227,11 @@ export type StaticFallbackPayload = Record<
 >;
 
 export interface InitializeResult {
+  surfaceTransport?: NonNullable<SurfaceIndexChangedNotificationMessage['params']>['surfaceTransport'];
+  sourceObservationContext?: import('./sourceObservation').SourceObservationContext;
+  sourceProvenance?: import('./surfaceSourceProvenance').SurfaceSourceProvenance | null;
+  venvInfo?: { root?: string; sitePackages?: string | null; editableInstalls?: Array<{ path: string }> } | null;
+  lookupCatalog?: import('../server/lookupCatalog').LookupCatalogPayload;
   serverName: string;
   protocolVersion: string;
   health: HealthSnapshot;
@@ -238,15 +244,26 @@ export interface InitializeResult {
   staticFallbackFingerprint?: string | null;
 }
 
+export interface DeletedSourceFilesResult {
+  filePaths?: string[];
+  error?: string;
+}
+
 export interface ReindexFileResult {
+  error?: string;
+  lookupCatalogDelta?: import('../server/lookupCatalog').LookupCatalogDelta;
   surfaceIndex?: Record<string, Record<string, Record<string, [string, string | null, string?, (string | null)?]>>>;
   surfaceIndexDelta?: Record<string, Record<string, Record<string, [string, string | null, string?, (string | null)?]>>>;
   surfaceFingerprints?: Record<string, string>;
   modelNames?: string[];
   staticFallback?: StaticFallbackPayload | null;
+  staticFallbackDelta?: StaticFallbackPayload;
+  removedStaticFallbackLabels?: string[];
   staticFallbackFingerprint?: string | null;
   /** When true, no model changes were detected — surfaceIndex/modelNames are omitted. */
   unchanged?: boolean;
+  /** The daemon verified identical source bytes and the same current index/runtime/graph owners. */
+  sourceUnchanged?: boolean;
   addedLabels?: string[];
   changedLabels?: string[];
   removedLabels?: string[];
@@ -282,6 +299,11 @@ export interface HealthChangedNotificationMessage {
 export interface SurfaceIndexChangedNotificationMessage {
   event: 'surfaceIndexChanged';
   params?: {
+    sourceProvenance?: import('./surfaceSourceProvenance').SurfaceSourceProvenance | null;
+    surfaceTransport?: { version: 1; sequence: number; kind: 'full' | 'delta'; baseSequence?: number };
+    surfaceIndexDelta?: Record<string, Record<string, Record<string, [string, string | null, string?, (string | null)?]>>>;
+    removedSurfaceLabels?: string[];
+    lookupCatalog?: import('../server/lookupCatalog').LookupCatalogPayload;
     health?: HealthSnapshot;
     modelNames?: string[];
     surfaceIndex?: Record<string, Record<string, Record<string, [string, string | null, string?, (string | null)?]>>>;

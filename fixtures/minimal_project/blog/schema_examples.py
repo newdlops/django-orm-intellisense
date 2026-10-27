@@ -26,15 +26,15 @@ class SchemaExample(models.Model):
                 condition=models.Q(pub=False),
             ),
             models.CheckConstraint(
-                check=Q(author__na__gt=''),
+                condition=Q(author__na__gt=''),
                 name='schema_example_author_name_partial',
             ),
             models.CheckConstraint(
-                check=Q(author__name__gt=''),
+                condition=Q(author__name__gt=''),
                 name='schema_example_author_name_not_empty',
             ),
             models.CheckConstraint(
-                check=models.Q(author__profile__bogus__isnull=True),
+                condition=models.Q(author__profile__bogus__isnull=True),
                 name='schema_example_author_profile_bogus',
             ),
         ]

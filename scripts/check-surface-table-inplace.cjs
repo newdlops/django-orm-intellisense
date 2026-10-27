@@ -1,0 +1,36 @@
+'use strict';
+const assert = require('node:assert/strict');
+const { encodeTable } = require('./probe-surface-tuple-cost.cjs');
+const { encodeInplaceTable, encodeTokenTable, decodeInplaceTable } = require('./probe-surface-table-inplace.cjs');
+for (const encode of [encodeTable, encodeInplaceTable, encodeTokenTable]) {
+  const source = JSON.parse('{"app.Post":{"instance":{"title":["scalar",null,"field","CharField"],"__proto__":["scalar",null,"field","CharField"],"two":["scalar",null],"three":["scalar",null,"field"],"four":["scalar",null,"field",null]},"manager":{"first":["instance","app.Post","method",null]},"queryset":{"first":["instance","app.Post","method",null]}},"__proto__":{"manager":{"first":["instance","app.Post","method",null]}}}');
+  const initial = JSON.stringify(source);
+  const encoded = encode(source);
+  const wire = JSON.stringify({ surfaceIndex: encoded, otherMetadata: { Unicode: '한글 😀' } });
+  const result = decodeInplaceTable(wire);
+  assert.equal(JSON.stringify(source), initial);
+  assert.equal(JSON.stringify(result.surfaceIndex), initial);
+  assert.equal(result.otherMetadata.Unicode, '한글 😀');
+  const model = result.surfaceIndex['app.Post'];
+  assert.equal(model.manager.first, model.queryset.first);
+  assert.notEqual(model.manager.first, result.surfaceIndex.__proto__.manager.first);
+  assert.equal(model.instance.title, model.instance.__proto__);
+  assert.equal(Object.getPrototypeOf(result.surfaceIndex), Object.prototype);
+  assert.equal(Object.getPrototypeOf(model.instance), Object.prototype);
+  assert.ok(Object.isFrozen(model.manager.first));
+  assert.throws(() => { model.manager.first[1] = 'app.Wrong'; }, TypeError);
+  assert.notEqual(model.instance.two, model.instance.three);
+  assert.notEqual(model.instance.three, model.instance.four);
+  source['app.Post'].instance.title[3] = 'DateField';
+  source['app.Post'].manager.first[1] = 'app.New';
+  delete source['app.Post'].queryset.first;
+  assert.equal(JSON.stringify(result.surfaceIndex), initial);
+  const next = decodeInplaceTable(JSON.stringify({ surfaceIndex: encode(source) }));
+  assert.equal(next.surfaceIndex['app.Post'].instance.title[3], 'DateField');
+  assert.equal(next.surfaceIndex['app.Post'].manager.first[1], 'app.New');
+  assert.equal(next.surfaceIndex['app.Post'].queryset.first, undefined);
+  assert.notEqual(next.surfaceIndex['app.Post'].manager.first, model.manager.first);
+  model.instance.added = ['scalar', null, 'field', 'IntegerField'];
+  assert.equal(source['app.Post'].instance.added, undefined);
+}
+console.log('Candidate-only full values, own unusual keys, frozen per-model aliases, tuple lengths and old/new sender/receiver isolation passed. Production protocol unchanged.');

@@ -1,0 +1,63 @@
+{
+  "version": "0.2.2028",
+  "date": "2026-10-27",
+  "target": "darwin-arm64",
+  "milestoneStatus": "accepted-complete",
+  "completionBasis": "The user accepted the current milestone and explicitly requested versioning, commit, push and publication.",
+  "source": "841-v48 with qualified single-pass member surface construction",
+  "sourceArchiveSha256": "c13003d0298aed940e537d4957985bf738fcb36d0afa7afd5e264018e9856b3f",
+  "included": [
+    "Current-source cache validation and incremental reindex recovery",
+    "Provider request lifetime and bounded native source readiness",
+    "Owned daemon, worker, tracker and source watcher lifecycles",
+    "Negotiated full snapshot reuse and overlapping idle warm-up",
+    "Single-pass member surface construction"
+  ],
+  "validation": {
+    "backendTestsRun": 3832,
+    "backendPassed": 3796,
+    "historicalBackendSkips": 36,
+    "backendFailures": 0,
+    "backendErrors": 0,
+    "nativeLifecycles": 8,
+    "originalRpcChecksPassed": 104,
+    "releaseTypeScriptBuildPassed": true,
+    "releaseNativeBuildPassed": true,
+    "releaseClientScripts": 49,
+    "releaseClientScriptExit0": 49,
+    "vsixMembers": 368,
+    "zipCrcRuntimeDependenciesSourceAndNativeModeChecksPassed": true
+  },
+  "startupObservations": {
+    "models": 500,
+    "pythonFiles": 5000,
+    "cachedMs": [
+      555.480791,
+      557.154167
+    ],
+    "fullColdAppliedMs": [
+      3919.414792,
+      3907.805667
+    ],
+    "stableSpeedupOrAllEditorLatencyClaimed": false
+  },
+  "retainedLimits": {
+    "cached500MsTargetMet": false,
+    "fullCold3000MsTargetMet": false,
+    "latestSourceFullVsCode168AndIrSuiteRepeated": false,
+    "previousWholeEditorReference": "837-v41; 168 tests passed on each of Django 5 and 6",
+    "fullDefault59ExtensionEnvironmentVerified": false,
+    "linuxAndWindowsPhysicalValidationPerformed": false,
+    "exactUniqueInstantaneousPhysicalMemoryPeakProven": false
+  },
+  "excludedExperiment": "Checked product-code cache: not adopted; its separate whole-run timeout remains recorded as unresolved.",
+  "policy": {
+    "noAdminSystemPathSecurityPermissionVpnAutorunChange": true,
+    "noSeparateResidentService": true
+  },
+  "package": {
+    "file": "django-orm-intellisense-0.2.2028-darwin-arm64.vsix",
+    "bytes": 2297537,
+    "sha256": "9563e6d3764e88941063c92bfa83c8cdb2bd30e5eeb60fc4fdb1c5e14a6782b2"
+  }
+}

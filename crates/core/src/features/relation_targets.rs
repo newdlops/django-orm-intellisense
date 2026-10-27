@@ -49,6 +49,9 @@ impl RelationTarget {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+// Resolved results are serialized immediately by the Node bridge; boxing the
+// 300-byte target would add a heap allocation to every successful lookup.
+#[allow(clippy::large_enum_variant)]
 pub enum ResolutionResult {
     Resolved {
         #[serde(rename = "matchKind")]

@@ -13,6 +13,8 @@ import {
   buildModelLabelByName,
   buildWorkspaceIndex,
   updateWorkspaceIndexIncremental,
+  applyStaticFallbackDelta,
+  includeStaticFallbackChanges,
   type StaticFallback,
   type SurfaceIndex,
 } from './workspaceIndexer';
@@ -182,6 +184,108 @@ function testBuiltinRuntimeEntryKeepsItsName(): void {
   }
 }
 
+function testFallbackDeltaMatchesFullBuild(): void {
+  let surface: SurfaceIndex = {};
+  const fallback: StaticFallback = structuredClone(POST_FALLBACK);
+  const index = buildWorkspaceIndex(surface, [], {}, fallback);
+  const stable = index.models.get('blog.Post');
+  const apply = (delta: StaticFallback, removed: string[], nextSurface: SurfaceIndex, surfaceRemoved: string[] = []): void => {
+    applyStaticFallbackDelta(fallback, delta, removed);
+    surface = nextSurface;
+    const diff = includeStaticFallbackChanges(index, surface, fallback,
+      { added: Object.keys(nextSurface), changed: [], removed: surfaceRemoved }, delta, removed);
+    updateWorkspaceIndexIncremental(index, surface, diff, {}, {}, fallback);
+    const full = buildWorkspaceIndex(surface, [], {}, fallback);
+    assert(JSON.stringify([...index.models.keys()].sort()) === JSON.stringify([...full.models.keys()].sort()), 'delta model labels match full build');
+    for (const [label, expected] of full.models) {
+      const actual = index.models.get(label)!;
+      assert(JSON.stringify([...actual.fields]) === JSON.stringify([...expected.fields]), `${label}: fields match`);
+      assert(JSON.stringify([...actual.relations]) === JSON.stringify([...expected.relations]), `${label}: relations match`);
+      assert(JSON.stringify([...actual.reverseRelations]) === JSON.stringify([...expected.reverseRelations]), `${label}: reverse relations match`);
+    }
+    const names = (value: Map<string, string>): string => JSON.stringify([...value].sort(([a], [b]) => a.localeCompare(b)));
+    assert(names(index.modelLabelByName) === names(full.modelLabelByName), 'short names match');
+  };
+  apply({ 'celery.Result': { fields: ['status'], runtimeOnly: true } }, [], {});
+  assert(index.models.get('blog.Post') === stable, 'unrelated fallback is not rebuilt');
+  apply({ 'blog.Post': { fields: ['score'], fieldDetails: { score: { fieldKind: 'IntegerField' } } } }, [], {});
+  apply({}, ['blog.Post'], { 'blog.Post': { instance: { headline: ['scalar', null, 'field', 'TextField'] } } });
+  apply({ 'blog.Post': POST_FALLBACK['blog.Post'] }, [], {}, ['blog.Post']);
+  apply({}, ['blog.Post', 'celery.Result'], {});
+}
+
+function testSurfaceCoverageUpdatesNameCollisionPriority(): void {
+  const fallback: StaticFallback = {
+    'aaa.Tag': { fields: ['first'] }, 'blog.Tag': { fields: ['second'] },
+  };
+  const surface: SurfaceIndex = {};
+  const index = buildWorkspaceIndex(surface, [], {}, fallback);
+  assert(index.modelLabelByName.get('Tag') === 'blog.Tag', 'initial last-collision priority');
+  surface['blog.Tag'] = { instance: { second: ['scalar', null, 'field', 'CharField'] } };
+  applyStaticFallbackDelta(fallback, {}, ['blog.Tag']);
+  let diff = includeStaticFallbackChanges(index, surface, fallback,
+    { added: ['blog.Tag'], changed: [], removed: [] }, {}, ['blog.Tag']);
+  updateWorkspaceIndexIncremental(index, surface, diff, {}, {}, fallback);
+  assert(index.modelLabelByName.get('Tag') === buildWorkspaceIndex(surface, [], {}, fallback).modelLabelByName.get('Tag'),
+    'surface promotion matches full-build collision priority');
+  surface['aaa.Tag'] = { instance: { first: ['scalar', null, 'field', 'CharField'] } };
+  applyStaticFallbackDelta(fallback, {}, ['aaa.Tag']);
+  diff = includeStaticFallbackChanges(index, surface, fallback,
+    { added: ['aaa.Tag'], changed: [], removed: [] }, {}, ['aaa.Tag']);
+  updateWorkspaceIndexIncremental(index, surface, diff, {}, {}, fallback);
+  delete surface['blog.Tag'];
+  applyStaticFallbackDelta(fallback, { 'blog.Tag': { fields: ['second'] } });
+  diff = includeStaticFallbackChanges(index, surface, fallback,
+    { added: [], changed: [], removed: ['blog.Tag'] });
+  updateWorkspaceIndexIncremental(index, surface, diff, {}, {}, fallback);
+  assert(index.modelLabelByName.get('Tag') === buildWorkspaceIndex(surface, [], {}, fallback).modelLabelByName.get('Tag'),
+    'restored fallback matches full-build collision priority');
+}
+
+function testIncrementalRelationTargetNormalization(): void {
+  const fallback: StaticFallback = { ...structuredClone(POST_FALLBACK), 'auth.User': { fields: ['username'], builtin: true } };
+  const index = buildWorkspaceIndex({}, [], {}, fallback);
+  const delta: StaticFallback = { 'blog.Post': { ...fallback['blog.Post'],
+    fieldDetails: { ...fallback['blog.Post'].fieldDetails,
+      author: { fieldKind: 'ForeignKey', isRelation: true, relatedModelLabel: 'User' } } } };
+  applyStaticFallbackDelta(fallback, delta);
+  const diff = includeStaticFallbackChanges(index, {}, fallback,
+    { added: [], changed: [], removed: [] }, delta);
+  updateWorkspaceIndexIncremental(index, {}, diff, {}, {}, fallback);
+  assert(index.models.get('blog.Post')?.relations.get('author')?.targetModelLabel === 'auth.User',
+    'changed fallback relation target is normalized against complete model index');
+}
+
+function testPrimaryKeyAuthorityAcrossSurfaceFallbackAndUpdates(): void {
+  const label = 'blog.Post';
+  const cases = [
+    { fields: { title: 'CharField' }, kind: 'BigAutoField', hasId: true },
+    { fields: { key: 'UUIDField', pk: 'UUIDField' }, kind: 'UUIDField', hasId: false },
+    { fields: { id: 'SlugField' }, kind: 'SlugField', hasId: true },
+    { fields: { id: 'UUIDField', pk: 'UUIDField' }, kind: 'UUIDField', hasId: true },
+  ];
+  for (const mode of ['surface', 'fallback']) {
+    let index: ReturnType<typeof buildWorkspaceIndex> | undefined;
+    for (const [position, item] of [...cases, cases[1]].entries()) {
+      const entries = Object.entries(item.fields);
+      const surface: SurfaceIndex = mode === 'surface' ? { [label]: { instance:
+        Object.fromEntries(entries.map(([name, kind]) => [name, ['scalar', null, 'field', kind]])) } } : {};
+      const fallback: StaticFallback = mode === 'fallback' ? { [label]: { fields: entries.map(([name]) => name),
+        fieldDetails: Object.fromEntries(entries.map(([name, fieldKind]) => [name, { fieldKind, isRelation: false }])) } } : {};
+      const full = buildWorkspaceIndex(surface, [], {}, fallback);
+      if (!index) index = full;
+      else updateWorkspaceIndexIncremental(index, surface, { added: [], removed: [], changed: [label] }, {}, {}, fallback);
+      for (const [name, current] of [['full', full], ['incremental', index]] as const) {
+        const model = current.models.get(label)!;
+        assert(model.fields.get('pk')?.fieldKind === item.kind, `${mode}/${position}/${name}: pk keeps declared type`);
+        assert(model.fields.has('id') === item.hasId, `${mode}/${position}/${name}: authoritative absence of id`);
+        assert(JSON.stringify([...model.fields]) === JSON.stringify([...full.models.get(label)!.fields]),
+          `${mode}/${position}/${name}: full and incremental field metadata agree`);
+      }
+    }
+  }
+}
+
 function main(): void {
   testFieldlessSurfaceEntryUsesStaticFallback();
   testSyntheticOnlySurfaceEntryUsesStaticFallback();
@@ -190,6 +294,10 @@ function main(): void {
   testRuntimeOnlyModelsAreIndexedByLabelOnly();
   testWorkspaceModelOwnsNameForBothCollisionModes();
   testBuiltinRuntimeEntryKeepsItsName();
+  testFallbackDeltaMatchesFullBuild();
+  testSurfaceCoverageUpdatesNameCollisionPriority();
+  testIncrementalRelationTargetNormalization();
+  testPrimaryKeyAuthorityAcrossSurfaceFallbackAndUpdates();
   console.log('workspaceIndexer.test: all passed');
 }
 

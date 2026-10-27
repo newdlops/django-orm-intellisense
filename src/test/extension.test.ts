@@ -1,11 +1,22 @@
 import * as assert from 'assert';
-import { execFile } from 'child_process';
+import { createHash } from 'node:crypto';
+import { execFile, type ChildProcessWithoutNullStreams } from 'child_process';
 import * as fs from 'fs';
+import * as inspector from 'node:inspector';
 import * as os from 'os';
 import * as path from 'path';
+import * as zlib from 'zlib';
 import * as vscode from 'vscode';
+import { State } from 'vscode-languageclient/node';
 import {
   getActiveDaemonForTesting,
+  getPendingSourceEventsForTesting,
+  getSourceWatcherStateForTesting,
+  getSourceWatcherCallbacksForTesting,
+  getSourceBatchPublicationCountForTesting,
+  getLanguageClientForTesting,
+  startLanguageClientForTesting,
+  enableAutoRestartsForTesting,
   promotePythonProvidersForTesting,
 } from '../client/extension';
 import {
@@ -16,11 +27,28 @@ import {
 } from '../client/daemon/analysisDaemon';
 import {
   getActiveDiagnosticScanRunningCountForTesting,
+  getCompletionTracesForTesting,
+  getHoverTracesForTesting,
+  getInlayTracesForTesting,
+  isAnyInteractiveRequestInFlight,
   clearReceiverAndLookupCachesForTesting,
   simulateDaemonReadyCacheClearForTesting,
   classifyNoRecvReasonForTesting,
+  resolveCachedReceiverForTesting,
 } from '../client/providers/pythonProviders';
-import type { HealthSnapshot } from '../client/protocol';
+import type { HealthSnapshot, LookupPathResolution, ReindexFileResult } from '../client/protocol';
+import { SurfaceSnapshotDecoder } from '../client/daemon/surfaceSnapshotTransport';
+import { normalizeSourcePath } from '../client/sourceWatcher';
+import { buildWorkspaceIndex, type StaticFallback } from '../server/workspaceIndexer';
+import { RendererHoverProbe, type RendererHoverObservation } from './rendererHoverProbe';
+import {
+  ensureNativeAstModules,
+  isNativeFastPathReady,
+  nativeResolveOrmMember,
+  nativeResolveLookupPath,
+  nativeListOrmMemberCompletions,
+  nativeListLookupPathCompletions,
+} from '../client/daemon/nativeFastPath';
 import {
   resolvePythonInterpreter,
   savePythonInterpreterSetting,
@@ -29,7 +57,7 @@ import {
 
 const EXTENSION_ID = 'newdlops.django-orm-intellisense';
 const FIXTURES_ROOT = path.resolve(__dirname, '../../fixtures');
-const DJANGO_E2E_MAJOR_VERSION = 5;
+const DJANGO_E2E_MAJOR_VERSION = Number(process.env.DJLS_E2E_DJANGO_MAJOR ?? '5');
 
 interface FixtureE2EProjectConfig {
   settingsModule: string;
@@ -92,6 +120,14 @@ suite('Django ORM Intellisense UI', () => {
     await clearExtensionSetting('workspaceRoot');
     await clearExtensionSetting('pythonInterpreter');
     await clearExtensionSetting('settingsModule');
+    // The cache directory belongs to both processes. Stop its writers while
+    // automatic restarts are still disabled, then remove their temp files.
+    const daemon = getActiveDaemonForTesting();
+    await daemon?.stop();
+    const client = getLanguageClientForTesting();
+    if (client?.isRunning()) await client.stop();
+    assert.ok(!client?.isRunning(), 'Language server still running at cache teardown.');
+    if (daemon) assert.strictEqual(daemon.getState().phase, 'stopped');
     if (fixtureHarnessWorkspacePath) {
       fs.rmSync(fixtureHarnessWorkspacePath, { recursive: true, force: true });
       fixtureHarnessWorkspacePath = undefined;
@@ -107,8 +143,440 @@ suite('Django ORM Intellisense UI', () => {
     }
   });
 
+  test('completes instance lookups and dynamic transform continuations', async function () {
+    const visualHoldMs = Math.min(180_000, Math.max(0, Number(process.env.DJLS_E2E_VISUAL_HOLD_MS ?? 0)));
+    this.timeout(45_000 + visualHoldMs);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const document = await openFixtureDocument(fixtureRoot, 'blog/dynamic_lookup_examples.py');
+    const checks: Array<[string, string, boolean]> = [
+      ['title__instance_o', 'instance_only', true],
+      ['other__instance_o', 'instance_only', false],
+      ['title__length__g', 'gte', true],
+      ['title__lower__length__g', 'gte', true],
+      ['payload__nested__0__ico', 'icontains', true],
+      ["values('created__date__iso_y", 'iso_year', true],
+      ["order_by('created__date__iso_y", 'iso_year', true],
+      ['aget(title__length__g', 'gte', true],
+      ['day__year__g', 'gte', true],
+      ['total__g', 'gte', true],
+      ['total__date', 'date', false],
+      ['filter(id__co', 'count', true],
+      ['filter(id__count__g', 'gte', true],
+      ["values('id__co", 'count', true],
+      ["order_by('id__co", 'count', true],
+      ['id__sum__g', 'gte', true],
+      ['id__count__l', 'lt', true],
+      ['score__count__g', 'gte', true],
+      ['filter(이름__ico', 'icontains', true],
+      ['payload__고객__0__ico', 'icontains', true],
+      ["values('payload__고객__0__이름__ico", 'icontains', false],
+      ['한글__g', 'gte', true],
+      ['payload__customer name__+1__ico', 'icontains', true],
+      ['dates__0__year__g', 'gte', true],
+      ['dates__len__g', 'gte', true],
+      ['titles__0__instance_o', 'instance_only', true],
+      ['copy__length__g', 'gte', true],
+      ['avg__date', 'date', false],
+      ['number__date', 'date', false],
+      ['typed.filter(result__ico', 'icontains', true],
+      ['typed.filter(result__year__g', 'gte', true],
+      ["Post.objects.select_related('", 'author', true],
+      ["Post.objects.select_related('", 'tags', false],
+      ["Post.objects.prefetch_related('", 'tags', true],
+      ["Post.objects.prefetch_related('", 'title', false],
+      ["QuestionThread.objects.select_related('t", 'tmeta', true],
+      ["QuestionThread.objects.select_related('_t", '_tmeta', false],
+      ["QuestionThread.objects.prefetch_related('t", 'tmeta', false],
+      ["QuestionThread.objects.prefetch_related('_t", '_tmeta', true],
+      ['uuid__istart', 'istartswith', true],
+    ];
+    for (const [text, expected, present] of checks) {
+      const completions = await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider', document.uri, positionAfterText(document, text),
+      );
+      assert.strictEqual(hasCompletionItemLabel(completions?.items, expected), present,
+        `${text}: expected ${expected} presence=${present}`);
+      if (text === "values('created__date__iso_y" || text === "order_by('created__date__iso_y") {
+        const completion = findCompletionItemByLabel(completions?.items, 'iso_year');
+        assert.strictEqual(completion?.insertText, 'iso_year');
+        assert.strictEqual(completion?.command, undefined);
+      }
+      if (text === 'filter(id__count__g') {
+        const completion = findCompletionItemByLabel(completions?.items, 'gte');
+        assert.strictEqual(completion?.insertText, 'gte');
+        assert.strictEqual(completionItemDescription(completion!), 'lookup · LookupSample.id__count');
+        const range = completion?.range;
+        assert.ok(range instanceof vscode.Range);
+        assert.strictEqual(document.getText(range), 'g');
+      }
+    }
+    const propertyCompletions = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider', document.uri, positionAfterText(document, 'all().totally_o'),
+    );
+    const property = findCompletionItemByLabel(propertyCompletions?.items, 'totally_ordered');
+    const available = /^6\.(?:[1-9]\d*)\./.test(getActiveDaemonForTesting()?.getState().runtime?.djangoVersion ?? '');
+    assert.strictEqual(Boolean(property), available, 'totally_ordered follows the runtime Django version');
+    if (property) {
+      assert.strictEqual(property.kind, vscode.CompletionItemKind.Property);
+      assert.strictEqual(property.insertText ?? 'totally_ordered', 'totally_ordered');
+    }
+    for (const [container, word, kind] of [
+      ["LookupSample.objects.values('이름')", '이름', 'CharField'],
+      ["filter(id__count__gte=1)", 'id__count__gte', 'IntegerField'],
+      ["typed.values('result')", 'result', 'DateTimeField'],
+    ]) {
+      const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider', document.uri, positionInsideText(document, container, word),
+      );
+      assert.ok(stringifyHovers(hovers).includes(kind), `${container}: typed hover ${kind}`);
+    }
+    if (visualHoldMs) {
+      const editor = await vscode.window.showTextDocument(document);
+      const cursor = positionAfterText(document, 'filter(id__count__g');
+      editor.selection = new vscode.Selection(cursor, cursor);
+      editor.revealRange(new vscode.Range(cursor, cursor), vscode.TextEditorRevealType.InCenter);
+      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+      await vscode.commands.executeCommand('editor.action.triggerSuggest');
+      console.log('VISUAL_QA_READY: aggregate alias operator popup');
+      await new Promise(resolve => setTimeout(resolve, visualHoldMs));
+    }
+  });
+
+  test('keeps interactive provider priority and results across Pylance activation and Python document switches', async function () {
+    this.timeout(45_000);
+    const pylance = vscode.extensions.getExtension('ms-python.vscode-pylance');
+    assert.ok(pylance?.isActive, 'Pylance must be active before checking provider ordering.');
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const document = await openFixtureDocument(fixtureRoot, 'blog/query_examples.py');
+    const lookupPosition = positionInsideText(
+      document,
+      "Post.objects.filter(author__profile__timezone='Asia/Seoul')",
+      'timezone'
+    );
+    const completionPosition = positionAfterText(document, 'author__pro');
+    const signaturePosition = positionAfterTextInContainer(
+      document,
+      "Post.objects.create(ti='draft', author_i=1)",
+      'ti'
+    );
+
+    const verifyPrimaryDocumentProviders = async (): Promise<void> => {
+      const completion = await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider', document.uri, completionPosition
+      );
+      const profileItems = completion?.items.filter(item => completionItemLabel(item) === 'profile') ?? [];
+      assert.strictEqual(profileItems.length, 1, 'The promoted ORM completion must not be duplicated by Pylance.');
+      assert.strictEqual(profileItems[0].insertText, 'profile__');
+
+      const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider', document.uri, lookupPosition
+      );
+      assert.ok(stringifyHovers(hovers).includes('Owner model: `blog.Profile`'));
+      assert.ok(stringifyHovers(hovers[0] ? [hovers[0]] : []).includes('Owner model: `blog.Profile`'),
+        'The higher-priority hover result must remain the ORM result after Pylance activation.');
+
+      const definitions = await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink>>(
+        'vscode.executeDefinitionProvider', document.uri, lookupPosition
+      );
+      assert.ok(firstDefinition(definitions)?.uri.fsPath.endsWith(path.join('blog', 'models.py')),
+        'The first definition after promotion must remain the ORM field definition.');
+
+      const signature = await vscode.commands.executeCommand<vscode.SignatureHelp>(
+        'vscode.executeSignatureHelpProvider', document.uri, signaturePosition
+      );
+      assert.ok(signature?.signatures[0]?.label.includes('title: CharField'),
+        'The first signature after promotion must retain Django model fields.');
+    };
+
+    await verifyPrimaryDocumentProviders();
+    const secondDocument = await openFixtureDocument(fixtureRoot, 'blog/dynamic_lookup_examples.py');
+    const secondCompletionPosition = positionAfterText(secondDocument, 'filter(id__count__g');
+    const secondCompletion = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider', secondDocument.uri, secondCompletionPosition
+    );
+    assert.strictEqual(
+      secondCompletion?.items.filter(item => completionItemLabel(item) === 'gte').length,
+      1,
+      'Switching Python documents must keep one ORM completion and no Pylance duplicate.'
+    );
+
+    await vscode.window.showTextDocument(document);
+    await delay(250);
+    await verifyPrimaryDocumentProviders();
+  });
+
+  test('renders ORM inlay hints after daemon readiness and refreshes their enabled state', async function () {
+    const rendererPort = Number(process.env.DJLS_E2E_RENDERER_DEBUG_PORT ?? 0);
+    if (!rendererPort) this.skip();
+    const visualHoldMs = Math.min(60_000, Math.max(0, Number(process.env.DJLS_E2E_VISUAL_HOLD_MS ?? 0)));
+    this.timeout(90_000 + visualHoldMs);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+    assert.ok(environment);
+    const fixtureWorkspace = ensureFixtureWorkspace(fixtureRoot, environment);
+    if (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath !== fixtureWorkspace) {
+      await removeWorkspaceFoldersFrom(0);
+      await addWorkspaceFolder(fixtureWorkspace);
+    }
+    await applyFixtureWorkspaceSettings(fixtureWorkspace, fixtureRoot, environment);
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    await daemon.stop();
+    assert.strictEqual(daemon.getState().phase, 'stopped');
+
+    const uri = vscode.Uri.file(path.join(fixtureRoot, 'blog/query_examples.py'));
+    const editorConfig = vscode.workspace.getConfiguration('editor', { uri, languageId: 'python' });
+    const ownConfig = vscode.workspace.getConfiguration('djangoOrmIntellisense', uri);
+    const originalEditorSetting = editorConfig.inspect<string>('inlayHints.enabled');
+    const originalOwnSetting = ownConfig.inspect<boolean>('inlayHints.enabled');
+    const currentEditorEnabled = () => vscode.workspace.getConfiguration('editor', { uri, languageId: 'python' })
+      .get<string>('inlayHints.enabled');
+    const currentOwnEnabled = () => vscode.workspace.getConfiguration('djangoOrmIntellisense', uri)
+      .get<boolean>('inlayHints.enabled');
+    const setEditorEnabled = async (value: 'on' | 'off') => {
+      await editorConfig.update('inlayHints.enabled', value, vscode.ConfigurationTarget.Global, true);
+      await waitForCondition(() => currentEditorEnabled() === value, 3_000);
+    };
+    const setOwnEnabled = async (value: boolean) => {
+      await ownConfig.update('inlayHints.enabled', value, vscode.ConfigurationTarget.Global);
+      await waitForCondition(() => currentOwnEnabled() === value, 3_000);
+    };
+    const renderer = await RendererHoverProbe.connect(rendererPort);
+    const states: Array<{ at: number; phase: string; bootstrapStatus: string | undefined }> = [];
+    const stateSubscription = daemon.onDidChangeState(state => states.push({ at: Date.now(),
+      phase: state.phase, bootstrapStatus: state.runtime?.bootstrapStatus }));
+    let autoRestartScope: vscode.Disposable | undefined;
+    try {
+      console.info('[inlay-render-original-config] ' + JSON.stringify({
+        editor: editorConfig.get('inlayHints.enabled'), own: ownConfig.get('inlayHints.enabled'),
+        editorInspection: originalEditorSetting, ownInspection: originalOwnSetting,
+      }));
+      // Global updates belong to this test's isolated user-data profile. The
+      // fixture file is outside the temporary harness workspace folder.
+      await setEditorEnabled('on');
+      await setOwnEnabled(true);
+      const openedAt = Date.now();
+      const document = await openFixtureDocument(fixtureRoot, 'blog/query_examples.py');
+      const editor = await vscode.window.showTextDocument(document);
+      const target = "Post.objects.filter(author__profile__timezone='Asia/Seoul')";
+      const position = positionAfterText(document, target);
+      editor.selection = new vscode.Selection(position, position);
+      editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
+      await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+      const targetLine = (line: { text: string }) => line.text.includes('Post.objects.filter(author__profile__timezone')
+        && line.text.includes("'Asia/Seoul'") && !line.text.includes('timezone__');
+      const relationLine = (line: { text: string }) => line.text.includes('Post.objects.filter(author__')
+        && line.text.includes("'mentor'") && !line.text.includes('author__pro');
+      const sample = async () => {
+        const observation = await renderer.codeLinesObservation();
+        const lines = observation.lines.filter(targetLine);
+        const relationLines = observation.lines.filter(relationLine);
+        return { unixMs: observation.unixMs, monotonicMs: observation.monotonicMs, lines,
+          painted: lines.some(line => line.spans.some(span => span.text === ': str')),
+          relationLines, relationPainted: relationLines.some(line => line.spans.some(span => span.text === ': Author')) };
+      };
+      const observe = async (phase: string, expected: boolean, timeoutMs: number) => {
+        const started = Date.now();
+        const first = await sample();
+        let last = first;
+        while ((last.painted !== expected || last.relationPainted !== expected) && Date.now() - started < timeoutMs) {
+          await delay(100);
+          last = await sample();
+        }
+        const screenshot = `bench/inlay-render-${phase}-${process.pid}-${Date.now()}.png`;
+        fs.writeFileSync(path.resolve(__dirname, '../../', screenshot), await renderer.screenshot());
+        const result = { phase, expected, elapsedMs: Date.now() - started, first, last, screenshot,
+          documentVersion: document.version, ownEnabled: currentOwnEnabled(),
+          editorEnabled: currentEditorEnabled(), daemonPhase: daemon.getState().phase,
+          modelLabels: { runtime: daemon.modelLabelByName.get('Post'),
+            local: daemon.localWorkspaceIndexForTesting.modelLabelByName.get('Post'),
+            resolved: daemon.findModelLabelByShortName('Post'), nativeReady: isNativeFastPathReady() },
+          traces: getInlayTracesForTesting().slice(-4) };
+        console.info('[inlay-render-phase] ' + JSON.stringify(result));
+        return result;
+      };
+      // Diagnostic-sourced inlays must not start a stopped daemon themselves.
+      await delay(1_000);
+      const stopped = await observe('stopped-session', false, 2_000);
+      assert.strictEqual(daemon.getState().phase, 'stopped', 'Background inlays must preserve lazy startup');
+      await daemon.ensureStarted(vscode.Uri.file(fixtureWorkspace));
+      const ready = await waitForHealthSnapshot(daemon, state => state.phase === 'ready'
+        && state.runtime?.bootstrapStatus === 'ready', 30_000);
+      assertFixtureE2EHealth(ready, fixtureRoot, environment);
+      // Do not invoke the inlay API before this automatic-paint observation.
+      const afterReady = await observe('daemon-ready', true, 10_000);
+      console.info('[inlay-render-startup] ' + JSON.stringify({ openedAt, states, ready }));
+      if (visualHoldMs > 0) {
+        console.info('[inlay-render-visual-hold] ' + JSON.stringify({ phase: 'daemon-ready', holdMs: visualHoldMs }));
+        await delay(visualHoldMs);
+      }
+      await delay(Math.max(0, 8_000 - visualHoldMs));
+      const settled = await observe('ready-settled', true, 3_000);
+      // Display toggles must also work with the production restart gate enabled.
+      autoRestartScope = enableAutoRestartsForTesting();
+      const range = new vscode.Range(position.line, 0, position.line + 1, 0);
+      const labels = async () => {
+        const startedAt = Date.now();
+        const hints = await vscode.commands.executeCommand<vscode.InlayHint[]>(
+          'vscode.executeInlayHintProvider', document.uri, range);
+        const narrow = (hints ?? []).map(hint => typeof hint.label === 'string'
+          ? hint.label : hint.label.map(part => part.value).join(''));
+        const full = await vscode.commands.executeCommand<vscode.InlayHint[]>(
+          'vscode.executeInlayHintProvider', document.uri, new vscode.Range(0, 0, document.lineCount, 0));
+        console.info('[inlay-render-api-range-control] ' + JSON.stringify({ range,
+          narrow, fullTarget: (full ?? []).filter(hint => hint.position.line === position.line),
+          fullCount: full?.length, ownEnabled: currentOwnEnabled(),
+          traces: getInlayTracesForTesting().filter(trace => trace.startedAt >= startedAt) }));
+        return narrow;
+      };
+      const enabledLabels = await labels();
+      // Independent renderer control: built-in configuration forces a fresh
+      // editor request without editing or invoking the provider command.
+      await setEditorEnabled('off');
+      const builtInOff = await observe('editor-disabled', false, 5_000);
+      await setEditorEnabled('on');
+      const builtInOn = await observe('editor-enabled', true, 10_000);
+      await setOwnEnabled(false);
+      const disabled = await observe('extension-disabled', false, 5_000);
+      const disabledLabels = await labels();
+      // Start the enable transition from a genuinely empty, settled editor
+      // response, even when the preceding disable refresh regressed.
+      await setEditorEnabled('off');
+      await observe('editor-off-extension-disabled', false, 5_000);
+      await setEditorEnabled('on');
+      await delay(1_000);
+      const empty = await observe('editor-on-extension-disabled', false, 5_000);
+      await setOwnEnabled(true);
+      const enabled = await observe('extension-enabled', true, 5_000);
+      const reenabledLabels = await labels();
+      console.info('[inlay-render-controls] ' + JSON.stringify({ enabledLabels, disabledLabels, reenabledLabels,
+        states, documentVersion: document.version }));
+      const warmHovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider', document.uri, positionInsideText(document, target, 'author__profile__timezone'));
+      const warmedLabels = await labels();
+      console.info('[inlay-render-foreground-control] ' + JSON.stringify({ warmedLabels,
+        hoverHasCharField: stringifyHovers(warmHovers).includes('CharField') }));
+      assert.ok(enabledLabels.includes(': str') && reenabledLabels.includes(': str'),
+        'The semantic control must return the expected lookup type when enabled');
+      assert.ok(!disabledLabels.includes(': str'), 'The semantic control must omit lookup hints when disabled');
+      assert.ok(builtInOff.last.lines.length && !builtInOff.last.painted && builtInOn.last.painted && !empty.last.painted,
+        'The independent built-in configuration control must display the target line and its type hint');
+      assert.ok(!stopped.last.painted && afterReady.last.painted && settled.last.painted && !disabled.last.painted && enabled.last.painted,
+        `Visible lookup hints must refresh without editing or reopening: afterReady=${afterReady.last.painted}, `
+        + `disabled=${disabled.last.painted}, reenabled=${enabled.last.painted}`);
+      assert.ok(stopped.last.relationLines.length && settled.last.relationLines.length && enabled.last.relationLines.length,
+        'The relation control must remain in the actual viewport');
+      assert.ok(!stopped.last.relationPainted && afterReady.last.relationPainted && settled.last.relationPainted
+        && !builtInOff.last.relationPainted && builtInOn.last.relationPainted
+        && !disabled.last.relationPainted && !empty.last.relationPainted && enabled.last.relationPainted,
+        `Visible relation hints must retain metadata across readiness and settings: `
+        + `ready=${afterReady.last.relationPainted}, settled=${settled.last.relationPainted}, `
+        + `reenabled=${enabled.last.relationPainted}`);
+    } finally {
+      autoRestartScope?.dispose();
+      stateSubscription.dispose();
+      try {
+        await ownConfig.update('inlayHints.enabled', originalOwnSetting?.globalValue, vscode.ConfigurationTarget.Global);
+        await editorConfig.update('inlayHints.enabled', originalEditorSetting?.globalLanguageValue,
+          vscode.ConfigurationTarget.Global, true);
+      } finally { await renderer.dispose(); }
+    }
+  });
+
+  test('inlay configuration preserves the daemon session while analysis settings still restart it', async function () {
+    this.timeout(90_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+    assert.ok(environment);
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    const document = await openFixtureDocument(fixtureRoot, 'blog/query_examples.py');
+    await vscode.window.showTextDocument(document);
+    const config = vscode.workspace.getConfiguration('djangoOrmIntellisense', document.uri);
+    const originalInlay = config.inspect<boolean>('inlayHints.enabled')?.globalValue;
+    const originalLogLevel = config.inspect<string>('logLevel')?.globalValue;
+    await config.update('inlayHints.enabled', true, vscode.ConfigurationTarget.Global);
+    await delay(8_000);
+    const internal = daemon as unknown as { process?: { pid?: number } };
+    const snapshot = () => ({ pid: internal.process?.pid, revision: daemon.getSessionRevision(),
+      phase: daemon.getState().phase, startedAt: daemon.getState().startedAt });
+    const baseline = snapshot();
+    assert.ok(baseline.pid);
+    const restartCalls: Array<{ scope: string | undefined; before: ReturnType<typeof snapshot> }> = [];
+    const restartJobs: Array<ReturnType<typeof daemon.restart>> = [];
+    const originalRestart = daemon.restart;
+    daemon.restart = (scope?: vscode.ConfigurationScope) => {
+      restartCalls.push({ scope: scope?.toString(), before: snapshot() });
+      const job = originalRestart.call(daemon, scope);
+      restartJobs.push(job);
+      return job;
+    };
+    const events: Array<{ inlay: boolean; logLevel: boolean }> = [];
+    const listener = vscode.workspace.onDidChangeConfiguration(event => events.push({
+      inlay: event.affectsConfiguration('djangoOrmIntellisense.inlayHints.enabled'),
+      logLevel: event.affectsConfiguration('djangoOrmIntellisense.logLevel'),
+    }));
+    const enabledRestarts = enableAutoRestartsForTesting();
+    try {
+      const phases = [];
+      const target = "Post.objects.filter(author__profile__timezone='Asia/Seoul')";
+      const position = positionAfterText(document, target);
+      const range = new vscode.Range(position.line - 1, 0, position.line + 1, 0);
+      for (const enabled of [false, true]) {
+        const previousEvents = events.length;
+        await config.update('inlayHints.enabled', enabled, vscode.ConfigurationTarget.Global);
+        await waitForCondition(() => events.slice(previousEvents).some(event => event.inlay), 5_000);
+        await Promise.all(restartJobs);
+        await waitForHealthSnapshot(daemon, state => state.phase === 'ready'
+          && state.runtime?.bootstrapStatus === 'ready', 30_000);
+        const hints = await vscode.commands.executeCommand<vscode.InlayHint[]>(
+          'vscode.executeInlayHintProvider', document.uri, range);
+        phases.push({ enabled, ...snapshot(), restartCalls: restartCalls.length,
+          labels: (hints ?? []).map(hint => typeof hint.label === 'string'
+            ? hint.label : hint.label.map(part => part.value).join('')) });
+      }
+      const inlayCalls = restartCalls.length;
+      const beforePositive = snapshot();
+      const previousEvents = events.length;
+      const currentLevel = vscode.workspace.getConfiguration('djangoOrmIntellisense', document.uri)
+        .get<string>('logLevel', 'info');
+      await config.update('logLevel', currentLevel === 'debug' ? 'info' : 'debug', vscode.ConfigurationTarget.Global);
+      await waitForCondition(() => events.slice(previousEvents).some(event => event.logLevel)
+        && restartCalls.length > inlayCalls, 5_000);
+      await Promise.all(restartJobs);
+      const positiveHealth = await waitForHealthSnapshot(daemon, state => state.phase === 'ready'
+        && state.runtime?.bootstrapStatus === 'ready', 30_000);
+      assertFixtureE2EHealth(positiveHealth, fixtureRoot, environment);
+      const positive = { before: beforePositive, after: snapshot(), calls: restartCalls.length - inlayCalls };
+      console.info('[inlay-config-restart-control] ' + JSON.stringify({ baseline, phases, inlayCalls,
+        positive, restartCalls, events, documentVersion: document.version }));
+      assert.equal(positive.calls, 1, 'The enabled production handler must still restart for an analysis setting');
+      assert.notEqual(positive.after.pid, positive.before.pid);
+      assert.ok(positive.after.revision > positive.before.revision);
+      assert.ok(restartCalls.every(call => call.scope === document.uri.toString()));
+      assert.equal(inlayCalls, 0, 'Display-only inlay toggles must not restart analysis');
+      assert.ok(phases.every(phase => phase.pid === baseline.pid && phase.revision === baseline.revision));
+      assert.equal(phases[0].labels.length, 0);
+      assert.ok(phases[1].labels.includes(': str') && phases[1].labels.includes(': Author'));
+      assert.equal(document.version, 1);
+    } finally {
+      enabledRestarts.dispose();
+      listener.dispose();
+      await Promise.allSettled(restartJobs);
+      daemon.restart = originalRestart;
+      await config.update('inlayHints.enabled', originalInlay, vscode.ConfigurationTarget.Global);
+      await config.update('logLevel', originalLogLevel, vscode.ConfigurationTarget.Global);
+    }
+  });
+
   test('completes and resolves ORM lookup paths in fixture project', async function () {
-    this.timeout(20_000);
+    this.timeout(60_000);
 
     const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
     await setWorkspaceRoot(fixtureRoot);
@@ -1082,7 +1550,7 @@ suite('Django ORM Intellisense UI', () => {
         `Expected file-watcher reindex to surface the new field. Received: ${(completionList?.items ?? [])
           .slice(0, 20)
           .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
-          .join(', ')}`
+          .join(', ')}\nLocal fields: ${[...(daemon.localWorkspaceIndexForTesting.models.get('blog.Post')?.fields.keys() ?? [])].join(', ')}\nModel label: ${daemon.findModelLabelByShortName('Post')}\nLogs:\n${getDiagnosticLogBufferForTesting().slice(-45).join('\n')}`
       );
 
       const inheritedLookupCompletionPosition = positionAfterTextInContainer(
@@ -1107,6 +1575,2651 @@ suite('Django ORM Intellisense UI', () => {
           .map((item) => `${completionItemDisplayLabel(item)} | ${item.detail ?? '<no detail>'}`)
           .join(', ')}`
       );
+
+      // A ready runtime catalog still contains the original CharField. Saving
+      // a new declared type must update both the graph and lookup descriptors.
+      const datedModels = updatedModels.replace(
+        '    title = models.CharField(max_length=255)\n',
+        '    title = models.DateField(null=True)\n',
+      );
+      fs.appendFileSync(queryExamplesPath, '\nPost.objects.filter(title__ye=2026)\n', 'utf8');
+      fs.writeFileSync(modelsPath, datedModels, 'utf8');
+      await waitForCondition(() => daemon.localWorkspaceIndexForTesting.models.get('blog.Post')?.fields.get('title')?.fieldKind === 'DateField', 15_000);
+      const datedDocument = await vscode.workspace.openTextDocument(queryExamplesPath);
+      const dateCompletions = await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider', datedDocument.uri, positionAfterText(datedDocument, 'Post.objects.filter(title__ye'),
+      );
+      assert.ok(hasCompletionItemLabel(dateCompletions?.items ?? [], 'year'), 'saved DateField must offer year despite the older runtime catalog');
+
+      // A surface no-op still needs to invalidate cached export locations.
+      // Exercise creation, movement and deletion through the real watcher.
+      const helperModule = 'blog.watcher_helper';
+      const helperPath = path.join(tempRoot, 'blog', 'watcher_helper.py');
+      assert.strictEqual((await daemon.resolveExportOrigin(helperModule, 'marker')).resolved, false);
+      const waitForHelper = async (expectedLine: number | null): Promise<void> => {
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const result = await daemon.resolveExportOrigin(helperModule, 'marker');
+          if (expectedLine === null ? !result.resolved : result.resolved && result.originLine === expectedLine) return;
+          await delay(100);
+        }
+        assert.fail(`Watcher did not refresh helper export to line ${expectedLine}`);
+      };
+      fs.writeFileSync(helperPath, 'def marker():\n    pass\n', 'utf8');
+      await waitForHelper(1);
+      fs.writeFileSync(helperPath, '\n\ndef marker():\n    pass\n', 'utf8');
+      await waitForHelper(3);
+      fs.unlinkSync(helperPath);
+      await waitForHelper(null);
+
+      const addedModelPath = path.join(tempRoot, 'blog', 'watcher_added.py');
+      fs.writeFileSync(addedModelPath, 'from django.db import models\nclass WatcherAdded(models.Model):\n    name = models.CharField(max_length=255)\n    class Meta:\n        app_label = "blog"\n', 'utf8');
+      await waitForCondition(() => daemon.localWorkspaceIndexForTesting.models.has('blog.WatcherAdded'), 10_000);
+      fs.appendFileSync(queryExamplesPath, "\nWatcherAdded.objects.filter(na='new')\n", 'utf8');
+      const addedDocument = await vscode.workspace.openTextDocument(queryExamplesPath);
+      await waitForCondition(() => addedDocument.getText().includes('WatcherAdded.objects.filter(na'), 10_000);
+      const addedCompletion = await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider', addedDocument.uri, positionAfterText(addedDocument, 'WatcherAdded.objects.filter(na'),
+      );
+      assert.ok(hasCompletionItemLabel(addedCompletion?.items ?? [], 'name'), 'created model must complete its fields');
+      fs.unlinkSync(addedModelPath);
+      await waitForCondition(() => !daemon.localWorkspaceIndexForTesting.models.has('blog.WatcherAdded'), 10_000);
+      assert.strictEqual(daemon.findModelLabelByShortName('WatcherAdded'), undefined, 'deleted model must release its short name');
+    } finally {
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  for (const installFormat of ['modern', 'relative-legacy']) {
+    test(installFormat === 'modern'
+      ? 'refreshes editable models after external saves and file watcher events'
+      : 'refreshes relative egg-link models after external saves and file watcher events', async function () {
+      const visualHoldMs = Math.min(60_000, Math.max(0, Number(process.env.DJLS_E2E_VISUAL_HOLD_MS ?? 0)));
+      this.timeout(90_000 + visualHoldMs);
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+      assert.ok(environment);
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-intellisense-editable-'));
+      const root = path.join(base, 'workspace');
+      const source = path.join(base, 'library');
+      const shared = path.join(source, 'shared');
+      for (const folder of [path.join(root, 'blog'), path.join(root, 'project'), shared]) fs.mkdirSync(folder, { recursive: true });
+      fs.writeFileSync(path.join(root, 'blog/__init__.py'), '');
+      fs.writeFileSync(path.join(root, 'blog/models.py'), 'from django.db import models\nclass Post(models.Model):\n    title = models.CharField()\n');
+      fs.writeFileSync(path.join(root, 'project/__init__.py'), '');
+      fs.writeFileSync(path.join(root, 'project/settings.py'), 'INSTALLED_APPS = ["blog"]\nSECRET_KEY = "editable-e2e"\nDATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}}\n');
+      fs.writeFileSync(path.join(shared, '__init__.py'), '');
+      const modelsPath = path.join(shared, 'models.py');
+      const original = 'from django.db import models\nclass Shared(models.Model):\n    value = models.CharField()\n';
+      fs.writeFileSync(modelsPath, original);
+      const sourceAlias = path.join(base, 'source-alias');
+      fs.symlinkSync(source, sourceAlias, 'dir');
+      const packages = path.join(root, '.venv/lib/python3.12/site-packages');
+      fs.mkdirSync(packages, { recursive: true });
+      if (installFormat === 'modern') {
+        for (const name of ['first', 'second']) {
+          const metadata = path.join(packages, `${name}-1.0.dist-info`);
+          fs.mkdirSync(metadata);
+          fs.writeFileSync(path.join(metadata, 'direct_url.json'), JSON.stringify({ url: vscode.Uri.file(sourceAlias).toString(), dir_info: { editable: true } }));
+        }
+      } else {
+        fs.writeFileSync(path.join(packages, 'legacy.egg-link'), path.relative(packages, sourceAlias) + '\n.');
+      }
+      fs.writeFileSync(path.join(root, '.venv/pyvenv.cfg'), 'version = 3.12.13\n');
+      const queryPath = path.join(shared, 'queries.py');
+      fs.writeFileSync(queryPath, 'from .models import Shared\nShared.objects.filter(value__i=1)\n');
+      await removeWorkspaceFoldersFrom(0);
+      try {
+        const daemon = getActiveDaemonForTesting();
+        assert.ok(daemon);
+        const workspace = ensureFixtureWorkspace(root, environment);
+        await addWorkspaceFolder(workspace);
+        await applyFixtureWorkspaceSettings(workspace, root, environment);
+        await daemon.restart(vscode.Uri.file(workspace));
+        await waitForHealthSnapshot(daemon, value => value.phase === 'ready', 30_000);
+        assert.strictEqual(daemon.getEditableSourceRoots().length, 1);
+        const query = await vscode.workspace.openTextDocument(queryPath);
+        await vscode.window.showTextDocument(query);
+        const fieldKind = (): string | null | undefined => daemon.surfaceIndex['shared.Shared']?.instance?.value?.[3]
+          ?? daemon.staticFallback?.['shared.Shared']?.fieldDetails?.value?.fieldKind;
+        await waitForCondition(() => fieldKind() === 'CharField', 10_000);
+        if (installFormat === 'relative-legacy') {
+          assert.deepStrictEqual(daemon.getEditableSourceRoots(), [normalizeSourcePath(source)]);
+          assert.ok(daemon.modelNames.has('Shared'), 'Relative legacy-only install omitted its external model');
+          console.info('[relative-egg-native] ' + JSON.stringify({ roots: daemon.getEditableSourceRoots(), model: 'shared.Shared' }));
+        }
+        const model = await vscode.workspace.openTextDocument(modelsPath);
+        const edit = new vscode.WorkspaceEdit();
+        edit.replace(model.uri, new vscode.Range(model.positionAt(0), model.positionAt(model.getText().length)), original.replace('CharField', 'IntegerField'));
+        assert.ok(await vscode.workspace.applyEdit(edit));
+        // IDE saves must enter the owned queue directly: a native watcher can
+        // still be attaching, and the language server can be stopped. Observe
+        // the actual save event before either asynchronous fallback is needed.
+        const normalizedModelsPath = normalizeSourcePath(modelsPath);
+        const saveObservations: Array<{ queued: boolean; languageServerRunning: boolean;
+          pending: ReturnType<typeof getPendingSourceEventsForTesting>; watcher: unknown }> = [];
+        const saveObserver = vscode.workspace.onDidSaveTextDocument(saved => {
+          if (saved.uri.toString() !== model.uri.toString()) return;
+          const pending = getPendingSourceEventsForTesting();
+          saveObservations.push({ queued: pending.files.includes(normalizedModelsPath),
+            languageServerRunning: getLanguageClientForTesting()?.isRunning() ?? false,
+            pending, watcher: getSourceWatcherStateForTesting() });
+        });
+        try { assert.ok(await model.save()); }
+        finally { saveObserver.dispose(); }
+        const saved = saveObservations[0];
+        assert.ok(saved, 'The actual IDE Python save event must be observed');
+        console.info('[editable-save-boundary] ' + JSON.stringify({ installFormat,
+          uri: model.uri.toString(), version: model.version, normalizedModelsPath, ...saved }));
+        assert.ok(saved.queued, 'IDE Python saves must immediately enter the owned source queue');
+        await waitForCondition(() => fieldKind() === 'IntegerField', 15_000);
+        assert.strictEqual((await daemon.resolveLookupPath('shared.Shared', 'value__exact', 'filter')).terminalType?.outputFieldKind, 'IntegerField');
+        const extraPath = path.join(shared, 'extra.py');
+        fs.writeFileSync(extraPath, 'from django.db import models\nclass Added(models.Model):\n    amount = models.IntegerField()\n');
+        await waitForCondition(() => daemon.modelNames.has('Added'), 15_000);
+        fs.unlinkSync(extraPath);
+        await waitForCondition(() => !daemon.modelNames.has('Added'), 15_000);
+        fs.writeFileSync(modelsPath, original);
+        await waitForCondition(() => fieldKind() === 'CharField', 15_000);
+        await vscode.window.showTextDocument(query);
+        const completions = await vscode.commands.executeCommand<vscode.CompletionList>('vscode.executeCompletionItemProvider', query.uri, positionAfterText(query, 'value__i'));
+        assert.ok(hasCompletionItemLabel(completions?.items, 'icontains'));
+
+        // A nested package must report child creation and directory rename
+        // events through the source watcher.
+        const nestedDirectory = path.join(shared, 'nested');
+        const movedDirectory = path.join(shared, 'moved');
+        fs.mkdirSync(nestedDirectory, { recursive: true });
+        fs.writeFileSync(path.join(nestedDirectory, '__init__.py'), '');
+        fs.writeFileSync(path.join(nestedDirectory, 'marker.py'), 'def marker():\n    pass\n');
+        const waitForExport = async (moduleName: string, expected: boolean): Promise<void> => {
+          const deadline = Date.now() + 15_000;
+          while (Date.now() < deadline) {
+            const result = await daemon.resolveExportOrigin(moduleName, 'marker');
+            if (result.resolved === expected) return;
+            await delay(100);
+          }
+          assert.fail(`Watcher did not resolve ${moduleName} to expected=${expected}`);
+        };
+        await waitForExport('shared.nested.marker', true);
+        fs.renameSync(nestedDirectory, movedDirectory);
+        await waitForExport('shared.nested.marker', false);
+        await waitForExport('shared.moved.marker', true);
+
+        fs.rmSync(shared, { recursive: true, force: true });
+        await waitForCondition(() => !daemon.modelNames.has('Shared'), 15_000);
+        assert.strictEqual((await daemon.resolveLookupPath('shared.Shared', 'value__exact', 'filter')).resolved, false);
+        const removedCompletions = await vscode.commands.executeCommand<vscode.CompletionList>('vscode.executeCompletionItemProvider', query.uri, positionAfterText(query, 'value__i'));
+        assert.ok(!hasCompletionItemLabel(removedCompletions?.items, 'icontains'), 'Deleted editable model still returned its field lookup');
+        fs.mkdirSync(shared, { recursive: true });
+        fs.writeFileSync(path.join(shared, '__init__.py'), '');
+        fs.writeFileSync(modelsPath, original);
+        await waitForCondition(() => daemon.modelNames.has('Shared'), 15_000);
+        fs.rmSync(source, { recursive: true, force: true });
+        await waitForCondition(() => !daemon.modelNames.has('Shared'), 15_000);
+        assert.strictEqual((await daemon.resolveLookupPath('shared.Shared', 'value__exact', 'filter')).resolved, false);
+        // Recreate the complete editable root with children already present.
+        fs.mkdirSync(shared, { recursive: true });
+        fs.writeFileSync(path.join(shared, '__init__.py'), '');
+        fs.writeFileSync(modelsPath, original);
+        fs.writeFileSync(path.join(shared, 'recreated.py'),
+          'from django.db import models\nclass Recreated(models.Model):\n    amount = models.IntegerField()\n    class Meta:\n        app_label = "shared"\n');
+        await waitForCondition(() => daemon.modelNames.has('Shared') && daemon.modelNames.has('Recreated'), 15_000);
+        const recreatedLookup = await daemon.resolveLookupPath('shared.Recreated', 'amount__exact', 'filter');
+        assert.strictEqual(recreatedLookup.terminalType?.outputFieldKind, 'IntegerField');
+        if (visualHoldMs > 0) {
+          const editor = await vscode.window.showTextDocument(query);
+          editor.selection = new vscode.Selection(positionAfterText(query, 'value__i'), positionAfterText(query, 'value__i'));
+          await vscode.commands.executeCommand('editor.action.triggerSuggest');
+          console.log(`[editable-delete-visual] ready uri=${query.uri.toString()} holdMs=${visualHoldMs}`);
+          await new Promise(resolve => setTimeout(resolve, visualHoldMs));
+        }
+      } finally {
+        await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+        await removeWorkspaceFoldersFrom(0);
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test('retains queued file changes and deletions when editable watcher roots refresh', async function () {
+    this.timeout(30_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+    assert.ok(environment);
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-intellisense-pending-roots-'));
+    const root = path.join(base, 'workspace');
+    const external = path.join(base, 'editable');
+    const blog = path.join(root, 'blog');
+    for (const folder of [blog, path.join(root, 'project'), external]) fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(path.join(blog, '__init__.py'), '');
+    fs.writeFileSync(path.join(root, 'project/__init__.py'), '');
+    fs.writeFileSync(path.join(root, 'project/settings.py'), 'INSTALLED_APPS = ["blog"]\nSECRET_KEY = "pending-e2e"\nDATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}}\n');
+    const modelsPath = path.join(blog, 'models.py');
+    const deletedPath = path.join(blog, 'deleted.py');
+    fs.writeFileSync(modelsPath, 'from django.db import models\nclass PendingPost(models.Model):\n    value = models.CharField()\n');
+    fs.writeFileSync(deletedPath, 'from django.db import models\nclass PendingDeleted(models.Model):\n    value = models.CharField()\n');
+    const normalizedModelsPath = normalizeSourcePath(modelsPath);
+    const normalizedDeletedPath = normalizeSourcePath(deletedPath);
+    await removeWorkspaceFoldersFrom(0);
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    const originalIsReady = daemon.isReady;
+    const originalEditableRoots = daemon.getEditableSourceRoots;
+    const state = daemon as unknown as { stateEmitter: vscode.EventEmitter<HealthSnapshot> };
+    try {
+      const workspace = ensureFixtureWorkspace(root, environment);
+      await addWorkspaceFolder(workspace);
+      await applyFixtureWorkspaceSettings(workspace, root, environment);
+      await daemon.restart(vscode.Uri.file(workspace));
+      await waitForHealthSnapshot(daemon, value => value.phase === 'ready', 20_000);
+      await waitForCondition(() => daemon.modelNames.has('PendingDeleted'), 5_000);
+      await waitForCondition(() => getPendingSourceEventsForTesting().files.length === 0
+        && getPendingSourceEventsForTesting().deletedPaths.length === 0, 5_000);
+      daemon.isReady = () => false;
+      fs.writeFileSync(modelsPath, 'from django.db import models\nclass PendingPost(models.Model):\n    value = models.IntegerField()\n');
+      fs.unlinkSync(deletedPath);
+      await waitForCondition(() => {
+        const queued = getPendingSourceEventsForTesting();
+        return queued.files.includes(normalizedModelsPath) && queued.deletedPaths.includes(normalizedDeletedPath);
+      }, 5_000);
+      daemon.getEditableSourceRoots = () => [external];
+      const beforeWatchers = getSourceWatcherStateForTesting() as { registrations: Array<[string, number]> };
+      const workspaceRegistration = new Map(beforeWatchers.registrations).get(normalizeSourcePath(root));
+      assert.ok(workspaceRegistration, 'Expected the active workspace watcher to be registered');
+      state.stateEmitter.fire(daemon.getState());
+      const afterWatchers = getSourceWatcherStateForTesting() as { registrations: Array<[string, number]> };
+      assert.strictEqual(new Map(afterWatchers.registrations).get(normalizeSourcePath(root)), workspaceRegistration,
+        'Adding an editable root must preserve the active workspace watcher registration');
+      const queuedAfterRefresh = getPendingSourceEventsForTesting();
+      console.info(`[pending-root-refresh] ${JSON.stringify(queuedAfterRefresh)}`);
+      assert.ok(queuedAfterRefresh.files.includes(normalizedModelsPath), 'Root refresh discarded a queued file change');
+      assert.ok(queuedAfterRefresh.deletedPaths.includes(normalizedDeletedPath), 'Root refresh discarded a queued deletion');
+      daemon.isReady = originalIsReady;
+      state.stateEmitter.fire(daemon.getState());
+      await waitForCondition(() => daemon.localWorkspaceIndexForTesting.models.get('blog.PendingPost')?.fields.get('value')?.fieldKind === 'IntegerField'
+        && !daemon.modelNames.has('PendingDeleted'), 10_000);
+      const lookup = await daemon.resolveLookupPath('blog.PendingPost', 'value__exact', 'filter');
+      assert.strictEqual(lookup.terminalType?.outputFieldKind, 'IntegerField');
+      assert.strictEqual((await daemon.resolveLookupPath('blog.PendingDeleted', 'value__exact', 'filter')).resolved, false);
+
+      const externalFile = path.join(external, 'queued.py');
+      const normalizedExternalFile = normalizeSourcePath(externalFile);
+      const initialEditableCallbacks = getSourceWatcherCallbacksForTesting(external);
+      assert.ok(initialEditableCallbacks, 'Expected actual editable watcher callbacks');
+      daemon.isReady = () => false;
+      fs.writeFileSync(externalFile, 'value = 1\n');
+      await waitForCondition(() => getPendingSourceEventsForTesting().files.includes(normalizedExternalFile), 5_000);
+      daemon.getEditableSourceRoots = () => [];
+      state.stateEmitter.fire(daemon.getState());
+      assert.ok(!getPendingSourceEventsForTesting().files.includes(normalizedExternalFile), 'Revoked editable root retained its queued work');
+      const revokedWatchers = new Map((getSourceWatcherStateForTesting() as { registrations: Array<[string, number]> }).registrations);
+      assert.strictEqual(revokedWatchers.get(normalizeSourcePath(root)), workspaceRegistration,
+        'Revoking an editable root must preserve the workspace watcher');
+      assert.ok(!revokedWatchers.has(normalizeSourcePath(external)), 'Revoked watcher was not disposed');
+
+      daemon.getEditableSourceRoots = () => [external];
+      state.stateEmitter.fire(daemon.getState());
+      assert.deepStrictEqual(getPendingSourceEventsForTesting(), { files: [], deletedPaths: [] });
+      const deliverLateCallbacks = (callbacks: NonNullable<ReturnType<typeof getSourceWatcherCallbacksForTesting>>,
+        watchedRoot: string): void => {
+        callbacks.create(vscode.Uri.file(path.join(watchedRoot, 'late_create.py')));
+        callbacks.change(vscode.Uri.file(path.join(watchedRoot, 'late_change.py')));
+        callbacks.delete(vscode.Uri.file(path.join(watchedRoot, 'late_delete.py')));
+        callbacks.rootDelete(vscode.Uri.file(watchedRoot));
+      };
+      deliverLateCallbacks(initialEditableCallbacks, external);
+      assert.deepStrictEqual(getPendingSourceEventsForTesting(), { files: [], deletedPaths: [] },
+        'Disposed editable callbacks must not enqueue work when the same root is added again');
+      fs.writeFileSync(modelsPath, 'from django.db import models\nclass PendingPost(models.Model):\n    value = models.CharField()\n');
+      await waitForCondition(() => getPendingSourceEventsForTesting().files.includes(normalizedModelsPath), 5_000);
+      // The root union is unchanged, but ownership switches to another workspace.
+      daemon.getEditableSourceRoots = () => [root];
+      const registrationsBeforeOwnershipSwitch = new Map((getSourceWatcherStateForTesting() as { registrations: Array<[string, number]> }).registrations);
+      const callbacksBeforeOwnershipSwitch = new Map([...registrationsBeforeOwnershipSwitch.keys()]
+        .map(watchedRoot => [watchedRoot, getSourceWatcherCallbacksForTesting(watchedRoot)] as const));
+      state.stateEmitter.fire({ ...daemon.getState(), workspaceRoot: external });
+      assert.deepStrictEqual(getPendingSourceEventsForTesting(), { files: [], deletedPaths: [] }, 'Workspace switch retained the previous workspace queue');
+      const registrationsAfterOwnershipSwitch = new Map((getSourceWatcherStateForTesting() as { registrations: Array<[string, number]> }).registrations);
+      for (const [watchedRoot, registration] of registrationsBeforeOwnershipSwitch) {
+        assert.notStrictEqual(registrationsAfterOwnershipSwitch.get(watchedRoot), registration,
+          'A new workspace owner must get new watcher registrations even with the same root union');
+      }
+      for (const [watchedRoot, callbacks] of callbacksBeforeOwnershipSwitch) {
+        assert.ok(callbacks);
+        deliverLateCallbacks(callbacks, watchedRoot);
+      }
+      assert.deepStrictEqual(getPendingSourceEventsForTesting(), { files: [], deletedPaths: [] },
+        'Old owner callbacks must not enqueue source work under the new owner with the same root union');
+      daemon.getEditableSourceRoots = () => [external];
+      state.stateEmitter.fire(daemon.getState());
+      for (const [watchedRoot, callbacks] of callbacksBeforeOwnershipSwitch) {
+        assert.ok(callbacks);
+        deliverLateCallbacks(callbacks, watchedRoot);
+      }
+      assert.deepStrictEqual(getPendingSourceEventsForTesting(), { files: [], deletedPaths: [] },
+        'Returning to the original workspace owner must not reactivate its old watcher callbacks');
+      const currentCallbacks = getSourceWatcherCallbacksForTesting(root);
+      assert.ok(currentCallbacks);
+      currentCallbacks.change(vscode.Uri.file(modelsPath));
+      assert.deepStrictEqual(getPendingSourceEventsForTesting(), { files: [normalizedModelsPath], deletedPaths: [] },
+        'The replacement active watcher must still enqueue legitimate source events');
+      console.info('[watcher-registration-retention] ' + JSON.stringify({
+        workspaceRegistration, before: beforeWatchers.registrations,
+        added: afterWatchers.registrations, revoked: [...revokedWatchers],
+        switched: [...registrationsAfterOwnershipSwitch],
+      }));
+    } finally {
+      daemon.isReady = originalIsReady;
+      daemon.getEditableSourceRoots = originalEditableRoots;
+      state.stateEmitter.fire(daemon.getState());
+      await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  for (const mode of ['overlap', 'retry', 'delete-retry', 'revoked-retry', 'restart-result'] as const) {
+    const title = {
+      overlap: 'serializes source batches while another file changes',
+      retry: 'retries a transient source reindex failure without another file event',
+      'delete-retry': 'retries a deleted model source after a transient reindex failure',
+      'revoked-retry': 'does not resurrect failed source work after workspace ownership changes',
+      'restart-result': 'discards a source batch result delayed across a same-workspace restart',
+    }[mode];
+    test(title, async function () {
+      this.timeout(30_000);
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+      assert.ok(environment);
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-intellisense-source-batch-'));
+      for (const folder of ['blog', 'project']) fs.mkdirSync(path.join(root, folder));
+      fs.writeFileSync(path.join(root, 'blog/__init__.py'), '');
+      fs.writeFileSync(path.join(root, 'project/__init__.py'), '');
+      fs.writeFileSync(path.join(root, 'project/settings.py'), 'INSTALLED_APPS = ["blog"]\nSECRET_KEY = "source-batch"\nDATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}}\n');
+      const modelsPath = path.join(root, 'blog/models.py');
+      const secondPath = path.join(root, 'blog/second.py');
+      const modelSource = 'from django.db import models\nclass BatchPost(models.Model):\n    value = models.CharField()\n';
+      fs.writeFileSync(modelsPath, modelSource);
+      fs.writeFileSync(secondPath, 'from django.db import models\nclass BatchSecond(models.Model):\n    value = models.CharField()\n');
+      const normalizedModelsPath = normalizeSourcePath(modelsPath);
+      const normalizedSecondPath = normalizeSourcePath(secondPath);
+      await removeWorkspaceFoldersFrom(0);
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon);
+      const originalReindex = daemon.reindexFile;
+      const originalReady = daemon.isReady;
+      const originalEditableRoots = daemon.getEditableSourceRoots;
+      const state = daemon as unknown as { stateEmitter: vscode.EventEmitter<HealthSnapshot> };
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let entered = false;
+      let finished = false;
+      let active = 0;
+      let maxActive = 0;
+      let modelCalls = 0;
+      let secondCalls = 0;
+      try {
+        const workspace = ensureFixtureWorkspace(root, environment);
+        await addWorkspaceFolder(workspace);
+        await applyFixtureWorkspaceSettings(workspace, root, environment);
+        await daemon.restart(vscode.Uri.file(workspace));
+        await waitForHealthSnapshot(daemon, value => value.phase === 'ready', 20_000);
+        await waitForCondition(() => daemon.modelNames.has('BatchPost') && daemon.modelNames.has('BatchSecond'), 5_000);
+        startLanguageClientForTesting();
+        const sourceClient = getLanguageClientForTesting();
+        assert.ok(sourceClient);
+        await sourceClient.sendRequest('django/perfReport');
+        await delay(350);
+        daemon.reindexFile = async file => {
+          active++;
+          maxActive = Math.max(maxActive, active);
+          try {
+            if (file === normalizedModelsPath) {
+              modelCalls++;
+              if (modelCalls === 1) {
+                entered = true;
+                if (mode === 'restart-result') {
+                  const result = await originalReindex.call(daemon, file);
+                  await gate;
+                  return result;
+                }
+                await gate;
+                if (mode !== 'overlap') throw new Error('controlled transient reindex failure');
+              }
+            }
+            if (file === normalizedSecondPath) secondCalls++;
+            return await originalReindex.call(daemon, file);
+          } finally {
+            active--;
+            finished = true;
+          }
+        };
+        if (mode === 'delete-retry') fs.unlinkSync(modelsPath);
+        else fs.writeFileSync(modelsPath, modelSource.replace('CharField', 'IntegerField'));
+        await waitForCondition(() => entered, 5_000);
+        if (mode === 'overlap') {
+          fs.writeFileSync(secondPath, 'from django.db import models\nclass BatchSecond(models.Model):\n    value = models.IntegerField()\n');
+          await waitForCondition(() => getPendingSourceEventsForTesting().files.includes(normalizedSecondPath), 5_000);
+          await delay(650);
+          console.info(`[source-batch-overlap] ${JSON.stringify({ maxActive, modelCalls, secondCalls })}`);
+          assert.strictEqual(maxActive, 1, 'Another source batch started before the first completed');
+          assert.strictEqual(secondCalls, 0, 'The next source batch must wait for the current publication');
+          release();
+          await waitForCondition(() => daemon.localWorkspaceIndexForTesting.models.get('blog.BatchPost')?.fields.get('value')?.fieldKind === 'IntegerField'
+            && daemon.localWorkspaceIndexForTesting.models.get('blog.BatchSecond')?.fields.get('value')?.fieldKind === 'IntegerField', 10_000);
+        } else if (mode === 'restart-result') {
+          await waitForCondition(() => daemon.localWorkspaceIndexForTesting.models.get('blog.BatchPost')?.fields.get('value')?.fieldKind === 'IntegerField', 5_000);
+          await daemon.restart(vscode.Uri.file(workspace));
+          await waitForHealthSnapshot(daemon, value => value.phase === 'ready', 20_000);
+          daemon.isReady = () => false;
+          const publicationsBeforeRelease = getSourceBatchPublicationCountForTesting();
+          release();
+          await waitForCondition(() => finished, 5_000);
+          await delay(100);
+          console.info(`[source-batch-restart] ${JSON.stringify({ publicationsBeforeRelease, publicationsAfterRelease: getSourceBatchPublicationCountForTesting() })}`);
+          assert.strictEqual(getSourceBatchPublicationCountForTesting(), publicationsBeforeRelease, 'An old source result was published after a daemon restart');
+          assert.ok(getPendingSourceEventsForTesting().files.includes(normalizedModelsPath), 'Still-owned delayed work must remain queued for the new daemon session');
+          daemon.isReady = originalReady;
+          // Entry into the retry precedes its RPC response and the cached
+          // source verification that can run after a restart. Check the
+          // completed retry before asserting the current lookup field type.
+          await waitForCondition(() => modelCalls >= 2 && active === 0
+            && daemon.localWorkspaceIndexForTesting.models.get('blog.BatchPost')?.fields.get('value')?.fieldKind === 'IntegerField', 5_000);
+        } else if (mode === 'revoked-retry') {
+          daemon.isReady = () => false;
+          // Preserve the root union but change the active workspace owner.
+          daemon.getEditableSourceRoots = () => [root];
+          state.stateEmitter.fire({ ...daemon.getState(), workspaceRoot: path.join(root, 'project') });
+          release();
+          await waitForCondition(() => finished, 5_000);
+          await delay(100);
+          assert.ok(!getPendingSourceEventsForTesting().files.includes(normalizedModelsPath), 'An old in-flight failure resurrected work after a workspace switch');
+          assert.strictEqual(modelCalls, 1);
+        } else {
+          daemon.isReady = () => false;
+          release();
+          await waitForCondition(() => finished, 5_000);
+          await delay(100);
+          const queued = getPendingSourceEventsForTesting();
+          console.info(`[source-batch-retry] ${JSON.stringify({ modelCalls, queued })}`);
+          assert.ok(queued.files.includes(normalizedModelsPath), 'Failed source reindex was dropped instead of retained for retry');
+          daemon.isReady = originalReady;
+          await waitForCondition(() => modelCalls >= 2 && (mode === 'delete-retry'
+            ? !daemon.modelNames.has('BatchPost')
+            : daemon.localWorkspaceIndexForTesting.models.get('blog.BatchPost')?.fields.get('value')?.fieldKind === 'IntegerField'), 10_000);
+        }
+        if (mode === 'delete-retry') assert.strictEqual((await daemon.resolveLookupPath('blog.BatchPost', 'value__exact', 'filter')).resolved, false);
+        else if (mode !== 'revoked-retry') assert.strictEqual((await daemon.resolveLookupPath('blog.BatchPost', 'value__exact', 'filter')).terminalType?.outputFieldKind, 'IntegerField');
+        assert.strictEqual(maxActive, 1, 'Source reindex attempts must remain serial');
+      } finally {
+        release();
+        daemon.isReady = originalReady;
+        await waitForCondition(() => active === 0, 5_000);
+        daemon.reindexFile = originalReindex;
+        daemon.getEditableSourceRoots = originalEditableRoots;
+        state.stateEmitter.fire(daemon.getState());
+        await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+        await removeWorkspaceFoldersFrom(0);
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test('health refreshes keep acknowledged language server metadata without retransmitting full snapshots', async function () {
+    this.timeout(30_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    startLanguageClientForTesting();
+    const client = getLanguageClientForTesting();
+    assert.ok(client);
+    const original = client.sendRequest;
+    let fullRequests = 0;
+    try {
+      await waitForCondition(() => Object.keys(daemon.surfaceIndex).length > 0, 5_000);
+      // Let pending authoritative surface publication and its ACK settle.
+      await delay(400);
+      await client.sendRequest('django/perfReport');
+      client.sendRequest = (async (method: unknown, ...args: unknown[]) => {
+        if (method === 'django/updateSurfaceIndex') fullRequests++;
+        return Reflect.apply(original, client, [method, ...args]);
+      }) as typeof client.sendRequest;
+      for (let refresh = 0; refresh < 5; refresh++) {
+        await daemon.refreshHealth();
+        await delay(50);
+        await client.sendRequest('django/perfReport');
+      }
+      assert.strictEqual(fullRequests, 0, 'Health-only state updates resent unchanged full surface snapshots');
+      const report = await client.sendRequest<{ snapshot: { modelCount: number } }>('django/perfReport');
+      assert.ok(report.snapshot.modelCount > 0, 'Acknowledged metadata must remain installed during health refresh');
+      console.info('[surface-health-refresh] ' + JSON.stringify({ refreshes: 5, fullRequests, models: report.snapshot.modelCount }));
+    } finally { client.sendRequest = original; }
+  });
+
+  test('recovers publication after a cache context acknowledgement hangs across daemon restart', async function () {
+    this.timeout(60_000);
+    const oldRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    const newRoot = path.resolve(__dirname, '../../fixtures/advanced_queries_project');
+    await setWorkspaceRoot(oldRoot);
+    const daemon = getActiveDaemonForTesting(); assert.ok(daemon);
+    startLanguageClientForTesting();
+    const client = getLanguageClientForTesting(); assert.ok(client);
+    await waitForCondition(() => client.isRunning() && Object.keys(daemon.surfaceIndex).length > 0, 10_000);
+    await delay(400); await client.sendRequest('django/perfReport');
+    const originalRequest = client.sendRequest, originalStop = client.stop, originalStart = client.start;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let entered = false, released = false, cancelled = false, stopCalls = 0, startCalls = 0, heldAt = 0;
+    let cancellationSubscription: vscode.Disposable | undefined;
+    let runningTransitions = 0, stoppedTransitions = 0;
+    const stateSubscription = client.onDidChangeState(event => {
+      if (event.newState === State.Running) runningTransitions++;
+      if (event.newState === State.Stopped) stoppedTransitions++;
+    });
+    const decoder = new SurfaceSnapshotDecoder();
+    const completeFrames: Array<NonNullable<import('../client/protocol').SurfaceIndexChangedNotificationMessage['params']>> = [];
+    try {
+      client.stop = ((...args: unknown[]) => { stopCalls++; return Reflect.apply(originalStop, client, args); }) as typeof client.stop;
+      client.start = ((...args: unknown[]) => { startCalls++; return Reflect.apply(originalStart, client, args); }) as typeof client.start;
+      client.sendRequest = (async (method: unknown, ...args: unknown[]) => {
+        const result = await Reflect.apply(originalRequest, client, [method, ...args]);
+        if (method === 'django/setSurfaceCacheContext' && !entered) {
+          entered = true; heldAt = Date.now();
+          const token = args[1] as vscode.CancellationToken | undefined;
+          cancellationSubscription = token?.onCancellationRequested(() => { cancelled = true; });
+          await held;
+        }
+        if (method === 'django/updateSurfaceIndex' && stopCalls > 0) {
+          const payload = args[0] as NonNullable<import('../client/protocol').SurfaceIndexChangedNotificationMessage['params']>;
+          completeFrames.push(decoder.decode(payload));
+        }
+        return result;
+      }) as typeof client.sendRequest;
+      const environment = await ensureFixtureE2EEnvironment(newRoot); assert.ok(environment);
+      const workspace = ensureFixtureWorkspace(newRoot, environment);
+      await applyFixtureWorkspaceSettings(workspace, newRoot, environment);
+      await daemon.restart(vscode.Uri.file(workspace));
+      await waitForCondition(() => entered, 5_000);
+      await waitForHealthSnapshot(daemon, value => value.phase === 'ready' && value.runtime?.bootstrapStatus === 'ready', 20_000);
+      await waitForCondition(() => completeFrames.some(frame => Object.keys(frame.surfaceIndex ?? {}).length > 0), 18_000);
+      assert.ok(!released, 'Current publication must recover while the old ACK is still held');
+      assert.ok(cancelled, 'The real context deadline must cancel the held request');
+      assert.strictEqual(stopCalls, 1); assert.strictEqual(stoppedTransitions, 1);
+      assert.strictEqual(runningTransitions, 1);
+      assert.ok(startCalls >= 1, 'Public LanguageClient.start must restore the connection');
+      assert.strictEqual(getLanguageClientForTesting(), client, 'Recovery reuses the public language client owner');
+      const fields = ['sourceProvenance', 'surfaceIndex', 'modelNames', 'surfaceFingerprints', 'customLookups', 'lookupCatalog',
+        'customLookupsFingerprint', 'staticFallback', 'staticFallbackFingerprint'] as const;
+      const snapshot = (): Record<string, unknown> => ({ sourceProvenance: daemon.sourceProvenance, surfaceIndex: daemon.surfaceIndex,
+        modelNames: [...daemon.modelNames], surfaceFingerprints: daemon.surfaceFingerprints, customLookups: daemon.customLookups,
+        lookupCatalog: daemon.lookupCatalog, customLookupsFingerprint: daemon.customLookupsFingerprint,
+        staticFallback: daemon.staticFallback, staticFallbackFingerprint: daemon.staticFallbackFingerprint });
+      const normalized = (value: Record<string, unknown>): unknown => JSON.parse(JSON.stringify(Object.fromEntries(fields.map(key => [key, value[key]]))));
+      assert.deepStrictEqual(normalized(completeFrames[completeFrames.length - 1]), normalized(snapshot()));
+      const paths = Object.entries(daemon.surfaceIndex).flatMap(([baseModelLabel, entry]) =>
+        Object.entries(entry.instance ?? {}).filter(([, value]) => value[0] === 'scalar' && value[2] === 'field')
+          .map(([name]) => ({ baseModelLabel, value: `${name}__exact`, method: 'filter' })));
+      assert.ok(paths.length > 0);
+      const validated = await client.sendRequest<Array<{ resolved: boolean }>>('django/validateLookupPaths', { paths });
+      assert.strictEqual(validated.length, paths.length); assert.ok(validated.every(value => value.resolved));
+      const before = JSON.stringify(daemon.surfaceIndex), revision = daemon.getSessionRevision();
+      released = true; release(); await delay(100);
+      assert.strictEqual(JSON.stringify(daemon.surfaceIndex), before); assert.strictEqual(daemon.getSessionRevision(), revision);
+      assert.strictEqual(normalizeRealPath(daemon.getState().workspaceRoot), normalizeRealPath(newRoot));
+      const report = await client.sendRequest<{ snapshot: { modelCount: number } }>('django/perfReport');
+      assert.ok(report.snapshot.modelCount > 0);
+      console.info('[surface-context-deadline] ' + JSON.stringify({ stoppedConnections: stoppedTransitions, restartedConnections: runningTransitions,
+        sdkStartCalls: startCalls,
+        oldAckHeldDuringRecovery: true, cancelled, recoveryMs: Date.now() - heldAt,
+        completeNineFields: true, validatedPaths: paths.length, lateAckPreservedCurrentOwner: true, models: report.snapshot.modelCount }));
+    } finally {
+      release(); cancellationSubscription?.dispose(); stateSubscription.dispose();
+      client.sendRequest = originalRequest; client.stop = originalStop; client.start = originalStart;
+    }
+  });
+
+  for (const delivery of ['delta', 'full', 'restart', 'lost-ack', 'hung-request'] as const) {
+    const title = delivery === 'restart'
+      ? 'rehydrates the language server after a restart and saves made while it is stopped'
+      : delivery === 'lost-ack'
+        ? 'recovers current metadata after an applied source delta loses its acknowledgement'
+        : delivery === 'hung-request'
+          ? 'recovers current metadata after a source delta request hangs until the real deadline'
+          : `recovers the language server after a ${delivery === 'delta' ? 'source delta' : 'full snapshot'} delivery failure without another save`;
+    test(title, async function () {
+      this.timeout(30_000);
+      const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+      const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+      assert.ok(environment);
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-intellisense-surface-delivery-'));
+      for (const folder of ['blog', 'project']) fs.mkdirSync(path.join(root, folder));
+      fs.writeFileSync(path.join(root, 'blog/__init__.py'), '');
+      fs.writeFileSync(path.join(root, 'project/__init__.py'), '');
+      fs.writeFileSync(path.join(root, 'project/settings.py'), 'INSTALLED_APPS = ["blog"]\nSECRET_KEY = "surface-delivery"\nDATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}}\n');
+      const modelsPath = path.join(root, 'blog/models.py');
+      const initialSource = 'from django.db import models\nclass DeliveryPost(models.Model):\n    delivery_old = models.CharField()\n';
+      fs.writeFileSync(modelsPath, initialSource);
+      await removeWorkspaceFoldersFrom(0);
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon);
+      const workspace = ensureFixtureWorkspace(root, environment);
+      await addWorkspaceFolder(workspace);
+      await applyFixtureWorkspaceSettings(workspace, root, environment);
+      await daemon.restart(vscode.Uri.file(workspace));
+      await waitForHealthSnapshot(daemon, value => value.phase === 'ready', 20_000);
+      await daemon.listOrmMemberCompletions('blog.DeliveryPost', 'instance', '');
+      await waitForCondition(() => Boolean(daemon.surfaceIndex['blog.DeliveryPost']?.instance?.delivery_old), 5_000);
+      startLanguageClientForTesting();
+      const client = getLanguageClientForTesting();
+      assert.ok(client);
+      const originalNotification = client.sendNotification;
+      const originalRequest = client.sendRequest;
+      let failures = 0;
+      const deadlineCase = delivery === 'lost-ack' || delivery === 'hung-request';
+      const failedMethod = delivery === 'delta' || deadlineCase ? 'django/updateSurfaceIndexDelta' : 'django/updateSurfaceIndex';
+      let releaseAcknowledgement: (() => void) | undefined;
+      const heldAcknowledgement = new Promise<{ applied: boolean }>(resolve => {
+        releaseAcknowledgement = () => resolve({ applied: true });
+      });
+      let heldAt = 0;
+      let serverAppliedBeforeTimeout = false;
+      let deadlineCancelled = false;
+      let recoveryFullRequests = 0;
+      const uri = vscode.Uri.file(path.join(root, 'query.py')).toString();
+      const text = 'DeliveryPost.objects.filter(delivery_';
+      const complete = async (): Promise<string[]> => {
+        const result = await client.sendRequest<Array<{ label: string }>>('textDocument/completion', {
+          textDocument: { uri }, position: { line: 0, character: text.length },
+        });
+        return result.map(item => item.label);
+      };
+      const waitForLabel = async (label: string, timeoutMs: number): Promise<void> => {
+        const deadline = Date.now() + timeoutMs;
+        let labels: string[] = [];
+        while (Date.now() < deadline) {
+          labels = await complete();
+          if (labels.includes(label)) return;
+          await delay(100);
+        }
+        assert.fail(`Language server did not return ${label}: ${labels.join(', ')}`);
+      };
+      try {
+        await client.sendRequest('django/perfReport');
+        await client.sendNotification('textDocument/didOpen', {
+          textDocument: { uri, languageId: 'python', version: 1, text },
+        });
+        await waitForLabel('delivery_old', 5_000);
+        if (delivery === 'restart') await client.stop();
+        client.sendNotification = (async (method: unknown, ...args: unknown[]) => {
+          if (delivery !== 'restart' && method === failedMethod && failures === 0) {
+            failures++;
+            throw new Error('controlled source delta delivery failure');
+          }
+          return Reflect.apply(originalNotification, client, [method, ...args]);
+        }) as typeof client.sendNotification;
+        client.sendRequest = (async (method: unknown, ...args: unknown[]) => {
+          if (deadlineCase && method === 'django/updateSurfaceIndex' && failures > 0) recoveryFullRequests++;
+          if (delivery !== 'restart' && method === failedMethod && failures === 0) {
+            failures++;
+            if (deadlineCase) {
+              heldAt = performance.now();
+              const token = args[1] as vscode.CancellationToken;
+              assert.ok(token && typeof token.onCancellationRequested === 'function', 'Surface request needs its real deadline cancellation token');
+              token.onCancellationRequested(() => { deadlineCancelled = true; });
+              if (delivery === 'lost-ack') {
+                const result = await Reflect.apply(originalRequest, client, [method, ...args]) as { applied: boolean };
+                assert.deepStrictEqual(result, { applied: true });
+                serverAppliedBeforeTimeout = true;
+              }
+              return heldAcknowledgement;
+            }
+            throw new Error('controlled source delta delivery failure');
+          }
+          return Reflect.apply(originalRequest, client, [method, ...args]);
+        }) as typeof client.sendRequest;
+        if (delivery === 'full') {
+          const state = daemon as unknown as { handleServerNotification(message: unknown): void };
+          state.handleServerNotification({ event: 'surfaceIndexChanged', params: {
+            surfaceIndex: daemon.surfaceIndex, surfaceFingerprints: daemon.surfaceFingerprints,
+            customLookups: daemon.customLookups, lookupCatalog: daemon.lookupCatalog,
+            customLookupsFingerprint: daemon.customLookupsFingerprint,
+            staticFallback: daemon.staticFallback, staticFallbackFingerprint: daemon.staticFallbackFingerprint,
+            health: daemon.getState(),
+          } });
+        }
+        fs.writeFileSync(modelsPath, initialSource.replace('delivery_old = models.CharField()', 'delivery_new = models.DateField()'));
+        await waitForCondition(() => (delivery === 'restart' || failures === 1)
+          && daemon.localWorkspaceIndexForTesting.models.get('blog.DeliveryPost')?.fields.get('delivery_new')?.fieldKind === 'DateField', 5_000);
+        if (delivery === 'restart') {
+          await client.start();
+          await client.sendNotification('textDocument/didOpen', {
+            textDocument: { uri, languageId: 'python', version: 1, text },
+          });
+        }
+        if (deadlineCase) {
+          await waitForCondition(() => heldAt > 0 && (delivery !== 'lost-ack' || serverAppliedBeforeTimeout), 3_000);
+          assert.ok(!deadlineCancelled, 'The ordinary ten-second deadline fired prematurely');
+          assert.strictEqual(recoveryFullRequests, 0, 'Recovery must await the real pending acknowledgement deadline');
+          const pendingLabels = await complete();
+          assert.ok(pendingLabels.includes(delivery === 'lost-ack' ? 'delivery_new' : 'delivery_old'),
+            'Controlled lost/applied and hung/unapplied requests must have different server state before timeout');
+          await waitForCondition(() => deadlineCancelled && recoveryFullRequests > 0, 12_000);
+          assert.ok(performance.now() - heldAt >= 9_900, 'Test must exercise the unchanged production ten-second deadline');
+        }
+        await waitForLabel('delivery_new', 3_000);
+        const labels = await complete();
+        console.info('[surface-delivery-recovery] ' + JSON.stringify({ delivery, failures, labels,
+          serverAppliedBeforeTimeout, deadlineCancelled, recoveryFullRequests,
+          elapsedFromHeldMs: heldAt ? performance.now() - heldAt : undefined }));
+        assert.ok(!labels.includes('delivery_old'), 'The language server must retire removed fields after recovery');
+        if (deadlineCase) {
+          releaseAcknowledgement?.();
+          await delay(400);
+          assert.deepStrictEqual(await complete(), labels, 'A late stale acknowledgement must not restore removed fields');
+          assert.strictEqual(recoveryFullRequests, 1, 'The late acknowledgement must not schedule redundant recovery snapshots');
+        }
+      } finally {
+        releaseAcknowledgement?.();
+        client.sendNotification = originalNotification;
+        client.sendRequest = originalRequest;
+        if (!client.isRunning()) await client.start();
+        await removeWorkspaceFoldersFrom(0);
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const mode of ['stop', 'crash'] as const) {
+    test(`releases retired client and language server metadata after ${mode}`, async function () {
+      this.timeout(45_000);
+      const root = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(root);
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon);
+      startLanguageClientForTesting();
+      const client = getLanguageClientForTesting();
+      assert.ok(client);
+      await waitForCondition(() => client.isRunning(), 5_000);
+      const modelCount = async (): Promise<number> => (await client.sendRequest<{ snapshot: { modelCount: number } }>('django/perfReport')).snapshot.modelCount;
+      const waitForServer = async (predicate: () => Promise<boolean>): Promise<void> => {
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          if (await predicate()) return;
+          await delay(25);
+        }
+        assert.fail('Language server metadata did not reach the expected state');
+      };
+      const uri = vscode.Uri.file(path.join(root, 'retirement-query.py')).toString();
+      const text = 'Post.objects.filter(tit';
+      const complete = async (): Promise<string[]> => (await client.sendRequest<Array<{ label: string }>>('textDocument/completion', {
+        textDocument: { uri }, position: { line: 0, character: text.length },
+      })).map(item => item.label);
+      const internal = daemon as any;
+      const empty = (): void => {
+        assert.strictEqual(Object.keys(daemon.surfaceIndex).length, 0, 'Retired surface models must be released');
+        assert.strictEqual(Object.keys(daemon.surfaceFingerprints).length, 0);
+        assert.strictEqual(Object.keys(daemon.customLookups).length, 0);
+        assert.strictEqual(daemon.lookupCatalog, undefined);
+        assert.strictEqual(daemon.customLookupsFingerprint, undefined);
+        assert.strictEqual(daemon.staticFallback, null);
+        assert.strictEqual(daemon.staticFallbackFingerprint, null);
+        assert.strictEqual(daemon.modelNames.size, 0);
+        assert.strictEqual(daemon.modelLabelByName.size, 0);
+        for (const key of ['models', 'perFile', 'modelLabelByName', 'fieldTrieByModel'] as const) {
+          assert.strictEqual(daemon.localWorkspaceIndexForTesting[key].size, 0, key);
+        }
+        assert.strictEqual(daemon.localWorkspaceIndexForTesting.lookupCatalog, undefined);
+        assert.strictEqual(daemon.localWorkspaceIndexForTesting.lookupTypes, undefined);
+        assert.strictEqual(internal.localModelFingerprints.size, 0);
+        assert.strictEqual(internal._shortNameFromFullLabelIndex, null);
+        assert.strictEqual(internal.process, undefined);
+        assert.strictEqual(isNativeFastPathReady(), false);
+      };
+      try {
+        await client.sendNotification('textDocument/didOpen', { textDocument: { uri, languageId: 'python', version: 1, text } });
+        await waitForServer(async () => Boolean(daemon.surfaceIndex['blog.Post'])
+          && (await modelCount()) > 0 && (await complete()).includes('title'));
+        assert.ok(daemon.surfaceIndex['blog.Post']);
+        const beforeModels = await modelCount();
+        if (mode === 'stop') await daemon.stop();
+        else {
+          assert.ok(internal.process?.kill('SIGKILL'));
+          await waitForCondition(() => daemon.getState().phase === 'error', 5_000);
+        }
+        empty();
+        await waitForServer(async () => (await modelCount()) === 0);
+        assert.deepStrictEqual(await complete(), [], 'Retired LSP metadata must not answer stale completions');
+        if (mode === 'stop') { await daemon.stop(); empty(); }
+        await setWorkspaceRoot(root);
+        await waitForServer(async () => (await modelCount()) === beforeModels && (await complete()).includes('title'));
+        assert.ok(daemon.surfaceIndex['blog.Post']?.instance?.title);
+        assert.ok((await daemon.resolveLookupPath('blog.Post', 'title__icontains', 'filter')).resolved);
+        console.info('[metadata-retirement] ' + JSON.stringify({ mode, beforeModels, retiredModels: 0,
+          restoredModels: await modelCount(), restoredLookup: true, staleCompletions: false }));
+      } finally {
+        if (client.isRunning()) await client.sendNotification('textDocument/didClose', { textDocument: { uri } });
+      }
+    });
+  }
+
+  for (const boundary of ['launch-context', 'initialize-response', 'health-response'] as const) {
+    test(`rejects retired daemon ${boundary === 'health-response' ? 'health' : 'startup'} delayed at ${boundary}`, async function () {
+      this.timeout(30_000);
+      const root = path.resolve(__dirname, '../../fixtures/minimal_project');
+      await setWorkspaceRoot(root);
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon);
+      if (boundary !== 'health-response') await daemon.stop();
+      const internal = daemon as any;
+      const original = boundary === 'launch-context' ? internal.createLaunchContext : internal.request;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let entered = false;
+      const property = boundary === 'launch-context' ? 'createLaunchContext' : 'request';
+      let pending: Promise<{ error?: unknown; result?: unknown }> | undefined;
+      try {
+        internal[property] = async (...args: unknown[]) => {
+          const value = await original.apply(daemon, args);
+          if (boundary === 'launch-context' || args[0] === (boundary === 'health-response' ? 'health' : 'initialize')) { entered = true; await gate; }
+          return value;
+        };
+        const starting = boundary === 'health-response' ? daemon.refreshHealth() : daemon.start(vscode.Uri.file(root));
+        pending = starting.then(result => ({ result }), error => ({ error }));
+        await waitForCondition(() => entered, 5_000);
+        await daemon.stop();
+        release();
+        const settled = await pending;
+        assert.ok(settled.error instanceof Error && /inactive daemon session/.test(settled.error.message));
+        assert.strictEqual(internal.process, undefined, 'Stopped launch must not spawn or retain a process');
+        assert.strictEqual(daemon.getState().phase, 'stopped');
+        assert.strictEqual(Object.keys(daemon.surfaceIndex).length, 0);
+        assert.strictEqual(daemon.localWorkspaceIndexForTesting.models.size, 0);
+        console.info('[metadata-retired-startup] ' + JSON.stringify({ boundary, rejected: true, models: 0 }));
+      } finally {
+        release();
+        if (pending) await pending;
+        internal[property] = original;
+      }
+    });
+  }
+
+  for (const boundary of ['launch-context', 'initialize-response'] as const) {
+    for (const late of ['resolve', 'reject'] as const) {
+      test(`cancelled startup callers settle before a held ${boundary} can ${late}`, async function () {
+        this.timeout(40_000);
+        const root = path.resolve(__dirname, '../../fixtures/minimal_project');
+        const replacementRoot = path.resolve(__dirname, '../../fixtures/advanced_queries_project');
+        await setWorkspaceRoot(root);
+        const daemon = getActiveDaemonForTesting(); assert.ok(daemon);
+        await daemon.stop();
+        const internal = daemon as any;
+        const property = boundary === 'launch-context' ? 'createLaunchContext' : 'request';
+        const original = internal[property], originalStart = internal.startProcess;
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        let entered = false, released = false, oldWorkSettled = false, startCalls = 0;
+        const settled: Array<{ label: string; result?: unknown; error?: unknown }> = [];
+        const pending: Array<Promise<void>> = [];
+        const observe = (label: string, promise: Promise<unknown>): void => {
+          pending.push(promise.then(result => { settled.push({ label, result }); }, error => { settled.push({ label, error }); }));
+        };
+        try {
+          internal.startProcess = async (...args: unknown[]) => {
+            const call = ++startCalls;
+            try { return await originalStart.apply(daemon, args); }
+            finally { if (call === 1) oldWorkSettled = true; }
+          };
+          internal[property] = async (...args: unknown[]) => {
+            const value = await original.apply(daemon, args);
+            if (!entered && (boundary === 'launch-context' || args[0] === 'initialize')) {
+              entered = true; await gate;
+              if (late === 'reject') throw new Error('controlled retired startup rejection');
+            }
+            return value;
+          };
+          observe('start', daemon.start(vscode.Uri.file(root)));
+          await waitForCondition(() => entered, 5_000);
+          observe('coalesced-start', daemon.start(vscode.Uri.file(root)));
+          observe('health', daemon.refreshHealth());
+          observe('ensure', daemon.ensureStarted(vscode.Uri.file(root)));
+          await daemon.stop();
+          await waitForCondition(() => settled.length === 4, 1_000);
+          assert.ok(!released && !oldWorkSettled, 'Cancellation must not wait for the held old work');
+          assert.ok(settled.every(row => row.error instanceof Error && /inactive daemon session/.test(row.error.message)));
+          assert.strictEqual(internal.startPromise, undefined);
+          const environment = await ensureFixtureE2EEnvironment(replacementRoot); assert.ok(environment);
+          const workspace = ensureFixtureWorkspace(replacementRoot, environment);
+          await applyFixtureWorkspaceSettings(workspace, replacementRoot, environment);
+          await daemon.start(vscode.Uri.file(workspace));
+          await waitForHealthSnapshot(daemon, value => value.phase === 'ready' && value.runtime?.bootstrapStatus === 'ready', 20_000);
+          await waitForCondition(() => Object.keys(daemon.surfaceIndex).length > 0, 5_000);
+          const currentProcess = internal.process, currentIndex = daemon.localWorkspaceIndexForTesting;
+          const revision = daemon.getSessionRevision(), surface = JSON.stringify(daemon.surfaceIndex);
+          released = true; release();
+          await waitForCondition(() => oldWorkSettled, 5_000);
+          assert.strictEqual(internal.process, currentProcess);
+          assert.strictEqual(daemon.localWorkspaceIndexForTesting, currentIndex);
+          assert.strictEqual(daemon.getSessionRevision(), revision);
+          assert.strictEqual(JSON.stringify(daemon.surfaceIndex), surface);
+          assert.strictEqual(normalizeRealPath(daemon.getState().workspaceRoot), normalizeRealPath(replacementRoot));
+          console.info('[startup-cancellation] ' + JSON.stringify({ boundary, late, cancelledCallers: settled.length,
+            heldWorkStillPendingAtCancellation: true, replacementReadyBeforeRelease: true,
+            lateWorkSettled: oldWorkSettled, replacementModels: currentIndex.models.size }));
+        } finally {
+          release(); await Promise.all(pending);
+          await waitForCondition(() => oldWorkSettled, 5_000);
+          internal[property] = original; internal.startProcess = originalStart;
+        }
+      });
+    }
+  }
+
+  for (const handoff of ['stopped', 'start', 'restart'] as const) {
+    test(`explicit stop revokes queued restarts before a ${handoff} handoff`, async function () {
+      this.timeout(40_000);
+      const root = path.resolve(__dirname, '../../fixtures/minimal_project');
+      const replacementRoot = path.resolve(__dirname, '../../fixtures/advanced_queries_project');
+      await setWorkspaceRoot(root);
+      const daemon = getActiveDaemonForTesting(); assert.ok(daemon);
+      await daemon.stop();
+      const internal = daemon as any;
+      const original = internal.request, originalStart = internal.startProcess;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let entered = false, oldWorkSettled = false, startCalls = 0;
+      const settled: Array<{ error?: unknown; result?: unknown }> = [];
+      const pending: Array<Promise<void>> = [];
+      const observe = (promise: Promise<unknown>): void => {
+        pending.push(promise.then(result => { settled.push({ result }); }, error => { settled.push({ error }); }));
+      };
+      try {
+        internal.startProcess = async (...args: unknown[]) => {
+          const call = ++startCalls;
+          try { return await originalStart.apply(daemon, args); }
+          finally { if (call === 1) oldWorkSettled = true; }
+        };
+        internal.request = async (...args: unknown[]) => {
+          const value = await original.apply(daemon, args);
+          if (!entered && args[0] === 'initialize') { entered = true; await gate; }
+          return value;
+        };
+        observe(daemon.restart(vscode.Uri.file(root)));
+        await waitForCondition(() => entered, 5_000);
+        observe(daemon.restart(vscode.Uri.file(replacementRoot)));
+        await daemon.stop();
+        await waitForCondition(() => settled.length === 2, 1_000);
+        assert.ok(!oldWorkSettled && settled.every(row => row.error instanceof Error));
+        assert.strictEqual(internal.restartPromise, undefined);
+        assert.strictEqual(internal.restartQueued, false);
+        assert.strictEqual(internal.queuedRestartScope, undefined);
+        let process: unknown, index: unknown;
+        if (handoff !== 'stopped') {
+          const environment = await ensureFixtureE2EEnvironment(replacementRoot); assert.ok(environment);
+          const workspace = ensureFixtureWorkspace(replacementRoot, environment);
+          await applyFixtureWorkspaceSettings(workspace, replacementRoot, environment);
+          await (handoff === 'start' ? daemon.start(vscode.Uri.file(workspace)) : daemon.restart(vscode.Uri.file(workspace)));
+          await waitForHealthSnapshot(daemon, value => value.phase === 'ready' && value.runtime?.bootstrapStatus === 'ready', 20_000);
+          await waitForCondition(() => Object.keys(daemon.surfaceIndex).length > 0, 5_000);
+          process = internal.process; index = daemon.localWorkspaceIndexForTesting;
+        }
+        release(); await waitForCondition(() => oldWorkSettled, 5_000);
+        assert.strictEqual(internal.process, process);
+        if (handoff === 'stopped') {
+          assert.strictEqual(daemon.getState().phase, 'stopped');
+          assert.strictEqual(daemon.localWorkspaceIndexForTesting.models.size, 0);
+          assert.strictEqual(startCalls, 1, 'The revoked restart queue must not spawn a new process');
+        } else {
+          assert.strictEqual(daemon.localWorkspaceIndexForTesting, index);
+          assert.strictEqual(normalizeRealPath(daemon.getState().workspaceRoot), normalizeRealPath(replacementRoot));
+        }
+        console.info('[restart-cancellation] ' + JSON.stringify({ handoff, cancelledCallers: settled.length,
+          revokedQueue: true, heldWorkStillPendingAtCancellation: true, lateWorkSettled: true, startCalls }));
+      } finally {
+        release(); await Promise.all(pending);
+        await waitForCondition(() => oldWorkSettled, 5_000);
+        internal.request = original; internal.startProcess = originalStart;
+        if (handoff === 'stopped') await daemon.stop();
+      }
+    });
+  }
+
+  test('startup and health callers join the final coalesced restart owner', async function () {
+    this.timeout(40_000);
+    const root = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(root);
+    const daemon = getActiveDaemonForTesting(); assert.ok(daemon);
+    const internal = daemon as any;
+    const original = internal.request, originalStart = internal.startProcess;
+    const firstScope = vscode.Uri.file(root), lastScope = firstScope.with({ fragment: 'latest-restart-owner' });
+    const scopes: unknown[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered = false;
+    const pending: Array<Promise<HealthSnapshot>> = [];
+    let ensured: Promise<void> | undefined;
+    try {
+      internal.startProcess = async (...args: unknown[]) => { scopes.push(args[0]); return originalStart.apply(daemon, args); };
+      internal.request = async (...args: unknown[]) => {
+        const value = await original.apply(daemon, args);
+        if (!entered && args[0] === 'initialize') { entered = true; await gate; }
+        return value;
+      };
+      pending.push(daemon.restart(firstScope));
+      await waitForCondition(() => entered, 5_000);
+      pending.push(daemon.restart(vscode.Uri.file(path.resolve(__dirname, '../../fixtures/advanced_queries_project'))));
+      pending.push(daemon.restart(lastScope));
+      pending.push(daemon.start(firstScope)); pending.push(daemon.refreshHealth());
+      ensured = daemon.ensureStarted(firstScope);
+      release();
+      const results = await Promise.all(pending); await ensured;
+      assert.ok(results.every(result => result === results[0]), 'All public waiters must observe the final restart owner');
+      assert.deepStrictEqual(scopes, [firstScope, lastScope], 'A burst must start only the first and latest requested scopes');
+      await waitForHealthSnapshot(daemon, value => value.phase === 'ready' && value.runtime?.bootstrapStatus === 'ready', 20_000);
+      await waitForCondition(() => Object.keys(daemon.surfaceIndex).length > 0, 5_000);
+      console.info('[restart-coalesced-owner] ' + JSON.stringify({ callers: pending.length + 1, starts: scopes.length,
+        finalScope: lastScope.toString(), sameFinalSnapshot: true, models: daemon.localWorkspaceIndexForTesting.models.size }));
+    } finally {
+      release(); await Promise.allSettled(pending); if (ensured) await ensured.catch(() => undefined);
+      internal.request = original; internal.startProcess = originalStart;
+    }
+  });
+
+  test('late retired process cleanup and messages preserve the replacement daemon session', async function () {
+    this.timeout(45_000);
+    const oldRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    const newRoot = path.resolve(__dirname, '../../fixtures/advanced_queries_project');
+    await setWorkspaceRoot(oldRoot);
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    const internal = daemon as any;
+    const oldProcess = internal.process;
+    const oldLine = internal.stdoutReader.listeners('line')[0];
+    const oldExit = oldProcess.listeners('exit')[0];
+    const originalTerminate = internal.terminateProcess;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered = false;
+    let stopping: Promise<void> | undefined;
+    try {
+      internal.terminateProcess = async (...args: unknown[]) => {
+        await originalTerminate.apply(daemon, args);
+        if (args[0] === oldProcess) { entered = true; await gate; }
+      };
+      stopping = daemon.stop();
+      await waitForCondition(() => entered, 5_000);
+      const environment = await ensureFixtureE2EEnvironment(newRoot);
+      assert.ok(environment);
+      const workspace = ensureFixtureWorkspace(newRoot, environment);
+      await applyFixtureWorkspaceSettings(workspace, newRoot, environment);
+      await daemon.start(vscode.Uri.file(workspace));
+      await waitForHealthSnapshot(daemon, value => value.phase === 'ready' && value.runtime?.bootstrapStatus === 'ready', 20_000);
+      const currentProcess = internal.process, currentIndex = daemon.localWorkspaceIndexForTesting;
+      const currentRevision = daemon.getSessionRevision();
+      const beforeSurface = JSON.stringify(daemon.surfaceIndex);
+      oldLine(JSON.stringify({ event: 'surfaceIndexChanged', params: { surfaceIndex: {}, modelNames: [],
+        health: { phase: 'stopped', capabilities: [], detail: 'late old process', workspaceRoot: oldRoot } } }));
+      oldExit(1, null);
+      release(); await stopping;
+      assert.strictEqual(internal.process, currentProcess);
+      assert.strictEqual(daemon.localWorkspaceIndexForTesting, currentIndex);
+      assert.strictEqual(daemon.getSessionRevision(), currentRevision);
+      assert.strictEqual(JSON.stringify(daemon.surfaceIndex), beforeSurface);
+      assert.strictEqual(daemon.getState().phase, 'ready');
+      assert.strictEqual(normalizeRealPath(daemon.getState().workspaceRoot), normalizeRealPath(newRoot));
+      console.info('[metadata-retired-handoff] ' + JSON.stringify({ lateLine: true, lateExit: true, lateStop: true,
+        currentModels: currentIndex.models.size, newRootPreserved: true }));
+    } finally {
+      release();
+      if (stopping) await stopping;
+      internal.terminateProcess = originalTerminate;
+    }
+  });
+
+  test('rejects a reindex RPC response resolved after its daemon session ends', async function () {
+    this.timeout(30_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    const internal = daemon as unknown as { request(...args: unknown[]): Promise<unknown> };
+    const originalRequest = internal.request;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered = false;
+    let inFlight: Promise<{ result?: unknown; error?: unknown }> | undefined;
+    try {
+      internal.request = async (...args) => {
+        const result = await originalRequest.apply(daemon, args);
+        if (args[0] === 'reindexFile') {
+          entered = true;
+          await gate;
+        }
+        return result;
+      };
+      const revision = daemon.getSessionRevision();
+      inFlight = daemon.reindexFile(path.join(fixtureRoot, 'blog/models.py')).then(result => ({ result }), error => ({ error }));
+      await waitForCondition(() => entered, 5_000);
+      await daemon.restart(vscode.Uri.file(fixtureRoot));
+      await waitForHealthSnapshot(daemon, value => value.phase === 'ready', 20_000);
+      assert.notStrictEqual(daemon.getSessionRevision(), revision);
+      const currentIndex = daemon.localWorkspaceIndexForTesting;
+      release();
+      const settled = await inFlight;
+      assert.ok(settled.error instanceof Error && settled.error.message.includes('inactive daemon session'), 'A delayed RPC response must be rejected before touching current local indexes');
+      assert.strictEqual(daemon.localWorkspaceIndexForTesting, currentIndex);
+    } finally {
+      release();
+      if (inFlight) await inFlight;
+      internal.request = originalRequest;
+    }
+  });
+
+  test('records first workbench hover rendering separately from provider completion', async function () {
+    const port = Number(process.env.DJLS_E2E_RENDERER_DEBUG_PORT ?? 0);
+    if (!port) this.skip();
+    this.timeout(120_000);
+    const environment = await ensureFixtureE2EEnvironment(path.resolve(__dirname, '../../fixtures/minimal_project'));
+    assert.ok(environment);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-intellisense-first-hover-'));
+    await execFileAsync(environment.interpreterPath, ['-c',
+      'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from benchmarks.bench_async_runtime_member_refresh import create_fixture; create_fixture(Path(sys.argv[2]), 500, 5000, empty_custom_app=True)',
+      path.resolve(__dirname, '../../python'), root]);
+    const queryPath = path.join(root, 'helpers/helper_0.py');
+    fs.writeFileSync(queryPath, 'from app0.models import Model1\nModel1.objects.filter(field_14__exact="value")\n');
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    await removeWorkspaceFoldersFrom(0);
+    const configured = { ...environment, settingsModule: 'bench_settings' };
+    const workspace = ensureFixtureWorkspace(root, configured);
+    await addWorkspaceFolder(workspace);
+    await applyFixtureWorkspaceSettings(workspace, root, configured);
+    startLanguageClientForTesting();
+    const client = getLanguageClientForTesting();
+    assert.ok(client);
+    const started = performance.now();
+    const artifactPrefix = `bench/hover-render-boundary-native-${process.pid}-${Date.now()}`;
+    const result: Record<string, unknown> = {
+      observedUtc: new Date().toISOString(), models: 500, pythonFiles: 5000, artifact: artifactPrefix + '.json',
+      scope: 'Fresh 500-model/5000-file project after full runtime and LSP readiness. First explicit keyboard showHover, without prior completion/hover probes. Own trace ends at the final synchronous statement after logging and scope cleanup; it precedes Promise settlement. Renderer MutationObserver records visible hover DOM with exact owner/field metadata, then two requestAnimationFrame callbacks and a screenshot. These are DOM and paint-opportunity boundaries, not physical compositor presentation. Separate executeHoverProvider runs afterwards and includes all providers. No mouse-hover-delay, stable SLO or aggregate-memory claim.',
+      measuredSha256: Object.fromEntries(['src/client/providers/pythonProviders.ts', 'out/client/providers/pythonProviders.js',
+        'src/test/extension.test.ts', 'out/test/extension.test.js', 'src/test/rendererHoverProbe.ts',
+        'out/test/rendererHoverProbe.js', '.vscode-test.mjs', 'native/darwin-arm64/index.node'].map(name => [name,
+          createHash('sha256').update(fs.readFileSync(path.resolve(__dirname, '../../', name))).digest('hex')])),
+    };
+    let fullAckMs: number | undefined;
+    const sendRequest = client.sendRequest;
+    client.sendRequest = (async (method: unknown, ...args: unknown[]) => {
+      const value = await Reflect.apply(sendRequest, client, [method, ...args]);
+      const params = args[0] as { surfaceIndex?: typeof daemon.surfaceIndex; surfaceIndexDelta?: typeof daemon.surfaceIndex } | undefined;
+      const surface = params?.surfaceIndex ?? params?.surfaceIndexDelta;
+      if (method === 'django/updateSurfaceIndex' && surface?.['app0.Model0']?.queryset.attached_query
+          && Object.keys(surface).length === 500) fullAckMs = performance.now() - started;
+      return value;
+    }) as typeof client.sendRequest;
+    let renderer: RendererHoverProbe | undefined;
+    try {
+      await daemon.restart(vscode.Uri.file(workspace));
+      await waitForHealthSnapshot(daemon, value => value.phase === 'ready'
+        && value.runtime?.bootstrapStatus === 'ready' && value.runtime.modelCount === 500, 45_000);
+      await waitForCondition(() => Object.keys(daemon.surfaceIndex).length === 500 && fullAckMs !== undefined, 30_000);
+      result.fullReadyMs = performance.now() - started;
+      result.fullLspAckMs = fullAckMs;
+      assert.strictEqual(daemon.getState().staticIndex?.pythonFileCount, 5000);
+      const catalog = daemon.lookupCatalog!;
+      const kinds = ['CharField', 'IntegerField', 'BooleanField', 'DateTimeField', 'FloatField', 'DecimalField', 'UUIDField', 'DateField'];
+      for (let model = 0; model < 500; model++) {
+        const label = `app${Math.floor(model / 50)}.Model${model}`;
+        for (let field = 0; field < 15; field++) {
+          assert.strictEqual(daemon.surfaceIndex[label].instance[`field_${field}`][3], kinds[field % kinds.length]);
+          assert.strictEqual(catalog.types[catalog.fields[label][`field_${field}`]].fieldKind, kinds[field % kinds.length]);
+        }
+      }
+      const snapshot = artifactPrefix + '-full-ready.json.gz';
+      fs.writeFileSync(path.resolve(__dirname, '../../', snapshot), zlib.gzipSync(JSON.stringify({
+        health: daemon.getState(), surfaceIndex: daemon.surfaceIndex, lookupCatalog: catalog,
+      })));
+      result.snapshot = snapshot;
+      const document = await vscode.workspace.openTextDocument(queryPath);
+      const editor = await vscode.window.showTextDocument(document);
+      const position = new vscode.Position(1, document.lineAt(1).text.indexOf('field_14') + 2);
+      editor.selection = new vscode.Selection(position, position);
+      editor.revealRange(new vscode.Range(position, position));
+      await vscode.commands.executeCommand('editor.action.hideHover');
+      const previousOwn = getHoverTracesForTesting().filter(trace => trace.uri === document.uri.toString()
+        && trace.line === position.line && trace.character === position.character);
+      result.targetHoverCallsBeforeTrigger = previousOwn;
+      assert.strictEqual(previousOwn.length, 0, 'First explicit target hover must not be prewarmed');
+      renderer = await RendererHoverProbe.connect(port);
+      result.rendererTarget = renderer.target;
+      const clockSamples = [];
+      for (let i = 0; i < 3; i++) {
+        const beforeMs = performance.now(), beforeUnixMs = Date.now();
+        const clock = await renderer.clock();
+        clockSamples.push({ beforeMs, beforeUnixMs, renderer: clock, afterMs: performance.now(), afterUnixMs: Date.now() });
+      }
+      result.clockSamples = clockSamples;
+      await renderer.arm(['Field kind: UUIDField', 'Owner model: app0.Model1']);
+      const before = await renderer.observation();
+      assert.ok(!before.firstExpected && !before.firstVisible, 'Observer must start with hover hidden');
+      const commandStartedMs = performance.now(), commandStartedUnixMs = Date.now();
+      const command = vscode.commands.executeCommand('editor.action.showHover').then(() => {
+        result.showHoverCommandReturnedMs = performance.now();
+        result.showHoverCommandReturnedUnixMs = Date.now();
+      });
+      result.commandStartedMs = commandStartedMs;
+      result.commandStartedUnixMs = commandStartedUnixMs;
+      let observation: RendererHoverObservation;
+      do {
+        observation = await renderer.observation();
+        if (observation.secondAnimationFrame) break;
+        assert.ok(performance.now() - commandStartedMs < 20_000, 'Expected typed hover did not render');
+        await delay(20);
+      } while (true);
+      result.renderer = observation;
+      assert.ok(observation.firstExpected);
+      const first = observation.firstExpected;
+      result.commandToExpectedDomUnixMs = first.unixMs - commandStartedUnixMs;
+      result.commandToExpectedDomBoundsMs = clockSamples.map(sample => ({
+        lower: sample.beforeMs + first.monotonicMs - sample.renderer.monotonicMs - commandStartedMs,
+        upper: sample.afterMs + first.monotonicMs - sample.renderer.monotonicMs - commandStartedMs,
+      }));
+      await command;
+      const own = getHoverTracesForTesting().filter(trace => trace.uri === document.uri.toString()
+        && trace.line === position.line && trace.character === position.character
+        && trace.startedMonotonicMs >= commandStartedMs);
+      result.firstExplicitOwnCallbacks = own;
+      assert.ok(own.some(trace => trace.returnedHover && trace.finishedMonotonicMs !== undefined), 'Own typed hover must finish');
+      const screenshot = artifactPrefix + '-hover.png';
+      fs.writeFileSync(path.resolve(__dirname, '../../', screenshot), await renderer.screenshot());
+      result.screenshot = screenshot;
+      await vscode.commands.executeCommand('editor.action.hideHover');
+      const apiStartedMs = performance.now(), apiStartedUnixMs = Date.now();
+      const hovers = await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', document.uri, position);
+      result.allProviderCommand = { startedMs: apiStartedMs, startedUnixMs: apiStartedUnixMs,
+        finishedMs: performance.now(), finishedUnixMs: Date.now(), markdown: stringifyHovers(hovers),
+        ownCallbacks: getHoverTracesForTesting().filter(trace => trace.uri === document.uri.toString()
+          && trace.line === position.line && trace.character === position.character && trace.startedMonotonicMs >= apiStartedMs) };
+      assert.ok(stringifyHovers(hovers).includes('Field kind: `UUIDField`'));
+    } catch (error) { result.failure = String(error); throw error; }
+    finally {
+      client.sendRequest = sendRequest;
+      result.environment = { djangoVersion: environment.djangoVersion, vscodeVersion: vscode.version,
+        providerTimeoutFlagSetByHarness: process.env.DJLS_DISABLE_PROVIDER_TIMEOUT === '1',
+        extraDisabledExtensions: process.env.DJLS_E2E_DISABLE_EXTENSIONS?.split(',') ?? [],
+        activeExtensions: vscode.extensions.all.filter(extension => extension.isActive)
+          .map(extension => ({ id: extension.id, version: extension.packageJSON.version })) };
+      fs.writeFileSync(path.resolve(__dirname, '../../', artifactPrefix + '.json'), JSON.stringify(result));
+      console.info('[hover-render-boundary] ' + JSON.stringify({ artifact: result.artifact, failure: result.failure,
+        fullReadyMs: result.fullReadyMs, commandToExpectedDomUnixMs: result.commandToExpectedDomUnixMs, screenshot: result.screenshot }));
+      await renderer?.dispose();
+      await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('preserves deferred UUID primary keys from the first daemon snapshot', async function () {
+    this.timeout(120_000);
+    const environment = await ensureFixtureE2EEnvironment(path.resolve(__dirname, '../../fixtures/minimal_project'));
+    assert.ok(environment);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-intellisense-initial-uuid-'));
+    await execFileAsync(environment.interpreterPath, ['-c',
+      'import sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); '
+      + 'from benchmarks.bench_async_runtime_member_refresh import create_fixture; '
+      + 'create_fixture(Path(sys.argv[2]),500,5000); '
+      + 'p=Path(sys.argv[2])/"app0/model_1.py"; '
+      + 'p.write_text(p.read_text().replace("class Model1(models.Model):",'
+      + '"class Model1(models.Model):\\n    key = models.UUIDField(primary_key=True)"))',
+      path.resolve(__dirname, '../../python'), root]);
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    await removeWorkspaceFoldersFrom(0);
+    const configured = { ...environment, settingsModule: 'bench_settings' };
+    const workspace = ensureFixtureWorkspace(root, configured);
+    await addWorkspaceFolder(workspace);
+    await applyFixtureWorkspaceSettings(workspace, root, configured);
+    startLanguageClientForTesting();
+    const client = getLanguageClientForTesting();
+    assert.ok(client);
+    const internal = daemon as unknown as {
+      request<T>(method: string, params: Record<string, unknown>, timeoutMs?: number, background?: boolean, source?: string): Promise<T>;
+      effectiveStaticFallback(): StaticFallback;
+    };
+    const request = internal.request;
+    const started = performance.now();
+    const artifactPrefix = `bench/initial-uuid-native-${process.pid}-${Date.now()}`;
+    const result: Record<string, unknown> = { observedUtc: new Date().toISOString(), models: 500, pythonFiles: 5000,
+      measuredSha256: Object.fromEntries(['src/test/extension.test.ts', 'out/test/extension.test.js',
+        'python/django_orm_intellisense/semantic/graph.py', 'python/django_orm_intellisense/static_index/indexer.py',
+        'python/django_orm_intellisense/runtime/source_fields.py', 'python/django_orm_intellisense/cache/store.py',
+        'native/darwin-arm64/index.node'].map(name => [name,
+          createHash('sha256').update(fs.readFileSync(path.resolve(__dirname, '../../', name))).digest('hex')])),
+      scope: 'Actual installed-extension VSCode host, fresh configured500-model/5000-file project. '
+        + 'First raw deferred Python response is checked before client adoption. Native/client/Python negative-id '
+        + 'and UUID-pk queries plus current full-index and LSP completion are checked subsequently. '
+        + 'No first-render, startup-load contention, stable latency or aggregate-memory claim.' };
+    let initial: { health: HealthSnapshot; staticFallback: StaticFallback } | undefined;
+    const snapshots: string[] = [];
+    internal.request = (async function (this: typeof internal, ...args: Parameters<typeof request>) {
+      const value = await Reflect.apply(request, this, args);
+      if (args[0] === 'initialize' && args[1].workspaceRoot === root) {
+        initial = value as typeof initial;
+        assert.ok(initial);
+        assert.strictEqual(initial.health.runtime?.bootstrapStatus, 'warming_up');
+        const uuid = initial.staticFallback['app0.Model1'];
+        assert.strictEqual(uuid.fieldDetails?.key.fieldKind, 'UUIDField');
+        assert.strictEqual(uuid.fieldDetails?.pk.fieldKind, 'UUIDField');
+        assert.ok(!uuid.fields.includes('id'));
+        assert.ok(!Object.hasOwn(uuid.fieldDetails!, 'id'));
+        result.firstResponseMs = performance.now() - started;
+      }
+      return value;
+    }) as typeof request;
+    const freshIndex = (): void => {
+      const expected = buildWorkspaceIndex(daemon.surfaceIndex, [...daemon.modelNames], daemon.customLookups,
+        internal.effectiveStaticFallback(), daemon.lookupCatalog);
+      const actual = daemon.localWorkspaceIndexForTesting;
+      for (const key of ['models', 'modelLabelByName', 'lookupTrie', 'transformTrie', 'lookupTypes', 'lookupCatalog'] as const)
+        assert.deepStrictEqual(actual[key], expected[key], `Initial UUID full-index oracle: ${key}`);
+    };
+    const nativeCheck = (phase: string): void => {
+      assert.ok(isNativeFastPathReady(), `${phase}: native fast path must be active`);
+      const pk = nativeResolveOrmMember('app0.Model1', 'instance', 'pk');
+      assert.ok(pk?.resolved);
+      assert.strictEqual(pk.item?.fieldKind, 'UUIDField');
+      assert.strictEqual(nativeResolveOrmMember('app0.Model1', 'instance', 'id'), undefined);
+      assert.strictEqual(nativeResolveLookupPath('app0.Model1', 'id__exact', 'filter')?.resolved, false);
+      const members = nativeListOrmMemberCompletions('app0.Model1', 'instance', 'id');
+      const lookups = nativeListLookupPathCompletions('app0.Model1', 'i', 'filter');
+      assert.ok(members && lookups);
+      assert.ok(!members.items.some(item => item.name === 'id'));
+      assert.ok(!lookups.items.some(item => item.name === 'id'));
+    };
+    try {
+      await daemon.restart(vscode.Uri.file(workspace));
+      assert.ok(initial, 'First initialize response must be captured');
+      result.afterInitialAdoption = { atMs: performance.now() - started,
+        runtimeStatus: daemon.getState().runtime?.bootstrapStatus, surfaceModels: Object.keys(daemon.surfaceIndex).length };
+      freshIndex();
+      await waitForCondition(() => isNativeFastPathReady(), 15_000);
+      result.firstNativeReady = { atMs: performance.now() - started,
+        runtimeStatus: daemon.getState().runtime?.bootstrapStatus, surfaceModels: Object.keys(daemon.surfaceIndex).length };
+      nativeCheck('firstNativeReady');
+      assert.strictEqual((await daemon.resolveOrmMember('app0.Model1', 'instance', 'id')).resolved, false);
+      assert.ok((await daemon.resolveLookupPath('app0.Model1', 'pk__exact', 'filter')).resolved);
+      assert.strictEqual((await internal.request<{ resolved: boolean }>('resolveOrmMember', {
+        modelLabel: 'app0.Model1', receiverKind: 'instance', name: 'id',
+      })).resolved, false);
+      await waitForCondition(() => Object.keys(daemon.surfaceIndex).length === 500
+        && Boolean(daemon.surfaceIndex['app0.Model0']?.queryset.attached_query), 45_000);
+      // Full surface arrival starts asynchronous native hydration. Preserve
+      // both timestamps so waiting for readiness cannot conceal its latency.
+      const fullSurfaceMs = performance.now() - started;
+      result.fullSurfaceReady = { atMs: fullSurfaceMs, nativeReady: isNativeFastPathReady() };
+      await waitForCondition(() => isNativeFastPathReady(), 15_000);
+      result.fullNativeReady = { atMs: performance.now() - started,
+        lagAfterFullSurfaceMs: performance.now() - started - fullSurfaceMs };
+      nativeCheck('fullReady');
+      assert.ok(await ensureNativeAstModules(root));
+      nativeCheck('astEnsured');
+      freshIndex();
+      assert.strictEqual(daemon.surfaceIndex['app0.Model1'].instance.pk[3], 'UUIDField');
+      assert.strictEqual(daemon.lookupCatalog?.types[daemon.lookupCatalog.fields['app0.Model1'].pk].fieldKind, 'UUIDField');
+      const uri = vscode.Uri.file(path.join(root, 'helpers', 'helper_0.py')).toString();
+      const prefix = 'from app0.models import Model1\nModel1.objects.filter(';
+      await client.sendNotification('textDocument/didOpen', { textDocument: { uri, languageId: 'python', version: 1,
+        text: prefix + 'i' } });
+      const missing = await client.sendRequest<Array<{ label: string }>>('textDocument/completion', {
+        textDocument: { uri }, position: { line: 1, character: (prefix + 'i').split('\n')[1].length },
+      });
+      assert.ok(!missing.some(item => item.label === 'id'));
+      const text = prefix + 'pk__ex';
+      await client.sendNotification('textDocument/didChange', { textDocument: { uri, version: 2 }, contentChanges: [{ text }] });
+      const positive = await client.sendRequest<Array<{ label: string }>>('textDocument/completion', {
+        textDocument: { uri }, position: { line: 1, character: text.split('\n')[1].length },
+      });
+      assert.ok(positive.some(item => item.label === 'exact'));
+      await client.sendNotification('textDocument/didClose', { textDocument: { uri } });
+      result.lspCompletions = { missingIdLabels: missing.map(item => item.label), pkLabels: positive.map(item => item.label) };
+      for (const [suffix, value] of [['initial', initial], ['full', { health: daemon.getState(),
+        surfaceIndex: daemon.surfaceIndex, lookupCatalog: daemon.lookupCatalog }]] as const) {
+        const snapshot = artifactPrefix + '-' + suffix + '.json.gz';
+        fs.writeFileSync(path.resolve(__dirname, '../../', snapshot), zlib.gzipSync(JSON.stringify(value)));
+        snapshots.push(snapshot);
+      }
+      result.initialAndFullUuidNegativeIdChecks = true;
+    } catch (error) { result.failure = String(error); throw error; }
+    finally {
+      internal.request = request;
+      if (initial && !snapshots.some(snapshot => snapshot.endsWith('-initial.json.gz'))) {
+        const snapshot = artifactPrefix + '-initial.json.gz';
+        fs.writeFileSync(path.resolve(__dirname, '../../', snapshot), zlib.gzipSync(JSON.stringify(initial)));
+        snapshots.push(snapshot);
+      }
+      result.snapshots = snapshots;
+      result.environment = { djangoVersion: environment.djangoVersion, vscodeVersion: vscode.version,
+        activeExtensions: vscode.extensions.all.filter(extension => extension.isActive)
+          .map(extension => ({ id: extension.id, version: extension.packageJSON.version })) };
+      result.finishedMs = performance.now() - started;
+      fs.writeFileSync(path.resolve(__dirname, '../../', artifactPrefix + '.json'), JSON.stringify(result));
+      console.info('[initial-uuid-native] ' + JSON.stringify({ artifact: artifactPrefix + '.json', failure: result.failure }));
+      await daemon.stop();
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('uses cached lookup metadata before the parent runtime registry finishes', async function () {
+    this.timeout(150_000);
+    const environment = await ensureFixtureE2EEnvironment(path.resolve(__dirname, '../../fixtures/minimal_project'));
+    assert.ok(environment);
+    const startupManifestPath = process.env.DJLS_E2E_CACHED_STARTUP_MANIFEST;
+    const previousCacheRoot = process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR;
+    const startupManifest = startupManifestPath ? JSON.parse(fs.readFileSync(startupManifestPath, 'utf8')) as {
+      root: string; cache: string; queryPath: string; sourceTreeSha256: string;
+    } : undefined;
+    if (startupManifest) {
+      assert.ok(path.isAbsolute(startupManifest.root) && path.isAbsolute(startupManifest.queryPath)
+        && path.isAbsolute(startupManifest.cache));
+    }
+    const root = startupManifest?.root ?? fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-intellisense-initial-catalog-'));
+    const artifactPrefix = `bench/initial-catalog-native-${process.pid}-${Date.now()}`;
+    const artifact = (suffix: string): string => path.resolve(__dirname, '../../', artifactPrefix + suffix);
+    await execFileAsync(environment.interpreterPath, ['-c',
+      'import sys,tarfile; from pathlib import Path; sys.path.insert(0,sys.argv[1]); '
+      + 'from benchmarks.bench_async_runtime_member_refresh import create_fixture; '
+      + 'r=Path(sys.argv[2]); '
+      + (startupManifest ? '' : 'create_fixture(r,500,5000); p=r/"app0/model_1.py"; '
+        + 'p.write_text(p.read_text().replace("class Model1(models.Model):",'
+        + '"class Model1(models.Model):\\n    key = models.UUIDField(primary_key=True)")); ')
+      + 't=tarfile.open(sys.argv[3],"w:gz"); '
+      + '[t.add(p,arcname=str(p.relative_to(r)),recursive=False) for p in sorted(r.rglob("*.py"))]; t.close()',
+      path.resolve(__dirname, '../../python'), root, artifact('-fixture-source.tar.gz')]);
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    await removeWorkspaceFoldersFrom(0);
+    const configured = { ...environment, settingsModule: 'bench_settings' };
+    const workspace = ensureFixtureWorkspace(root, configured);
+    await addWorkspaceFolder(workspace);
+    await applyFixtureWorkspaceSettings(workspace, root, configured);
+    startLanguageClientForTesting();
+    const client = getLanguageClientForTesting();
+    assert.ok(client);
+    const internal = daemon as unknown as {
+      request<T>(method: string, params: Record<string, unknown>, timeoutMs?: number, background?: boolean, source?: string): Promise<T>;
+      effectiveStaticFallback(): StaticFallback;
+    };
+    const request = internal.request;
+    const methods = daemon as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const originalLog = methods.log;
+    const sendRequest = client.sendRequest;
+    const started = performance.now();
+    const now = (): number => performance.now() - started;
+    let phase = startupManifest ? 'cached' : 'cold';
+    const logs: Array<{ phase: string; atMs: number; text: string }> = [];
+    const snapshots: string[] = [];
+    const initials = new Map<string, unknown>();
+    const queries: Array<{ phase: string; name: string; startedMs: number; finishedMs: number; result: unknown }> = [];
+    const publications: Array<Record<string, unknown>> = [];
+    const initializations: Array<{ phase: string; startedMs: number; responseMs: number }> = [];
+    const fullStates: Array<{ phase: string; observedMs: number }> = [];
+    const acknowledgedSurfaceDecoder = new SurfaceSnapshotDecoder();
+    let editedCatalogAcknowledgedMs: number | undefined;
+    let editedMembersAcknowledgedMs: number | undefined;
+    const result: Record<string, unknown> = { observedUtc: new Date().toISOString(), models: 500, pythonFiles: 5000,
+      fixtureArchive: artifactPrefix + '-fixture-source.tar.gz',
+      startupMode: startupManifest ? 'fresh-editor-prefilled-cache' : 'cold-then-same-editor-restart',
+      startupManifest: startupManifestPath,
+      measuredSha256: Object.fromEntries(['src/test/extension.test.ts', 'out/test/extension.test.js',
+        'python/django_orm_intellisense/features/lookup_paths.py', 'python/django_orm_intellisense/runtime/inspector.py',
+        'python/django_orm_intellisense/server/app.py', 'python/django_orm_intellisense/cache/store.py',
+        'python/django_orm_intellisense/cache/json_stream.py', 'native/darwin-arm64/index.node'].map(name => [name,
+          createHash('sha256').update(fs.readFileSync(path.resolve(__dirname, '../../', name))).digest('hex')])),
+      scope: 'Actual VSCode host with installed extensions and fresh configured500-model/5000-file project. '
+        + 'Cold bootstrap populates the cache. Cached raw Python lookup queries run immediately after initialize '
+        + 'and before client adoption, then native/client/LSP and a same-size preserved-mtime constructor edit are checked. '
+        + 'Parent registry log receipt is an observed marker; no physical paint, stable SLO or aggregate-memory claim.' };
+    type Lookup = { resolved: boolean; terminalType?: { outputFieldKind: string }; [key: string]: unknown };
+    const rawLookup = async (name: string, value: string, label = 'app0.Model0'): Promise<Lookup> => {
+      const before = now();
+      const reply = await Reflect.apply(request, internal, ['resolveLookupPath', {
+        baseModelLabel: label, value, method: 'filter',
+      }, 15_000, false, 'hover']) as Lookup;
+      queries.push({ phase, name, startedMs: before, finishedMs: now(), result: reply });
+      return reply;
+    };
+    const startupHover = async (): Promise<void> => {
+      if (!startupManifest) return;
+      const openedMs = now();
+      const document = await vscode.workspace.openTextDocument(startupManifest.queryPath);
+      await vscode.window.showTextDocument(document);
+      const position = new vscode.Position(1, document.lineAt(1).text.indexOf('field_14') + 2);
+      const before = now();
+      const hovers = await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', document.uri, position);
+      const finishedMs = now();
+      assert.ok(stringifyHovers(hovers ?? []).includes('Field kind: `UUIDField`'));
+      const callbacks = getHoverTracesForTesting().filter(trace => trace.uri === document.uri.toString()
+        && trace.line === position.line && trace.character === position.character
+        && trace.startedMonotonicMs >= started + before).map(trace => ({ ...trace,
+          startedMs: trace.startedMonotonicMs - started,
+          finishedMs: trace.finishedMonotonicMs === undefined ? undefined : trace.finishedMonotonicMs - started }));
+      assert.ok(callbacks.some(trace => trace.returnedHover && trace.finishedMs !== undefined));
+      result.startupHover = { openedMs, startedMs: before, finishedMs, providerCallbacks: callbacks };
+    };
+    methods.log = function (...args) {
+      if (typeof args[1] === 'string' && args[1].includes('[daemon stderr]'))
+        logs.push({ phase, atMs: now(), text: args[1] });
+      return Reflect.apply(originalLog, this, args);
+    };
+    client.sendRequest = (async (method: unknown, ...args: unknown[]) => {
+      const before = now(), label = phase;
+      const reply = await Reflect.apply(sendRequest, client, [method, ...args]);
+      if (method === 'django/updateSurfaceIndex' || method === 'django/updateSurfaceIndexDelta') {
+        const params = args[0] as { surfaceIndex?: typeof daemon.surfaceIndex;
+          surfaceIndexDelta?: typeof daemon.surfaceIndex;
+          surfaceTransport?: { kind: string; sequence: number }; lookupCatalog?: typeof daemon.lookupCatalog;
+          lookupCatalogDelta?: Record<string, typeof daemon.lookupCatalog> };
+        const catalog = params.lookupCatalog ?? params.lookupCatalogDelta?.['app0.Model0'];
+        const type = catalog?.fields['app0.Model0']?.field_0;
+        const output = type && catalog?.types[type]?.transforms.field_size;
+        const outputKind = output ? catalog?.types[output]?.fieldKind : undefined;
+        const finishedMs = now();
+        const acknowledged = method === 'django/updateSurfaceIndex' && (reply as { applied?: boolean }).applied
+          ? acknowledgedSurfaceDecoder.decode(args[0] as Parameters<SurfaceSnapshotDecoder['decode']>[0]) : undefined;
+        publications.push({ phase: label, method, startedMs: before, finishedMs, outputKind, reply,
+          surfaceModels: params.surfaceIndex && Object.keys(params.surfaceIndex).length,
+          reconstructedSurfaceModels: acknowledged?.surfaceIndex && Object.keys(acknowledged.surfaceIndex).length,
+          transportKind: params.surfaceTransport?.kind, transportSequence: params.surfaceTransport?.sequence });
+        if (label === 'sourceEdit' && outputKind === 'DateField'
+            && (reply as { applied?: boolean }).applied) editedCatalogAcknowledgedMs = finishedMs;
+        const entry = acknowledged?.surfaceIndex?.['app0.Model0'];
+        if (label === 'sourceEdit' && entry?.instance.attached_instance && entry.instance.attached_class
+            && entry.model_class.attached_class && entry.model_class.attached_instance
+            && entry.manager.attached_query && entry.queryset.attached_query && entry.related_manager.attached_query
+            && entry.model_class.special
+            && (reply as { applied?: boolean }).applied)
+          editedMembersAcknowledgedMs = finishedMs;
+      }
+      return reply;
+    }) as typeof client.sendRequest;
+    internal.request = (async function (this: typeof internal, ...args: Parameters<typeof request>) {
+      const before = now(), label = phase;
+      const value = await Reflect.apply(request, this, args);
+      if (args[0] === 'initialize' && args[1].workspaceRoot === root) {
+        initializations.push({ phase: label, startedMs: before, responseMs: now() });
+        const initial = value as { health: HealthSnapshot; staticFallback?: StaticFallback | null;
+          surfaceIndex?: typeof daemon.surfaceIndex };
+        initials.set(phase, initial);
+        assert.strictEqual(initial.health.runtime?.bootstrapStatus, phase === 'cold' ? 'warming_up' : 'ready');
+        if (Object.keys(initial.surfaceIndex ?? {}).length > 0) {
+          assert.strictEqual(Object.keys(initial.surfaceIndex!).length, 500);
+          assert.strictEqual(initial.surfaceIndex!['app0.Model1'].instance.pk[3], 'UUIDField');
+          assert.ok(!Object.hasOwn(initial.surfaceIndex!['app0.Model1'].instance, 'id'));
+        } else {
+          assert.strictEqual(initial.staticFallback?.['app0.Model1'].fieldDetails?.pk.fieldKind, 'UUIDField');
+          assert.ok(!initial.staticFallback!['app0.Model1'].fields.includes('id'));
+        }
+        if (phase === 'cached') {
+          const builtin = await rawLookup('builtin', 'field_14__exact');
+          assert.ok(builtin.resolved);
+          assert.strictEqual(builtin.terminalType?.outputFieldKind, 'UUIDField');
+          const custom = await rawLookup('custom', 'field_0__field_size__exact');
+          assert.ok(custom.resolved);
+          assert.strictEqual(custom.terminalType?.outputFieldKind, 'CharField');
+          assert.strictEqual((await rawLookup('negative', 'field_0__not_registered')).resolved, false);
+          assert.strictEqual((await rawLookup('uuid', 'pk__exact', 'app0.Model1')).terminalType?.outputFieldKind, 'UUIDField');
+          assert.strictEqual((await rawLookup('missingId', 'id__exact', 'app0.Model1')).resolved, false);
+        }
+        const snapshot = artifactPrefix + '-' + phase + '-initial.json.gz';
+        if (!startupManifest) {
+          fs.writeFileSync(path.resolve(__dirname, '../../', snapshot), zlib.gzipSync(JSON.stringify(initial)));
+          snapshots.push(snapshot);
+        }
+      }
+      return value;
+    }) as typeof request;
+    const saveSnapshot = (suffix: string): void => {
+      const snapshot = artifactPrefix + '-' + suffix + '.json.gz';
+      fs.writeFileSync(path.resolve(__dirname, '../../', snapshot), zlib.gzipSync(JSON.stringify({
+        health: daemon.getState(), surfaceIndex: daemon.surfaceIndex, lookupCatalog: daemon.lookupCatalog,
+      })));
+      snapshots.push(snapshot);
+    };
+    const freshIndex = (): void => {
+      const expected = buildWorkspaceIndex(daemon.surfaceIndex, [...daemon.modelNames], daemon.customLookups,
+        internal.effectiveStaticFallback(), daemon.lookupCatalog);
+      for (const key of ['models', 'modelLabelByName', 'lookupTrie', 'transformTrie', 'lookupTypes', 'lookupCatalog'] as const)
+        assert.deepStrictEqual(daemon.localWorkspaceIndexForTesting[key], expected[key], `Initial catalog fresh-index oracle: ${key}`);
+    };
+    const requiredMembers = [['instance', 'attached_instance'], ['instance', 'attached_class'],
+      ['model_class', 'attached_class'], ['model_class', 'attached_instance'],
+      ['manager', 'attached_query'], ['queryset', 'attached_query'], ['related_manager', 'attached_query']] as const;
+    const missingMembers = (): string[] => requiredMembers.filter(([kind, name]) =>
+      daemon.surfaceIndex['app0.Model0']?.[kind]?.[name]?.[1] !== 'app0.Model0').map(([kind, name]) => `${kind}.${name}`);
+    const full = async (verify = true): Promise<void> => {
+      await waitForCondition(() => Object.keys(daemon.surfaceIndex).length === 500
+        && missingMembers().length === 0 && Boolean(daemon.surfaceIndex['app0.Model0']?.model_class.special), 45_000);
+      if (!fullStates.some(state => state.phase === phase)) fullStates.push({ phase, observedMs: now() });
+      if (!verify) return;
+      assert.strictEqual(daemon.getState().runtime?.bootstrapStatus, 'ready');
+      const catalog = daemon.lookupCatalog;
+      assert.ok(catalog);
+      const kinds = ['CharField', 'IntegerField', 'BooleanField', 'DateTimeField',
+        'FloatField', 'DecimalField', 'UUIDField', 'DateField'];
+      for (let model = 0; model < 500; model++) {
+        const label = `app${Math.floor(model / 50)}.Model${model}`;
+        for (let field = 0; field < 15; field++) {
+          assert.strictEqual(daemon.surfaceIndex[label].instance[`field_${field}`][3], kinds[field % kinds.length]);
+          assert.strictEqual(catalog.types[catalog.fields[label][`field_${field}`]].fieldKind, kinds[field % kinds.length]);
+        }
+      }
+      assert.strictEqual(daemon.surfaceIndex['app0.Model1'].instance.pk[3], 'UUIDField');
+      assert.ok(!Object.hasOwn(daemon.surfaceIndex['app0.Model1'].instance, 'id'));
+      freshIndex();
+    };
+    try {
+      if (startupManifest) process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR = startupManifest.cache;
+      if (!startupManifest) {
+        await daemon.restart(vscode.Uri.file(workspace));
+        await full();
+        saveSnapshot('cold-full');
+        await daemon.stop();
+        phase = 'cached';
+      }
+      await daemon.restart(vscode.Uri.file(workspace));
+      const hover = startupHover().then(() => undefined, (error: unknown) => error);
+      await full(!startupManifest);
+      const hoverFailure = await hover;
+      if (hoverFailure) throw hoverFailure;
+      if (startupManifest) await full();
+      await waitForCondition(() => logs.some(log => log.phase === 'cached'
+        && log.text.includes('runtime_field_registry(background) ready')), 30_000);
+      const marker = logs.find(log => log.phase === 'cached' && log.text.includes('runtime_field_registry(background) ready'))!;
+      result.parentRegistryMarker = marker;
+      const early = queries.filter(query => query.phase === 'cached');
+      assert.strictEqual(early.length, 5);
+      assert.ok(early.every(query => query.finishedMs < marker.atMs), 'Cached captured queries must finish before observed registry readiness');
+      result.cachedRawQueriesFinishedBeforeRegistryMarker = true;
+      await waitForCondition(() => isNativeFastPathReady(), 15_000);
+      assert.strictEqual(nativeResolveLookupPath('app0.Model0', 'field_14__exact', 'filter')?.terminalType?.outputFieldKind, 'UUIDField');
+      assert.strictEqual(nativeResolveLookupPath('app0.Model1', 'id__exact', 'filter')?.resolved, false);
+      result.nativeBuiltinAndNegativeIdChecked = true;
+      assert.ok((await daemon.resolveLookupPath('app0.Model0', 'field_0__field_size__exact', 'filter')).resolved);
+      saveSnapshot('cached-full');
+      if (startupManifest) {
+        // Adoption shares the initial surface with the client's local delta
+        // owner. Archive after timed startup/hover, before a save replaces
+        // entries in that dictionary; finally must not capture later state.
+        const snapshot = artifactPrefix + '-cached-initial.json.gz';
+        fs.writeFileSync(path.resolve(__dirname, '../../', snapshot), zlib.gzipSync(JSON.stringify(initials.get('cached'))));
+        snapshots.push(snapshot);
+      }
+      phase = 'sourceEdit';
+      const modelsPath = path.join(root, 'app0/model_0.py');
+      const stamp = fs.statSync(modelsPath, { bigint: true });
+      const before = fs.readFileSync(modelsPath, 'utf8');
+      const after = before.replace('field_0 = models.CharField(max_length=255)', 'field_0 = models.CharField(max_length=10 )');
+      assert.notStrictEqual(after, before);
+      assert.strictEqual(Buffer.byteLength(after), Buffer.byteLength(before));
+      fs.writeFileSync(modelsPath, after);
+      await execFileAsync(environment.interpreterPath, ['-c',
+        'import os,sys; os.utime(sys.argv[1],ns=(int(sys.argv[2]),int(sys.argv[3])))',
+        modelsPath, stamp.atimeNs.toString(), stamp.mtimeNs.toString()]);
+      const currentStamp = fs.statSync(modelsPath, { bigint: true });
+      assert.strictEqual(currentStamp.mtimeNs, stamp.mtimeNs);
+      result.sourceEdit = { before, after, bytes: Number(stamp.size), previousMtimeNs: stamp.mtimeNs.toString(),
+        currentMtimeNs: currentStamp.mtimeNs.toString(), requestedMs: now() };
+      await daemon.reindexFile(modelsPath);
+      Object.assign(result.sourceEdit as Record<string, unknown>, { reindexResponseMs: now() });
+      const duplicateStartedMs = now();
+      const duplicate = await daemon.reindexFile(modelsPath);
+      result.sourceEditDuplicateReindex = { startedMs: duplicateStartedMs, finishedMs: now(), result: duplicate };
+      assert.strictEqual(duplicate.unchanged, true, 'An immediate identical save must reuse the current source');
+      assert.strictEqual(duplicate.sourceUnchanged, true, 'Only a verified identical source can preserve client resolver caches');
+      result.sourceEditMemberReadiness = { deltaReadyMs: now(), missingAfterReindex: missingMembers() };
+      saveSnapshot('source-edit-after-reindex');
+      await waitForCondition(() => {
+        const catalog = daemon.lookupCatalog;
+        const id = catalog?.fields['app0.Model0'].field_0;
+        const output = id && catalog?.types[id]?.transforms.field_size;
+        return Boolean(output && catalog?.types[output]?.fieldKind === 'DateField');
+      }, 30_000);
+      const edited = await rawLookup('editedCustom', 'field_0__field_size__year__gte');
+      assert.ok(edited.resolved);
+      assert.strictEqual(edited.terminalType?.outputFieldKind, 'IntegerField');
+      assert.strictEqual((await daemon.resolveLookupPath('app0.Model0', 'field_0__field_size', 'filter'))
+        .terminalType?.outputFieldKind, 'DateField');
+      await waitForCondition(() => nativeResolveOrmMember('app0.Model0', 'instance', 'field_0')?.item?.fieldKind === 'CharField', 15_000);
+      freshIndex();
+      await waitForCondition(() => editedCatalogAcknowledgedMs !== undefined, 30_000);
+      result.editedCatalogAcknowledgedMs = editedCatalogAcknowledgedMs;
+      const uri = vscode.Uri.file(path.join(root, 'helpers/helper_0.py')).toString();
+      const text = 'from app0.models import Model0\nModel0.objects.filter(field_0__field_size__ye';
+      await client.sendNotification('textDocument/didOpen', { textDocument: { uri, languageId: 'python', version: 1, text } });
+      const completions = await client.sendRequest<Array<{ label: string }>>('textDocument/completion', {
+        textDocument: { uri }, position: { line: 1, character: text.split('\n')[1].length },
+      });
+      result.editedLspCompletionLabels = completions.map(item => item.label);
+      assert.ok(completions.some(item => item.label === 'year'));
+      Object.assign(result.sourceEditMemberReadiness as Record<string, unknown>, {
+        lookupReadyMs: now(), missingBeforeWait: missingMembers() });
+      saveSnapshot('source-edit-before-members');
+      await full();
+      const memberResolutions = [];
+      for (const [kind, name] of requiredMembers) {
+        const before = now();
+        const native = nativeResolveOrmMember('app0.Model0', kind, name) ?? null;
+        const resolved = await daemon.resolveOrmMember('app0.Model0', kind, name);
+        const python = await internal.request<{ resolved: boolean; item?: { returnModelLabel?: string } }>(
+          'resolveOrmMember', { modelLabel: 'app0.Model0', receiverKind: kind, name }, 15_000, false, 'hover');
+        assert.ok(resolved.resolved && python.resolved);
+        assert.strictEqual(resolved.item?.returnModelLabel, 'app0.Model0');
+        assert.strictEqual(python.item?.returnModelLabel, 'app0.Model0');
+        memberResolutions.push({ kind, name, startedMs: before, finishedMs: now(), native, resolved, python });
+      }
+      result.sourceEditMemberResolutions = memberResolutions;
+      await waitForCondition(() => editedMembersAcknowledgedMs !== undefined, 30_000);
+      const memberText = 'from app0.models import Model0\nModel0.objects.atta';
+      await client.sendNotification('textDocument/didChange', { textDocument: { uri, version: 2 },
+        contentChanges: [{ text: memberText }] });
+      const memberCompletions = await client.sendRequest<Array<{ label: string }>>('textDocument/completion', {
+        textDocument: { uri }, position: { line: 1, character: memberText.split('\n')[1].length },
+      });
+      result.editedLspMemberCompletionLabels = memberCompletions.map(item => item.label);
+      // The language server owns lookup completion; ORM methods are offered by
+      // the registered VS Code provider. Exercise that actual user path too.
+      const memberDocument = await vscode.workspace.openTextDocument(path.join(root, 'helpers/helper_1.py'));
+      const originalMemberText = memberDocument.getText();
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(memberDocument.uri, new vscode.Range(memberDocument.positionAt(0),
+        memberDocument.positionAt(originalMemberText.length)), memberText);
+      assert.ok(await vscode.workspace.applyEdit(edit));
+      assert.strictEqual(memberDocument.getText(), memberText);
+      const memberPosition = memberDocument.positionAt(memberText.length);
+      const completionStartedMs = now();
+      const completionStartedAt = Date.now();
+      try {
+        const editorCompletions = await vscode.commands.executeCommand<vscode.CompletionList>(
+          'vscode.executeCompletionItemProvider', memberDocument.uri, memberPosition);
+        const labels = (editorCompletions?.items ?? []).map(item =>
+          typeof item.label === 'string' ? item.label : item.label.label);
+        const callbacks = getCompletionTracesForTesting().filter(trace => trace.uri === memberDocument.uri.toString()
+          && trace.line === memberPosition.line && trace.character === memberPosition.character
+          && trace.startedAt >= completionStartedAt);
+        result.editedEditorMemberCompletion = { startedMs: completionStartedMs, finishedMs: now(),
+          startedAt: completionStartedAt, labels, callbacks };
+        assert.ok(labels.includes('attached_query'));
+        assert.ok(callbacks.some(trace => trace.receiver?.modelLabel === 'app0.Model0'
+          && trace.receiver.kind === 'manager' && trace.memberNames?.includes('attached_query')));
+      } finally {
+        const restore = new vscode.WorkspaceEdit();
+        restore.replace(memberDocument.uri, new vscode.Range(memberDocument.positionAt(0),
+          memberDocument.positionAt(memberDocument.getText().length)), originalMemberText);
+        assert.ok(await vscode.workspace.applyEdit(restore));
+        assert.strictEqual(memberDocument.getText(), originalMemberText);
+      }
+      Object.assign(result.sourceEditMemberReadiness as Record<string, unknown>, { fullVerifiedMs: now(),
+        lspMembersAcknowledgedMs: editedMembersAcknowledgedMs, missingAfterWait: missingMembers(),
+        verifiedReceiverKinds: [...new Set(requiredMembers.map(([kind]) => kind))],
+        verifiedMemberPairs: requiredMembers.map(([kind, name]) => `${kind}.${name}`) });
+      await client.sendNotification('textDocument/didClose', { textDocument: { uri } });
+      result.sourceEditCurrentPythonAndClientTypesChecked = true;
+      saveSnapshot('source-edit-full');
+    } catch (error) { result.failure = String(error); throw error; }
+    finally {
+      internal.request = request;
+      methods.log = originalLog;
+      client.sendRequest = sendRequest;
+      if (result.failure) saveSnapshot('failure-state');
+      for (const [label, initial] of initials) {
+        const snapshot = artifactPrefix + '-' + label + '-initial.json.gz';
+        if (!snapshots.includes(snapshot)) {
+          fs.writeFileSync(path.resolve(__dirname, '../../', snapshot), zlib.gzipSync(JSON.stringify(initial)));
+          snapshots.push(snapshot);
+        }
+      }
+      result.queries = queries;
+      result.publications = publications;
+      result.initializations = initializations;
+      result.fullStates = fullStates;
+      result.logs = logs;
+      result.snapshots = snapshots;
+      result.environment = { djangoVersion: environment.djangoVersion, vscodeVersion: vscode.version,
+        cacheRoot: process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR ?? null,
+        surfaceCacheIdleMs: process.env.DJLS_SURFACE_CACHE_IDLE_MS ?? null,
+        inlineCachedSurface: process.env.DJLS_INLINE_CACHED_SURFACE ?? null,
+        surfaceCacheLoadMode: process.env.DJLS_SURFACE_CACHE_LOAD_MODE ?? null,
+        surfacePrebuildOnMiss: process.env.DJLS_SURFACE_PREBUILD_ON_MISS ?? null,
+        runtimeRegistryMode: process.env.DJLS_RUNTIME_REGISTRY_MODE ?? null,
+        providerTimeoutFlagSetByHarness: process.env.DJLS_DISABLE_PROVIDER_TIMEOUT === '1',
+        extraDisabledExtensions: process.env.DJLS_E2E_DISABLE_EXTENSIONS?.split(',') ?? [],
+        activeExtensions: vscode.extensions.all.filter(extension => extension.isActive)
+          .map(extension => ({ id: extension.id, version: extension.packageJSON.version })) };
+      result.finishedMs = now();
+      fs.writeFileSync(artifact('.json'), JSON.stringify(result));
+      console.info('[initial-catalog-native] ' + JSON.stringify({ artifact: artifactPrefix + '.json', failure: result.failure }));
+      await daemon.stop();
+      if (startupManifest) await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+      await removeWorkspaceFoldersFrom(0);
+      if (!startupManifest) fs.rmSync(root, { recursive: true, force: true });
+      if (previousCacheRoot === undefined) delete process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR;
+      else process.env.DJANGO_ORM_INTELLISENSE_CACHE_DIR = previousCacheRoot;
+    }
+  });
+
+  test('profiles live foreground requests across complete large runtime saves', async function () {
+    this.timeout(240_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+    assert.ok(environment);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-intellisense-live-foreground-'));
+    const prepared = await execFileAsync(environment.interpreterPath, ['-c',
+      'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from benchmarks.bench_async_runtime_member_refresh import create_fixture; source, helper, pyc = create_fixture(Path(sys.argv[2]), 500, 5000, empty_custom_app=True); print(source)',
+      path.resolve(__dirname, '../../python'), root]);
+    const modelsPath = prepared.trim();
+    const helperPath = path.join(root, 'bench_runtime.py');
+    const queryPath = path.join(root, 'helpers/helper_0.py');
+    fs.writeFileSync(queryPath, 'from app0.models import Model1\nModel1.objects.fi\nModel1.objects.filter(field_14__exact="value")\n');
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    await removeWorkspaceFoldersFrom(0);
+    const configured = { ...environment, settingsModule: 'bench_settings' };
+    const workspace = ensureFixtureWorkspace(root, configured);
+    await addWorkspaceFolder(workspace);
+    await applyFixtureWorkspaceSettings(workspace, root, configured);
+    startLanguageClientForTesting();
+    const client = getLanguageClientForTesting();
+    assert.ok(client);
+    const internal = daemon as unknown as {
+      request<T>(method: string, params: Record<string, unknown>, timeoutMs?: number, background?: boolean, source?: string): Promise<T>;
+      effectiveStaticFallback(): StaticFallback;
+    };
+    const request = internal.request;
+    const sendRequest = client.sendRequest;
+    const methods = daemon as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const originals = new Map<string, (...args: unknown[]) => unknown>();
+    const nativeMethods = require('../client/daemon/nativeFastPath') as Record<string, (...args: unknown[]) => unknown>;
+    const nativeOriginals = new Map<string, (...args: unknown[]) => unknown>();
+    const started = performance.now();
+    let phase = 'startup';
+    const requests: Array<Record<string, unknown>> = [];
+    const phases: Array<Record<string, unknown>> = [];
+    const windows: Array<Record<string, unknown>> = [];
+    const fullAcks = new Map<string, number>();
+    const newModelAcks = new Map<string, number>();
+    const newModelChecks: Array<Record<string, unknown>> = [];
+    const nativeLogs: Array<Record<string, unknown>> = [];
+    const hoverEvents: Array<{ phase: string; atMs: number; message: string }> = [];
+    const cpuProfiles: Array<{ phase: string; artifact: string }> = [];
+    const profilingEnabled = process.env.DJLS_E2E_CPU_PROFILE !== '0';
+    const artifactPrefix = `bench/lsp-live-foreground-native-${process.pid}-${Date.now()}`;
+    const artifactPath = path.resolve(__dirname, '../../', artifactPrefix + '.json');
+    const relativeNow = (): number => performance.now() - started;
+    const prefixes = ['attached', 'modified', 'replaced'];
+    const originalDiagnosticLog = methods.logDiagnostic;
+    originals.set('logDiagnostic', originalDiagnosticLog);
+    methods.logDiagnostic = function (...args) {
+      if (typeof args[0] === 'string' && args[0].startsWith('[hover')) {
+        hoverEvents.push({ phase, atMs: relativeNow(), message: args[0] });
+      }
+      return Reflect.apply(originalDiagnosticLog, this, args);
+    };
+    const originalLog = methods.log;
+    originals.set('log', originalLog);
+    methods.log = function (...args) {
+      if (args[0] !== 'debug' && typeof args[1] === 'string' && args[1].startsWith('[fastpath]')) {
+        nativeLogs.push({ phase, atMs: relativeNow(), message: args[1] });
+      }
+      return Reflect.apply(originalLog, this, args);
+    };
+    for (const name of ['ensureNativeFastPath', 'ensureNativeAstModules', 'hydrateNativeFastPathFromSurface',
+      'nativeResolveModule', 'nativeResolveExportOrigin', 'nativeResolveLookupPath', 'nativeResolveOrmMember',
+      'nativeListOrmMemberCompletions', 'resetNativeAstModulesFlag']) {
+      const original = nativeMethods[name];
+      nativeOriginals.set(name, original);
+      nativeMethods[name] = function (...args) {
+        const before = relativeNow(), label = phase;
+        try {
+          const result = Reflect.apply(original, this, args);
+          if (result instanceof Promise) void result.then(
+            () => { phases.push({ phase: label, method: 'native.' + name + '.settled', startedMs: before, elapsedMs: relativeNow() - before }); },
+            () => { phases.push({ phase: label, method: 'native.' + name + '.rejected', startedMs: before, elapsedMs: relativeNow() - before }); });
+          return result;
+        } finally { phases.push({ phase: label, method: 'native.' + name + '.sync', startedMs: before, elapsedMs: relativeNow() - before }); }
+      };
+    }
+    for (const name of ['parseServerMessage', 'handleServerNotification', 'rebuildLocalWorkspaceIndex',
+      'updateLocalWorkspaceIndex', 'refreshNativeFastPathFromSurface']) {
+      const original = methods[name];
+      originals.set(name, original);
+      methods[name] = function (...args) {
+        const before = relativeNow();
+        try { return Reflect.apply(original, this, args); }
+        finally { phases.push({ phase, method: name, startedMs: before, elapsedMs: relativeNow() - before }); }
+      };
+    }
+    internal.request = (async function (this: typeof internal, ...args: Parameters<typeof request>) {
+      const before = relativeNow(), label = phase;
+      try { return await Reflect.apply(request, this, args); }
+      finally { requests.push({ phase: label, transport: 'python', method: args[0], background: args[3] ?? false,
+        source: args[4], startedMs: before, elapsedMs: relativeNow() - before,
+        filePath: args[0] === 'reindexFile' ? args[1].filePath : undefined }); }
+    }) as typeof request;
+    client.sendRequest = (async (method: unknown, ...args: unknown[]) => {
+      const before = relativeNow(), label = phase;
+      const result = await Reflect.apply(sendRequest, client, [method, ...args]);
+      const elapsedMs = relativeNow() - before;
+      const params = args[0] as { surfaceIndex?: typeof daemon.surfaceIndex; surfaceIndexDelta?: typeof daemon.surfaceIndex;
+        surfaceTransport?: { kind: string; sequence: number }; removedSurfaceLabels?: string[];
+        lookupCatalog?: typeof daemon.lookupCatalog } | undefined;
+      const surface = params?.surfaceIndex ?? params?.surfaceIndexDelta;
+      const runtimePrefix = prefixes.find(prefix => Boolean(surface?.['app0.Model0']?.queryset?.[prefix + '_query']));
+      if (method === 'django/updateSurfaceIndex' && runtimePrefix) fullAcks.set(runtimePrefix, relativeNow());
+      if (method === 'django/updateSurfaceIndex' && label === 'newModelAdded'
+          && surface?.['late_custom.Added']?.queryset.current_query
+          && params?.lookupCatalog?.fields['late_custom.Added']?.pk) newModelAcks.set('added', relativeNow());
+      if (method === 'django/updateSurfaceIndex' && label === 'newModelDeleted'
+          && (params?.removedSurfaceLabels?.includes('late_custom.Added') || (params?.surfaceIndex && !params.surfaceIndex['late_custom.Added']))
+          && !params?.lookupCatalog?.fields['late_custom.Added']) newModelAcks.set('deleted', relativeNow());
+      requests.push({ phase: label, transport: 'lsp', method, startedMs: before, elapsedMs,
+        transportKind: params?.surfaceTransport?.kind, runtimePrefix,
+        models: surface && Object.keys(surface).length });
+      return result;
+    }) as typeof client.sendRequest;
+    const assertComplete = (prefix: string, manager: string, output: string): string => {
+      assert.strictEqual(Object.keys(daemon.surfaceIndex).length, 500);
+      const catalog = daemon.lookupCatalog!;
+      for (let model = 0; model < 500; model++) {
+        const label = `app${Math.floor(model / 50)}.Model${model}`;
+        const entry: (typeof daemon.surfaceIndex)[string] = daemon.surfaceIndex[label];
+        for (let field = 0; field < 15; field++) assert.ok(entry.instance[`field_${field}`]);
+        for (let relation = 0; relation < 2; relation++) {
+          const target = (model + relation + 1) % 500;
+          assert.strictEqual(entry.instance[`fk_${relation}`][1], `app${Math.floor(target / 50)}.Model${target}`);
+          const idType = catalog.fields[label][`fk_${relation}_id`];
+          assert.strictEqual(catalog.types[idType].fieldKind, 'BigAutoField', `Current catalog attname: ${label}.fk_${relation}_id`);
+        }
+      }
+      const entry = daemon.surfaceIndex['app0.Model0'];
+      for (const kind of ['instance', 'model_class', 'manager', 'queryset', 'related_manager']) {
+        for (const suffix of kind === 'instance' || kind === 'model_class' ? ['_instance', '_class'] : ['_query']) {
+          assert.strictEqual(entry[kind][prefix + suffix][1], 'app0.Model0');
+          for (const retired of prefixes.filter(value => value !== prefix)) assert.ok(!entry[kind][retired + suffix]);
+        }
+      }
+      assert.ok(entry.model_class[manager]);
+      for (const retired of ['special', 'another', 'revised'].filter(value => value !== manager)) assert.ok(!entry.model_class[retired]);
+      const field = catalog.types[catalog.fields['app0.Model0'].field_0];
+      assert.strictEqual(catalog.types[field.transforms.field_size!].fieldKind, output);
+      const health = daemon.getState();
+      assert.strictEqual(health.runtime?.modelCount, 500);
+      assert.strictEqual(health.semanticGraph?.runtimeModelCount, 500);
+      assert.strictEqual(health.staticIndex?.pythonFileCount, 5000);
+      assert.strictEqual(health.runtime?.modelPreview?.length, 10);
+      const preview = health.runtime?.modelPreview?.find(model => model.label === 'app0.Model0');
+      assert.deepStrictEqual(preview?.managerNames, ['objects', manager]);
+      const fresh = buildWorkspaceIndex(daemon.surfaceIndex, [...daemon.modelNames], daemon.customLookups,
+        internal.effectiveStaticFallback(), catalog);
+      const actual = daemon.localWorkspaceIndexForTesting;
+      for (const key of ['models', 'modelLabelByName', 'lookupTrie', 'transformTrie', 'lookupTypes', 'lookupCatalog'] as const) {
+        assert.deepStrictEqual(actual[key], fresh[key], `Live native complete fresh-index oracle: ${key}`);
+      }
+      const file = artifactPrefix + '-' + prefix + '.json.gz';
+      fs.writeFileSync(path.resolve(__dirname, '../../', file), zlib.gzipSync(JSON.stringify({
+        surfaceIndex: daemon.surfaceIndex, surfaceFingerprints: daemon.surfaceFingerprints,
+        customLookups: daemon.customLookups, customLookupsFingerprint: daemon.customLookupsFingerprint,
+        lookupCatalog: catalog, staticFallback: daemon.staticFallback,
+        staticFallbackFingerprint: daemon.staticFallbackFingerprint, modelNames: [...daemon.modelNames],
+        health: daemon.getState(), sources: { model: fs.readFileSync(modelsPath, 'utf8'), helper: fs.readFileSync(helperPath, 'utf8') },
+      })));
+      return file;
+    };
+    let document: vscode.TextDocument;
+    let lspVersion = 1;
+    const lspUri = vscode.Uri.file(path.join(root, 'virtual_foreground_query.py')).toString();
+    const describe = (values: number[]): Record<string, number> => {
+      const sorted = [...values].sort((a, b) => a - b);
+      return { count: values.length, medianMs: sorted.length === 0 ? 0 : sorted.length % 2
+        ? sorted[Math.floor(sorted.length / 2)] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2,
+        p95Ms: sorted[Math.ceil(sorted.length * .95) - 1] ?? 0, maxMs: sorted.at(-1) ?? 0,
+        above20Ms: values.filter(value => value >= 20).length, above50Ms: values.filter(value => value >= 50).length };
+    };
+    const measure = async (label: string, ready: () => boolean, minimumMs: number): Promise<void> => {
+      const profileClock: Record<string, number | boolean> = { enabled: profilingEnabled };
+      const session = profilingEnabled ? new inspector.Session() : undefined;
+      if (session) {
+        profileClock.setupStartedMs = relativeNow();
+        session.connect();
+        try {
+          await new Promise<void>((resolve, reject) => session.post('Profiler.enable', error => error ? reject(error) : resolve()));
+          await new Promise<void>((resolve, reject) => session.post('Profiler.setSamplingInterval', { interval: 2000 }, error => error ? reject(error) : resolve()));
+          profileClock.startRequestedMs = relativeNow();
+          profileClock.startRequestedUnixMs = Date.now();
+          await new Promise<void>((resolve, reject) => session.post('Profiler.start', error => error ? reject(error) : resolve()));
+          profileClock.startReturnedMs = relativeNow();
+          profileClock.startReturnedUnixMs = Date.now();
+        } catch (error) { session.disconnect(); throw error; }
+      }
+      phase = label;
+      const before = relativeNow();
+      const ticks: Array<{ atMs: number; excessMs: number }> = [];
+      const probes: Array<Record<string, unknown>> = [];
+      let lastTick = relativeNow(), readyAt: number | undefined;
+      const timer = setInterval(() => {
+        const now = relativeNow(); ticks.push({ atMs: now, excessMs: Math.max(0, now - lastTick - 10) }); lastTick = now;
+      }, 10);
+      try {
+        while (probes.length < 12 || readyAt === undefined || relativeNow() - readyAt < 300 || relativeNow() - before < minimumMs) {
+          assert.ok(relativeNow() - before < 60_000, 'Live foreground window must reach complete latest runtime and LSP state');
+          const probe = probes.length % 4;
+          const at = relativeNow(), unix = Date.now();
+          let method: string;
+          let provider: unknown;
+          let providerCallbacks: unknown;
+          if (probe === 0) {
+            method = 'rawPythonLookup';
+            const result = await internal.request<{ resolved: boolean }>('resolveLookupPath', {
+              baseModelLabel: 'app0.Model1', value: 'field_14__exact', method: 'filter',
+            }, 10_000, false, 'hover');
+            assert.ok(result.resolved);
+          } else if (probe === 1) {
+            method = 'lspCompletion';
+            const text = 'Model1.objects.filter(fk_0__field_0__i';
+            await client.sendNotification('textDocument/didChange', { textDocument: { uri: lspUri, version: ++lspVersion },
+              contentChanges: [{ text }] });
+            const result = await client.sendRequest<Array<{ label: string }>>('textDocument/completion', {
+              textDocument: { uri: lspUri }, position: { line: 0, character: text.length },
+            });
+            assert.ok(result.some(item => item.label === 'icontains'));
+          } else if (probe === 2) {
+            method = 'vscodeMemberCompletion';
+            const result = await vscode.commands.executeCommand<vscode.CompletionList>('vscode.executeCompletionItemProvider',
+              document.uri, new vscode.Position(1, document.lineAt(1).text.length));
+            assert.ok(hasCompletionItemLabel(result?.items, 'filter'), 'Actual VSCode manager completion must remain available during runtime saves');
+            provider = getCompletionTracesForTesting().filter(value => value.uri === document.uri.toString()
+              && value.line === 1 && value.startedAt >= unix).map(value => ({ startedAt: value.startedAt,
+              finishedAt: value.finishedAt, receiver: value.receiver, cancelled: value.cancelled, error: value.error,
+              memberCount: value.memberNames?.length, outputCount: value.outputNames?.length }));
+          } else {
+            method = 'vscodeHover';
+            const hoverPosition = new vscode.Position(2, document.lineAt(2).text.indexOf('field_14') + 2);
+            const result = await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', document.uri,
+              hoverPosition);
+            assert.ok(result && result.length > 0, 'Actual VSCode field hover must remain available during runtime saves');
+            assert.ok(stringifyHovers(result).includes('Field kind: `UUIDField`'),
+              'The hover command must include this extension\'s current field metadata');
+            provider = hoverEvents.filter(event => event.atMs >= at
+              && event.message.includes(`helpers/helper_0.py:${hoverPosition.line}:${hoverPosition.character}`));
+            providerCallbacks = getHoverTracesForTesting().filter(trace => trace.uri === document.uri.toString()
+              && trace.line === hoverPosition.line && trace.character === hoverPosition.character
+              && trace.startedMonotonicMs >= started + at).map(trace => ({ ...trace,
+                startedMs: trace.startedMonotonicMs - started,
+                finishedMs: trace.finishedMonotonicMs === undefined ? undefined : trace.finishedMonotonicMs - started }));
+            assert.ok((providerCallbacks as Array<{ returnedHover?: boolean; finishedMs?: number }>).some(
+              trace => trace.returnedHover && trace.finishedMs !== undefined), 'Own hover callback must finish with metadata');
+          }
+          const finishedMs = relativeNow();
+          probes.push({ method, startedMs: at, finishedMs, startedUnixMs: unix, elapsedMs: finishedMs - at, provider, providerCallbacks });
+          if (readyAt === undefined && ready()) readyAt = relativeNow();
+          await delay(10);
+        }
+      } finally {
+        clearInterval(timer);
+        windows.push({ phase: label, startedMs: before, finishedMs: relativeNow(), readyAtMs: readyAt,
+          probes, ticks, probeSummary: describe(probes.map(value => value.elapsedMs as number)),
+          timerExcessSummary: describe(ticks.map(value => value.excessMs)), profileClock });
+        if (session) {
+          profileClock.stopRequestedMs = relativeNow();
+          profileClock.stopRequestedUnixMs = Date.now();
+          let profile: inspector.Profiler.Profile;
+          try {
+            profile = await new Promise<inspector.Profiler.Profile>((resolve, reject) => {
+              session.post('Profiler.stop', (error, result) => error ? reject(error) : resolve(result.profile));
+            });
+            profileClock.stopReturnedMs = relativeNow();
+            profileClock.stopReturnedUnixMs = Date.now();
+          } finally { session.disconnect(); }
+          profileClock.startTimeUs = profile.startTime;
+          profileClock.endTimeUs = profile.endTime;
+          const artifact = artifactPrefix + '-' + label + '.cpuprofile';
+          fs.writeFileSync(path.resolve(__dirname, '../../', artifact), JSON.stringify(profile));
+          cpuProfiles.push({ phase: label, artifact });
+        }
+      }
+      phase = 'verification';
+    };
+    let failure: string | undefined;
+    const snapshots: string[] = [];
+    let stderrStream: NodeJS.ReadableStream | undefined;
+    const stderrChunks: Array<{ atMs: number; text: string }> = [];
+    const stderrListener = (chunk: Buffer): void => { stderrChunks.push({ atMs: relativeNow(), text: chunk.toString() }); };
+    try {
+      await daemon.restart(vscode.Uri.file(workspace));
+      stderrStream = (daemon as unknown as { process?: { stderr?: NodeJS.ReadableStream } }).process?.stderr;
+      stderrStream?.on('data', stderrListener);
+      await waitForHealthSnapshot(daemon, value => value.phase === 'ready' && value.runtime?.bootstrapStatus === 'ready', 30_000);
+      await waitForCondition(() => Boolean(daemon.surfaceIndex['app0.Model0']?.queryset.attached_query && fullAcks.has('attached')), 30_000);
+      const fullReadyAtMs = relativeNow();
+      snapshots.push(assertComplete('attached', 'special', 'CharField'));
+      document = await vscode.workspace.openTextDocument(queryPath);
+      await vscode.window.showTextDocument(document);
+      await client.sendNotification('textDocument/didOpen', { textDocument: { uri: lspUri, languageId: 'python', version: lspVersion, text: '' } });
+      await measure('firstInteraction', () => true, 0);
+      await measure('idle', () => true, 1000);
+      let previous = 'attached', previousManager = 'special', previousLength = '255';
+      for (const edit of [{ prefix: 'modified', manager: 'another', length: '10 ', output: 'DateField' },
+        { prefix: 'replaced', manager: 'revised', length: '255', output: 'CharField' }]) {
+        phase = edit.prefix;
+        const savedAtMs = relativeNow();
+        for (const file of [modelsPath, helperPath]) {
+          const old = fs.readFileSync(file, 'utf8');
+          const next = old.replaceAll(previous + '_', edit.prefix + '_')
+            .replace(previousManager + ' = ProjectManager()', edit.manager + ' = ProjectManager()')
+            .replace('field_0 = models.CharField(max_length=' + previousLength + ')',
+              'field_0 = models.CharField(max_length=' + edit.length + ')');
+          assert.strictEqual(Buffer.byteLength(next), Buffer.byteLength(old), 'Save keeps source size but changes current content');
+          fs.writeFileSync(file, next);
+        }
+        await measure(edit.prefix, () => Boolean(fullAcks.has(edit.prefix)
+          && daemon.surfaceIndex['app0.Model0']?.queryset[edit.prefix + '_query']), 0);
+        windows[windows.length - 1].savedAtMs = savedAtMs;
+        windows[windows.length - 1].fullLspAcknowledgedAtMs = fullAcks.get(edit.prefix);
+        snapshots.push(assertComplete(edit.prefix, edit.manager, edit.output));
+        const text = `Model0.objects.filter(field_0__field_size__${edit.output === 'DateField' ? 'ye' : 'i'}`;
+        await client.sendNotification('textDocument/didChange', { textDocument: { uri: lspUri, version: ++lspVersion }, contentChanges: [{ text }] });
+        const completion = await client.sendRequest<Array<{ label: string }>>('textDocument/completion', {
+          textDocument: { uri: lspUri }, position: { line: 0, character: text.length },
+        });
+        assert.ok(completion.some(item => item.label === (edit.output === 'DateField' ? 'year' : 'icontains')));
+        previous = edit.prefix; previousManager = edit.manager; previousLength = edit.length;
+      }
+      windows.unshift({ phase: 'startup', fullReadyAtMs });
+      // Model topology checks are outside the foreground timing windows.
+      const lateSource = path.join(root, 'lateapp/models.py');
+      const label = 'late_custom.Added';
+      const freshIndexCheck = (): void => {
+        const fresh = buildWorkspaceIndex(daemon.surfaceIndex, [...daemon.modelNames], daemon.customLookups,
+          internal.effectiveStaticFallback(), daemon.lookupCatalog);
+        for (const key of ['models', 'modelLabelByName', 'lookupTrie', 'transformTrie', 'lookupTypes', 'lookupCatalog'] as const) {
+          assert.deepStrictEqual(daemon.localWorkspaceIndexForTesting[key], fresh[key], `New model fresh-index oracle: ${key}`);
+        }
+      };
+      phase = 'newModelAdded';
+      const addedAtMs = relativeNow();
+      fs.writeFileSync(lateSource, [
+        'from django.db import models', 'class Size(models.Transform):', '    lookup_name="alias_size"',
+        '    output_field=models.IntegerField()', 'class Queries(models.QuerySet):', '    pass',
+        'def current_query(self) -> models.QuerySet:', '    return self', 'Queries.current_query=current_query',
+        'class Manager(models.Manager.from_queryset(Queries)):', '    pass', 'class Added(models.Model):',
+        '    code=models.UUIDField(primary_key=True)', '    value=models.CharField(max_length=20)',
+        '    owner=models.ForeignKey("app0.Model0", on_delete=models.CASCADE, related_name="late_rows", related_query_name="late_query")',
+        '    objects=Manager()', '    archive=Manager()', '    def current_instance(self) -> "Added":', '        return self',
+        '    @classmethod', '    def current_class(cls) -> "Added":', '        return cls()',
+        'Added._meta.get_field("value").register_lookup(Size)', '',
+      ].join('\n'));
+      await waitForCondition(() => Boolean(newModelAcks.has('added') && daemon.surfaceIndex[label]?.queryset.current_query
+        && daemon.getState().runtime?.modelCount === 501), 45_000);
+      const entry = daemon.surfaceIndex[label], catalogue = daemon.lookupCatalog!;
+      assert.strictEqual(Object.keys(daemon.surfaceIndex).length, 501);
+      assert.ok(!daemon.surfaceIndex['lateapp.Added']);
+      assert.strictEqual(entry.instance.pk[3], 'UUIDField');
+      assert.ok(!entry.instance.id);
+      assert.strictEqual(entry.instance.owner[1], 'app0.Model0');
+      assert.strictEqual(entry.instance.owner_id[3], 'BigAutoField');
+      assert.strictEqual(catalogue.types[catalogue.fields[label].pk].fieldKind, 'UUIDField');
+      assert.ok(!catalogue.fields[label].id);
+      assert.strictEqual(catalogue.types[catalogue.fields[label].owner_id].fieldKind, 'BigAutoField');
+      assert.strictEqual(catalogue.types[catalogue.types[catalogue.fields[label].value].transforms.alias_size!].fieldKind, 'IntegerField');
+      await waitForCondition(() => isNativeFastPathReady()
+        && nativeResolveOrmMember(label, 'instance', 'pk')?.item?.fieldKind === 'UUIDField', 15_000);
+      for (const nativePhase of ['ready', 'astEnsured']) {
+        if (nativePhase === 'astEnsured') assert.ok(await ensureNativeAstModules(root));
+        assert.strictEqual(nativeResolveOrmMember(label, 'instance', 'id'), undefined,
+          `${nativePhase}: native resolution must preserve the runtime absence of id`);
+        assert.strictEqual(nativeResolveLookupPath(label, 'id__exact', 'filter')?.resolved, false,
+          `${nativePhase}: native lookup must reject nonexistent id`);
+        const members = nativeListOrmMemberCompletions(label, 'instance', 'id');
+        const lookups = nativeListLookupPathCompletions(label, 'i', 'filter');
+        assert.ok(members && lookups, `${nativePhase}: native completion bindings are active`);
+        assert.ok(!members.items.some(item => item.name === 'id'));
+        assert.ok(!lookups.items.some(item => item.name === 'id'));
+      }
+      assert.strictEqual((await daemon.resolveOrmMember(label, 'instance', 'id')).resolved, false);
+      assert.strictEqual((await daemon.resolveLookupPath(label, 'id__exact', 'filter')).resolved, false);
+      assert.strictEqual((await internal.request<{ resolved: boolean }>('resolveOrmMember', {
+        modelLabel: label, receiverKind: 'instance', name: 'id',
+      })).resolved, false);
+      assert.strictEqual((await internal.request<{ resolved: boolean }>('resolveLookupPath', {
+        baseModelLabel: label, value: 'id__exact', method: 'filter',
+      })).resolved, false);
+      for (const name of ['late_rows', 'late_query']) assert.strictEqual(daemon.surfaceIndex['app0.Model0'].instance[name][1], label);
+      for (const kind of ['instance', 'model_class', 'manager', 'queryset', 'related_manager'] as const) {
+        const name = kind === 'instance' || kind === 'model_class' ? 'current_instance' : 'current_query';
+        const native = await daemon.resolveOrmMember(label, kind, name);
+        const python = await internal.request<{ resolved: boolean }>('resolveOrmMember', { modelLabel: label, receiverKind: kind, name });
+        assert.ok(native.resolved && python.resolved, `New runtime model receiver: ${kind}`);
+      }
+      for (const kind of ['manager', 'queryset', 'related_manager'] as const) {
+        assert.ok((await daemon.resolveOrmMemberChain(label, kind, ['current_query'], 'archive')).resolved);
+      }
+      for (const [base, value] of [[label, 'value__alias_size__gte'], [label, 'pk__exact'], [label, 'owner_id__gte'],
+        ['app0.Model0', 'late_query__value__alias_size__gte']]) {
+        assert.ok((await daemon.resolveLookupPath(base, value, 'filter')).resolved);
+        assert.ok((await internal.request<{ resolved: boolean }>('resolveLookupPath', { baseModelLabel: base, value, method: 'filter' })).resolved);
+      }
+      const text = 'Added.objects.filter(value__alias_size__g';
+      await client.sendNotification('textDocument/didChange', { textDocument: { uri: lspUri, version: ++lspVersion }, contentChanges: [{ text }] });
+      const completion = await client.sendRequest<Array<{ label: string }>>('textDocument/completion', {
+        textDocument: { uri: lspUri }, position: { line: 0, character: text.length },
+      });
+      assert.ok(completion.some(item => item.label === 'gte'), 'LSP completion uses the new model transform output');
+      const missingIdText = 'Added.objects.filter(i';
+      await client.sendNotification('textDocument/didChange', { textDocument: { uri: lspUri, version: ++lspVersion },
+        contentChanges: [{ text: missingIdText }] });
+      const missingIdCompletion = await client.sendRequest<Array<{ label: string }>>('textDocument/completion', {
+        textDocument: { uri: lspUri }, position: { line: 0, character: missingIdText.length },
+      });
+      assert.ok(!missingIdCompletion.some(item => item.label === 'id'), 'LSP completion preserves absent id');
+      freshIndexCheck();
+      const archiveTopology = (suffix: string): string => {
+        const file = artifactPrefix + '-' + suffix + '.json.gz';
+        fs.writeFileSync(path.resolve(__dirname, '../../', file), zlib.gzipSync(JSON.stringify({ surfaceIndex: daemon.surfaceIndex,
+          lookupCatalog: daemon.lookupCatalog, health: daemon.getState(), modelNames: [...daemon.modelNames],
+          source: fs.readFileSync(lateSource, 'utf8') })));
+        snapshots.push(file);
+        return file;
+      };
+      newModelChecks.push({ phase: 'added', modelCount: 501, savedAtMs: addedAtMs, lspAckAtMs: newModelAcks.get('added'),
+        allFiveNativeAndPythonReceivers: true, namedChains: true, nativeAndPythonLookupChains: true,
+        nativePrimaryKeyAuthority: true, absentIdMemberLookupAndCompletions: true,
+        customTransformLspCompletion: true, completeFreshIndexEqual: true, artifact: archiveTopology('new-model-added') });
+      phase = 'newModelDeleted';
+      const deletedAtMs = relativeNow();
+      fs.writeFileSync(lateSource, '');
+      await waitForCondition(() => Boolean(newModelAcks.has('deleted') && !daemon.surfaceIndex[label]
+        && daemon.getState().runtime?.modelCount === 500), 45_000);
+      assert.strictEqual(Object.keys(daemon.surfaceIndex).length, 500);
+      assert.ok(!daemon.lookupCatalog?.fields[label]);
+      for (const name of ['late_rows', 'late_query']) assert.ok(!daemon.surfaceIndex['app0.Model0'].instance[name]);
+      assert.strictEqual((await daemon.resolveOrmMember(label, 'instance', 'current_instance')).resolved, false);
+      freshIndexCheck();
+      newModelChecks.push({ phase: 'deleted', modelCount: 500, savedAtMs: deletedAtMs, lspAckAtMs: newModelAcks.get('deleted'),
+        retiredModelAndReverseAliasesRemoved: true, completeFreshIndexEqual: true, artifact: archiveTopology('new-model-deleted') });
+    } catch (error) { failure = String(error); throw error; }
+    finally {
+      internal.request = request; client.sendRequest = sendRequest;
+      for (const [name, original] of originals) methods[name] = original;
+      for (const [name, original] of nativeOriginals) nativeMethods[name] = original;
+      stderrStream?.removeListener('data', stderrListener);
+      const result = { observedUtc: new Date().toISOString(), models: 500, pythonFiles: 5000, failure,
+        measuredSha256: Object.fromEntries(['src/test/extension.test.ts', 'out/test/extension.test.js',
+          'src/client/daemon/analysisDaemon.ts', 'out/client/daemon/analysisDaemon.js',
+          'src/client/providers/pythonProviders.ts', 'out/client/providers/pythonProviders.js',
+          'python/django_orm_intellisense/server/app.py', 'python/django_orm_intellisense/cache/store.py',
+          'native/darwin-arm64/index.node'].map(name => [name,
+            createHash('sha256').update(fs.readFileSync(path.resolve(__dirname, '../../', name))).digest('hex')])),
+        environment: { djangoVersion: environment.djangoVersion, vscodeVersion: vscode.version,
+          cpuProfilingEnabled: profilingEnabled,
+          surfaceCacheIdleMs: process.env.DJLS_SURFACE_CACHE_IDLE_MS ?? null,
+          inlineCachedSurface: process.env.DJLS_INLINE_CACHED_SURFACE ?? null,
+          surfaceCacheLoadMode: process.env.DJLS_SURFACE_CACHE_LOAD_MODE ?? null,
+          surfacePrebuildOnMiss: process.env.DJLS_SURFACE_PREBUILD_ON_MISS ?? null,
+          runtimeRegistryMode: process.env.DJLS_RUNTIME_REGISTRY_MODE ?? null,
+          providerTimeoutFlagSetByHarness: process.env.DJLS_DISABLE_PROVIDER_TIMEOUT === '1',
+          extraDisabledExtensions: process.env.DJLS_E2E_DISABLE_EXTENSIONS?.split(',') ?? [],
+          activeExtensions: vscode.extensions.all.filter(extension => extension.isActive)
+            .map(extension => ({ id: extension.id, version: extension.packageJSON.version })) },
+        windows, requests, phases, nativeLogs, hoverEvents, stderrChunks, cpuProfiles, snapshots, newModelChecks, artifact: artifactPrefix + '.json',
+        scope: 'Actual VSCode with installed extensions (active IDs recorded), complete live 500-model/5000-file configured Django fixture. Normal external model/helper saves through real watcher/debounce, negotiated full snapshot model-delta LSP transport, sequential uncached raw foreground Python RPC, actual LSP relation completion, all-provider VSCode manager completion and field hover. Every foreground measurement window includes at least three of each probe. Ten-ms timer samples extension-host gaps. Optional in-process V8 CPU profiles sample at2ms and add diagnostic overhead; profileClock records start/stop request and return boundaries separately from the foreground window. CPU-profile clock alignment is bounded by those calls, not an exact shared-clock mapping. No forced GC, fresh-index oracle or JSON/hash/size diagnostics inside foreground windows; complete runtime metadata and independent client full-index oracles after each window. Native synchronous entry and asynchronous settlement are distinct. The provider-timeout environment flag is recorded, without asserting it changes production behavior. Provider timings include the harness environment and VSCode command includes other providers; no isolated-host or all-RPC/renderer memory/SLO proof.' };
+      fs.writeFileSync(artifactPath, JSON.stringify(result));
+      console.info('[live-surface-foreground] ' + JSON.stringify({ artifact: result.artifact, failure,
+        windows: windows.map(({ probes, ticks, ...value }) => ({ ...value, probes: (probes as unknown[] | undefined)?.length,
+          ticks: (ticks as unknown[] | undefined)?.length })), snapshots, requests: requests.length, phases: phases.length }));
+      await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('recovers surface transport baseline without losing saved model metadata', async function () {
+    this.timeout(120_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+    assert.ok(environment);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-intellisense-transport-'));
+    const prepared = await execFileAsync(environment.interpreterPath, ['-c',
+      'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from benchmarks.bench_async_runtime_member_refresh import create_fixture; source, helper, pyc = create_fixture(Path(sys.argv[2]), 500, 5000); print(source)',
+      path.resolve(__dirname, '../../python'), root]);
+    const modelsPath = prepared.trim();
+    const modelLabel = 'app0.Model0';
+    const source = fs.readFileSync(modelsPath, 'utf8').replace('class Model0(models.Model):',
+      'class Model0(models.Model):\n    transport_added = models.TextField()');
+    fs.writeFileSync(modelsPath, source);
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    const internal = daemon as unknown as {
+      surfaceSnapshotDecoder: { reset(): void; baseline?: { sequence: number } };
+      surfaceResyncPromise?: Promise<void>;
+      handleServerNotification(message: { event: string; params?: Record<string, unknown> }): void;
+      request(...args: unknown[]): Promise<unknown>;
+      effectiveStaticFallback(): StaticFallback;
+    };
+    const handle = internal.handleServerNotification;
+    const request = internal.request;
+    const frames: Array<{ kind: string; sequence: number; changed: string[]; handlerMs: number; phasesMs: Record<string, number>; reusedModels: number;
+      fallbackFingerprintBefore: string | null; fallbackFingerprintAfter: string | null; changedKindTypes: string[] }> = [];
+    const parsedFrames: Array<{ kind: string; sequence: number; parseMs: number; wireBytes: number }> = [];
+    const languageServerUpdates: Array<{ method: string; models: number; finalField: boolean; dispatchMs: number; acknowledgementMs: number; applied: boolean;
+      transportKind?: string; wireSequence?: number; payloadBytes: number }> = [];
+    let activePhases: Record<string, number> | undefined;
+    const methods = internal as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const originals = new Map<string, (...args: unknown[]) => unknown>();
+    for (const name of ['clearResponseCache', 'rebuildModelLabelByName', 'rebuildModelNames',
+      'rebuildLocalWorkspaceIndex', 'updateLocalWorkspaceIndex', 'refreshNativeFastPathFromSurface', 'updateState']) {
+      const original = methods[name];
+      originals.set(name, original);
+      methods[name] = function (...args) {
+        const started = performance.now();
+        try { return Reflect.apply(original, this, args); }
+        finally { if (activePhases) activePhases[name] = (activePhases[name] ?? 0) + performance.now() - started; }
+      };
+    }
+    const parse = methods.parseServerMessage;
+    methods.parseServerMessage = function (...args) {
+      const started = performance.now();
+      const result = Reflect.apply(parse, this, args) as { params?: { surfaceTransport?: { kind: string; sequence: number } } } | undefined;
+      const parseMs = performance.now() - started;
+      const header = result?.params?.surfaceTransport;
+      if (header) parsedFrames.push({ ...header, parseMs, wireBytes: Buffer.byteLength(String(args[0])) });
+      return result;
+    };
+    startLanguageClientForTesting();
+    const client = getLanguageClientForTesting();
+    assert.ok(client);
+    const sendRequest = client.sendRequest;
+    let freshIndexComparisons = 0;
+    const assertCompleteIndex = (): void => {
+      const expected = buildWorkspaceIndex(daemon.surfaceIndex, [...daemon.modelNames], daemon.customLookups,
+        internal.effectiveStaticFallback(), daemon.lookupCatalog);
+      const actual = daemon.localWorkspaceIndexForTesting;
+      for (const key of ['models', 'modelLabelByName', 'lookupTrie', 'transformTrie', 'lookupTypes', 'lookupCatalog'] as const) {
+        assert.deepStrictEqual(actual[key], expected[key], `Actual VSCode complete fresh-index oracle: ${key}`);
+      }
+      freshIndexComparisons++;
+    };
+    let recoveryRequests = 0;
+    let failNextResync = false;
+    await removeWorkspaceFoldersFrom(0);
+    try {
+      const configured = { ...environment, settingsModule: 'bench_settings' };
+      const workspace = ensureFixtureWorkspace(root, configured);
+      await addWorkspaceFolder(workspace);
+      await applyFixtureWorkspaceSettings(workspace, root, configured);
+      internal.handleServerNotification = function (message) {
+        const header = message.params?.surfaceTransport as { kind: string; sequence: number } | undefined;
+        const previousModels = new Map(daemon.localWorkspaceIndexForTesting.models);
+        const fallbackFingerprintBefore = daemon.staticFallbackFingerprint;
+        const nextCatalog = message.params?.lookupCatalog as typeof daemon.lookupCatalog;
+        const oldCatalog = daemon.localWorkspaceIndexForTesting.lookupCatalog;
+        const changedKindTypes = Object.entries(nextCatalog?.kinds ?? {}).filter(([kind, id]) =>
+          JSON.stringify(oldCatalog?.types?.[oldCatalog.kinds?.[kind] ?? '']) !== JSON.stringify(nextCatalog?.types?.[id])).map(([kind]) => kind);
+        const started = performance.now();
+        const phasesMs: Record<string, number> = {};
+        activePhases = phasesMs;
+        try { return handle.call(this, message); }
+        finally {
+          activePhases = undefined;
+          const handlerMs = performance.now() - started;
+          if (header) frames.push({ ...header, changed: Object.keys(message.params?.surfaceIndexDelta ?? {}),
+            handlerMs, phasesMs, fallbackFingerprintBefore, fallbackFingerprintAfter: daemon.staticFallbackFingerprint, changedKindTypes,
+            reusedModels: [...daemon.localWorkspaceIndexForTesting.models]
+              .filter(([label, model]) => previousModels.get(label) === model).length });
+        }
+      };
+      client.sendRequest = (async (method: unknown, ...args: unknown[]) => {
+        if (method !== 'django/updateSurfaceIndex' && method !== 'django/updateSurfaceIndexDelta') {
+          return Reflect.apply(sendRequest, client, [method, ...args]);
+        }
+        const started = performance.now();
+        const pending = Reflect.apply(sendRequest, client, [method, ...args]) as Promise<{ applied: boolean }>;
+        const dispatchMs = performance.now() - started;
+        const result = await pending;
+        const acknowledgementMs = performance.now() - started;
+        const params = args[0] as { surfaceIndex?: typeof daemon.surfaceIndex; surfaceIndexDelta?: typeof daemon.surfaceIndex;
+          surfaceTransport?: { kind: string; sequence: number } };
+        const surface = params.surfaceIndex ?? params.surfaceIndexDelta ?? {};
+        languageServerUpdates.push({ method, models: Object.keys(params.surfaceIndex ?? params.surfaceIndexDelta ?? {}).length,
+          finalField: Boolean(surface[modelLabel]?.instance?.transport_final),
+          dispatchMs, acknowledgementMs, applied: result.applied,
+          transportKind: params.surfaceTransport?.kind, wireSequence: params.surfaceTransport?.sequence,
+          payloadBytes: Buffer.byteLength(JSON.stringify(params)) });
+        return result;
+      }) as typeof client.sendRequest;
+      internal.request = function (...args) {
+        if (args[0] === 'resyncSurfaceSnapshot') {
+          recoveryRequests++;
+          if (failNextResync) { failNextResync = false; return Promise.reject(new Error('controlled transient resync failure')); }
+        }
+        return Reflect.apply(request, this, args);
+      };
+      await daemon.restart(vscode.Uri.file(workspace));
+      await waitForHealthSnapshot(daemon, value => value.phase === 'ready' && value.runtime?.bootstrapStatus === 'ready', 30_000);
+      await waitForCondition(() => Boolean(daemon.surfaceIndex[modelLabel]?.instance.transport_added
+        && internal.surfaceSnapshotDecoder.baseline), 15_000);
+      assert.strictEqual(Object.keys(daemon.surfaceIndex).length, 500);
+      assert.strictEqual(client.initializeResult?.capabilities.experimental?.djangoSurfaceSnapshotTransport, 1);
+      assertCompleteIndex();
+      const sequence = internal.surfaceSnapshotDecoder.baseline!.sequence;
+      const edited = source.replace('transport_added = models.TextField()', 'transport_added = models.IntegerField()');
+      fs.writeFileSync(modelsPath, edited);
+      await waitForCondition(() => daemon.localWorkspaceIndexForTesting.models.get(modelLabel)?.fields.get('transport_added')?.fieldKind === 'IntegerField'
+        && frames.some(frame => frame.kind === 'delta' && frame.sequence > sequence && frame.changed.includes(modelLabel)), 20_000);
+      assertCompleteIndex();
+      const beforeSurface = JSON.stringify(daemon.surfaceIndex);
+      const beforeFingerprints = JSON.stringify(daemon.surfaceFingerprints);
+      const lastSequence = internal.surfaceSnapshotDecoder.baseline!.sequence;
+      internal.surfaceSnapshotDecoder.reset();
+      const invalid = { event: 'surfaceIndexChanged', params: {
+        surfaceTransport: { version: 1, kind: 'delta', sequence: lastSequence + 1, baseSequence: lastSequence },
+        surfaceIndexDelta: {}, surfaceFingerprints: {}, removedSurfaceLabels: [],
+      } };
+      const previousRequests = recoveryRequests;
+      internal.handleServerNotification(invalid);
+      internal.handleServerNotification(invalid);
+      assert.strictEqual(recoveryRequests, previousRequests + 1, 'Concurrent baseline failures must share one real resync request');
+      await waitForCondition(() => Boolean(internal.surfaceSnapshotDecoder.baseline && !internal.surfaceResyncPromise
+        && frames.some(frame => frame.kind === 'full' && frame.sequence > lastSequence)), 15_000);
+      assert.deepStrictEqual(daemon.surfaceIndex, JSON.parse(beforeSurface));
+      assert.deepStrictEqual(daemon.surfaceFingerprints, JSON.parse(beforeFingerprints));
+      assertCompleteIndex();
+      const firstRecoveredSequence = internal.surfaceSnapshotDecoder.baseline!.sequence;
+      const firstRecoveryRequests = recoveryRequests;
+      failNextResync = true;
+      internal.surfaceSnapshotDecoder.reset();
+      internal.handleServerNotification(invalid);
+      internal.handleServerNotification(invalid);
+      assert.strictEqual(recoveryRequests, firstRecoveryRequests + 1);
+      await waitForCondition(() => recoveryRequests === firstRecoveryRequests + 2
+        && Boolean(internal.surfaceSnapshotDecoder.baseline && !internal.surfaceResyncPromise)
+        && frames.some(frame => frame.kind === 'full' && frame.sequence > firstRecoveredSequence), 15_000);
+      assert.deepStrictEqual(daemon.surfaceIndex, JSON.parse(beforeSurface));
+      assertCompleteIndex();
+      const recoveredSequence = internal.surfaceSnapshotDecoder.baseline!.sequence;
+      // Clear the actual LSP wire basis through a rejected request. The publisher
+      // must recover the next publication even though the Python basis is valid.
+      await assert.rejects(client.sendRequest('django/updateSurfaceIndex', {
+        surfaceTransport: { version: 1, kind: 'delta', sequence: 1, baseSequence: -1 },
+        surfaceIndexDelta: {}, surfaceFingerprints: {}, removedSurfaceLabels: [],
+      }));
+      fs.writeFileSync(modelsPath, edited.replaceAll('transport_added', 'transport_final'));
+      await waitForCondition(() => daemon.localWorkspaceIndexForTesting.models.get(modelLabel)?.fields.has('transport_final') === true
+        && !daemon.localWorkspaceIndexForTesting.models.get(modelLabel)?.fields.has('transport_added')
+        && frames.some(frame => frame.kind === 'delta' && frame.sequence > recoveredSequence && frame.changed.includes(modelLabel)), 20_000);
+      assertCompleteIndex();
+      await waitForCondition(() => languageServerUpdates.some(update => update.finalField && update.applied), 15_000);
+      assert.ok(languageServerUpdates.some(update => update.method === 'django/updateSurfaceIndex'
+        && update.transportKind === 'delta' && update.applied), 'Actual negotiated LSP snapshot transport must exercise a model delta');
+      console.info('[surface-transport-recovery] ' + JSON.stringify({ recoveryRequests, frames, parsedFrames, languageServerUpdates, freshIndexComparisons,
+        models: Object.keys(daemon.surfaceIndex).length, pythonFiles: 5000,
+        finalFieldKind: daemon.localWorkspaceIndexForTesting.models.get(modelLabel)?.fields.get('transport_final')?.fieldKind }));
+      const uri = vscode.Uri.file(path.join(root, 'transport_query.py')).toString();
+      const text = 'Model0.objects.filter(transport_';
+      await client.sendNotification('textDocument/didOpen', { textDocument: { uri, languageId: 'python', version: 1, text } });
+      const serverFields = await client.sendRequest<Array<{ label: string }>>('textDocument/completion', {
+        textDocument: { uri }, position: { line: 0, character: text.length },
+      });
+      const labels = serverFields.map(value => value.label);
+      assert.ok(labels.includes('transport_final'), `Actual LSP completion must include the renamed field: ${labels.join(', ')}`);
+      assert.ok(!labels.includes('transport_added'), 'Actual LSP completion must retire the removed field');
+      console.info('[surface-adoption-lsp-completion] ' + JSON.stringify({ labels }));
+    } finally {
+      internal.handleServerNotification = handle;
+      internal.request = request;
+      methods.parseServerMessage = parse;
+      for (const [name, original] of originals) methods[name] = original;
+      client.sendRequest = sendRequest;
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('refreshes parameterized lookup output after a same-kind field save', async function () {
+    const visualHoldMs = Math.min(180_000, Math.max(0, Number(process.env.DJLS_E2E_VISUAL_HOLD_MS ?? 0)));
+    this.timeout(45_000 + visualHoldMs);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+    assert.ok(environment);
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-intellisense-constructor-root-'));
+    copyDirectory(fixtureRoot, tempRoot);
+    const modelsPath = path.join(tempRoot, 'blog/models.py');
+    const original = fs.readFileSync(modelsPath, 'utf8') + `\nclass FieldSizeTransform(models.Transform):
+    lookup_name = 'field_size'
+    @property
+    def output_field(self):
+        return models.DateField() if self.lhs.output_field.max_length == 10 else models.CharField()
+Post._meta.get_field('title').register_lookup(FieldSizeTransform)
+`;
+    fs.writeFileSync(modelsPath, original, 'utf8');
+    const queryPath = path.join(tempRoot, 'blog/query_examples.py');
+    fs.appendFileSync(queryPath, '\nPost.objects.filter(title__field_size__ye=2026)\n', 'utf8');
+    await removeWorkspaceFoldersFrom(0);
+    try {
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon);
+      const workspace = ensureFixtureWorkspace(tempRoot, environment);
+      await addWorkspaceFolder(workspace);
+      await applyFixtureWorkspaceSettings(workspace, tempRoot, environment);
+      await daemon.restart(vscode.Uri.file(workspace));
+      await waitForHealthSnapshot(daemon, value => value.phase === 'ready' && value.runtime?.bootstrapStatus === 'ready', 30_000);
+      assert.strictEqual((await daemon.resolveLookupPath('blog.Post', 'title__field_size', 'filter')).terminalType?.outputFieldKind, 'CharField');
+      const constantSource = original.replace('class Post(models.Model):', 'POST_TITLE_LIMIT = 255\n\nclass Post(models.Model):')
+        .replace('    title = models.CharField(max_length=255)\n', '    title = models.CharField(max_length=POST_TITLE_LIMIT)\n');
+      assert.notStrictEqual(constantSource, original);
+      for (const edit of [
+        { source: original.replace('    title = models.CharField(max_length=255)\n', '    title = models.CharField(max_length=10)\n'), output: 'DateField' },
+        { source: constantSource, output: 'CharField' },
+        { source: constantSource.replace('POST_TITLE_LIMIT = 255', 'POST_TITLE_LIMIT = 10'), output: 'DateField' },
+      ]) {
+        fs.writeFileSync(modelsPath, edit.source, 'utf8');
+        await waitForCondition(() => {
+          const catalog = daemon.lookupCatalog;
+          const rootId = catalog?.fields['blog.Post']?.title;
+          const outputId = rootId && catalog?.types[rootId]?.transforms.field_size;
+          return Boolean(outputId && catalog?.types[outputId]?.fieldKind === edit.output);
+        }, 15_000);
+        assert.strictEqual((await daemon.resolveLookupPath('blog.Post', 'title__field_size', 'filter')).terminalType?.outputFieldKind, edit.output);
+      }
+      const constantsPath = path.join(tempRoot, 'blog/title_options.py');
+      fs.writeFileSync(constantsPath, 'POST_TITLE_LIMIT = 255\nTITLE_CODE = "draft"\nTITLE_LABEL = "Draft"\n', 'utf8');
+      const importedSource = constantSource.replace(
+        'POST_TITLE_LIMIT = 255', 'from .title_options import POST_TITLE_LIMIT, TITLE_CODE, TITLE_LABEL')
+        .replace('models.CharField(max_length=POST_TITLE_LIMIT)',
+          'models.CharField(max_length=POST_TITLE_LIMIT, choices=[(TITLE_CODE, TITLE_LABEL), ("done", "Done")])');
+      fs.writeFileSync(modelsPath, importedSource, 'utf8');
+      await waitForCondition(() => {
+        const catalog = daemon.lookupCatalog;
+        const rootId = catalog?.fields['blog.Post']?.title;
+        const outputId = rootId && catalog?.types[rootId]?.transforms.field_size;
+        return Boolean(outputId && catalog?.types[outputId]?.fieldKind === 'CharField');
+      }, 15_000);
+      for (const edit of [
+        { value: 10, output: 'DateField' },
+        { value: 255, output: 'CharField' },
+        { value: 10, output: 'DateField' },
+      ]) {
+        fs.writeFileSync(constantsPath,
+          `POST_TITLE_LIMIT = ${edit.value}\nTITLE_CODE = "draft"\nTITLE_LABEL = "Draft"\n`, 'utf8');
+        await waitForCondition(() => {
+          const catalog = daemon.lookupCatalog;
+          const rootId = catalog?.fields['blog.Post']?.title;
+          const outputId = rootId && catalog?.types[rootId]?.transforms.field_size;
+          return Boolean(outputId && catalog?.types[outputId]?.fieldKind === edit.output);
+        }, 15_000);
+        assert.strictEqual(fs.readFileSync(modelsPath, 'utf8'), importedSource,
+          'Imported constant updates must refresh lookups without rewriting the model declaration.');
+        assert.strictEqual((await daemon.resolveLookupPath('blog.Post', 'title__field_size', 'filter')).terminalType?.outputFieldKind, edit.output);
+      }
+      assert.strictEqual((await daemon.resolveLookupPath('blog.Post', 'title__field_size__year__gte', 'filter')).terminalType?.outputFieldKind, 'IntegerField');
+      const document = await vscode.workspace.openTextDocument(queryPath);
+      const editor = await vscode.window.showTextDocument(document);
+      const position = positionAfterText(document, 'Post.objects.filter(title__field_size__ye');
+      const completions = await vscode.commands.executeCommand<vscode.CompletionList>('vscode.executeCompletionItemProvider', document.uri, position);
+      assert.ok(hasCompletionItemLabel(completions?.items ?? [], 'year'), 'saved constructor options must refresh chained completion');
+      editor.selection = new vscode.Selection(position, position);
+      editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
+      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+      await vscode.commands.executeCommand('editor.action.triggerSuggest');
+      if (visualHoldMs) {
+        console.info('[constructor:e2e] suggestion popup held for visual QA');
+        await delay(visualHoldMs);
+      }
+    } finally {
+      await removeWorkspaceFoldersFrom(0);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('keeps runtime app labels canonical after model field saves', async function () {
+    this.timeout(40_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    const environment = await ensureFixtureE2EEnvironment(fixtureRoot);
+    assert.ok(environment);
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-intellisense-label-split-root-'));
+    copyDirectory(fixtureRoot, tempRoot);
+    const appRoot = path.join(tempRoot, 'relabelled');
+    fs.mkdirSync(appRoot);
+    fs.writeFileSync(path.join(appRoot, '__init__.py'), '', 'utf8');
+    fs.writeFileSync(path.join(appRoot, 'apps.py'), "from django.apps import AppConfig\nclass RelabelledConfig(AppConfig):\n    name = 'relabelled'\n    label = 'graph_db'\n", 'utf8');
+    const modelsPath = path.join(appRoot, 'models.py');
+    const original = 'from django.db import models\nclass LabelSplitInvoice(models.Model):\n    title = models.CharField(max_length=30)\n';
+    fs.writeFileSync(modelsPath, original, 'utf8');
+    fs.appendFileSync(path.join(tempRoot, 'project/settings.py'), "\nINSTALLED_APPS.append('relabelled.apps.RelabelledConfig')\n", 'utf8');
+    const queryPath = path.join(appRoot, 'queries.py');
+    fs.writeFileSync(queryPath, 'from relabelled.models import LabelSplitInvoice\nLabelSplitInvoice.objects.filter(co=1)\n', 'utf8');
+    await removeWorkspaceFoldersFrom(0);
+    try {
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon);
+      const workspace = ensureFixtureWorkspace(tempRoot, environment);
+      await addWorkspaceFolder(workspace);
+      await applyFixtureWorkspaceSettings(workspace, tempRoot, environment);
+      await daemon.restart(vscode.Uri.file(workspace));
+      await waitForHealthSnapshot(daemon, value => value.phase === 'ready' && value.runtime?.bootstrapStatus === 'ready', 30_000);
+      fs.writeFileSync(modelsPath, original + '    count = models.IntegerField()\n', 'utf8');
+      await waitForCondition(() => Boolean(daemon.surfaceIndex['graph_db.LabelSplitInvoice']?.instance?.count), 15_000);
+      assert.strictEqual(daemon.surfaceIndex['relabelled.LabelSplitInvoice'], undefined);
+      assert.strictEqual(daemon.findModelLabelByShortName('LabelSplitInvoice'), 'graph_db.LabelSplitInvoice');
+      const resolved = await daemon.resolveLookupPath('graph_db.LabelSplitInvoice', 'count__gte', 'filter');
+      assert.ok(resolved.resolved, JSON.stringify(resolved));
+      assert.strictEqual(resolved.terminalType?.outputFieldKind, 'IntegerField');
+      const document = await vscode.workspace.openTextDocument(queryPath);
+      await vscode.window.showTextDocument(document);
+      const completions = await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider', document.uri, positionAfterText(document, 'LabelSplitInvoice.objects.filter(co'));
+      assert.ok(hasCompletionItemLabel(completions?.items ?? [], 'count'));
     } finally {
       await removeWorkspaceFoldersFrom(0);
       fs.rmSync(tempRoot, { recursive: true, force: true });
@@ -1181,10 +4294,21 @@ suite('Django ORM Intellisense UI', () => {
       );
       fs.writeFileSync(basePath, updatedBase, 'utf8');
 
-      await waitForCondition(
-        () => Boolean(daemon.surfaceIndex['org.Vendor']?.instance?.updated_by),
-        15_000
-      );
+      try {
+        await waitForCondition(
+          () => Boolean(daemon.surfaceIndex['org.Vendor']?.instance?.updated_by),
+          15_000
+        );
+      } catch (error) {
+        console.error('[inheritance-watch-miss] ' + JSON.stringify({
+          basePath, pending: getPendingSourceEventsForTesting(),
+          watcher: getSourceWatcherStateForTesting(),
+          localField: daemon.localWorkspaceIndexForTesting.models.get('org.Vendor')?.fields.get('updated_by'),
+          surfaceField: daemon.surfaceIndex['org.Vendor']?.instance?.updated_by,
+          recentLogs: getDiagnosticLogBufferForTesting().slice(-20),
+        }));
+        throw error;
+      }
 
       const document = await openFixtureDocument(
         tempRoot,
@@ -1296,9 +4420,11 @@ suite('Django ORM Intellisense UI', () => {
       definitionTarget,
       'Expected a definition target for the runtime-backed reverse lookup path.'
     );
+    const modelsPath = path.join(fixtureRoot, 'blog/models.py');
+    assert.strictEqual(definitionTarget!.uri.fsPath, modelsPath);
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      127,
+      findClassFieldLine(modelsPath, 'CorporateRegistration', 'registration_code'),
       'Expected reverse lookup definition to target the CorporateRegistration.registration_code field.'
     );
 
@@ -1374,9 +4500,11 @@ suite('Django ORM Intellisense UI', () => {
       definitionTarget,
       'Expected a definition target for the app-label-overridden reverse lookup path.'
     );
+    const modelsPath = path.join(fixtureRoot, 'blog/models.py');
+    assert.strictEqual(definitionTarget!.uri.fsPath, modelsPath);
     assert.strictEqual(
       definitionTarget!.range.start.line + 1,
-      190,
+      findClassFieldLine(modelsPath, 'AppLabelCorporateRegistration', 'registration_code'),
       'Expected app-label-overridden reverse lookup definition to target AppLabelCorporateRegistration.registration_code.'
     );
 
@@ -1971,7 +5099,7 @@ suite('Django ORM Intellisense UI', () => {
     );
     assert.strictEqual(
       queryNameDefinitionTarget!.range.start.line + 1,
-      164,
+      277,
       'Expected reverse related_query_name definition to target FaqLink.label.'
     );
 
@@ -2878,20 +6006,33 @@ suite('Django ORM Intellisense UI', () => {
   });
 
   test('suppresses automatic ORM parameter hints without disabling manual signature help', async function () {
-    this.timeout(30_000);
+    const visualHoldMs = Math.min(60_000, Math.max(0, Number(process.env.DJLS_E2E_VISUAL_HOLD_MS ?? 0)));
+    const nativeInput = process.env.DJLS_E2E_NATIVE_INPUT === '1';
+    this.timeout(30_000 + visualHoldMs + (nativeInput ? 120_000 : 0));
 
     const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
     await setWorkspaceRoot(fixtureRoot);
 
-    const document = await openFixtureDocument(
+    let document = await openFixtureDocument(
       fixtureRoot,
       'blog/query_examples.py'
     );
-    const editor = vscode.window.activeTextEditor;
+    let editor = vscode.window.activeTextEditor;
     assert.ok(editor, 'Expected the fixture document to be visible.');
     assert.strictEqual(editor!.document.uri.toString(), document.uri.toString());
 
     let fallbackCalls = 0;
+    const rendererPort = Number(process.env.DJLS_E2E_RENDERER_DEBUG_PORT ?? 0);
+    const renderer = rendererPort ? await RendererHoverProbe.connect(rendererPort) : undefined;
+    const inputChanges = nativeInput || renderer ? vscode.workspace.onDidChangeTextDocument(event => {
+      if (event.document.uri.toString() === document.uri.toString()) {
+        console.info('[signature-document-change] ' + JSON.stringify({ version: event.document.version,
+          changes: event.contentChanges.map(change => ({ text: change.text.slice(0, 100), range: change.range })) }));
+      }
+    }) : undefined;
+    const nativeFocusObserver = nativeInput ? vscode.window.onDidChangeWindowState(state => {
+      console.info('[signature-native-window] ' + JSON.stringify({ focused: state.focused, at: Date.now() }));
+    }) : undefined;
     const fallbackSignatureProvider =
       vscode.languages.registerSignatureHelpProvider(
         // Register a competing provider after the extension, then explicitly
@@ -2899,7 +6040,7 @@ suite('Django ORM Intellisense UI', () => {
         // generic Python providers such as Pylance.
         'python',
         {
-          provideSignatureHelp() {
+          provideSignatureHelp(document, position, _token, context) {
             fallbackCalls++;
             const fallbackHelp = new vscode.SignatureHelp();
             fallbackHelp.signatures = [
@@ -2920,8 +6061,9 @@ suite('Django ORM Intellisense UI', () => {
         10_000
       );
       await delay(250);
+      clearDiagnosticLogBufferForTesting();
       promotePythonProvidersForTesting('signature-overlap-test');
-      await delay(500);
+      await waitForCondition(() => getDiagnosticLogBufferForTesting().some(line => line.includes('Re-registered Python providers (signature-overlap-test)')), 10_000);
 
       const filterCall = 'Post.objects.filter()';
       const openParenPosition = positionAfterTextInContainer(
@@ -2940,20 +6082,59 @@ suite('Django ORM Intellisense UI', () => {
         'Expected the fixture call parentheses to be removed before typing.'
       );
 
-      editor!.selection = new vscode.Selection(
-        openParenPosition,
-        openParenPosition
-      );
-      await vscode.commands.executeCommand(
-        'workbench.action.focusActiveEditorGroup'
-      );
-      await vscode.commands.executeCommand('type', { text: '(' });
+      editor!.selection = new vscode.Selection(openParenPosition, openParenPosition);
+      editor!.revealRange(new vscode.Range(openParenPosition, openParenPosition), vscode.TextEditorRevealType.InCenter);
+      // The test-owned workbench can restore a focused Chat input. Keep the
+      // code editor as the sole visible typing target for this keyboard test.
+      await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+      if (renderer) console.info('[signature-editor-before-input] ' + JSON.stringify(await renderer.editorObservation()));
+      if (nativeInput) {
+        console.info('[signature-native-input] ' + JSON.stringify({ phase: 'orm', uri: document.uri.toString(),
+          line: openParenPosition.line, character: openParenPosition.character, windowFocused: vscode.window.state.focused }));
+        try {
+          await waitForCondition(() => document.lineAt(openParenPosition.line).text.includes('Post.objects.filter('), 60_000);
+        } catch (error) {
+          console.info('[signature-native-input-miss] ' + JSON.stringify({ closed: document.isClosed,
+            version: document.version, line: document.lineAt(openParenPosition.line).text,
+            activeVersion: vscode.window.activeTextEditor?.document.version,
+            activeLine: vscode.window.activeTextEditor?.document.lineAt(openParenPosition.line).text,
+            ui: await renderer?.editorObservation() }));
+          throw error;
+        }
+      } else if (visualHoldMs > 0) {
+        console.info(`[signature-input-visual] ready uri=${document.uri.toString()} holdMs=${visualHoldMs}`);
+        await delay(visualHoldMs);
+      }
+      if (!nativeInput) await vscode.commands.executeCommand('default:type', { text: '(' });
+      if (renderer) console.info('[signature-editor-after-input] ' + JSON.stringify({
+        ui: await renderer.editorObservation(), closed: document.isClosed, version: document.version,
+        line: document.lineAt(openParenPosition.line).text,
+        activeVersion: vscode.window.activeTextEditor?.document.version,
+        activeLine: vscode.window.activeTextEditor?.document.lineAt(openParenPosition.line).text,
+      }));
+      try {
+        await waitForCondition(() => vscode.window.activeTextEditor?.document.uri.toString() === document.uri.toString()
+          && vscode.window.activeTextEditor.document.lineAt(openParenPosition.line).text.includes('Post.objects.filter('), 1_000);
+      } catch (error) {
+        const active = vscode.window.activeTextEditor;
+        console.info(`[signature-input-miss] ${JSON.stringify({ expected: document.uri.toString(), active: active?.document.uri.toString(),
+          line: document.lineAt(openParenPosition.line).text, cursor: active?.selection.active, viewColumn: active?.viewColumn,
+          visible: vscode.window.visibleTextEditors.map(value => ({ uri: value.document.uri.toString(), viewColumn: value.viewColumn })),
+          windowFocused: vscode.window.state.focused })}`);
+        throw error;
+      }
 
       // Signature help is delayed by VS Code before providers are queried.
       // Give the real ORM provider enough time to resolve and return its empty
       // automatic result; a missing/undefined result would continue into the
       // lower-priority fallback provider.
       await delay(1_500);
+      console.info('[signature-automatic-observation] ' + JSON.stringify({ nativeInput, fallbackCalls,
+        windowFocused: vscode.window.state.focused,
+        signatures: getDiagnosticLogBufferForTesting().filter(line => line.startsWith('[signature]')).slice(-8) }));
+      assert.ok(getDiagnosticLogBufferForTesting().some(line => line.includes('[signature] receiver=Post.objects model=blog.Post trigger=2')),
+        'Automatic ORM signature help must actually run after the trigger character');
       assert.strictEqual(
         fallbackCalls,
         0,
@@ -2963,6 +6144,8 @@ suite('Django ORM Intellisense UI', () => {
       await vscode.commands.executeCommand('closeParameterHints');
       if (document.isDirty) {
         await vscode.commands.executeCommand('workbench.action.files.revert');
+        document = await vscode.workspace.openTextDocument(document.uri);
+        editor = await vscode.window.showTextDocument(document);
       }
       await delay(300);
 
@@ -3002,7 +6185,15 @@ suite('Django ORM Intellisense UI', () => {
         'Expected the control call parentheses to be removed before typing.'
       );
       editor!.selection = new vscode.Selection(nonOrmOpenParen, nonOrmOpenParen);
-      await vscode.commands.executeCommand('type', { text: '(' });
+      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+      if (nativeInput) {
+        console.info('[signature-native-input] ' + JSON.stringify({ phase: 'non-orm', uri: document.uri.toString(),
+          line: nonOrmOpenParen.line, character: nonOrmOpenParen.character, windowFocused: vscode.window.state.focused }));
+        await waitForCondition(() => document.lineAt(nonOrmOpenParen.line).text.includes('plain_collection.filter('), 60_000);
+      } else {
+        await vscode.commands.executeCommand('default:type', { text: '(' });
+      }
+      assert.ok(editor!.document.lineAt(nonOrmOpenParen.line).text.includes('plain_collection.filter('), 'The non-ORM opening parenthesis must reach the code editor');
       await delay(1_500);
       assert.ok(
         fallbackCalls > 0,
@@ -3012,6 +6203,8 @@ suite('Django ORM Intellisense UI', () => {
       await vscode.commands.executeCommand('closeParameterHints');
       if (document.isDirty) {
         await vscode.commands.executeCommand('workbench.action.files.revert');
+        document = await vscode.workspace.openTextDocument(document.uri);
+        editor = await vscode.window.showTextDocument(document);
       }
       fallbackCalls = 0;
       await delay(300);
@@ -3042,13 +6235,118 @@ suite('Django ORM Intellisense UI', () => {
         'Expected the Django ORM provider to handle explicit signature help before the fallback provider.'
       );
     } finally {
+      inputChanges?.dispose();
+      nativeFocusObserver?.dispose();
       fallbackSignatureProvider.dispose();
       await vscode.commands.executeCommand('closeParameterHints');
       await vscode.window.showTextDocument(document);
       if (document.isDirty) {
         await vscode.commands.executeCommand('workbench.action.files.revert');
       }
+      await renderer?.dispose();
     }
+  });
+
+  // Keep these controls independently runnable. The automatic ORM assertion
+  // above can fail before either fallback or explicit invocation is exercised.
+  const withLateSignatureFallback = async (
+    reason: string,
+    check: (document: vscode.TextDocument, editor: vscode.TextEditor, calls: () => number) => Promise<void>
+  ): Promise<void> => {
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const document = await openFixtureDocument(fixtureRoot, 'blog/query_examples.py');
+    const editor = vscode.window.activeTextEditor;
+    assert.ok(editor);
+    assert.strictEqual(editor.document, document);
+    let fallbackCalls = 0;
+    const fallback = vscode.languages.registerSignatureHelpProvider('python', {
+      provideSignatureHelp() {
+        fallbackCalls++;
+        const help = new vscode.SignatureHelp();
+        help.signatures = [new vscode.SignatureInformation('fallback(*args, **kwargs)')];
+        help.activeSignature = 0;
+        help.activeParameter = 0;
+        return help;
+      },
+    }, '(', ',');
+    try {
+      await waitForCondition(() => getActiveDiagnosticScanRunningCountForTesting() === 0, 10_000);
+      await delay(250);
+      clearDiagnosticLogBufferForTesting();
+      promotePythonProvidersForTesting(reason);
+      await waitForCondition(() => getDiagnosticLogBufferForTesting().some(
+        line => line.includes(`Re-registered Python providers (${reason})`)
+      ), 10_000);
+      await check(document, editor, () => fallbackCalls);
+    } finally {
+      fallback.dispose();
+      await vscode.commands.executeCommand('closeParameterHints');
+      await vscode.window.showTextDocument(document);
+      if (document.isDirty) await vscode.commands.executeCommand('workbench.action.files.revert');
+    }
+  };
+
+  test('preserves rich manual ORM signature help after a later Python provider and promotion', async function () {
+    this.timeout(30_000);
+    await withLateSignatureFallback('signature-manual-independent', async (document, _editor, calls) => {
+      const position = positionAfterTextInContainer(
+        document, "Post.objects.create(ti='draft', author_i=1)", 'ti'
+      );
+      const help = await vscode.commands.executeCommand<vscode.SignatureHelp>(
+        'vscode.executeSignatureHelpProvider', document.uri, position
+      );
+      const label = help?.signatures[0]?.label;
+      console.info('[signature-manual-independent] ' + JSON.stringify({ label, fallbackCalls: calls(),
+        signatures: getDiagnosticLogBufferForTesting().filter(line => line.startsWith('[signature]')) }));
+      assert.ok(label?.includes('create(*,'), `Explicit ORM signature must describe create(*, ...). Received: ${label}`);
+      assert.ok(label?.includes('title: CharField'), `Explicit ORM signature must retain model fields. Received: ${label}`);
+      assert.strictEqual(calls(), 0, 'Explicit ORM signature help must be handled before the fallback');
+    });
+  });
+
+  test('preserves non-ORM automatic Python signature fallback after promotion', async function () {
+    const visualHoldMs = Math.min(60_000, Math.max(0, Number(process.env.DJLS_E2E_VISUAL_HOLD_MS ?? 0)));
+    const nativeInput = process.env.DJLS_E2E_NATIVE_INPUT === '1';
+    this.timeout(30_000 + visualHoldMs + (nativeInput ? 60_000 : 0));
+    await withLateSignatureFallback('signature-python-independent', async (document, editor, calls) => {
+      const original = 'Post.objects.filter()';
+      const offset = document.getText().indexOf(original);
+      assert.ok(offset >= 0);
+      const start = document.positionAt(offset);
+      const replacement = 'plain_collection.filter';
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(document.uri, new vscode.Range(start, document.positionAt(offset + original.length)), replacement);
+      assert.strictEqual(await vscode.workspace.applyEdit(edit), true);
+      const position = start.translate(0, replacement.length);
+      const versionBeforeInput = document.version;
+      editor.selection = new vscode.Selection(position, position);
+      editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
+      await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+      const rendererPort = Number(process.env.DJLS_E2E_RENDERER_DEBUG_PORT ?? 0);
+      const renderer = rendererPort ? await RendererHoverProbe.connect(rendererPort) : undefined;
+      try {
+        console.info('[signature-python-input-ready] ' + JSON.stringify({ uri: document.uri.toString(),
+          line: position.line, character: position.character, versionBeforeInput, visualHoldMs, nativeInput,
+          ui: await renderer?.editorObservation() }));
+        if (nativeInput) {
+          await waitForCondition(() => document.lineAt(position.line).text.includes(`${replacement}(`), 60_000);
+        } else {
+          if (visualHoldMs > 0) await delay(visualHoldMs);
+          await vscode.commands.executeCommand('default:type', { text: '(' });
+        }
+        await waitForCondition(() => document.version > versionBeforeInput
+          && document.lineAt(position.line).text.includes(`${replacement}(`), 1_000);
+        await delay(1_500);
+        console.info('[signature-python-independent] ' + JSON.stringify({ fallbackCalls: calls(),
+          versionBeforeInput, versionAfterInput: document.version, line: document.lineAt(position.line).text,
+          ui: await renderer?.editorObservation() }));
+        assert.ok(calls() > 0, 'A typed non-ORM filter call must reach a normal Python signature provider');
+      } finally {
+        await renderer?.dispose();
+      }
+    });
   });
 
   test('supports create-like field contexts through queryset and instance-related receivers', async function () {
@@ -4419,6 +7717,12 @@ suite('Django ORM Intellisense UI', () => {
       ),
       `Expected descending Index/order_by fields to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
     );
+    assert.ok(
+      diagnostics.every((item) =>
+        !/Unknown schema field `(author|code)`/.test(item.message)
+      ),
+      `Expected valid Meta fields to avoid diagnostics. Received: ${stringifyDiagnostics(diagnostics)}`
+    );
   });
 
   test('supports Meta constraint Q lookup paths', async function () {
@@ -4451,7 +7755,7 @@ suite('Django ORM Intellisense UI', () => {
 
     const nestedCompletionPosition = positionAfterTextInContainer(
       document,
-      "check=Q(author__na__gt='')",
+      "condition=Q(author__na__gt='')",
       'author__na'
     );
     const nestedCompletionList =
@@ -4477,7 +7781,7 @@ suite('Django ORM Intellisense UI', () => {
 
     const hoverPosition = positionInsideText(
       document,
-      "check=Q(author__name__gt='')",
+      "condition=Q(author__name__gt='')",
       'name__gt'
     );
     const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
@@ -4525,22 +7829,22 @@ suite('Django ORM Intellisense UI', () => {
       document.uri,
       (items) =>
         items.some((item) =>
-          item.message.includes('Unknown Django lookup operator `na`')
+          /Unknown (?:Django lookup operator|ORM lookup segment) `na`/.test(item.message)
         ) &&
         items.some((item) =>
-          item.message.includes('Unknown Django lookup operator `bogus`')
+          /Unknown (?:Django lookup operator|ORM lookup segment) `bogus`/.test(item.message)
         )
     );
 
     assert.ok(
       diagnostics.some((item) =>
-        item.message.includes('Unknown Django lookup operator `na`')
+        /Unknown (?:Django lookup operator|ORM lookup segment) `na`/.test(item.message)
       ),
       `Expected Meta constraint Q diagnostics to flag incomplete related paths. Received: ${stringifyDiagnostics(diagnostics)}`
     );
     assert.ok(
       diagnostics.some((item) =>
-        item.message.includes('Unknown Django lookup operator `bogus`')
+        /Unknown (?:Django lookup operator|ORM lookup segment) `bogus`/.test(item.message)
       ),
       `Expected Meta constraint Q diagnostics to flag invalid related paths. Received: ${stringifyDiagnostics(diagnostics)}`
     );
@@ -4664,12 +7968,10 @@ suite('Django ORM Intellisense UI', () => {
       `Expected bulk_update() field hover to mention the owner model. Received: ${bulkUpdateHoverText}`
     );
 
+    // The fixture enables full-document diagnostics, including offscreen lists.
     const bulkUpdateDiagnostics = await waitForDiagnostics(
       document.uri,
       (items) =>
-        items.some((item) =>
-          item.message.includes('Unknown schema field `bog`')
-        ) ||
         items.some((item) =>
           item.message.includes('Unknown bulk_update field `bog`')
         )
@@ -4681,6 +7983,54 @@ suite('Django ORM Intellisense UI', () => {
       ),
       `Expected bulk_update() diagnostics to flag invalid fields. Received: ${stringifyDiagnostics(bulkUpdateDiagnostics)}`
     );
+  });
+
+  test('refreshes large-file diagnostics when scrolling without editing', async function () {
+    this.timeout(30_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const configuration = vscode.workspace.getConfiguration('djangoOrmIntellisense', extensionConfigurationScope());
+    const originalFullDocument = configuration.get<boolean>('diagnostics.fullDocument');
+    const filePath = path.join(fixtureRoot, 'blog', `_diagnostic_viewport_${E2E_PROCESS_TAG}.py`);
+    fs.writeFileSync(filePath, [
+      'from blog.models import Post',
+      'Post.objects.bulk_update([], ["bog_viewport_top"])',
+      ...Array.from({ length: 800 }, () => '# viewport padding'),
+      'Post.objects.bulk_update([], ["bog_viewport_bottom"])',
+      '',
+    ].join('\n'));
+    try {
+      await configuration.update('diagnostics.fullDocument', false, configurationTarget());
+      const document = await vscode.workspace.openTextDocument(filePath);
+      const editor = await vscode.window.showTextDocument(document);
+      editor.revealRange(new vscode.Range(0, 0, 0, 0), vscode.TextEditorRevealType.AtTop);
+      const top = await waitForDiagnostics(document.uri, items => items.some(item =>
+        item.message.includes('Unknown bulk_update field `bog_viewport_top`')
+      ));
+      assert.ok(top.every(item => !item.message.includes('bog_viewport_bottom')),
+        'Default diagnostics should not scan the far offscreen bulk-update field.');
+      const version = document.version;
+      const bottomPosition = positionInsideText(
+        document, 'Post.objects.bulk_update([], ["bog_viewport_bottom"])', 'bog_viewport_bottom'
+      );
+      editor.revealRange(new vscode.Range(bottomPosition, bottomPosition), vscode.TextEditorRevealType.InCenter);
+      await waitForDiagnostics(document.uri, items => items.some(item =>
+        item.message.includes('Unknown bulk_update field `bog_viewport_bottom`')
+      ));
+      assert.strictEqual(document.version, version, 'Viewport refresh must not require a document edit.');
+      editor.revealRange(new vscode.Range(0, 0, 0, 0), vscode.TextEditorRevealType.AtTop);
+      await waitForDiagnostics(document.uri, items =>
+        items.some(item => item.message.includes('Unknown bulk_update field `bog_viewport_top`'))
+        && items.every(item => !item.message.includes('bog_viewport_bottom'))
+      );
+      assert.strictEqual(document.version, version);
+    } finally {
+      if (vscode.window.activeTextEditor?.document.uri.fsPath === filePath) {
+        await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+      }
+      fs.rmSync(filePath, { force: true });
+      await configuration.update('diagnostics.fullDocument', originalFullDocument, configurationTarget());
+    }
   });
 
   test('infers multiline parenthesized assignment receivers', async function () {
@@ -5344,6 +8694,58 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
+  test('shows Django instance hover among the leading rendered cards', async function () {
+    const visualHoldMs = Math.min(60_000, Math.max(0, Number(process.env.DJLS_E2E_VISUAL_HOLD_MS ?? 0)));
+    const rendererPort = Number(process.env.DJLS_E2E_RENDERER_DEBUG_PORT ?? 0);
+    if (!rendererPort) this.skip();
+    this.timeout(35_000 + visualHoldMs);
+
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const document = await openFixtureDocument(fixtureRoot, 'blog/query_examples.py');
+    const position = positionInsideText(document,
+      "self.company.question_thread_set.create(ti='draft')", 'company');
+    const renderer = await RendererHoverProbe.connect(rendererPort);
+    try {
+      const editor = await vscode.window.showTextDocument(document);
+      editor.selection = new vscode.Selection(position, position);
+      editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
+      await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+      await vscode.commands.executeCommand('editor.action.hideHover');
+      if (visualHoldMs > 0) {
+        console.info('[self-hover-visual] ' + JSON.stringify({ uri: document.uri.toString(),
+          line: position.line, character: position.character, holdMs: visualHoldMs }));
+        await delay(visualHoldMs);
+      }
+      await renderer.arm(['self.company', 'Model: blog.Company']);
+      console.info('[self-hover-render-before] ' + JSON.stringify(await renderer.editorObservation()));
+      await vscode.commands.executeCommand('editor.action.showHover');
+      const started = Date.now();
+      let observation: RendererHoverObservation;
+      do {
+        observation = await renderer.observation();
+        if (observation.secondAnimationFrame || Date.now() - started > 10_000) break;
+        await delay(20);
+      } while (true);
+      const screenshot = `bench/self-hover-render-${process.pid}-${Date.now()}.png`;
+      fs.writeFileSync(path.resolve(__dirname, '../../', screenshot), await renderer.screenshot());
+      const ui = await renderer.editorObservation();
+      console.info('[self-hover-render-observation] ' + JSON.stringify({ observation, ui, screenshot }));
+      assert.ok(observation.firstExpected && observation.secondAnimationFrame,
+        'The actual workbench must render the Django instance hover before checking its order');
+      const cards = ui.hovers.find(hover => hover.text.includes('Model: blog.Company'))?.cards;
+      assert.ok(cards, 'Expected visible Django hover rows in the actual workbench');
+      const djangoIndex = cards.findIndex(card => card.includes('self.company: Company instance')
+        && card.includes('Model: blog.Company'));
+      assert.ok(djangoIndex >= 0 && djangoIndex < 2,
+        `Expected the Django instance hover among the leading two rendered cards; index=${djangoIndex}. Cards: ${JSON.stringify(cards)}`);
+    } finally {
+      try { await vscode.commands.executeCommand('editor.action.hideHover'); }
+      finally { await renderer.dispose(); }
+    }
+  });
+
   test('shows hover for self and annotated self attributes as instances', async function () {
     this.timeout(20_000);
 
@@ -5392,9 +8794,17 @@ suite('Django ORM Intellisense UI', () => {
         selfCompanyHoverPosition
       );
     const selfCompanyHoverText = stringifyHovers(selfCompanyHovers);
-    const leadingSelfCompanyHoverText = stringifyHovers(
-      selfCompanyHovers?.slice(0, 2)
-    );
+    console.info('[self-hover-result-order] ' + JSON.stringify({
+      matches: {
+        generic: vscode.languages.match('python', document),
+        file: vscode.languages.match({ language: 'python', scheme: 'file' }, document),
+        exact: vscode.languages.match({ language: 'python', scheme: 'file',
+          pattern: new vscode.RelativePattern(path.dirname(document.uri.fsPath), path.basename(document.uri.fsPath)) }, document),
+      },
+      responses: selfCompanyHovers?.map((hover, index) => ({ index,
+        django: stringifyHovers([hover]).includes('**self.company**: `Company` instance'),
+        text: stringifyHovers([hover]).slice(0, 180) })),
+    }));
 
     assert.ok(
       selfCompanyHoverText.includes('**self.company**: `Company` instance'),
@@ -5411,10 +8821,6 @@ suite('Django ORM Intellisense UI', () => {
     assert.ok(
       selfCompanyHoverText.includes('Class category: `django`'),
       `Expected self.company hover to mark the resolved class as django. Received: ${selfCompanyHoverText}`
-    );
-    assert.ok(
-      leadingSelfCompanyHoverText.includes('**self.company**: `Company` instance'),
-      `Expected the Django ORM extension hover to appear among the leading hover cards. Leading hovers: ${leadingSelfCompanyHoverText}`
     );
 
     const customRelatedManagerHoverPosition = positionInsideText(
@@ -6129,19 +9535,661 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
+  test('background diagnostics waiting on startup cannot retarget the new daemon session', async function () {
+    this.timeout(20_000);
+    const minimalRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    const advancedRoot = path.resolve(__dirname, '../../fixtures/advanced_queries_project');
+    await setWorkspaceRoot(minimalRoot);
+    const oldDocument = await openFixtureDocument(minimalRoot, 'blog/query_examples.py');
+    const environment = await ensureFixtureE2EEnvironment(advancedRoot);
+    assert.ok(environment);
+    const workspace = ensureFixtureWorkspace(advancedRoot, environment);
+    await applyFixtureWorkspaceSettings(workspace, advancedRoot, environment);
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    const internal = daemon as unknown as {
+      startPromise?: Promise<HealthSnapshot>;
+      startProcess(scope?: vscode.ConfigurationScope): Promise<HealthSnapshot>;
+    };
+    const originalStart = internal.startProcess;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered = false;
+    let restart: Promise<HealthSnapshot> | undefined;
+    let diagnostic: Promise<void> | undefined;
+    const stateRoots: string[] = [];
+    const subscription = daemon.onDidChangeState(value => {
+      if (value.workspaceRoot) stateRoots.push(normalizeRealPath(value.workspaceRoot)!);
+    });
+    try {
+      internal.startProcess = async scope => {
+        entered = true;
+        await gate;
+        return originalStart.call(daemon, scope);
+      };
+      restart = daemon.restart(vscode.Uri.file(workspace));
+      await waitForCondition(() => entered && Boolean(internal.startPromise), 2_000);
+      diagnostic = daemon.withRequestSource('diagnostic', () => daemon.ensureStarted(oldDocument.uri));
+      release();
+      await restart;
+      await diagnostic;
+      console.info(`[diagnostic-startup-scope] ${JSON.stringify({ stateRoots, currentRoot: daemon.getState().workspaceRoot })}`);
+      assert.strictEqual(normalizeRealPath(daemon.getState().workspaceRoot), normalizeRealPath(advancedRoot), 'Old diagnostic startup scope replaced the explicitly restarted project');
+      const activeRevision = daemon.getSessionRevision();
+      await daemon.withRequestSource('diagnostic', () => daemon.ensureStarted(oldDocument.uri));
+      assert.strictEqual(daemon.getSessionRevision(), activeRevision, 'A ready-session diagnostic must not replace the active process');
+      await daemon.stop();
+      const stoppedRevision = daemon.getSessionRevision();
+      await assert.rejects(daemon.withRequestSource('diagnostic', () => daemon.ensureStarted(oldDocument.uri)), /ready daemon session/);
+      assert.strictEqual(daemon.getSessionRevision(), stoppedRevision, 'A lazy diagnostic must not start a stopped process');
+    } finally {
+      release();
+      if (restart) await restart.catch(() => undefined);
+      if (diagnostic) await diagnostic.catch(() => undefined);
+      internal.startProcess = originalStart;
+      subscription.dispose();
+    }
+  });
+
+  test('drops a diagnostic scan held across a foreground project restart', async function () {
+    this.timeout(25_000);
+    const minimalRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    const advancedRoot = path.resolve(__dirname, '../../fixtures/advanced_queries_project');
+    await setWorkspaceRoot(minimalRoot);
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    const temporaryPath = path.join(minimalRoot, `diagnostic_session_${E2E_PROCESS_TAG}.py`);
+    fs.writeFileSync(temporaryPath, 'from blog.models import Post\nPost.objects.filter(title__not_a_lookup="x")\n');
+    const originalEnsure = daemon.ensureStarted;
+    const requestContext = daemon as unknown as { currentRequestSource(): string };
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered = false;
+    let held = false;
+    try {
+      daemon.ensureStarted = async function (scope) {
+        await originalEnsure.call(this, scope);
+        if (!held && requestContext.currentRequestSource() === 'diagnostic'
+          && scope instanceof vscode.Uri && scope.fsPath === temporaryPath) {
+          held = true;
+          entered = true;
+          await gate;
+        }
+      };
+      const document = await vscode.workspace.openTextDocument(temporaryPath);
+      await vscode.window.showTextDocument(document);
+      const visibleEdit = new vscode.WorkspaceEdit();
+      visibleEdit.insert(document.uri, document.positionAt(document.getText().length), '# queued diagnostic\n');
+      assert.ok(await vscode.workspace.applyEdit(visibleEdit));
+      await waitForCondition(() => entered, 5_000);
+      const environment = await ensureFixtureE2EEnvironment(advancedRoot);
+      assert.ok(environment);
+      const workspace = ensureFixtureWorkspace(advancedRoot, environment);
+      await applyFixtureWorkspaceSettings(workspace, advancedRoot, environment);
+      await daemon.restart(vscode.Uri.file(workspace));
+      await waitForHealthSnapshot(daemon, value => value.phase === 'ready', 15_000);
+      release();
+      await waitForCondition(() => getActiveDiagnosticScanRunningCountForTesting() === 0, 5_000);
+      const diagnostics = vscode.languages.getDiagnostics(document.uri).filter(item => item.source === 'Django ORM Intellisense');
+      assert.strictEqual(diagnostics.length, 0, 'A retired-session diagnostic scan published into the current project');
+      assert.strictEqual(normalizeRealPath(daemon.getState().workspaceRoot), normalizeRealPath(advancedRoot));
+    } finally {
+      release();
+      daemon.ensureStarted = originalEnsure;
+      const document = vscode.workspace.textDocuments.find(value => value.uri.fsPath === temporaryPath);
+      if (document?.isDirty) {
+        await vscode.window.showTextDocument(document);
+        await vscode.commands.executeCommand('workbench.action.files.revert');
+      }
+      await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+      fs.rmSync(temporaryPath, { force: true });
+    }
+  });
+
+  test('unchanged health queries retain warmed receiver caches while registry notifications invalidate them', async function () {
+    this.timeout(30_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/advanced_queries_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const document = await openFixtureDocument(fixtureRoot, 'sales/query_examples.py');
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    await waitForAdvancedFixtureSurface(daemon, fixtureRoot);
+    await waitForCondition(() => getActiveDiagnosticScanRunningCountForTesting() === 0 && !isAnyInteractiveRequestInFlight(), 10_000);
+    const internal = daemon as unknown as {
+      modelsReindexedEmitter: vscode.EventEmitter<void>;
+      currentRequestSource(): string;
+      handleServerNotification(message: unknown): void;
+    };
+    const position = positionAfterTextInContainer(document, 'manager.ac', 'manager.ac');
+    const originalResolve = daemon.resolveRelationTarget;
+    let receiverResolutions = 0;
+    daemon.resolveRelationTarget = async function (...args) {
+      if (internal.currentRequestSource() === 'completion') receiverResolutions++;
+      return originalResolve.apply(this, args);
+    };
+    const complete = async (): Promise<void> => {
+      const result = await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider', document.uri, position
+      );
+      assert.ok(hasCompletionItemLabel(result?.items, 'active'), 'Current custom manager member must remain available');
+    };
+    let stateEvents = 0;
+    const subscription = daemon.onDidChangeState(() => { stateEvents++; });
+    try {
+      internal.modelsReindexedEmitter.fire();
+      await complete();
+      assert.ok(receiverResolutions > 0, 'Cold manager resolution must exercise the real receiver path');
+      await waitForCondition(() => getActiveDiagnosticScanRunningCountForTesting() === 0 && !isAnyInteractiveRequestInFlight(), 5_000);
+      await complete();
+      receiverResolutions = 0;
+      await complete();
+      assert.strictEqual(receiverResolutions, 0, 'Control request must use the warmed receiver cache');
+      stateEvents = 0;
+      const before = JSON.stringify(daemon.getState());
+      for (let refresh = 0; refresh < 5; refresh++) {
+        assert.strictEqual(JSON.stringify(await daemon.refreshHealth()), before, 'Fixture health must stay identical during query-only refresh');
+        await complete();
+      }
+      console.info('[receiver-health-refresh] ' + JSON.stringify({ refreshes: 5, stateEvents, receiverResolutions }));
+      assert.strictEqual(receiverResolutions, 0, 'Identical health queries repeated warmed receiver resolution');
+      assert.strictEqual(stateEvents, 0, 'Identical health queries invalidated provider caches through state events');
+      internal.handleServerNotification({ event: 'healthChanged', params: { health: daemon.getState() } });
+      await complete();
+      assert.ok(receiverResolutions > 0, 'Registry-ready notification with identical health must invalidate stale receiver caches');
+      assert.strictEqual(stateEvents, 1, 'Meaningful registry notification must remain observable');
+      console.info('[receiver-registry-notification] ' + JSON.stringify({ stateEvents, receiverResolutions }));
+      const state = daemon as unknown as { currentState: HealthSnapshot };
+      const current = daemon.getState();
+      let changed: HealthSnapshot;
+      try {
+        state.currentState = { ...current, detail: 'Prior status detail before a changed health response.' };
+        receiverResolutions = 0;
+        changed = await daemon.refreshHealth();
+      } finally { state.currentState = current; }
+      assert.strictEqual(JSON.stringify(changed), JSON.stringify(current), 'Changed query must install the complete actual health response');
+      assert.strictEqual(stateEvents, 2, 'Changed health query must still notify providers');
+      await complete();
+      assert.ok(receiverResolutions > 0, 'Changed query must still invalidate receiver resolution');
+      console.info('[receiver-changed-health-query] ' + JSON.stringify({ stateEvents, receiverResolutions }));
+    } finally {
+      subscription.dispose();
+      daemon.resolveRelationTarget = originalResolve;
+    }
+  });
+
+  test('verified identical-source reindex responses retain warmed receiver and IPC caches', async function () {
+    this.timeout(30_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/advanced_queries_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const document = await openFixtureDocument(fixtureRoot, 'sales/query_examples.py');
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    await waitForAdvancedFixtureSurface(daemon, fixtureRoot);
+    await waitForCondition(() => getActiveDiagnosticScanRunningCountForTesting() === 0 && !isAnyInteractiveRequestInFlight(), 10_000);
+    const internal = daemon as unknown as {
+      request(method: string, ...args: unknown[]): Promise<unknown>;
+      cachedRequest(method: string, params: Record<string, unknown>): Promise<unknown>;
+      clearResponseCache(): void;
+      responseCache: Map<string, unknown>;
+      modelsReindexedEmitter: vscode.EventEmitter<void>;
+      currentRequestSource(): string;
+    };
+    const native = require('../client/daemon/nativeFastPath') as {
+      resetNativeAstModulesFlag: typeof import('../client/daemon/nativeFastPath').resetNativeAstModulesFlag;
+      ensureNativeAstModules: typeof ensureNativeAstModules;
+    };
+    const originalRequest = internal.request;
+    const originalClear = internal.clearResponseCache;
+    const originalResolve = daemon.resolveRelationTarget;
+    const originalReset = native.resetNativeAstModulesFlag;
+    const originalEnsure = native.ensureNativeAstModules;
+    let reply: Record<string, unknown> = { unchanged: true, sourceUnchanged: true };
+    let cacheClears = 0, events = 0, receiverResolutions = 0, astResets = 0, astEnsures = 0;
+    const subscription = daemon.onDidReindexModels(() => { events++; });
+    const position = positionAfterTextInContainer(document, 'manager.ac', 'manager.ac');
+    const complete = async (): Promise<void> => {
+      const result = await vscode.commands.executeCommand<vscode.CompletionList>(
+        'vscode.executeCompletionItemProvider', document.uri, position);
+      assert.ok(hasCompletionItemLabel(result?.items, 'active'), 'Current custom manager member must remain available');
+    };
+    try {
+      internal.request = async function (method, ...args) {
+        if (method === 'reindexFile') return { ...reply };
+        return originalRequest.call(this, method, ...args);
+      };
+      internal.clearResponseCache = function () { cacheClears++; originalClear.call(this); };
+      daemon.resolveRelationTarget = async function (...args) {
+        if (internal.currentRequestSource() === 'completion') receiverResolutions++;
+        return originalResolve.apply(this, args);
+      };
+      native.resetNativeAstModulesFlag = function () { astResets++; originalReset(); };
+      native.ensureNativeAstModules = function (...args) { astEnsures++; return originalEnsure(...args); };
+      internal.modelsReindexedEmitter.fire();
+      await complete();
+      assert.ok(receiverResolutions > 0, 'Cold completion must exercise actual receiver resolution');
+      await complete();
+      receiverResolutions = 0;
+      await complete();
+      assert.strictEqual(receiverResolutions, 0, 'Control completion must use the warmed receiver cache');
+      await internal.cachedRequest('health', {});
+      const key = JSON.stringify({ method: 'health', params: {} });
+      const warmed = internal.responseCache.get(key);
+      assert.ok(warmed, 'The IPC cache must contain the actual health response');
+      cacheClears = events = astResets = astEnsures = 0;
+      for (let duplicate = 0; duplicate < 5; duplicate++) {
+        const result: ReindexFileResult = await daemon.reindexFile(path.join(fixtureRoot, 'sales/models.py'));
+        assert.strictEqual(result.unchanged, true);
+        await complete();
+      }
+      const retained = internal.responseCache.get(key) === warmed;
+      console.info('[duplicate-source-cache-control] ' + JSON.stringify({
+        controlledReplies: 5, cacheClears, events, receiverResolutions, astResets, astEnsures, retained,
+        scope: 'Controlled wire replies in the actual editor with real warmed provider and IPC caches.' }));
+      assert.strictEqual(cacheClears, 0, 'Verified source duplicates cleared IPC responses');
+      assert.strictEqual(events, 0, 'Verified source duplicates invalidated receiver caches');
+      assert.strictEqual(receiverResolutions, 0, 'Verified source duplicates repeated receiver resolution');
+      assert.strictEqual(astResets, 0, 'Verified source duplicates reset native AST ownership');
+      assert.strictEqual(astEnsures, 0, 'Verified source duplicates scheduled native AST reloads');
+      assert.ok(retained, 'Verified source duplicates discarded the warmed IPC entry');
+      for (const sourceFlag of [undefined, false, 'true']) {
+        reply = { unchanged: true, ...(sourceFlag === undefined ? {} : { sourceUnchanged: sourceFlag }) };
+        cacheClears = events = receiverResolutions = astResets = astEnsures = 0;
+        await daemon.reindexFile(path.join(fixtureRoot, 'sales/models.py'));
+        await complete();
+        assert.strictEqual(cacheClears, 1, 'A surface-only no-op must invalidate IPC responses');
+        assert.strictEqual(events, 1, 'A surface-only no-op must invalidate receiver caches');
+        assert.ok(receiverResolutions > 0, 'A surface-only no-op retained stale receiver resolution');
+        assert.strictEqual(astResets, 1, 'A surface-only no-op must reset native AST ownership');
+        assert.strictEqual(astEnsures, 1, 'A surface-only no-op must schedule current export metadata');
+        await originalEnsure(fixtureRoot);
+        console.info('[duplicate-source-conservative-control] ' + JSON.stringify({
+          sourceFlag: sourceFlag ?? 'absent', cacheClears, events, receiverResolutions, astResets, astEnsures }));
+      }
+      reply = { unchanged: true, sourceUnchanged: true, error: 'injected reindex error' };
+      await assert.rejects(daemon.reindexFile(path.join(fixtureRoot, 'sales/models.py')), /injected reindex error/);
+    } finally {
+      subscription.dispose();
+      internal.request = originalRequest;
+      internal.clearResponseCache = originalClear;
+      daemon.resolveRelationTarget = originalResolve;
+      native.resetNativeAstModulesFlag = originalReset;
+      native.ensureNativeAstModules = originalEnsure;
+    }
+  });
+
+  for (const kind of ['orm', 'lookup'] as const) {
+    for (const handoff of ['reindex', 'registry', 'edit', 'close', 'restart'] as const) {
+      test(`${kind} receiver cache rejects results delayed across ${handoff} ownership changes`, async function () {
+        this.timeout(30_000);
+        const fixtureRoot = path.resolve(__dirname, '../../fixtures/advanced_queries_project');
+        await setWorkspaceRoot(fixtureRoot);
+        let document = await openFixtureDocument(fixtureRoot, 'sales/query_examples.py');
+        const daemon = getActiveDaemonForTesting();
+        assert.ok(daemon);
+        await waitForCondition(() => getActiveDiagnosticScanRunningCountForTesting() === 0 && !isAnyInteractiveRequestInFlight(), 10_000);
+        const internal = daemon as unknown as {
+          modelsReindexedEmitter: vscode.EventEmitter<void>;
+          currentRequestSource(): string;
+          handleServerNotification(message: unknown): void;
+        };
+        const position = positionAfterTextInContainer(document, 'fulfillment.primary_detail.de', '.de');
+        const beforeOffset = document.offsetAt(position);
+        const expression = kind === 'orm' ? 'fulfillment.primary_detail' : 'Product.objects.active';
+        const ownerModel = kind === 'orm' ? 'sales.Fulfillment' : 'sales.Product';
+        const memberName = kind === 'orm' ? 'primary_detail' : 'active';
+        const expectedModel = kind === 'orm' ? 'sales.FulfillmentDetail' : 'sales.Product';
+        const originalLocal = daemon.resolveOrmMemberLocal;
+        const originalMember = daemon.resolveOrmMember;
+        let calls = 0;
+        let entered = false;
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        const matches = (label: string, member: string): boolean => internal.currentRequestSource() === 'completion'
+          && label === ownerModel && member === memberName;
+        daemon.resolveOrmMemberLocal = function (label, receiver, member, ...rest) {
+          if (matches(label, member)) return undefined;
+          return originalLocal.call(this, label, receiver, member, ...rest);
+        };
+        daemon.resolveOrmMember = async function (label, receiver, member, ...rest) {
+          const result = await originalMember.call(this, label, receiver, member, ...rest);
+          if (matches(label, member)) {
+            calls++;
+            assert.strictEqual(result.item?.returnModelLabel, expectedModel);
+            if (calls === 1) { entered = true; await gate; }
+          }
+          return result;
+        };
+        let pending: Promise<unknown> | undefined;
+        try {
+          internal.modelsReindexedEmitter.fire();
+          pending = daemon.withRequestSource('completion', () => resolveCachedReceiverForTesting(
+            daemon, document, expression, beforeOffset, kind
+          ));
+          await waitForCondition(() => entered, 5_000);
+          const oldVersion = document.version;
+          const oldSession = daemon.getSessionRevision();
+          if (handoff === 'reindex') internal.modelsReindexedEmitter.fire();
+          else if (handoff === 'registry') internal.handleServerNotification({ event: 'healthChanged', params: { health: daemon.getState() } });
+          else if (handoff === 'edit') {
+            const edit = new vscode.WorkspaceEdit();
+            edit.insert(document.uri, document.positionAt(document.getText().length), '\n# receiver owner version changed\n');
+            assert.ok(await vscode.workspace.applyEdit(edit));
+            assert.ok(document.version > oldVersion);
+          } else if (handoff === 'close') {
+            const oldDocument = document;
+            let closes = 0;
+            const closeSubscription = vscode.workspace.onDidCloseTextDocument(value => {
+              if (value.uri.toString() === oldDocument.uri.toString()) closes++;
+            });
+            try {
+              // Language changes raise actual close/open events while VS Code
+              // can reuse the same live TextDocument object and version.
+              const reopened = await vscode.languages.setTextDocumentLanguage(document, 'plaintext');
+              document = await vscode.languages.setTextDocumentLanguage(reopened, 'python');
+              assert.strictEqual(closes, 2, 'Both actual language close/open transitions must be observed');
+            } finally { closeSubscription.dispose(); }
+          } else {
+            await daemon.restart(document.uri);
+            await waitForHealthSnapshot(daemon, value => value.phase === 'ready', 15_000);
+            assert.notStrictEqual(daemon.getSessionRevision(), oldSession);
+          }
+          release();
+          const oldResult = await pending as { modelLabel?: string } | undefined;
+          assert.strictEqual(oldResult?.modelLabel, expectedModel, 'In-flight caller must retain its resolved receiver');
+          const fresh = await daemon.withRequestSource('completion', () => resolveCachedReceiverForTesting(
+            daemon, document, expression, beforeOffset, kind
+          ));
+          assert.strictEqual(fresh?.modelLabel, expectedModel);
+          console.info('[receiver-cache-owner] ' + JSON.stringify({ kind, handoff, calls, oldVersion,
+            currentVersion: document.version, oldSession, currentSession: daemon.getSessionRevision() }));
+          assert.strictEqual(calls, 2, 'Delayed old receiver result repopulated the current cache');
+          await daemon.withRequestSource('completion', () => resolveCachedReceiverForTesting(
+            daemon, document, expression, beforeOffset, kind
+          ));
+          assert.strictEqual(calls, 2, 'Current receiver result must still be cached');
+        } finally {
+          release();
+          await pending;
+          daemon.resolveOrmMemberLocal = originalLocal;
+          daemon.resolveOrmMember = originalMember;
+          if (document.isDirty && !document.isClosed) {
+            await vscode.window.showTextDocument(document);
+            await vscode.commands.executeCommand('workbench.action.files.revert');
+          }
+          internal.modelsReindexedEmitter.fire();
+        }
+      });
+    }
+  }
+
+  test('nested property completion preserves its receiver across a surface cache clear', async function () {
+    this.timeout(20_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/advanced_queries_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const document = await openFixtureDocument(fixtureRoot, 'sales/query_examples.py');
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    await waitForCondition(() => getActiveDiagnosticScanRunningCountForTesting() === 0 && !isAnyInteractiveRequestInFlight(), 10_000);
+    const internal = daemon as unknown as {
+      stateEmitter: vscode.EventEmitter<HealthSnapshot>;
+      modelsReindexedEmitter: vscode.EventEmitter<void>;
+      currentRequestSource(): string;
+    };
+    // Use the production ready-state listener, including its provider-cache
+    // reset, while the dynamic receiver's member RPC is awaited.
+    internal.stateEmitter.fire(daemon.getState());
+    const resolveLocal = daemon.resolveOrmMemberLocal;
+    const resolveMember = daemon.resolveOrmMember;
+    let cleared = false;
+    let clearCaches = () => internal.stateEmitter.fire(daemon.getState());
+    daemon.resolveOrmMemberLocal = function (modelLabel, kind, memberName, ...rest) {
+      if (!cleared && internal.currentRequestSource() === 'completion'
+        && modelLabel === 'sales.Fulfillment' && memberName === 'primary_detail') return undefined;
+      return resolveLocal.call(this, modelLabel, kind, memberName, ...rest);
+    };
+    daemon.resolveOrmMember = async function (modelLabel, kind, memberName, ...rest) {
+      const result = await resolveMember.call(this, modelLabel, kind, memberName, ...rest);
+      if (!cleared && internal.currentRequestSource() === 'completion'
+        && modelLabel === 'sales.Fulfillment' && memberName === 'primary_detail') {
+        assert.strictEqual(result.item?.returnModelLabel, 'sales.FulfillmentDetail');
+        cleared = true;
+        clearCaches();
+      }
+      return result;
+    };
+    try {
+      const position = positionAfterTextInContainer(document, 'fulfillment.primary_detail.de', '.de');
+      for (const event of ['ready', 'reindex'] as const) {
+        cleared = false;
+        clearCaches = event === 'ready'
+          ? () => internal.stateEmitter.fire(daemon.getState())
+          : () => internal.modelsReindexedEmitter.fire();
+        clearCaches();
+        for (const request of ['cold', 'warm'] as const) {
+          const started = performance.now();
+          const result = await vscode.commands.executeCommand<vscode.CompletionList>(
+            'vscode.executeCompletionItemProvider', document.uri, position
+          );
+          const labels = result?.items.map(completionItemLabel) ?? [];
+          console.info('[property-surface-clear] ' + JSON.stringify({ event, request, cleared, durationMs: performance.now() - started, labels }));
+          assert.ok(cleared, 'The member RPC must cross the production receiver-cache reset');
+          assert.ok(labels.includes('detail_code'), 'A nested property must keep the returned model after a cache reset');
+          assert.ok(!labels.includes('reference'), 'A nested property must not fall back to its base model');
+        }
+      }
+    } finally {
+      daemon.resolveOrmMemberLocal = resolveLocal;
+      daemon.resolveOrmMember = resolveMember;
+    }
+  });
+
+  test('provider promotion preserves an in-flight nested property completion', async function () {
+    const visualHoldMs = Math.min(60_000, Math.max(0, Number(process.env.DJLS_E2E_VISUAL_HOLD_MS ?? 0)));
+    this.timeout(20_000 + visualHoldMs);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/advanced_queries_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const document = await openFixtureDocument(fixtureRoot, 'sales/query_examples.py');
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    const position = positionAfterTextInContainer(document, 'fulfillment.primary_detail.de', '.de');
+    const baseline = await vscode.commands.executeCommand<vscode.CompletionList>(
+      'vscode.executeCompletionItemProvider', document.uri, position
+    );
+    assert.ok(hasCompletionItemLabel(baseline?.items, 'detail_code'), 'Property completion must resolve before the controlled promotion');
+    await waitForCondition(() => getActiveDiagnosticScanRunningCountForTesting() === 0, 10_000);
+    await delay(250);
+    clearDiagnosticLogBufferForTesting();
+    const ensureStarted = daemon.ensureStarted;
+    const context = daemon as unknown as { currentRequestSource(): string };
+    let entered = false;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    daemon.ensureStarted = async function (scope) {
+      await ensureStarted.call(this, scope);
+      if (context.currentRequestSource() === 'completion') {
+        entered = true;
+        await gate;
+      }
+    };
+    let response: Thenable<vscode.CompletionList | undefined> | undefined;
+    try {
+      response = vscode.commands.executeCommand<vscode.CompletionList>('vscode.executeCompletionItemProvider', document.uri, position);
+      await waitForCondition(() => entered, 2_000);
+      await delay(250);
+      const scans = getActiveDiagnosticScanRunningCountForTesting();
+      assert.strictEqual(scans, 0, 'The controlled test must isolate completion from diagnostic deferral');
+      promotePythonProvidersForTesting('test-inflight-property-completion');
+      const promotion = getDiagnosticLogBufferForTesting().filter(line => line.includes('test-inflight-property-completion'));
+      console.info('[property-promotion] ' + JSON.stringify({ entered, scans, promotion }));
+      assert.ok(promotion.length > 0, 'The promotion must reach its guard rather than be throttled');
+      release();
+      const result = await response;
+      assert.ok(hasCompletionItemLabel(result?.items, 'detail_code'), 'Provider promotion dropped the in-flight property completion');
+      await waitForCondition(() => getDiagnosticLogBufferForTesting().some(line => line.includes('Re-registered Python providers (test-inflight-property-completion)')), 5_000);
+      await waitForCondition(() => !isAnyInteractiveRequestInFlight(), 5_000);
+      if (visualHoldMs > 0) {
+        daemon.ensureStarted = ensureStarted;
+        const editor = await vscode.window.showTextDocument(document);
+        editor.selection = new vscode.Selection(position, position);
+        await vscode.commands.executeCommand('editor.action.triggerSuggest');
+        console.info(`[property-promotion-visual] ready uri=${document.uri.toString()} holdMs=${visualHoldMs}`);
+        await delay(visualHoldMs);
+      }
+    } finally {
+      release();
+      daemon.ensureStarted = ensureStarted;
+      await response;
+    }
+  });
+
+  test('provider promotion waits for hover definition and signature responses', async function () {
+    this.timeout(30_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const document = await openFixtureDocument(fixtureRoot, 'blog/query_examples.py');
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    const fieldPosition = positionInsideText(document, 'author__profile__timezone', 'timezone');
+    const signaturePosition = positionAfterTextInContainer(document, "Post.objects.create(ti='draft', author_i=1)", 'ti');
+    const cases = [
+      { source: 'hover', command: 'vscode.executeHoverProvider', position: fieldPosition,
+        check: (result: unknown) => assert.ok(stringifyHovers(result as vscode.Hover[]).includes('Owner model: `blog.Profile`')) },
+      { source: 'definition', command: 'vscode.executeDefinitionProvider', position: fieldPosition,
+        check: (result: unknown) => assert.ok(firstDefinition(result as Array<vscode.Location | vscode.LocationLink>)?.uri.fsPath.endsWith(path.join('blog', 'models.py'))) },
+      { source: 'signature', command: 'vscode.executeSignatureHelpProvider', position: signaturePosition,
+        check: (result: unknown) => assert.ok((result as vscode.SignatureHelp)?.signatures[0]?.label.includes('title: CharField')) },
+    ];
+    const context = daemon as unknown as { currentRequestSource(): string };
+    for (const item of cases) {
+      item.check(await vscode.commands.executeCommand(item.command, document.uri, item.position));
+      await waitForCondition(() => getActiveDiagnosticScanRunningCountForTesting() === 0 && !isAnyInteractiveRequestInFlight(), 10_000);
+      await delay(250);
+      clearDiagnosticLogBufferForTesting();
+      const original = daemon.ensureStarted;
+      let entered = false;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      daemon.ensureStarted = async function (scope) {
+        await original.call(this, scope);
+        if (context.currentRequestSource() === item.source) { entered = true; await gate; }
+      };
+      let response: Thenable<unknown> | undefined;
+      const reason = `test-inflight-${item.source}`;
+      try {
+        response = vscode.commands.executeCommand(item.command, document.uri, item.position);
+        await waitForCondition(() => entered, 2_000);
+        await delay(250);
+        promotePythonProvidersForTesting(reason);
+        assert.ok(getDiagnosticLogBufferForTesting().some(line => line.includes(`Deferred Python provider promotion (${reason})`) && line.includes('interactive requests in flight')));
+        release();
+        item.check(await response);
+        await waitForCondition(() => getDiagnosticLogBufferForTesting().some(line => line.includes(`Re-registered Python providers (${reason})`)), 5_000);
+        await waitForCondition(() => !isAnyInteractiveRequestInFlight(), 5_000);
+      } finally {
+        release();
+        daemon.ensureStarted = original;
+        await response;
+      }
+    }
+  });
+
+  test('interactive request guards release after hover timeout and completion failure', async function () {
+    this.timeout(20_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const document = await openFixtureDocument(fixtureRoot, 'blog/query_examples.py');
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    const context = daemon as unknown as { currentRequestSource(): string };
+    const fieldPosition = positionInsideText(document, 'author__profile__timezone', 'timezone');
+    const completionPosition = positionAfterTextInContainer(document, "Post.objects.create(ti='draft', author_i=1)", 'ti');
+    for (const source of ['hover', 'completion']) {
+      await waitForCondition(() => getActiveDiagnosticScanRunningCountForTesting() === 0 && !isAnyInteractiveRequestInFlight(), 10_000);
+      await delay(250);
+      clearDiagnosticLogBufferForTesting();
+      const original = daemon.ensureStarted;
+      let entered = false;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      daemon.ensureStarted = async function (scope) {
+        await original.call(this, scope);
+        if (context.currentRequestSource() === source) {
+          entered = true;
+          await gate;
+          if (source === 'completion') throw new Error('controlled completion failure');
+        }
+      };
+      let response: Thenable<unknown> | undefined;
+      const reason = `test-ended-${source}`;
+      try {
+        response = vscode.commands.executeCommand(source === 'hover' ? 'vscode.executeHoverProvider' : 'vscode.executeCompletionItemProvider',
+          document.uri, source === 'hover' ? fieldPosition : completionPosition);
+        await waitForCondition(() => entered, 2_000);
+        await delay(250);
+        promotePythonProvidersForTesting(reason);
+        assert.ok(getDiagnosticLogBufferForTesting().some(line => line.includes(`Deferred Python provider promotion (${reason})`)));
+        if (source === 'completion') release();
+        await response;
+        await waitForCondition(() => !isAnyInteractiveRequestInFlight(), 5_000);
+        if (source === 'hover') assert.ok(getDiagnosticLogBufferForTesting().some(line => line.includes('[hover]') && line.includes('TIMEOUT')));
+        await waitForCondition(() => getDiagnosticLogBufferForTesting().some(line => line.includes(`Re-registered Python providers (${reason})`)), 5_000);
+      } finally {
+        release();
+        daemon.ensureStarted = original;
+        await response;
+      }
+    }
+  });
+
   test('completes manager, queryset, and model instance members without stubs', async function () {
     this.timeout(20_000);
+    const startedAt = Date.now();
+    const trace = (stage: string): void => {
+      console.info(`[memberqa] elapsed=${Date.now() - startedAt}ms ${stage}`);
+    };
+    trace('workspace begin');
 
     const fixtureRoot = path.resolve(
       __dirname,
       '../../fixtures/advanced_queries_project'
     );
     await setWorkspaceRoot(fixtureRoot);
+    trace('workspace ready');
+    trace('document begin');
 
     const document = await openFixtureDocument(
       fixtureRoot,
       'sales/query_examples.py'
     );
+
+    trace('document ready');
+    const timedCompletion = async (
+      command: string,
+      uri: vscode.Uri,
+      position: vscode.Position
+    ): Promise<vscode.CompletionList | undefined> => {
+      const requestStartedAt = Date.now();
+      const diagnosticStart = getDiagnosticLogBufferForTesting().length;
+      const context = document.lineAt(position.line).text.trim().slice(0, 140);
+      trace(`completion begin line=${position.line + 1} ${context}`);
+      const result = await vscode.commands.executeCommand<vscode.CompletionList>(
+        command,
+        uri,
+        position
+      );
+      const elapsedMs = Date.now() - requestStartedAt;
+      trace(`completion done duration=${elapsedMs}ms line=${position.line + 1}`);
+      if (process.env.DJLS_E2E_MEMBER_TIMING_TRACE === '1') {
+        const provider = getCompletionTracesForTesting().filter(value => value.uri === uri.toString()
+          && value.line === position.line && value.character === position.character && value.startedAt >= requestStartedAt);
+        const recentLogs = getDiagnosticLogBufferForTesting().slice(diagnosticStart);
+        console.info('[memberqa:timing] ' + JSON.stringify({ line: position.line + 1, context, elapsedMs,
+          provider: provider.map(value => ({ startedAt: value.startedAt, finishedAt: value.finishedAt,
+            receiver: value.receiver, cancelled: value.cancelled, error: value.error,
+            memberCount: value.memberNames?.length, outputCount: value.outputNames?.length })), recentLogs }));
+      }
+      return result;
+    };
 
     const managerCompletionPosition = positionAfterTextInContainer(
       document,
@@ -6149,7 +10197,7 @@ suite('Django ORM Intellisense UI', () => {
       'manager.ac'
     );
     const managerCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         managerCompletionPosition
@@ -6166,7 +10214,7 @@ suite('Django ORM Intellisense UI', () => {
       'manager.with_li'
     );
     const managerCustomCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         managerCustomCompletionPosition
@@ -6183,7 +10231,7 @@ suite('Django ORM Intellisense UI', () => {
       'na'
     );
     const managerCreateFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         managerCreateFieldCompletionPosition
@@ -6204,7 +10252,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const customQuerysetCreateFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         customQuerysetCreateFieldCompletionPosition
@@ -6225,7 +10273,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const alternateManagerCreateFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         alternateManagerCreateFieldCompletionPosition
@@ -6246,7 +10294,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const annotatedManagerCreateFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         annotatedManagerCreateFieldCompletionPosition
@@ -6267,7 +10315,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const annotatedAlternateManagerCreateFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         annotatedAlternateManagerCreateFieldCompletionPosition
@@ -6291,7 +10339,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const annotatedGenericManagerCreateFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         annotatedGenericManagerCreateFieldCompletionPosition
@@ -6315,7 +10363,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const annotatedQuerysetCreateFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         annotatedQuerysetCreateFieldCompletionPosition
@@ -6336,7 +10384,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const functionAnnotatedManagerCreateFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         functionAnnotatedManagerCreateFieldCompletionPosition
@@ -6360,7 +10408,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const functionAnnotatedAlternateManagerCreateFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         functionAnnotatedAlternateManagerCreateFieldCompletionPosition
@@ -6384,7 +10432,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const functionAnnotatedGenericManagerCreateFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         functionAnnotatedGenericManagerCreateFieldCompletionPosition
@@ -6408,7 +10456,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const functionAnnotatedQuerysetCreateFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         functionAnnotatedQuerysetCreateFieldCompletionPosition
@@ -6432,7 +10480,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const memberAnnotatedGenericManagerCreateFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         memberAnnotatedGenericManagerCreateFieldCompletionPosition
@@ -6456,7 +10504,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const memberAnnotatedGenericManagerFilterFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         memberAnnotatedGenericManagerFilterFieldCompletionPosition
@@ -6480,7 +10528,7 @@ suite('Django ORM Intellisense UI', () => {
         'na'
       );
     const memberAnnotatedGenericManagerExcludeFieldCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         memberAnnotatedGenericManagerExcludeFieldCompletionPosition
@@ -6503,7 +10551,7 @@ suite('Django ORM Intellisense UI', () => {
       'primary_d'
     );
     const propertyCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         propertyCompletionPosition
@@ -6530,11 +10578,22 @@ suite('Django ORM Intellisense UI', () => {
       '.de'
     );
     const propertyNestedCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         propertyNestedCompletionPosition
       );
+    if (!hasCompletionItemLabel(propertyNestedCompletionList?.items, 'detail_code')) {
+      const daemon = getActiveDaemonForTesting();
+      console.error('[memberqa:property-miss] ' + JSON.stringify({
+        items: propertyNestedCompletionList?.items.map(completionItemLabel).slice(0, 20),
+        surface: daemon?.surfaceIndex['sales.Fulfillment']?.instance?.primary_detail,
+        local: daemon?.resolveOrmMemberLocal('sales.Fulfillment', 'instance', 'primary_detail'),
+      }));
+      if (daemon) console.error('[memberqa:property-miss:resolved] ' + JSON.stringify(
+        await daemon.resolveOrmMember('sales.Fulfillment', 'instance', 'primary_detail')
+      ));
+    }
 
     assert.ok(
       hasCompletionItemLabel(propertyNestedCompletionList?.items, 'detail_code'),
@@ -6547,7 +10606,7 @@ suite('Django ORM Intellisense UI', () => {
       'queryset.fi'
     );
     const querysetCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         querysetCompletionPosition
@@ -6557,6 +10616,27 @@ suite('Django ORM Intellisense UI', () => {
       hasCompletionItemLabel(querysetCompletionList?.items, 'filter'),
       'Expected queryset completion to include the built-in `filter` method.'
     );
+    if (!hasCompletionItemLabel(querysetCompletionList?.items, 'first')) {
+      const daemon = getActiveDaemonForTesting();
+      const provider = getCompletionTracesForTesting().filter(trace => trace.uri === document.uri.toString()
+        && trace.line === querysetCompletionPosition.line && trace.character === querysetCompletionPosition.character);
+      const modelLabel = provider.find(trace => trace.receiver)?.receiver?.modelLabel
+        ?? daemon?.modelLabelByName.get('Product') ?? 'sales.Product';
+      console.error('[memberqa:queryset-first-miss] ' + JSON.stringify({
+        items: querysetCompletionList?.items.map(completionItemLabel),
+        state: daemon?.getState().phase,
+        modelLabel,
+        surface: daemon?.surfaceIndex[modelLabel]?.queryset,
+        local: daemon?.resolveOrmMemberLocal(modelLabel, 'queryset', 'first'),
+        provider,
+        recentLogs: getDiagnosticLogBufferForTesting().slice(-20),
+      }));
+    }
+    console.info('[memberqa:queryset-first-provider] ' + JSON.stringify({
+      aggregateHasFirst: hasCompletionItemLabel(querysetCompletionList?.items, 'first'),
+      provider: getCompletionTracesForTesting().filter(trace => trace.uri === document.uri.toString()
+        && trace.line === querysetCompletionPosition.line && trace.character === querysetCompletionPosition.character),
+    }));
     assert.ok(
       hasCompletionItemLabel(querysetCompletionList?.items, 'first'),
       'Expected queryset completion to include the built-in `first` method.'
@@ -6568,7 +10648,7 @@ suite('Django ORM Intellisense UI', () => {
       'queryset.with_li'
     );
     const querysetCustomCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         querysetCustomCompletionPosition
@@ -6585,7 +10665,7 @@ suite('Django ORM Intellisense UI', () => {
       'instance.'
     );
     const blankInstanceCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         blankInstanceCompletionPosition
@@ -6606,7 +10686,7 @@ suite('Django ORM Intellisense UI', () => {
       'instance.na'
     );
     const instanceCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         instanceCompletionPosition
@@ -6629,7 +10709,7 @@ suite('Django ORM Intellisense UI', () => {
       'instance.category.ti'
     );
     const relationCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         relationCompletionPosition
@@ -6646,7 +10726,7 @@ suite('Django ORM Intellisense UI', () => {
       'category.ti'
     );
     const firstRelationCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         firstRelationCompletionPosition
@@ -6663,7 +10743,7 @@ suite('Django ORM Intellisense UI', () => {
       'dynamic_instance.'
     );
     const dynamicInstanceCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         dynamicInstanceCompletionPosition
@@ -6680,7 +10760,7 @@ suite('Django ORM Intellisense UI', () => {
       'dynamic_instance.category.ti'
     );
     const dynamicRelationCompletionList =
-      await vscode.commands.executeCommand<vscode.CompletionList>(
+      await timedCompletion(
         'vscode.executeCompletionItemProvider',
         document.uri,
         dynamicRelationCompletionPosition
@@ -6690,6 +10770,54 @@ suite('Django ORM Intellisense UI', () => {
       hasCompletionItemLabel(dynamicRelationCompletionList?.items, 'title'),
       'Expected dynamically resolved instance relations to keep related model completion.'
     );
+  });
+
+  test('resolves annotated property returns when native methods lack type metadata', async function () {
+    this.timeout(20_000);
+    const fixtureRoot = path.resolve(__dirname, '../../fixtures/advanced_queries_project');
+    await setWorkspaceRoot(fixtureRoot);
+    const document = await openFixtureDocument(fixtureRoot, 'sales/query_examples.py');
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon);
+    await daemon.ensureStarted(document.uri);
+    await waitForCondition(() => isNativeFastPathReady(), 10_000);
+    assert.ok(await ensureNativeAstModules(fixtureRoot));
+    const before = daemon.surfaceIndex;
+    const empty = {};
+    try {
+      // Keep the actual native AST, but remove prepared return metadata. A
+      // native source location alone cannot resolve an annotated receiver.
+      daemon.surfaceIndex = empty;
+      const cold = await daemon.resolveOrmMember('sales.Fulfillment', 'instance', 'primary_detail');
+      assert.strictEqual(cold.item?.returnKind, 'instance');
+      assert.strictEqual(cold.item?.returnModelLabel, 'sales.FulfillmentDetail');
+    } finally {
+      if (daemon.surfaceIndex === empty) daemon.surfaceIndex = before;
+    }
+    // The cold Python request may publish its loaded surface and replace the
+    // native state. Establish the AST precondition again before asserting
+    // that prepared return metadata preserves an actual native result.
+    await waitForCondition(() => isNativeFastPathReady(), 10_000);
+    assert.ok(await ensureNativeAstModules(fixtureRoot));
+    await waitForCondition(() => nativeResolveOrmMember('sales.Fulfillment', 'instance', 'primary_detail')?.item?.memberKind === 'property', 10_000);
+    assert.strictEqual(nativeResolveOrmMember('sales.Fulfillment', 'instance', 'primary_detail')?.item?.source, 'project');
+    const current = daemon.surfaceIndex;
+    const prepared = {
+      ...current,
+      'sales.Fulfillment': { ...current['sales.Fulfillment'], instance: {
+        ...current['sales.Fulfillment']?.instance,
+        primary_detail: ['instance', 'sales.FulfillmentDetail', 'property', null] as [string, string, string, null],
+      } },
+    };
+    try {
+      daemon.surfaceIndex = prepared;
+      const warm = await daemon.resolveOrmMember('sales.Fulfillment', 'instance', 'primary_detail');
+      assert.strictEqual(warm.item?.returnKind, 'instance');
+      assert.strictEqual(warm.item?.returnModelLabel, 'sales.FulfillmentDetail');
+      assert.strictEqual(warm.item?.source, 'project', 'Prepared metadata should preserve the native result');
+    } finally {
+      if (daemon.surfaceIndex === prepared) daemon.surfaceIndex = current;
+    }
   });
 
   test('completes related managers and querysets from instance receivers', async function () {
@@ -8104,7 +12232,7 @@ suite('Django ORM Intellisense UI', () => {
       `Expected custom queryset methods that wrap annotate() to preserve alias lookup completion. Received: ${(customLookupCompletionList?.items ?? [])
         .map((item) => completionItemLabel(item))
         .slice(0, 20)
-        .join(', ')}`
+        .join(', ')}\n${getDiagnosticLogBufferForTesting().filter((line) => /Product|with_line_count|line_co/.test(line)).slice(-20).join('\n')}`
     );
   });
 
@@ -9820,6 +13948,26 @@ suite('Django ORM Intellisense UI', () => {
       'blog/query_examples.py'
     );
 
+    const invalidLookupPosition = positionInsideText(document, 'Post.objects.values("author__unknown")', 'unknown');
+    vscode.window.activeTextEditor!.revealRange(
+      new vscode.Range(invalidLookupPosition, invalidLookupPosition), vscode.TextEditorRevealType.InCenter
+    );
+    // Compare the local diagnostic verdict with the independent Python RPC.
+    // Relations can expose transforms too, so an absent segment may be an
+    // invalid operator rather than an unknown related-model field.
+    const daemon = getActiveDaemonForTesting()!;
+    const backend = await (daemon as unknown as {
+      request(method: string, params: Record<string, unknown>): Promise<LookupPathResolution>;
+    }).request('resolveLookupPath', {
+      baseModelLabel: 'blog.Post', value: 'author__unknown', method: 'values',
+    });
+    assert.strictEqual(backend.resolved, false);
+    assert.strictEqual(backend.missingSegment, 'unknown');
+    assert.ok(backend.reason === 'segment_not_found' || backend.reason === 'invalid_lookup_operator',
+      `Unexpected Python lookup verdict: ${JSON.stringify(backend)}`);
+    const unknownFieldMessage = backend.reason === 'segment_not_found'
+      ? 'Unknown ORM lookup segment `unknown`' : 'Unknown Django lookup operator `unknown`';
+
     const diagnostics = await waitForDiagnostics(
       document.uri,
       (items) =>
@@ -9831,7 +13979,7 @@ suite('Django ORM Intellisense UI', () => {
 
     assert.ok(
       diagnostics.some((item) =>
-        item.message.includes('Unknown ORM lookup segment `unknown`')
+        item.message.includes(unknownFieldMessage) && item.message.includes('author__unknown')
       ),
       `Expected diagnostics to flag an unknown string lookup segment. Received: ${stringifyDiagnostics(diagnostics)}`
     );
@@ -10989,7 +15137,7 @@ suite('Django ORM Intellisense UI', () => {
     );
   });
 
-  test('budget-exhausted diagnostics keep re-firing on the same document version', async function () {
+  test('budget-exhausted diagnostics do not retry unchanged versions without metadata invalidation', async function () {
     // Reproduces the bug observed in production logs: when diagnostics
     // exhausts its time budget, `lastDiagnosedDocumentVersions` is never
     // populated for that version, so any subsequent tracked-refresh
@@ -11045,47 +15193,64 @@ suite('Django ORM Intellisense UI', () => {
         );
       }
 
-      // After budget exhaustion, deliberately churn the visible editors so
-      // `onDidChangeVisibleTextEditors` fires a tracked-refresh. In the buggy
-      // state this re-fires `refreshDiagnostics` for the same version because
-      // `lastDiagnosedDocumentVersions` was never populated by the partial run.
+      // Registry prewarm can invalidate a version during the tab-refresh
+      // debounce. Keep sending real tab changes until one refresh reaches an
+      // already handled version; still reject every duplicate fire within a
+      // metadata epoch below, including all of these stimuli.
       const churnDoc = await openFixtureDocument(
         fixtureRoot,
         'blog/query_examples.py'
       );
-      await delay(200);
-      await vscode.window.showTextDocument(document);
-      await delay(200);
-      await vscode.window.showTextDocument(churnDoc);
-      await delay(200);
-      await vscode.window.showTextDocument(document);
+      const matchesSameVersionSkip = (line: string): boolean =>
+        line.startsWith('[diagnostics:trigger] skip ')
+        && line.includes(`cause=same-version v=${expectedVersion} `) && line.endsWith(fsPathSuffix);
+      const tabRefreshDeadline = Date.now() + 10_000;
+      let tabRefreshAttempts = 0;
+      do {
+        await waitForCondition(() => getActiveDiagnosticScanRunningCountForTesting() === 0, 5_000);
+        await vscode.window.showTextDocument(churnDoc);
+        await delay(100);
+        await vscode.window.showTextDocument(document);
+        tabRefreshAttempts++;
+        // Cover the real 500ms debounce and the forced 5ms partial scan.
+        await delay(1_000);
+      } while (!getDiagnosticLogBufferForTesting().some(matchesSameVersionSkip)
+        && Date.now() < tabRefreshDeadline);
 
-      // Give the tracked-refresh debounce (500ms) plus a small budget run
-      // enough time to schedule and fire again on the same version.
-      await delay(2_500);
-
-      const fireLines = getDiagnosticLogBufferForTesting().filter(matchesFireForDoc);
+      const diagnosticLog = getDiagnosticLogBufferForTesting();
+      const fireLines = diagnosticLog.filter(matchesFireForDoc);
       const fireLinesForExpectedVersion = fireLines.filter((line) =>
         line.includes(` v=${expectedVersion} `)
       );
-      const recentTriggerLines = getDiagnosticLogBufferForTesting()
+      const recentTriggerLines = diagnosticLog
         .filter((line) => line.startsWith('[diagnostics:trigger]'))
         .slice(-30);
 
-      // Regression assertion: the same document at the same version must
-      // not be re-scanned just because a previous scan exhausted its time
-      // budget. Today this assertion FAILS — `lastDiagnosedDocumentVersions`
-      // is only populated after a clean completion, so a tracked-refresh
-      // from visible-editors-changed re-fires the full pipeline. Once that
-      // is fixed (e.g. mark the version partial-but-handled at budget
-      // exhaustion) this test should pass.
-      assert.strictEqual(
-        fireLinesForExpectedVersion.length,
-        1,
-        `Diagnostics re-fired ${fireLinesForExpectedVersion.length} times at v=${expectedVersion} ` +
-        `after a budget-exhausted partial scan; expected exactly 1. ` +
-        `This reproduces the production bug where partial-result documents ` +
-        `keep being re-diagnosed on every tracked-refresh trigger.\n` +
+      // Registry-ready notifications intentionally clear handled versions,
+      // even with an identical health snapshot: previously unresolved paths
+      // may now resolve. Count fires within metadata validity epochs so the
+      // test rejects tab-switch retries while preserving that contract.
+      let epoch = 0;
+      const firesByEpoch = new Map<number, number>();
+      for (const line of diagnosticLog) {
+        if (line.startsWith('[diagnostics:trigger] tracked-refresh source=daemon-state ')
+          || line.startsWith('[diagnostics:trigger] tracked-refresh source=models-reindexed ')) {
+          epoch++;
+        }
+        if (matchesFireForDoc(line) && line.includes(` v=${expectedVersion} `)) {
+          firesByEpoch.set(epoch, (firesByEpoch.get(epoch) ?? 0) + 1);
+        }
+      }
+      const sameVersionSkips = diagnosticLog.filter(matchesSameVersionSkip).length;
+      console.info('[diagnostics-budget-epochs] ' + JSON.stringify({ version: expectedVersion,
+        metadataInvalidations: epoch, firesByEpoch: [...firesByEpoch], sameVersionSkips, tabRefreshAttempts,
+        triggerLines: diagnosticLog.filter(line => line.startsWith('[diagnostics:trigger]')).slice(-60) }));
+      assert.ok(fireLinesForExpectedVersion.length > 0 && sameVersionSkips > 0,
+        'The test must observe both a budget-exhausted scan and suppressed same-version tab refreshes.');
+      assert.ok(
+        [...firesByEpoch.values()].every(count => count === 1),
+        `Diagnostics re-fired at v=${expectedVersion} without metadata invalidation ` +
+        `after a budget-exhausted partial scan. Epoch fire counts: ${JSON.stringify([...firesByEpoch])}.\n` +
         `Re-fires: ${fireLinesForExpectedVersion.join(' || ')}\n` +
         `Recent trigger lines: ${recentTriggerLines.join(' || ')}`
       );
@@ -11112,7 +15277,7 @@ suite('Django ORM Intellisense UI', () => {
     process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
     try {
       const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
-      await setWorkspaceRoot(fixtureRoot);
+      await prepareDiagnosticCacheFixture(fixtureRoot);
       await waitForCondition(
         () => getActiveDiagnosticScanRunningCountForTesting() === 0,
         15_000
@@ -11229,7 +15394,7 @@ suite('Django ORM Intellisense UI', () => {
     process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
     try {
       const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
-      await setWorkspaceRoot(fixtureRoot);
+      await prepareDiagnosticCacheFixture(fixtureRoot);
       await waitForCondition(
         () => getActiveDiagnosticScanRunningCountForTesting() === 0,
         15_000
@@ -11288,8 +15453,22 @@ suite('Django ORM Intellisense UI', () => {
       const cycle1Lines = buf.slice(0, reRegisterIdx);
       const cycle2Lines = buf.slice(reRegisterIdx);
 
-      // Cycle 1: every phase2-scan should miss (cold cache).
-      const cycle1Phase2Scans = cycle1Lines.filter((l) =>
+      // A runtime-registry notification can cause another diagnostic scan
+      // before the requested promotion. Only the first actual fire is cold;
+      // later same-version scans should reuse its pure-text scan coverage.
+      const firstFire = cycle1Lines.findIndex(line => line.startsWith('[diagnostics:trigger] fire ')
+        && line.endsWith('blog/heavy_lookup_examples.py'));
+      assert.ok(firstFire >= 0, 'The cold diagnostic cycle must actually fire.');
+      const nextFire = cycle1Lines.findIndex((line, index) => index > firstFire
+        && line.startsWith('[diagnostics:trigger] fire '));
+      const coldCycleLines = cycle1Lines.slice(firstFire, nextFire < 0 ? undefined : nextFire);
+      console.info('[diagnostics-scan-cache-cycles] ' + JSON.stringify({
+        cycle1: cycle1Lines.filter(line => line.startsWith('[diagnostics:trigger]')
+          || line.includes('phase2-scan:') || line.startsWith('[extension]')),
+        cycle2: cycle2Lines.filter(line => line.startsWith('[diagnostics:trigger]')
+          || line.includes('phase2-scan:') || line.startsWith('[extension]')),
+      }));
+      const cycle1Phase2Scans = coldCycleLines.filter((l) =>
         l.includes('[diagnostics:phase] phase2-scan:')
       );
       assert.ok(
@@ -11370,7 +15549,7 @@ suite('Django ORM Intellisense UI', () => {
     process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
     try {
       const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
-      await setWorkspaceRoot(fixtureRoot);
+      await prepareDiagnosticCacheFixture(fixtureRoot);
       await waitForCondition(
         () => getActiveDiagnosticScanRunningCountForTesting() === 0,
         15_000
@@ -11831,14 +16010,15 @@ suite('Django ORM Intellisense UI', () => {
     // blocking the queue. The next cycle benefits because the underlying
     // Promise still resolves into the response cache.
     //
-    // This test injects a 2.5s delay into resolveOrmMember BG IPC so the
-    // timeout (default 1500ms) fires reliably, then asserts:
+    // This test injects a 2.5s delay into background lookup responses,
+    // including local/native results, so the 300ms test cap fires, then asserts:
     //   1. `timeout:N` exit counter is > 0
     //   2. phase2-lookups wall time stays well under the diagnostic budget
     this.timeout(60_000);
     process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '10000';
     process.env.DJLS_DIAGNOSTIC_PER_CONTEXT_TIMEOUT_MS = '300';
-    process.env.DJLS_TEST_RESOLVE_LOOKUP_PATH_DELAY_MS = '2500';
+    let restoreLookupResolver: (() => void) | undefined;
+    let delayedResponses = 0;
     try {
       const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
       await setWorkspaceRoot(fixtureRoot);
@@ -11849,8 +16029,22 @@ suite('Django ORM Intellisense UI', () => {
       clearReceiverAndLookupCachesForTesting();
       clearDiagnosticLogBufferForTesting();
 
-      // Invalid lookups force the daemon's resolveLookupPath BG IPC to
-      // fire (native says unresolved; BG is consulted as a fallback).
+      // Local resolution intentionally bypasses the IPC-only delay knob.
+      // Delay this method's real result at the boundary consumed by the
+      // per-context race, so the test still exercises slow responses.
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon);
+      const resolveLookupPath = daemon.resolveLookupPath;
+      daemon.resolveLookupPath = async function (...args) {
+        const response = await Reflect.apply(resolveLookupPath, this, args);
+        if (args[3]) {
+          delayedResponses++;
+          await delay(2500);
+        }
+        return response;
+      };
+      restoreLookupResolver = () => { daemon.resolveLookupPath = resolveLookupPath; };
+
       // The fixture spans 600+ lines so most lookups fall into the
       // phase2-lookups ranges (outside the visible-first window), which
       // is where the per-context timeout machinery lives. With injected
@@ -11860,6 +16054,7 @@ suite('Django ORM Intellisense UI', () => {
         fixtureRoot,
         'blog/heavy_invalid_lookup_examples.py'
       );
+      promotePythonProvidersForTesting('phase2-timeout-injection-test');
 
       const matchesFireForDoc = (line: string): boolean =>
         line.startsWith('[diagnostics:trigger] fire ') &&
@@ -11900,6 +16095,10 @@ suite('Django ORM Intellisense UI', () => {
       }
 
       assert.ok(
+        delayedResponses >= 32,
+        `Slow-response injection must reach at least 32 real lookup calls; got ${delayedResponses}.`
+      );
+      assert.ok(
         totalTimeouts > 0,
         `Expected per-context timeout to fire at least once with a 2500ms ` +
         `injected daemon delay and 300ms per-context cap. ` +
@@ -11920,12 +16119,12 @@ suite('Django ORM Intellisense UI', () => {
         `(without cap this would be ~16 max with 4-way concurrency and 2.5s IPC). ` +
         `phase2-lookups lines:\n  ${phase2Lines.join('\n  ')}`
       );
-      // Silence unused: maxPhaseMs is informational (budget-bounded).
-      void maxPhaseMs;
+      assert.ok(maxPhaseMs < 12_000,
+        `Phase2 must remain within the 10s budget plus 2s scheduling margin; got ${maxPhaseMs}ms.`);
     } finally {
+      restoreLookupResolver?.();
       delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
       delete process.env.DJLS_DIAGNOSTIC_PER_CONTEXT_TIMEOUT_MS;
-      delete process.env.DJLS_TEST_RESOLVE_LOOKUP_PATH_DELAY_MS;
     }
   });
 
@@ -12063,6 +16262,10 @@ suite('Django ORM Intellisense UI', () => {
         fixtureRoot,
         'blog/builtin_model_lookup_examples.py'
       );
+      // An already visible document can have completed its same-version scan
+      // during restart, before the log buffer was cleared. Request a fresh
+      // provider cycle instead of relying on another open/visibility event.
+      promotePythonProvidersForTesting('known-model-race-recovery-test');
 
       const matchesFireForDoc = (line: string): boolean =>
         line.startsWith('[diagnostics:trigger] fire ') &&
@@ -12151,6 +16354,7 @@ suite('Django ORM Intellisense UI', () => {
         fixtureRoot,
         'blog/builtin_model_lookup_examples.py'
       );
+      promotePythonProvidersForTesting('localworkspace-fallback-baseline-test');
 
       const matchesFireForDoc = (line: string): boolean =>
         line.startsWith('[diagnostics:trigger] fire ') &&
@@ -12712,10 +16916,13 @@ suite('Django ORM Intellisense UI', () => {
     // the scan. The fix ensures BOTH return early: one as "Deferred ...",
     // the other as "Coalesced ...".
     this.timeout(60_000);
-    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '500';
+    process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
+    let releaseScan = (): void => {};
+    let restoreEnsureStarted: (() => void) | undefined;
+    let revertDocument: (() => Promise<void>) | undefined;
     try {
       const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
-      await setWorkspaceRoot(fixtureRoot);
+      await prepareDiagnosticCacheFixture(fixtureRoot);
       await waitForCondition(
         () => getActiveDiagnosticScanRunningCountForTesting() === 0,
         15_000
@@ -12723,26 +16930,66 @@ suite('Django ORM Intellisense UI', () => {
       clearReceiverAndLookupCachesForTesting();
       clearDiagnosticLogBufferForTesting();
 
-      await openFixtureDocument(
-        fixtureRoot,
-        'blog/heavy_lookup_examples.py'
-      );
+      const document = await openFixtureDocument(fixtureRoot, 'blog/heavy_lookup_examples.py');
+      await waitForCondition(() => getActiveDiagnosticScanRunningCountForTesting() === 0, 15_000);
+      assert.ok(!document.isDirty, 'The promotion fixture must start from its saved contents.');
+      const originalVersion = document.version;
 
-      let inFlightObserved = false;
-      const tStart = Date.now();
-      while (Date.now() - tStart < 10_000) {
-        if (getActiveDiagnosticScanRunningCountForTesting() >= 1) {
-          inFlightObserved = true;
-          break;
+      // A prior scan can leave delayed resolver calls after it finishes.
+      // Gate at entry, before ensureStarted awaits anything, and only while
+      // a real scan is active for the document's new edited version.
+      const daemon = getActiveDaemonForTesting();
+      assert.ok(daemon);
+      const ensureStarted = daemon.ensureStarted;
+      const context = daemon as unknown as { currentRequestSource(): string };
+      const gate = new Promise<void>(resolve => { releaseScan = resolve; });
+      const targetPath = path.join(fixtureRoot, 'blog/heavy_lookup_examples.py');
+      const targetLogPath = targetPath.split('/').slice(-2).join('/');
+      let entered = false;
+      daemon.ensureStarted = async function (scope) {
+        // Fire captures this scan's version immediately before its initial
+        // ensureStarted call. Late resolver calls from a cancelled older
+        // scan must not satisfy the new document's gate.
+        const lastTrigger = getDiagnosticLogBufferForTesting().at(-1);
+        if (scope && 'fsPath' in scope && scope.fsPath === targetPath
+          && context.currentRequestSource() === 'diagnostic' && !entered
+          && lastTrigger?.startsWith('[diagnostics:trigger] fire ')
+          && lastTrigger.endsWith(`v=${document.version} ${targetLogPath}`)
+          && document.version > originalVersion && getActiveDiagnosticScanRunningCountForTesting() > 0) {
+          entered = true;
+          await gate;
         }
-        await delay(5);
-      }
-      assert.ok(inFlightObserved, 'Cycle 1 should reach in-flight state.');
+        return ensureStarted.call(this, scope);
+      };
+      restoreEnsureStarted = () => { daemon.ensureStarted = ensureStarted; };
+
+      // Editing forces a fresh diagnostic owner even when the same fixture
+      // stayed open and was already handled by an earlier registration.
+      const edit = new vscode.WorkspaceEdit();
+      edit.insert(document.uri, document.positionAt(document.getText().length), '\n# diagnostic promotion gate\n');
+      revertDocument = async () => {
+        await vscode.window.showTextDocument(document);
+        await vscode.commands.executeCommand('workbench.action.files.revert');
+      };
+      assert.strictEqual(await vscode.workspace.applyEdit(edit), true);
+      await waitForCondition(() => entered, 10_000);
+      await delay(250);
+      assert.ok(getActiveDiagnosticScanRunningCountForTesting() >= 1,
+        'The real diagnostic scan must remain in flight at promotion.\n'
+        + getDiagnosticLogBufferForTesting().slice(-30).join('\n'));
 
       // Fire TWO promotions with distinct reasons back-to-back while the
       // scan is still in flight.
+      console.info('[diagnostics-promotion-in-flight] ' + JSON.stringify({
+        activeScans: getActiveDiagnosticScanRunningCountForTesting(),
+        recent: getDiagnosticLogBufferForTesting().slice(-30),
+      }));
       promotePythonProvidersForTesting('test-reason-A');
       promotePythonProvidersForTesting('test-reason-B');
+      console.info('[diagnostics-promotion-triggered] ' + JSON.stringify({
+        activeScans: getActiveDiagnosticScanRunningCountForTesting(),
+        recent: getDiagnosticLogBufferForTesting().slice(-10),
+      }));
 
       // Expect one Deferred line for A and one Coalesced line for B.
       await waitForCondition(
@@ -12775,6 +17022,8 @@ suite('Django ORM Intellisense UI', () => {
 
       // Once the scan ends, the deferred A promotion should fire (B is
       // coalesced and dropped, which is fine — both just dispose+recreate).
+      releaseScan();
+      restoreEnsureStarted();
       await waitForCondition(
         () => getActiveDiagnosticScanRunningCountForTesting() === 0,
         20_000
@@ -12786,6 +17035,9 @@ suite('Django ORM Intellisense UI', () => {
         5_000
       );
     } finally {
+      releaseScan();
+      restoreEnsureStarted?.();
+      await revertDocument?.();
       delete process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS;
     }
   });
@@ -12810,7 +17062,7 @@ suite('Django ORM Intellisense UI', () => {
     process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
     try {
       const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
-      await setWorkspaceRoot(fixtureRoot);
+      await prepareDiagnosticCacheFixture(fixtureRoot);
       await waitForCondition(
         () => getActiveDiagnosticScanRunningCountForTesting() === 0,
         15_000
@@ -12829,10 +17081,8 @@ suite('Django ORM Intellisense UI', () => {
 
       // Position visible range deep into the file (not at line 0, otherwise
       // both reveal calls end up at the start and no drift occurs).
-      editor.revealRange(
-        new vscode.Range(200, 0, 200, 0),
-        vscode.TextEditorRevealType.AtTop
-      );
+      const firstViewportStart = await revealDiagnosticViewportForTesting(editor, 200);
+      const measuredVersion = document.version;
       await delay(300);
 
       // Wait for Cycle 1 publish.
@@ -12842,14 +17092,21 @@ suite('Django ORM Intellisense UI', () => {
         ),
         25_000
       );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0
+          && getDiagnosticLogBufferForTesting().some(line => line.startsWith('[diagnostics:phase] phase2-scan:')),
+        15_000
+      );
+      assert.ok(
+        getDiagnosticLogBufferForTesting().some(line => line.startsWith('[diagnostics:phase] phase2-scan:')),
+        'The cold viewport cycle must populate phase2 coverage before measuring reuse.'
+      );
       const cycle1End = getDiagnosticLogBufferForTesting().length;
 
       // Drift the visible range by a few lines (mirrors the captain 3-line
       // delta) before triggering Cycle 2.
-      editor.revealRange(
-        new vscode.Range(203, 0, 203, 0),
-        vscode.TextEditorRevealType.AtTop
-      );
+      await revealDiagnosticViewportForTesting(editor, 203, firstViewportStart + 3);
+      assert.strictEqual(document.version, measuredVersion, 'Viewport cache comparison must keep one document version.');
       await delay(300);
 
       // Trigger same-version Cycle 2 via promote (so cache pre-existing
@@ -13228,7 +17485,7 @@ suite('Django ORM Intellisense UI', () => {
     process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS = '15000';
     try {
       const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
-      await setWorkspaceRoot(fixtureRoot);
+      await prepareDiagnosticCacheFixture(fixtureRoot);
       await waitForCondition(
         () => getActiveDiagnosticScanRunningCountForTesting() === 0,
         15_000
@@ -13244,10 +17501,8 @@ suite('Django ORM Intellisense UI', () => {
       assert.ok(editor && editor.document.uri.toString() === document.uri.toString());
 
       // Cycle 1 viewport at line 100.
-      editor.revealRange(
-        new vscode.Range(100, 0, 100, 0),
-        vscode.TextEditorRevealType.AtTop
-      );
+      const firstViewportStart = await revealDiagnosticViewportForTesting(editor, 100);
+      const measuredVersion = document.version;
       await delay(300);
 
       await waitForCondition(
@@ -13256,14 +17511,21 @@ suite('Django ORM Intellisense UI', () => {
         ),
         25_000
       );
+      await waitForCondition(
+        () => getActiveDiagnosticScanRunningCountForTesting() === 0
+          && getDiagnosticLogBufferForTesting().some(line => line.startsWith('[diagnostics:phase] phase2-scan:')),
+        15_000
+      );
+      assert.ok(
+        getDiagnosticLogBufferForTesting().some(line => line.startsWith('[diagnostics:phase] phase2-scan:')),
+        'The cold viewport cycle must populate phase2 coverage before measuring reuse.'
+      );
       const cycle1End = getDiagnosticLogBufferForTesting().length;
 
       // Cycle 2 viewport at line 200 (100-line drift — crosses ALL 50-line
       // grid boundaries the current fix relies on).
-      editor.revealRange(
-        new vscode.Range(200, 0, 200, 0),
-        vscode.TextEditorRevealType.AtTop
-      );
+      await revealDiagnosticViewportForTesting(editor, 200, firstViewportStart + 100);
+      assert.strictEqual(document.version, measuredVersion, 'Viewport cache comparison must keep one document version.');
       await delay(300);
 
       promotePythonProvidersForTesting('scan-large-drift-test');
@@ -13687,7 +17949,7 @@ suite('Django ORM Intellisense UI', () => {
     process.env.DJLS_TEST_RESOLVE_LOOKUP_PATH_DELAY_MS = '1500';
     try {
       const fixtureRoot = path.resolve(__dirname, '../../fixtures/minimal_project');
-      await setWorkspaceRoot(fixtureRoot);
+      await prepareDiagnosticCacheFixture(fixtureRoot);
       await waitForCondition(
         () => getActiveDiagnosticScanRunningCountForTesting() === 0,
         15_000
@@ -13808,6 +18070,178 @@ suite('Django ORM Intellisense UI', () => {
     }
   });
 });
+
+async function prepareDiagnosticCacheFixture(fixtureRoot: string): Promise<void> {
+  // A visible document from the previous test can start a scan during the
+  // restart and leave daemon-ready promotion deferred into our cold cycle.
+  const previousDaemon = getActiveDaemonForTesting();
+  assert.ok(previousDaemon, 'Expected the analysis daemon for the diagnostic cache fixture.');
+  type RegistryDaemon = {
+    process?: ChildProcessWithoutNullStreams;
+    log(level: 'info' | 'debug', message: string): void;
+  };
+  const prototype = Object.getPrototypeOf(previousDaemon) as { log(level: 'info' | 'debug', message: string): void };
+  const originalLog = prototype.log;
+  const originalLogDescriptor = Object.getOwnPropertyDescriptor(prototype, 'log');
+  assert.ok(originalLogDescriptor);
+  // Earlier full-suite instrumentation can restore log as an own property.
+  // Preserve that exact descriptor while observing its spawns too.
+  const originalOwnLogDescriptor = Object.getOwnPropertyDescriptor(previousDaemon, 'log');
+  const listeners: Array<{ child: ChildProcessWithoutNullStreams; listener: (chunk: Buffer) => void }> = [];
+  let registryOwner: { daemon: NonNullable<ReturnType<typeof getActiveDaemonForTesting>>; child: ChildProcessWithoutNullStreams; revision: number; completion?: 'parent-registry' | 'cold-runtime' } | undefined;
+  // Attach at this daemon's actual spawn, before initialization can emit its
+  // registry marker. A retired process's stderr must not satisfy this gate.
+  const observeSpawn = (loggingDaemon: NonNullable<ReturnType<typeof getActiveDaemonForTesting>>, message: string): void => {
+    const internal = loggingDaemon as unknown as RegistryDaemon;
+    const child = internal.process;
+    if (child && loggingDaemon === getActiveDaemonForTesting()
+      && message === `Daemon process spawned with pid ${child.pid ?? 'unknown'}.`) {
+      const revision = loggingDaemon.getSessionRevision();
+      if (registryOwner?.daemon === loggingDaemon && registryOwner.child === child
+        && registryOwner.revision === revision) return;
+      const owner: NonNullable<typeof registryOwner> = { daemon: loggingDaemon, child, revision };
+      registryOwner = owner;
+      let tail = '';
+      const listener = (chunk: Buffer): void => {
+        if (loggingDaemon !== getActiveDaemonForTesting() || internal.process !== child
+          || loggingDaemon.getSessionRevision() !== owner.revision) return;
+        const text = tail + chunk.toString();
+        if (text.includes('runtime_field_registry(background) ready')) owner.completion = 'parent-registry';
+        // Cold deferred setup publishes its warmed runtime without scheduling
+        // the cached-start parent registry prewarm. Observe its own completion.
+        if (text.includes('inspect_runtime(background) status=ready')) owner.completion = 'cold-runtime';
+        tail = text.slice(-512);
+      };
+      child.stderr.on('data', listener);
+      listeners.push({ child, listener });
+    }
+  };
+  prototype.log = function (level, message): void {
+    observeSpawn(this as unknown as NonNullable<ReturnType<typeof getActiveDaemonForTesting>>, message);
+    Reflect.apply(originalLog, this, [level, message]);
+  };
+  try {
+    if (originalOwnLogDescriptor) {
+      const originalOwnLog = originalOwnLogDescriptor.value as RegistryDaemon['log'];
+      Object.defineProperty(previousDaemon, 'log', { ...originalOwnLogDescriptor, value: function (
+        this: NonNullable<ReturnType<typeof getActiveDaemonForTesting>>, level: 'info' | 'debug', message: string
+      ): void {
+        observeSpawn(this, message);
+        Reflect.apply(originalOwnLog, this, [level, message]);
+      } });
+    }
+    await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+    await setWorkspaceRoot(fixtureRoot);
+    // Workspace/interpreter setup can replace the AnalysisDaemon instance.
+    const daemon = getActiveDaemonForTesting();
+    assert.ok(daemon, 'Expected the prepared diagnostic cache daemon.');
+    const internal = daemon as unknown as RegistryDaemon;
+    const revision = daemon.getSessionRevision();
+    const startedAt = performance.now();
+    // Surface metadata and the parent registry finish independently. Its
+    // healthChanged notification can otherwise cancel the first cold scan.
+    await waitForCondition(() => {
+      assert.strictEqual(getActiveDaemonForTesting(), daemon, 'Diagnostic cache fixture changed active daemon owner');
+      assert.strictEqual(daemon.getSessionRevision(), revision, 'Diagnostic cache fixture changed daemon session during surface readiness');
+      const health = daemon.getState();
+      const titleTypeId = daemon.lookupCatalog?.fields['blog.Post']?.title;
+      return health.phase === 'ready' && health.runtime?.bootstrapStatus === 'ready'
+        && normalizeRealPath(health.workspaceRoot) === normalizeRealPath(fixtureRoot)
+        && Object.keys(daemon.surfaceIndex).length === 36
+        && daemon.surfaceIndex['blog.Post']?.instance.title?.[3] === 'CharField'
+        && titleTypeId !== undefined
+        && daemon.lookupCatalog?.types[titleTypeId]?.fieldKind === 'CharField'
+        && registryOwner?.completion !== undefined && registryOwner.revision === revision
+        && registryOwner.daemon === daemon
+        && registryOwner.child === internal.process;
+    }, 10_000);
+    // The cached producer prints its marker while holding the state lock, then
+    // writes healthChanged before releasing that lock. The existing health
+    // RPC acquires the same lock, so its reply follows that notification even
+    // when stderr and stdout are delivered in different orders. Cold warmup
+    // has already published its runtime before its completion marker; the
+    // full-surface gate above separately confirms its later surface adoption.
+    await daemon.refreshHealth();
+    assert.strictEqual(getActiveDaemonForTesting(), daemon, 'Diagnostic cache health barrier changed active daemon owner');
+    assert.strictEqual(daemon.getSessionRevision(), revision, 'Diagnostic cache health barrier changed daemon session');
+    console.info('[diagnostic-cache-fixture-ready] ' + JSON.stringify({
+      elapsedMs: performance.now() - startedAt, sessionRevision: revision,
+      surfaceModels: Object.keys(daemon.surfaceIndex).length,
+      verifiedPostTitleFieldKindCataloguePair: true,
+      startupCompletion: registryOwner?.completion, registryPid: registryOwner?.child.pid,
+      healthNotificationBarrier: true,
+      scope: 'Test-owned readiness only: prior editors closed; full surface and current-process registry notification precede cold measurement. One health RPC outside the measured cycles.',
+    }));
+  } finally {
+    if (originalOwnLogDescriptor) Object.defineProperty(previousDaemon, 'log', originalOwnLogDescriptor);
+    Object.defineProperty(prototype, 'log', originalLogDescriptor);
+    for (const { child, listener } of listeners) child.stderr.off('data', listener);
+  }
+}
+
+async function revealDiagnosticViewportForTesting(
+  editor: vscode.TextEditor,
+  line: number,
+  expectedStartLine?: number
+): Promise<number> {
+  const document = editor.document;
+  const version = document.version;
+  editor.revealRange(new vscode.Range(line, 0, line, 0), vscode.TextEditorRevealType.AtTop);
+  await waitForCondition(() => {
+    assert.strictEqual(vscode.window.activeTextEditor?.document, document, 'Diagnostic viewport changed active document.');
+    assert.strictEqual(document.version, version, 'Diagnostic viewport changed document version.');
+    const range = editor.visibleRanges[0];
+    // AtTop can retain a few lines of scroll padding. The second reveal
+    // must still prove the exact intended movement of this same viewport.
+    return range !== undefined && range.start.line >= Math.max(0, line - 10)
+      && range.start.line <= line && range.end.line > line
+      && (expectedStartLine === undefined || range.start.line === expectedStartLine);
+  }, 5_000);
+  console.info('[diagnostic-viewport-ready] ' + JSON.stringify({
+    uri: document.uri.toString(), version, requestedLine: line,
+    actualStartLine: editor.visibleRanges[0].start.line,
+    actualEndLine: editor.visibleRanges[0].end.line, expectedStartLine,
+  }));
+  return editor.visibleRanges[0].start.line;
+}
+
+async function waitForAdvancedFixtureSurface(
+  daemon: NonNullable<ReturnType<typeof getActiveDaemonForTesting>>,
+  fixtureRoot: string
+): Promise<void> {
+  const revision = daemon.getSessionRevision();
+  const expectedFields: Record<string, Record<string, string>> = {
+    'catalog.Category': { slug: 'SlugField', title: 'CharField' },
+    'sales.Product': { category: 'ForeignKey', name: 'CharField', is_active: 'BooleanField' },
+    'sales.Order': { customer_name: 'CharField', created_at: 'DateTimeField' },
+    'sales.LineItem': { order: 'ForeignKey', product: 'ForeignKey', quantity: 'PositiveIntegerField' },
+    'sales.Fulfillment': { reference: 'CharField' },
+    'sales.FulfillmentDetail': { detail_code: 'CharField', fulfillment: 'ForeignKey' },
+  };
+  const startedAt = performance.now();
+  // Runtime ready can precede the complete surface publication. Warming a
+  // query-only cache before that publication tests a legitimate invalidation.
+  await waitForCondition(() => {
+    assert.strictEqual(daemon.getSessionRevision(), revision, 'Cache fixture changed daemon session during surface readiness');
+    const health = daemon.getState();
+    return health.phase === 'ready' && health.runtime?.bootstrapStatus === 'ready'
+      && normalizeRealPath(health.workspaceRoot) === normalizeRealPath(fixtureRoot)
+      && Object.keys(daemon.surfaceIndex).length === Object.keys(expectedFields).length
+      && Boolean(daemon.surfaceIndex['sales.Product']?.manager.active)
+      && Boolean(daemon.surfaceIndex['sales.Product']?.queryset.active)
+      && Object.entries(expectedFields).every(([label, fields]) =>
+        Object.entries(fields).every(([name, kind]) =>
+          daemon.surfaceIndex[label]?.instance[name]?.[3] === kind
+          && daemon.lookupCatalog?.types[daemon.lookupCatalog.fields[label]?.[name]]?.fieldKind === kind));
+  }, 10_000);
+  console.info('[cache-fixture-surface-ready] ' + JSON.stringify({
+    elapsedMs: performance.now() - startedAt, sessionRevision: revision,
+    surfaceModels: Object.keys(daemon.surfaceIndex).length,
+    verifiedFieldKindCataloguePairs: Object.values(expectedFields).reduce((sum, fields) => sum + Object.keys(fields).length, 0),
+    productManagerAndQuerysetActive: true,
+    scope: 'Public fixture metadata precondition only; no target completion or extra daemon request.',
+  }));
+}
 
 async function setWorkspaceRoot(rootPath: string): Promise<void> {
   const e2eEnvironment = await ensureFixtureE2EEnvironment(rootPath);
@@ -14102,7 +18536,7 @@ async function findDjango5BaseInterpreter(): Promise<string> {
 
   assert.fail(
     `Could not find a Python interpreter with Django ${DJANGO_E2E_MAJOR_VERSION}.x. ` +
-      'Set DJLS_E2E_BASE_PYTHON or install Django 5 into a discoverable interpreter.'
+      `Set DJLS_E2E_BASE_PYTHON or install Django ${DJANGO_E2E_MAJOR_VERSION} into a discoverable interpreter.`
   );
 }
 
@@ -14450,6 +18884,18 @@ function locationFilePath(
   return definition.uri.fsPath;
 }
 
+function findClassFieldLine(filePath: string, className: string, fieldName: string): number {
+  const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
+  const classStart = lines.findIndex(line => line.startsWith(`class ${className}(`));
+  assert.ok(classStart >= 0, `Expected class ${className} in ${filePath}`);
+  const nextClass = lines.findIndex((line, index) => index > classStart && /^class\s/.test(line));
+  const classEnd = nextClass < 0 ? lines.length : nextClass;
+  const fieldLine = lines.findIndex((line, index) => index > classStart && index < classEnd
+    && new RegExp(`^\\s+${fieldName}\\s*=`).test(line));
+  assert.ok(fieldLine >= 0, `Expected ${className}.${fieldName} in ${filePath}`);
+  return fieldLine + 1;
+}
+
 function bestDefinitionForFixture(
   definitions: Array<vscode.Location | vscode.LocationLink> | undefined,
   fixturePathSuffix: string
@@ -14498,7 +18944,9 @@ async function waitForDiagnostics(
   if (!predicate(finalDiagnostics)) {
     assert.fail(
       `waitForDiagnostics timed out after ${timeoutMs}ms. ` +
-      `Current diagnostics: ${stringifyDiagnostics(finalDiagnostics)}`
+      `Current diagnostics: ${stringifyDiagnostics(finalDiagnostics)}\n` +
+      `Recent diagnostic phases:\n${getDiagnosticLogBufferForTesting()
+        .filter(line => line.startsWith('[diagnostics:')).slice(-16).join('\n')}`
     );
   }
   return finalDiagnostics;

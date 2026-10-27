@@ -1,9 +1,16 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { NativeSignaturePriority } from './nativeSignaturePriority';
 import { getExtensionSettings, CONFIGURATION_SECTION } from '../config/settings';
 import { AnalysisDaemon } from '../daemon/analysisDaemon';
 import { isPylanceAvailable } from '../python/pylance';
-import { pythonTypeForKind } from '../../server/fieldLookups';
+import { pythonTypeForKind, operandPythonType } from '../../server/fieldLookups';
+import { getCompletionCandidates, parseLookupChain, supportsLookupTransforms, FILTER_LOOKUP_METHODS } from '../../server/lookupResolver';
+import { virtualLookupIndex, type AnnotationOutputSpec } from '../../server/virtualLookup';
+import { ANNOTATION_ROOT, defaultAggregateAlias, matchAnnotationAlias } from '../../server/annotationAliases';
+import { isPythonIdentifier, lookupKeywordStart, openStringContentStart, PYTHON_IDENTIFIER_RE, PYTHON_IDENTIFIER_GLOBAL_RE, PYTHON_IDENTIFIER_PATTERN } from '../../server/lookupSyntax';
+import { djangoBuiltinAvailable } from '../../server/djangoVersion';
+import { ProviderRequestOwner, type ProviderRequestScope } from './providerRequestLifetime';
 import type {
   ExportOriginResolution,
   LookupPathCompletionsResult,
@@ -22,8 +29,8 @@ function buildPythonSelector(): vscode.DocumentSelector {
   const selectors: vscode.DocumentFilter[] = [];
   const activeDocument = vscode.window.activeTextEditor?.document;
 
-  // Use the active file as the most-specific selector so our hover/signature
-  // providers outrank generic Python stub providers from other extensions.
+  // These filters describe the supported files. Matching Python filters all
+  // score 10; an exact-file pattern does not raise registration priority.
   if (
     activeDocument?.languageId === 'python' &&
     activeDocument.uri.scheme === 'file'
@@ -50,6 +57,133 @@ function buildPythonSelector(): vscode.DocumentSelector {
   return selectors;
 }
 
+interface PythonInteractiveProviders {
+  hover: vscode.HoverProvider;
+  completion: vscode.CompletionItemProvider;
+  definition: vscode.DefinitionProvider;
+  signatureHelp: vscode.SignatureHelpProvider;
+  inlayHints: vscode.InlayHintsProvider;
+}
+
+/** Keep the VS Code adapters alive while provider implementations are promoted.
+ * A request can already target an adapter before its callback is entered, so
+ * the in-callback request guard cannot protect an adapter that is disposed. */
+export class PythonInteractiveProviderOwner implements vscode.Disposable {
+  private providers: PythonInteractiveProviders | undefined;
+  private disposed = false;
+  private readonly registrations: vscode.Disposable[];
+  private readonly selector = buildPythonSelector();
+  private readonly signatureHelpAdapter: vscode.SignatureHelpProvider;
+  private signatureHelpPriorityPromoted = false;
+  private readonly signaturePriority: NativeSignaturePriority;
+  // VS Code observes the registered adapter throughout delegate replacement.
+  private readonly inlayHintsChanged = new vscode.EventEmitter<void>();
+  private inlayHintsChangeSubscription: vscode.Disposable | undefined;
+
+  constructor() {
+    const selector = this.selector;
+    this.signatureHelpAdapter = this.adapter(
+      'signatureHelp', 'provideSignatureHelp'
+    ) as unknown as vscode.SignatureHelpProvider;
+    this.signaturePriority = new NativeSignaturePriority(
+      this.signatureHelpAdapter, selector, vscode.languages.registerSignatureHelpProvider,
+      typeof vscode.version === 'string'
+    );
+    this.registrations = [
+      vscode.languages.registerHoverProvider(
+        selector,
+        this.adapter('hover', 'provideHover') as unknown as vscode.HoverProvider
+      ),
+      vscode.languages.registerCompletionItemProvider(
+        selector,
+        this.adapter('completion', 'provideCompletionItems') as unknown as vscode.CompletionItemProvider,
+        "'", '"', '.', '_', '(', ','
+      ),
+      vscode.languages.registerDefinitionProvider(
+        selector,
+        this.adapter('definition', 'provideDefinition') as unknown as vscode.DefinitionProvider
+      ),
+      vscode.languages.registerSignatureHelpProvider(
+        selector,
+        this.signatureHelpAdapter,
+        { triggerCharacters: ['(', ','], retriggerCharacters: [','] }
+      ),
+      vscode.languages.registerInlayHintsProvider(
+        selector,
+        { ...this.adapter('inlayHints', 'provideInlayHints'),
+          onDidChangeInlayHints: this.inlayHintsChanged.event } as unknown as vscode.InlayHintsProvider
+      ),
+    ];
+  }
+
+  promoteSignatureHelpPriority(): void {
+    if (this.disposed || this.signatureHelpPriorityPromoted) return;
+    const registration = vscode.languages.registerSignatureHelpProvider(
+      this.selector,
+      this.signatureHelpAdapter,
+      { triggerCharacters: ['(', ','], retriggerCharacters: [','] }
+    );
+    this.registrations.push(registration);
+    this.signatureHelpPriorityPromoted = true;
+    this.signaturePriority.prepare();
+  }
+
+  refreshSignatureHelpPriority(): Promise<boolean> | undefined {
+    if (this.disposed || !this.signatureHelpPriorityPromoted) return undefined;
+    return this.signaturePriority.refresh();
+  }
+
+  setProviders(providers: PythonInteractiveProviders): vscode.Disposable {
+    if (this.disposed) {
+      throw new Error('Cannot replace disposed Python interactive providers');
+    }
+    this.inlayHintsChangeSubscription?.dispose();
+    this.providers = providers;
+    this.inlayHintsChangeSubscription = providers.inlayHints.onDidChangeInlayHints?.(
+      () => this.inlayHintsChanged.fire()
+    );
+    this.inlayHintsChanged.fire();
+    return new vscode.Disposable(() => {
+      if (this.providers === providers) {
+        this.providers = undefined;
+        this.inlayHintsChangeSubscription?.dispose();
+        this.inlayHintsChangeSubscription = undefined;
+        this.inlayHintsChanged.fire();
+      }
+    });
+  }
+
+  private adapter(
+    providerKind: keyof PythonInteractiveProviders,
+    method: string
+  ): Record<string, (...args: unknown[]) => unknown> {
+    return {
+      [method]: (...args: unknown[]) => {
+        const provider = this.providers?.[providerKind] as unknown as
+          | Record<string, unknown>
+          | undefined;
+        const callback = provider?.[method];
+        return typeof callback === 'function'
+          ? Reflect.apply(callback, provider, args)
+          : undefined;
+      },
+    };
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.signaturePriority.dispose();
+    this.providers = undefined;
+    this.inlayHintsChangeSubscription?.dispose();
+    this.inlayHintsChangeSubscription = undefined;
+    this.inlayHintsChanged.dispose();
+    for (const registration of this.registrations) {
+      registration.dispose();
+    }
+  }
+}
+
 const RELATION_FIELD_CALL_PATTERN = String.raw`(?:[A-Za-z_][\w.]*\.)?(?:ForeignKey|OneToOneField|ManyToManyField|ParentalKey|ParentalManyToManyField)`;
 const RELATION_TARGET_ARGUMENT_PATTERN = String.raw`${RELATION_FIELD_CALL_PATTERN}\(\s*(?:to\s*=\s*)?`;
 const RELATION_COMPLETION_PATTERN = new RegExp(
@@ -59,9 +193,9 @@ const RELATION_HOVER_PATTERN = new RegExp(
   String.raw`${RELATION_TARGET_ARGUMENT_PATTERN}(['"])([\w.]+)\1`,
   'g'
 );
-const PREFETCH_LOOKUP_COMPLETION_PATTERN = /(?:[A-Za-z_][\w.]*\.)?Prefetch\(\s*(['"])([-\w.]*)$/;
+const PREFETCH_LOOKUP_COMPLETION_PATTERN = /(?:[A-Za-z_][\w.]*\.)?Prefetch\(\s*(['"])([^'"\\\r\n]*)$/;
 const PREFETCH_LOOKUP_HOVER_PATTERN =
-  /(?:[A-Za-z_][\w.]*\.)?Prefetch\(\s*(['"])([-\w.]+)\1/g;
+  /(?:[A-Za-z_][\w.]*\.)?Prefetch\(\s*(['"])([^'"\\\r\n]+)\1/g;
 const LOOKUP_DICT_KEY_COMPLETION_PATTERN =
   /(?:\*\*\{\s*|,\s*)(?:[rRuUbBfF]{0,2})(['"])([^'"]*)$/;
 const LOOKUP_DICT_KEY_HOVER_PATTERN =
@@ -73,8 +207,8 @@ const IMPORT_MODULE_SPEC_PATTERN = /([A-Za-z_][\w.]*)(?:\s+as\s+([A-Za-z_][\w]*)
 const LOOKUP_METHOD_PATTERN =
   'values|values_list|order_by|only|defer|select_related|prefetch_related';
 const KEYWORD_LOOKUP_METHOD_PATTERN =
-  'filter|exclude|get|get_or_create|update_or_create';
-const DIRECT_FIELD_KEYWORD_METHOD_PATTERN = 'create|update';
+  'filter|exclude|get|get_or_create|update_or_create|aget|aget_or_create|aupdate_or_create';
+const DIRECT_FIELD_KEYWORD_METHOD_PATTERN = 'create|update|acreate|aupdate';
 const STRING_LOOKUP_METHODS = new Set([
   'values',
   'values_list',
@@ -94,8 +228,11 @@ const KEYWORD_LOOKUP_METHODS = new Set([
   'get',
   'get_or_create',
   'update_or_create',
+  'aget',
+  'aget_or_create',
+  'aupdate_or_create',
 ]);
-const DIRECT_FIELD_KEYWORD_METHODS = new Set(['create', 'update']);
+const DIRECT_FIELD_KEYWORD_METHODS = new Set(['create', 'update', 'acreate', 'aupdate']);
 const ORM_FIELD_SIGNATURE_METHODS = new Set([
   ...KEYWORD_LOOKUP_METHODS,
   ...DIRECT_FIELD_KEYWORD_METHODS,
@@ -123,6 +260,7 @@ const FAST_LOCAL_ORM_MEMBER_HOVER_NAMES = new Set([
   'explain',
   'extra',
   'filter',
+  'fetch_mode',
   'first',
   'get',
   'get_or_create',
@@ -211,10 +349,10 @@ const EXPRESSION_QUERYSET_METHOD_PATTERN =
 const QUERYSET_RECEIVER_PATTERN =
   String.raw`[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*|\([^()]*\))*`;
 const LOOKUP_COMPLETION_PATTERN = new RegExp(
-  String.raw`\.(${LOOKUP_METHOD_PATTERN})\(\s*(['"])([-\w.]*)$`
+  String.raw`\.(${LOOKUP_METHOD_PATTERN})\(\s*(['"])([^'"\\\r\n]*)$`
 );
 const LOOKUP_HOVER_PATTERN = new RegExp(
-  String.raw`\.(${LOOKUP_METHOD_PATTERN})\(\s*(['"])([-\w.]+)\2`,
+  String.raw`\.(${LOOKUP_METHOD_PATTERN})\(\s*(['"])([^'"\\\r\n]+)\2`,
   'g'
 );
 const F_EXPRESSION_METHOD = 'f_expression';
@@ -225,6 +363,25 @@ const EDIT_DIAGNOSTIC_DEBOUNCE_MS = 1000;
 function diagnosticTimeBudgetMs(): number {
   const override = parseInt(process.env.DJLS_DIAGNOSTIC_TIME_BUDGET_MS ?? '', 10);
   return Number.isFinite(override) && override > 0 ? override : 10_000;
+}
+
+function diagnosticViewportRange(
+  document: vscode.TextDocument,
+  visibleRange = vscode.window.visibleTextEditors.find(editor =>
+    editor.document.uri.toString() === document.uri.toString()
+  )?.visibleRanges[0]
+): { useVisibleRangeScan: boolean; startLine: number; endLine: number } {
+  const useVisibleRangeScan = document.lineCount >= 500 && visibleRange !== undefined;
+  // Coarse boundaries prevent small scrolls/resizes from rescanning the same
+  // document. Keep the margin in sync for scheduling and the actual scan.
+  return {
+    useVisibleRangeScan,
+    startLine: useVisibleRangeScan
+      ? Math.max(0, Math.floor((visibleRange!.start.line - 50) / 50) * 50) : 0,
+    endLine: useVisibleRangeScan
+      ? Math.min(document.lineCount, Math.ceil((visibleRange!.end.line + 50) / 50) * 50)
+      : document.lineCount,
+  };
 }
 
 function areOrmDiagnosticsEnabled(
@@ -238,13 +395,78 @@ function areOrmDiagnosticsEnabled(
 // disposing+recreating provider registrations. Avoids killing a 10s scan
 // just to bump provider priority by one slot.
 let activeDiagnosticScanRunningCount = 0;
+let activeInteractiveRequestCount = 0;
 export function isAnyDiagnosticScanInFlight(): boolean {
   return activeDiagnosticScanRunningCount > 0;
+}
+
+/** Keep priority-only provider replacement from cancelling user responses. */
+export function isAnyInteractiveRequestInFlight(): boolean {
+  return activeInteractiveRequestCount > 0;
 }
 
 /** Test-only: peek the in-flight counter for regression assertions. */
 export function getActiveDiagnosticScanRunningCountForTesting(): number {
   return activeDiagnosticScanRunningCount;
+}
+
+interface CompletionTraceForTesting {
+  uri: string;
+  line: number;
+  character: number;
+  startedAt: number;
+  finishedAt?: number;
+  cancelled?: boolean;
+  receiver?: { modelLabel: string; kind: string; expression: string; prefix: string };
+  memberNames?: string[];
+  outputNames?: string[];
+  error?: string;
+}
+const completionTracesForTesting: CompletionTraceForTesting[] = [];
+export function getCompletionTracesForTesting(): readonly CompletionTraceForTesting[] {
+  return completionTracesForTesting.map(trace => ({ ...trace,
+    receiver: trace.receiver ? { ...trace.receiver } : undefined,
+    memberNames: trace.memberNames ? [...trace.memberNames] : undefined,
+    outputNames: trace.outputNames ? [...trace.outputNames] : undefined,
+  }));
+}
+
+interface HoverTraceForTesting {
+  uri: string;
+  line: number;
+  character: number;
+  startedAt: number;
+  startedMonotonicMs: number;
+  finishedAt?: number;
+  finishedMonotonicMs?: number;
+  returnedHover?: boolean;
+  cancelled?: boolean;
+  disposed?: boolean;
+  error?: string;
+}
+const hoverTracesForTesting: HoverTraceForTesting[] = [];
+export function getHoverTracesForTesting(): readonly HoverTraceForTesting[] {
+  return hoverTracesForTesting.map(trace => ({ ...trace }));
+}
+
+interface InlayTraceForTesting {
+  uri: string;
+  startLine: number;
+  endLine: number;
+  startedAt: number;
+  finishedAt?: number;
+  daemonPhase: string;
+  candidates?: number;
+  hintCount?: number;
+  startupError?: string;
+  cancelled?: boolean;
+  disposed?: boolean;
+  samples: Array<{ line: number; lookup?: string; receiver?: string; modelLabel?: string;
+    label?: string; resolved?: boolean; reason?: string; error?: string }>;
+}
+const inlayTracesForTesting: InlayTraceForTesting[] = [];
+export function getInlayTracesForTesting(): readonly InlayTraceForTesting[] {
+  return inlayTracesForTesting.map(trace => ({ ...trace, samples: trace.samples.map(sample => ({ ...sample })) }));
 }
 
 /** Test-only: clear the cross-registration receiver/lookup caches so a
@@ -254,6 +476,7 @@ export function clearReceiverAndLookupCachesForTesting(): void {
   _receiverCachesAcrossRegistrations.clear();
   _lookupResolutionCachesAcrossRegistrations.clear();
   _scanCacheAcrossRegistrations.clear();
+  lookupContextValidationCaches = new WeakMap();
 }
 
 /** Test-only: simulate the cache clearing that `daemon.onDidChangeState`
@@ -263,6 +486,23 @@ export function clearReceiverAndLookupCachesForTesting(): void {
  *  scan cache intact; this hook lets the test prove it. */
 export function simulateDaemonReadyCacheClearForTesting(): void {
   clearLookupResolutionAndReceiverCachesAcrossRegistrations();
+}
+
+/** Test-only: exercise the actual cached receiver walkers without editor
+ * cancellation hiding a response that crosses an ownership change. */
+export function resolveCachedReceiverForTesting(
+  daemon: AnalysisDaemon,
+  document: vscode.TextDocument,
+  expression: string,
+  beforeOffset: number,
+  kind: 'orm' | 'lookup'
+): Promise<OrmReceiverInfo | undefined> {
+  if (process.env.DJLS_TEST_CAPTURE_LOGS !== '1') {
+    throw new Error('Receiver cache testing requires log capture.');
+  }
+  return kind === 'orm'
+    ? resolveOrmReceiverAtOffset(daemon, document, expression, beforeOffset, new Set())
+    : resolveLookupReceiverAtOffset(daemon, document, expression, beforeOffset, new Set());
 }
 
 /** Test-only: directly invoke the diagnostic noRecv classifier on an
@@ -362,18 +602,24 @@ function getScanCacheEntry(
   return fresh;
 }
 
-/** Returns true if every line in [startLine, endLine) is inside one of the
- *  cached intervals. */
-function intervalsCover(
+/** Return only the uncovered parts of [startLine, endLine). Intervals are
+ *  sorted and merged by intervalsAdd. Partial overlap must not rescan and
+ *  append contexts from lines already retained in this document version. */
+function uncoveredScanRanges(
   intervals: Array<[number, number]>,
   startLine: number,
   endLine: number,
-): boolean {
-  if (startLine >= endLine) return true;
+): Array<[number, number]> {
+  const missing: Array<[number, number]> = [];
+  let cursor = startLine;
   for (const [s, e] of intervals) {
-    if (s <= startLine && endLine <= e) return true;
+    if (cursor >= endLine || s >= endLine) break;
+    if (e <= cursor) continue;
+    if (s > cursor) missing.push([cursor, s]);
+    cursor = Math.max(cursor, e);
   }
-  return false;
+  if (cursor < endLine) missing.push([cursor, endLine]);
+  return missing;
 }
 
 /** Merge [start, end) into the sorted, non-overlapping interval list. */
@@ -408,6 +654,56 @@ function intervalsAdd(
   intervals.push(...next);
 }
 
+async function collectDiagnosticScanContexts(
+  document: vscode.TextDocument,
+  startLine: number,
+  endLine: number,
+  isCancelled: () => boolean,
+  daemon: AnalysisDaemon,
+): Promise<{
+  relations: RelationDiagnosticContext[];
+  lookups: LookupDiagnosticContext[];
+  cacheHit: boolean;
+  scannedLines: number;
+}> {
+  const cache = getScanCacheEntry(document);
+  const inRange = (context: { range: vscode.Range }): boolean =>
+    context.range.start.line >= startLine && context.range.start.line < endLine;
+  const relations = cache.relations.filter(inRange);
+  const lookups = cache.lookups.filter(inRange);
+  const missing = uncoveredScanRanges(cache.scanned, startLine, endLine);
+  const insertsBeforeCachedTail = missing.length > 0 && cache.scanned.length > 0
+    && missing[0][0] < cache.scanned[cache.scanned.length - 1][1];
+  let scannedLines = 0;
+  for (const [start, end] of missing) {
+    if (isCancelled()) break;
+    const newRelations = findRelationDiagnosticContexts(document, start, end);
+    const newLookups = await findLookupDiagnosticContexts(document, isCancelled, start, end, daemon);
+    relations.push(...newRelations);
+    lookups.push(...newLookups);
+    // Interrupted collection can return partial contexts for this cycle's
+    // cancellation logging, but must never mark the whole gap as covered.
+    if (isCancelled()) break;
+    cache.relations.push(...newRelations);
+    cache.lookups.push(...newLookups);
+    intervalsAdd(cache.scanned, start, end);
+    scannedLines += end - start;
+  }
+  if (insertsBeforeCachedTail) {
+    // Cached portions may lie between new gaps. Keep validation order equal
+    // to a fresh scan so a tight diagnostic budget still prioritizes lines
+    // in their original order. Stable line sorting preserves each line's
+    // collector order, and stored order keeps complete hits cheap.
+    const byLine = (a: { range: vscode.Range }, b: { range: vscode.Range }): number =>
+      a.range.start.line - b.range.start.line;
+    cache.relations.sort(byLine);
+    cache.lookups.sort(byLine);
+    relations.sort(byLine);
+    lookups.sort(byLine);
+  }
+  return { relations, lookups, cacheHit: missing.length === 0, scannedLines };
+}
+
 function clearLookupResolutionAndReceiverCachesAcrossRegistrations(): void {
   _receiverCachesAcrossRegistrations.clear();
   _lookupResolutionCachesAcrossRegistrations.clear();
@@ -420,41 +716,11 @@ function clearLookupResolutionAndReceiverCachesAcrossRegistrations(): void {
 const DIAGNOSTIC_REQUEST_BUDGET = 1000;
 const DIAGNOSTIC_LOOKUP_PARALLELISM = 4;
 const modelSubclassRelationCache = new Map<string, boolean>();
-const VIRTUAL_LOOKUP_OPERATORS = [
-  'exact',
-  'iexact',
-  'contains',
-  'icontains',
-  'in',
-  'gt',
-  'gte',
-  'lt',
-  'lte',
-  'startswith',
-  'istartswith',
-  'endswith',
-  'iendswith',
-  'range',
-  'isnull',
-  'regex',
-  'iregex',
-  'date',
-  'year',
-  'month',
-  'day',
-  'week',
-  'week_day',
-  'quarter',
-  'time',
-  'hour',
-  'minute',
-  'second',
-] as const;
 const F_EXPRESSION_COMPLETION_PATTERN = new RegExp(
-  String.raw`(?:^|[^\w.])(?:[A-Za-z_][\w.]*\.)?F\(\s*(['"])([-\w.]*)$`
+  String.raw`(?:^|[^\w.])(?:[A-Za-z_][\w.]*\.)?F\(\s*(['"])([^'"\\\r\n]*)$`
 );
 const F_EXPRESSION_HOVER_PATTERN = new RegExp(
-  String.raw`(?:^|[^\w.])(?:[A-Za-z_][\w.]*\.)?F\(\s*(['"])([-\w.]+)\1`,
+  String.raw`(?:^|[^\w.])(?:[A-Za-z_][\w.]*\.)?F\(\s*(['"])([^'"\\\r\n]+)\1`,
   'g'
 );
 const EXPRESSION_FIELD_FUNCTION_NAMES = [
@@ -470,6 +736,9 @@ const EXPRESSION_FIELD_FUNCTION_NAMES = [
   'ArrayAgg',
   'JSONBAgg',
   'StringAgg',
+  'BitAnd',
+  'BitOr',
+  'BitXor',
   'Concat',
   'Greatest',
   'Least',
@@ -509,14 +778,16 @@ const EXPRESSION_WRAPPER_FUNCTION_NAMES = new Set([
   'JSONObject',
 ]);
 const EXPRESSION_PATH_COMPLETION_PATTERN = new RegExp(
-  String.raw`(?:^|[^\w.])((?:[A-Za-z_][\w.]*\.)?(?:${EXPRESSION_FIELD_FUNCTION_PATTERN}))\(\s*(['"])([-\w.]*)$`
+  String.raw`(?:^|[^\w.])((?:[A-Za-z_][\w.]*\.)?(?:${EXPRESSION_FIELD_FUNCTION_PATTERN}))\(\s*(['"])([^'"\\\r\n]*)$`
 );
 const EXPRESSION_PATH_HOVER_PATTERN = new RegExp(
-  String.raw`(?:^|[^\w.])((?:[A-Za-z_][\w.]*\.)?(?:${EXPRESSION_FIELD_FUNCTION_PATTERN}))\(\s*(['"])([-\w.]+)\2`,
+  String.raw`(?:^|[^\w.])((?:[A-Za-z_][\w.]*\.)?(?:${EXPRESSION_FIELD_FUNCTION_PATTERN}))\(\s*(['"])([^'"\\\r\n]+)\2`,
   'g'
 );
-const EXPRESSION_STRING_COMPLETION_PATTERN = /(['"])([-\w.]*)$/;
-const EXPRESSION_STRING_HOVER_PATTERN = /(['"])([-\w.]+)\1/g;
+const EXPRESSION_STRING_COMPLETION_PATTERN = /(['"])([^'"\\\r\n]*)$/;
+// Consume empty strings too, so their closing quote cannot pair with the
+// opening quote of a later field-path argument (e.g. Greatest(Value(""), "name")).
+const EXPRESSION_STRING_HOVER_PATTERN = /(['"])([^'"\\\r\n]*)\1/g;
 const ANY_POSITION_EXPRESSION_FIELD_FUNCTIONS = new Set<string>([
   'Coalesce',
   'Concat',
@@ -531,13 +802,6 @@ const FIRST_ARGUMENT_EXPRESSION_FIELD_FUNCTIONS = new Set<string>([
 ]);
 const KEYWORD_VALUE_EXPRESSION_FIELD_FUNCTIONS = new Set<string>(['JSONObject']);
 const DJANGO_FIELD_PRIORITY_METHODS = new Set(['filter', 'exclude', 'get']);
-const LOOKUP_OPERATOR_METHODS = new Set([
-  'filter',
-  'exclude',
-  'get',
-  'get_or_create',
-  'update_or_create',
-]);
 const LOOKUP_RECEIVER_KINDS = new Set<OrmReceiverKind>([
   'model_class',
   'manager',
@@ -575,6 +839,7 @@ const QUERYSET_ANNOTATION_PRESERVING_METHODS = new Set([
   'distinct',
   'exclude',
   'filter',
+  'fetch_mode',
   'only',
   'order_by',
   'prefetch_related',
@@ -820,6 +1085,30 @@ interface RelationDiagnosticContext {
 interface LookupDiagnosticContext extends LookupLiteral {
   range: vscode.Range;
 }
+
+interface DeferredLookupDiagnosticContext extends LookupDiagnosticContext {
+  _needsCallContextValidation?: boolean;
+  _absoluteStart?: number;
+  _absoluteEnd?: number;
+  _isPrefetch?: boolean;
+  _isDictKey?: boolean;
+  _isFExpression?: boolean;
+  _isExpressionPath?: boolean;
+}
+
+type LookupContextValidationDecision = Pick<DeferredLookupDiagnosticContext,
+  'receiverExpression' | 'method' | '_needsCallContextValidation' |
+  '_absoluteStart' | '_absoluteEnd' | '_isPrefetch' | '_isDictKey' |
+  '_isFExpression' | '_isExpressionPath'> & { valid: boolean };
+
+// Syntax depends only on the exact document and context inputs. Keep it
+// separate from metadata-dependent receiver/lookup caches, and let closing
+// or collecting the document release all decisions without retaining it.
+let lookupContextValidationCaches = new WeakMap<vscode.TextDocument, {
+  version: number;
+  text: string;
+  decisions: WeakMap<LookupDiagnosticContext, LookupContextValidationDecision>;
+}>();
 
 interface DirectFieldKeywordContext {
   receiverExpression: string;
@@ -1071,6 +1360,7 @@ interface OrmReceiverInfo {
 }
 
 interface VirtualOrmField {
+  output?: AnnotationOutputSpec;
   name: string;
   detail: string;
   fieldKind: string;
@@ -1108,8 +1398,9 @@ const INLAY_HINT_MAX_CANDIDATES = 60;
  *  The lookbehind avoids attribute access / longer identifiers; `(?!=)` avoids
  *  `==`. This is only a cheap pre-filter; keywordLookupLiteral validates the
  *  actual queryset call context. */
-const INLAY_LOOKUP_KWARG_RE =
-  /(?<![.\w])([A-Za-z_]\w*(?:__[A-Za-z_]\w*)+)\s*=(?!=)/g;
+const INLAY_LOOKUP_KWARG_RE = new RegExp(
+  String.raw`(?<![.\p{XID_Continue}])(${PYTHON_IDENTIFIER_PATTERN}__[_\p{XID_Continue}]*)\s*=(?!=)`, 'gu',
+);
 
 function areLookupInlayHintsEnabled(
   scope?: vscode.ConfigurationScope
@@ -1162,9 +1453,10 @@ function collectInlayLookupCandidates(
 function inlayTypeLabelForResolution(
   resolution: LookupPathResolution
 ): string | undefined {
-  if (!resolution.resolved || !resolution.target) {
+  if (!resolution.resolved) {
     return undefined;
   }
+  // Local validation retains terminal types without a display/source target.
   const terminalType = resolution.terminalType;
   if (terminalType) {
     if (terminalType.lookupOperator && terminalType.operandPythonType) {
@@ -1173,6 +1465,9 @@ function inlayTypeLabelForResolution(
     return terminalType.pythonType;
   }
   const target = resolution.target;
+  if (!target) {
+    return undefined;
+  }
   if (target.isRelation) {
     return target.relatedModelLabel
       ? shortModelLabelName(target.relatedModelLabel)
@@ -1197,7 +1492,8 @@ function shortModelLabelName(modelLabel: string): string {
 }
 
 export function registerPythonProviders(
-  daemon: AnalysisDaemon
+  daemon: AnalysisDaemon,
+  providerOwner?: PythonInteractiveProviderOwner
 ): vscode.Disposable[] {
   const pythonSelector = buildPythonSelector();
   const diagnosticCollection = vscode.languages.createDiagnosticCollection(
@@ -1245,14 +1541,7 @@ export function registerPythonProviders(
       parameterHintDismissTimers.add(timer);
     }
   };
-  // Disposal signal: rejects when providers are disposed, used with Promise.race
-  // to immediately abort in-flight hover/completion/definition/signature calls.
-  let fireDisposalSignal: (() => void) | undefined;
-  const disposalSignal = new Promise<never>((_, reject) => {
-    fireDisposalSignal = () => reject(new Error('providers disposed'));
-  });
-  // Suppress unhandled rejection from the signal promise itself
-  disposalSignal.catch(() => {});
+  const requestOwner = new ProviderRequestOwner();
   const diagnosticTimers = new Map<string, NodeJS.Timeout>();
   const lastDiagnosedDocumentVersions = new Map<string, number>();
   /** Tracks partial diagnostic results from budget-exhausted scans so the
@@ -1264,6 +1553,10 @@ export function registerPythonProviders(
     budgetExhausted: boolean;
   }>();
   const activeDiagnosticScans = new Set<string>();
+  // A closed document can still own an in-flight URI scan while a reopened
+  // document queues behind it. Preserve the latest document, not just its URI.
+  const pendingDiagnosticRefreshes = new Map<string, vscode.TextDocument>();
+  const diagnosticViewportKeys = new Map<string, string>();
   let fullDiagnosticsRefreshTimer: NodeJS.Timeout | undefined;
   // VS Code fires onDidChangeVisibleTextEditors twice for a single tab switch
   // (the visible set transitions through remove-old then add-new). The refresh
@@ -1287,6 +1580,7 @@ export function registerPythonProviders(
       clearTimeout(timer);
     }
     diagnosticTimers.clear();
+    pendingDiagnosticRefreshes.clear();
   };
 
   const COMPLETION_DIAGNOSTIC_DEFER_MS = 3_000;
@@ -1295,7 +1589,7 @@ export function registerPythonProviders(
     delayMs = 200,
     reason = 'unknown'
   ): void => {
-    if (!canRunDiagnostics()) {
+    if (diagnosticsDisposed || document.isClosed || !canRunDiagnostics()) {
       return;
     }
     if (!shouldAnalyzeDocument(document, daemon.getState().workspaceRoot)) {
@@ -1345,7 +1639,9 @@ export function registerPythonProviders(
     const documents = new Map<string, vscode.TextDocument>();
 
     for (const editor of vscode.window.visibleTextEditors) {
-      documents.set(editor.document.uri.toString(), editor.document);
+      if (!editor.document.isClosed) {
+        documents.set(editor.document.uri.toString(), editor.document);
+      }
     }
 
     return [...documents.values()];
@@ -1374,7 +1670,11 @@ export function registerPythonProviders(
       // debounce) — the edit-triggered timer is more specific and should
       // take priority over the blanket tracked refresh.
       const docKey = document.uri.toString();
-      if (diagnosticTimers.has(docKey) || activeDiagnosticScans.has(docKey)) {
+      if (activeDiagnosticScans.has(docKey)) {
+        pendingDiagnosticRefreshes.set(docKey, document);
+        continue;
+      }
+      if (diagnosticTimers.has(docKey)) {
         continue;
       }
 
@@ -1401,19 +1701,21 @@ export function registerPythonProviders(
     triggerReason = 'unknown'
   ): Promise<void> => daemon.withDeadline(performance.now() + diagnosticTimeBudgetMs(), () =>
   daemon.withRequestSource('diagnostic', async () => {
+    const key = document.uri.toString();
+    let ownsScan = false;
     activeDiagnosticScanRunningCount++;
     try {
-    if (diagnosticsDisposed) {
+    if (diagnosticsDisposed || document.isClosed) {
       return;
     }
     if (!canRunDiagnostics()) {
       return;
     }
-    const key = document.uri.toString();
     const shortPath = document.uri.fsPath.split('/').slice(-2).join('/');
 
     // Prevent overlapping scans of the same document from concurrent triggers
     if (activeDiagnosticScans.has(key)) {
+      pendingDiagnosticRefreshes.set(key, document);
       daemon.logDiagnostic(`[diagnostics:trigger] skip reason=${triggerReason} cause=active-scan ${shortPath}`);
       return;
     }
@@ -1434,11 +1736,12 @@ export function registerPythonProviders(
       return;
     }
 
+    const diagnosticSessionRevision = daemon.getSessionRevision();
     activeDiagnosticScans.add(key);
+    ownsScan = true;
     try {
       await daemon.ensureStarted(document.uri);
     } catch {
-      activeDiagnosticScans.delete(key);
       if (!diagnosticsDisposed) {
         diagnosticCollection.delete(document.uri);
       }
@@ -1449,8 +1752,8 @@ export function registerPythonProviders(
     // This ensures hover/definition/completion requests that arrived first
     // can be processed without being blocked by diagnostic scanning.
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    if (diagnosticsDisposed || document.version !== documentVersion) {
-      activeDiagnosticScans.delete(key);
+    if (diagnosticsDisposed || document.isClosed || document.version !== documentVersion
+      || diagnosticSessionRevision !== daemon.getSessionRevision()) {
       return;
     }
 
@@ -1543,7 +1846,8 @@ export function registerPythonProviders(
       );
     };
     const isDiagnosticsCancelled = () => {
-      if (diagnosticsDisposed || document.version !== documentVersion) {
+      if (diagnosticsDisposed || document.isClosed || pendingDiagnosticRefreshes.has(key) || document.version !== documentVersion
+        || diagnosticSessionRevision !== daemon.getSessionRevision()) {
         return true;
       }
       const elapsed = Date.now() - diagnosticStartTime;
@@ -1571,62 +1875,24 @@ export function registerPythonProviders(
     const trackRequest = (): void => { diagnosticRequestCount++; };
 
     // Determine visible range for prioritized scanning on large files
-    const VISIBLE_RANGE_SCAN_THRESHOLD = 500; // lines
-    const visibleEditor = vscode.window.visibleTextEditors.find(
-      (e) => e.document.uri.toString() === document.uri.toString()
-    );
-    const visibleRange = visibleEditor?.visibleRanges[0];
-    const useVisibleRangeScan = document.lineCount >= VISIBLE_RANGE_SCAN_THRESHOLD && visibleRange != null;
+    const { useVisibleRangeScan, startLine: visStartLine, endLine: visEndLine } =
+      diagnosticViewportRange(document);
+    diagnosticViewportKeys.set(key, `${visStartLine}:${visEndLine}`);
     const allowFullDocumentDiagnostics =
       getExtensionSettings(document.uri).diagnosticsFullDocument;
-    // Expand visible range by a margin to catch surrounding context.
-    // Snap boundaries to a coarse grid so small visible-range drifts (a
-    // few-line scroll or editor resize) produce identical scan cache keys.
-    // Captain regression A: Cycle 1 scanned 143–290 and Cycle 2 scanned
-    // 140–287 for the same document version, wasting ~1.5s rescanning.
-    const VISIBLE_MARGIN = 50;
-    const VISIBLE_RANGE_GRID = 50;
-    const snapStart = (line: number): number =>
-      Math.max(0, Math.floor(line / VISIBLE_RANGE_GRID) * VISIBLE_RANGE_GRID);
-    const snapEnd = (line: number): number =>
-      Math.min(
-        document.lineCount,
-        Math.ceil(line / VISIBLE_RANGE_GRID) * VISIBLE_RANGE_GRID,
-      );
-    const visStartLine = useVisibleRangeScan
-      ? snapStart(visibleRange!.start.line - VISIBLE_MARGIN)
-      : 0;
-    const visEndLine = useVisibleRangeScan
-      ? snapEnd(visibleRange!.end.line + VISIBLE_MARGIN)
-      : document.lineCount;
 
     daemon.logDiagnostic(`[diagnostics:scan] starting sync scan for ${document.uri.fsPath.split('/').slice(-2).join('/')}${useVisibleRangeScan ? ` (visible-first: lines ${visStartLine}-${visEndLine})` : ''}`);
     const _scanStart = beginDiagnosticPhase('scan-visible');
 
     // Phase 1: scan visible range (or full doc for small files)
-    const _scanCache = getScanCacheEntry(document);
-    let _relationContexts: RelationDiagnosticContext[];
-    let _lookupContexts: LookupDiagnosticContext[];
-    let _visScanCacheHit = false;
-    if (intervalsCover(_scanCache.scanned, visStartLine, visEndLine)) {
-      _relationContexts = _scanCache.relations.filter((c) =>
-        c.range.start.line >= visStartLine && c.range.start.line < visEndLine,
-      );
-      _lookupContexts = _scanCache.lookups.filter((c) =>
-        c.range.start.line >= visStartLine && c.range.start.line < visEndLine,
-      );
-      _visScanCacheHit = true;
-      perfScanCacheHit++;
-    } else {
-      perfScanCacheMiss++;
-      _relationContexts = findRelationDiagnosticContexts(document, visStartLine, visEndLine);
-      _lookupContexts = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, visStartLine, visEndLine, daemon);
-      _scanCache.relations.push(..._relationContexts);
-      _scanCache.lookups.push(..._lookupContexts);
-      intervalsAdd(_scanCache.scanned, visStartLine, visEndLine);
-    }
+    const visibleScan = await collectDiagnosticScanContexts(
+      document, visStartLine, visEndLine, isDiagnosticsCancelled, daemon
+    );
+    const { relations: _relationContexts, lookups: _lookupContexts, cacheHit: _visScanCacheHit } = visibleScan;
+    if (_visScanCacheHit) perfScanCacheHit++;
+    else perfScanCacheMiss++;
     daemon.logDiagnostic(`[diagnostics:scan] complete ${(performance.now() - _scanStart).toFixed(0)}ms relations=${_relationContexts.length} lookups=${_lookupContexts.length} cache=${_visScanCacheHit ? 'hit' : 'miss'}`);
-    logDiagnosticPhase('scan-visible', _scanStart, `relations=${_relationContexts.length} lookups=${_lookupContexts.length} cache=${_visScanCacheHit ? 'hit' : 'miss'}`);
+    logDiagnosticPhase('scan-visible', _scanStart, `relations=${_relationContexts.length} lookups=${_lookupContexts.length} cache=${_visScanCacheHit ? 'hit' : 'miss'} scannedLines=${visibleScan.scannedLines}`);
 
     // Deduplicate relation target resolution within a single scan.
     // The same model string (e.g. "User") may appear in many ForeignKey
@@ -1679,7 +1945,13 @@ export function registerPythonProviders(
     const resolveCachedLookupReceiverInfo = async (
       context: LookupDiagnosticContext
     ): Promise<OrmReceiverInfo | null> => {
-      const receiverCacheKey = context.receiverExpression;
+      const root = receiverRootIdentifier(context.receiverExpression);
+      const binding = root && !daemon.hasModelByShortName(root)
+        ? findNearestAssignedExpression(document, root, document.offsetAt(context.range.start))
+        : undefined;
+      const receiverCacheKey = root && !daemon.hasModelByShortName(root)
+        ? `${context.receiverExpression}@${binding?.offset ?? context.range.start.line}`
+        : context.receiverExpression;
       const cached = _receiverCache.get(receiverCacheKey);
       if (cached) {
         const cachedResult = await cached;
@@ -1880,7 +2152,7 @@ export function registerPythonProviders(
         if (isDiagnosticsCancelled()) break;
       }
       const batch = _lookupContexts.slice(batchStart, batchStart + VALIDATION_BATCH_SIZE);
-      _validatedLookupContexts.push(...validateLookupContexts(batch, _docTextForValidation, isDiagnosticsCancelled));
+      _validatedLookupContexts.push(...validateLookupContexts(batch, _docTextForValidation, isDiagnosticsCancelled, document));
     }
     logDiagnosticPhase(
       'validate-lookups-visible',
@@ -1930,7 +2202,7 @@ export function registerPythonProviders(
         continue;
       }
 
-      const virtualRes = resolveVirtualLookupPath(lookupReceiver, context.value, context.method);
+      const virtualRes = resolveVirtualLookupPath(daemon, lookupReceiver, context.value, context.method);
       if (virtualRes?.resolved) {
         // Virtual lookup resolved successfully — skip daemon
         _virtualResolved++;
@@ -1984,7 +2256,8 @@ export function registerPythonProviders(
       // or version change), mark the version so tracked-refresh storms do not
       // keep retrying the same heavy scan. Disposal/version-change paths are
       // intentionally left unmarked so the next valid refresh can run.
-      if (diagnosticBudgetLogged && !diagnosticsDisposed && document.version === documentVersion) {
+      if (diagnosticBudgetLogged && !diagnosticsDisposed && !document.isClosed && document.version === documentVersion
+        && diagnosticSessionRevision === daemon.getSessionRevision()) {
         partialDiagnosticResults.set(key, {
           version: documentVersion,
           diagnostics: [...diagnostics],
@@ -1995,7 +2268,6 @@ export function registerPythonProviders(
       }
       // Clear active-scan even on disposal/version-change so subsequent
       // tracked-refresh triggers are not silently dropped.
-      activeDiagnosticScans.delete(key);
       return;
     }
     const _batchResolveStart = beginDiagnosticPhase('batch-lookups-visible');
@@ -2065,7 +2337,7 @@ export function registerPythonProviders(
                 context.method,
                 false
               )).items,
-              virtualLookupCompletionItems(receiver, context.value, context.method)
+              virtualLookupCompletionItems(daemon, receiver, context.value, context.method)
             ),
             resolved: true,
           };
@@ -2097,7 +2369,8 @@ export function registerPythonProviders(
     ) {
       const _phase2Start = beginDiagnosticPhase('phase2-remaining');
       const _phase2DiagnosticsBefore = diagnostics.length;
-      if (!diagnosticsDisposed && document.version === documentVersion) {
+      if (!diagnosticsDisposed && !document.isClosed && !pendingDiagnosticRefreshes.has(key) && document.version === documentVersion
+        && diagnosticSessionRevision === daemon.getSessionRevision()) {
         diagnosticCollection.set(document.uri, [...diagnostics]);
       }
 
@@ -2108,7 +2381,8 @@ export function registerPythonProviders(
       const incrementalPublish = () => {
         phase2NewDiagCount++;
         if (phase2NewDiagCount % INCREMENTAL_PUBLISH_INTERVAL === 0) {
-          if (!diagnosticsDisposed && document.version === documentVersion) {
+          if (!diagnosticsDisposed && !document.isClosed && !pendingDiagnosticRefreshes.has(key) && document.version === documentVersion
+            && diagnosticSessionRevision === daemon.getSessionRevision()) {
             diagnosticCollection.set(document.uri, [...diagnostics]);
           }
         }
@@ -2123,31 +2397,16 @@ export function registerPythonProviders(
         if (isDiagnosticsCancelled()) break;
 
         const _phase2ScanStart = beginDiagnosticPhase(`phase2-scan:${rStart}-${rEnd}`);
-        const scanCache = getScanCacheEntry(document);
-        let extraRelations: RelationDiagnosticContext[];
-        let extraLookups: LookupDiagnosticContext[];
-        let _scanCacheHit = false;
-        if (intervalsCover(scanCache.scanned, rStart, rEnd)) {
-          extraRelations = scanCache.relations.filter((c) =>
-            c.range.start.line >= rStart && c.range.start.line < rEnd,
-          );
-          extraLookups = scanCache.lookups.filter((c) =>
-            c.range.start.line >= rStart && c.range.start.line < rEnd,
-          );
-          _scanCacheHit = true;
-          perfScanCacheHit++;
-        } else {
-          perfScanCacheMiss++;
-          extraRelations = findRelationDiagnosticContexts(document, rStart, rEnd);
-          extraLookups = await findLookupDiagnosticContexts(document, isDiagnosticsCancelled, rStart, rEnd, daemon);
-          scanCache.relations.push(...extraRelations);
-          scanCache.lookups.push(...extraLookups);
-          intervalsAdd(scanCache.scanned, rStart, rEnd);
-        }
+        const extraScan = await collectDiagnosticScanContexts(
+          document, rStart, rEnd, isDiagnosticsCancelled, daemon
+        );
+        const { relations: extraRelations, lookups: extraLookups, cacheHit: _scanCacheHit } = extraScan;
+        if (_scanCacheHit) perfScanCacheHit++;
+        else perfScanCacheMiss++;
         logDiagnosticPhase(
           `phase2-scan:${rStart}-${rEnd}`,
           _phase2ScanStart,
-          `relations=${extraRelations.length} lookups=${extraLookups.length} cache=${_scanCacheHit ? 'hit' : 'miss'}`
+          `relations=${extraRelations.length} lookups=${extraLookups.length} cache=${_scanCacheHit ? 'hit' : 'miss'} scannedLines=${extraScan.scannedLines}`
         );
 
         const _phase2RelationStart = beginDiagnosticPhase(`phase2-relations:${rStart}-${rEnd}`);
@@ -2178,7 +2437,7 @@ export function registerPythonProviders(
         // Process extra lookup contexts through the same pipeline
         const _phase2LookupStart = beginDiagnosticPhase(`phase2-lookups:${rStart}-${rEnd}`);
         const extraDocText = getDocumentText(document);
-        const extraValidated = validateLookupContexts(extraLookups, extraDocText, isDiagnosticsCancelled);
+        const extraValidated = validateLookupContexts(extraLookups, extraDocText, isDiagnosticsCancelled, document);
         let _phase2LookupAdded = 0;
         let _exitCancelled = 0;
         let _exitNoReceiver = 0;
@@ -2274,7 +2533,7 @@ export function registerPythonProviders(
               }
               return;
             }
-            const virtualRes = resolveVirtualLookupPath(lookupReceiver, context.value, context.method);
+            const virtualRes = resolveVirtualLookupPath(daemon, lookupReceiver, context.value, context.method);
             if (virtualRes?.resolved) { _exitVirtualResolved++; return; }
             // Phantom receiver short-circuit: the modelLabel was synthesized
             // from a bare PascalCase identifier the daemon has no record of.
@@ -2300,7 +2559,7 @@ export function registerPythonProviders(
               const partialCompletions = {
 	                items: mergeLookupCompletionItems(
 	                  (await listLookupPathCompletionsFast(daemon, lookupReceiver.modelLabel, context.value, context.method, false)).items,
-	                  virtualLookupCompletionItems(lookupReceiver, context.value, context.method)
+	                  virtualLookupCompletionItems(daemon, lookupReceiver, context.value, context.method)
 	                ),
                 resolved: true,
               };
@@ -2354,13 +2613,17 @@ export function registerPythonProviders(
       );
     }
 
+    // The whole-document option applies to field-list/keyword diagnostics too,
+    // not just the generic lookup/relation contexts scanned in phase 2.
+    const fieldStartLine = allowFullDocumentDiagnostics ? 0 : visStartLine;
+    const fieldEndLine = allowFullDocumentDiagnostics ? document.lineCount : visEndLine;
     // Yield before heavy synchronous scan to let hover/definition respond.
     const _directFieldStart = beginDiagnosticPhase('direct-fields-visible');
     let _directFieldContextCount = 0;
     let _directFieldAdded = 0;
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (!isDiagnosticsCancelled()) {
-      const directFieldContexts = findDirectFieldDiagnosticContexts(document, visStartLine, visEndLine);
+      const directFieldContexts = findDirectFieldDiagnosticContexts(document, fieldStartLine, fieldEndLine);
       _directFieldContextCount = directFieldContexts.length;
       for (const context of directFieldContexts) {
         if (isDiagnosticsCancelled()) break;
@@ -2409,7 +2672,7 @@ export function registerPythonProviders(
     let _schemaFieldAdded = 0;
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (!isDiagnosticsCancelled()) {
-      const schemaFieldContexts = findSchemaFieldDiagnosticContexts(document, visStartLine, visEndLine);
+      const schemaFieldContexts = findSchemaFieldDiagnosticContexts(document, fieldStartLine, fieldEndLine);
       _schemaFieldContextCount = schemaFieldContexts.length;
       for (const context of schemaFieldContexts) {
         if (isDiagnosticsCancelled()) break;
@@ -2457,7 +2720,7 @@ export function registerPythonProviders(
     let _metaConstraintAdded = 0;
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (!isDiagnosticsCancelled()) {
-      const metaConstraintContexts = findMetaConstraintLookupDiagnosticContexts(document, visStartLine, visEndLine);
+      const metaConstraintContexts = findMetaConstraintLookupDiagnosticContexts(document, fieldStartLine, fieldEndLine);
       _metaConstraintContextCount = metaConstraintContexts.length;
       for (const context of metaConstraintContexts) {
         if (isDiagnosticsCancelled()) break;
@@ -2510,7 +2773,7 @@ export function registerPythonProviders(
     let _bulkUpdateAdded = 0;
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     if (!isDiagnosticsCancelled()) {
-      const bulkUpdateContexts = findBulkUpdateFieldDiagnosticContexts(document, visStartLine, visEndLine);
+      const bulkUpdateContexts = findBulkUpdateFieldDiagnosticContexts(document, fieldStartLine, fieldEndLine);
       _bulkUpdateContextCount = bulkUpdateContexts.length;
       for (const context of bulkUpdateContexts) {
         if (isDiagnosticsCancelled()) break;
@@ -2558,8 +2821,8 @@ export function registerPythonProviders(
     // Returning early would discard all partial results, leaving the user
     // with zero ORM diagnostics until the next document change.
     const _publishStart = beginDiagnosticPhase('publish');
-    if (diagnosticsDisposed || document.version !== documentVersion) {
-      activeDiagnosticScans.delete(key);
+    if (diagnosticsDisposed || document.isClosed || pendingDiagnosticRefreshes.has(key) || document.version !== documentVersion
+      || diagnosticSessionRevision !== daemon.getSessionRevision()) {
       return;
     }
 
@@ -2597,31 +2860,45 @@ export function registerPythonProviders(
     if (!diagnosticBudgetLogged) {
       partialDiagnosticResults.delete(key);
     }
-    activeDiagnosticScans.delete(key);
     } finally {
+      if (ownsScan) {
+        activeDiagnosticScans.delete(key);
+        const pendingDocument = pendingDiagnosticRefreshes.get(key);
+        pendingDiagnosticRefreshes.delete(key);
+        if (pendingDocument && !diagnosticsDisposed && !pendingDocument.isClosed) {
+          lastDiagnosedDocumentVersions.delete(key);
+          partialDiagnosticResults.delete(key);
+          scheduleDiagnosticsRefresh(pendingDocument, 0, 'pending-refresh-after-active-scan');
+        }
+      }
       activeDiagnosticScanRunningCount--;
     }
   }));
 
-  const completionProvider = vscode.languages.registerCompletionItemProvider(
-    pythonSelector,
-    {
+  const completionImplementation: vscode.CompletionItemProvider = {
       async provideCompletionItems(document, position, token) {
         daemon.logDiagnostic(`[completion:enter] ${document.uri.fsPath.split('/').slice(-2).join('/')}:${position.line}:${position.character}`);
+        const trace = process.env.DJLS_TEST_CAPTURE_LOGS === '1' ? {
+          uri: document.uri.toString(), line: position.line, character: position.character,
+          startedAt: Date.now(),
+        } as CompletionTraceForTesting : undefined;
+        if (trace) {
+          completionTracesForTesting.push(trace);
+          if (completionTracesForTesting.length > 8) completionTracesForTesting.shift();
+        }
         activeCompletionCount++;
+        activeInteractiveRequestCount++;
+        let requestScope: ProviderRequestScope | undefined;
         try {
         if (providersDisposed || token.isCancellationRequested) {
           return undefined;
         }
         const compStart = performance.now();
         const COMP_TIMEOUT_MS = 3_000;
-        const compAbort = new AbortController();
-        token.onCancellationRequested(() => compAbort.abort());
-        const compTimeout = setTimeout(() => compAbort.abort(), COMP_TIMEOUT_MS);
-        const tokenAbort = new Promise<undefined>((resolve) => {
-          token.onCancellationRequested(() => resolve(undefined));
-        });
+        const scope = requestOwner.begin(token, COMP_TIMEOUT_MS);
+        requestScope = scope;
         const documentVersion = document.version;
+        const cacheOwner = captureReceiverCacheOwner(daemon, document);
         const relationContext = relationCompletionContext(document, position);
         const lookupContext =
           lookupCompletionContext(document, position) ??
@@ -2653,7 +2930,7 @@ export function registerPythonProviders(
         );
         const compResult = await Promise.race([
         daemon.withDeadline(compStart + COMP_TIMEOUT_MS, () =>
-        daemon.withAbortSignal(compAbort.signal, () =>
+        daemon.withAbortSignal(scope.signal, () =>
         daemon.withRequestSource('completion', async () => {
         if (relationContext) {
           try {
@@ -2722,7 +2999,7 @@ export function registerPythonProviders(
               // aborted result (possibly an incomplete model_class with no virtual
               // fields) must be retried — not stuck — on the next completion.
               if (lookupReceiver && !daemon.isAborted()) {
-                setCachedOrmReceiver(document, recvCacheKey, lookupReceiver);
+                setCachedOrmReceiver(daemon, document, recvCacheKey, lookupReceiver, cacheOwner);
               }
             }
             if (token.isCancellationRequested) {
@@ -2745,7 +3022,11 @@ export function registerPythonProviders(
                 lookupContext.prefix
               )}`
             );
-            const result = await listLookupPathCompletionsFast(
+            const matchedAnnotation = matchAnnotationAlias(lookupReceiver.virtualFields ?? [],
+              normalizeVirtualLookupPrefix(lookupContext.prefix, lookupContext.method));
+            const result: LookupPathCompletionsResult = matchedAnnotation
+              ? { items: [], resolved: true, currentModelLabel: baseModelLabel }
+              : await listLookupPathCompletionsFast(
               daemon,
               baseModelLabel,
               lookupContext.prefix,
@@ -2759,6 +3040,7 @@ export function registerPythonProviders(
             // universal Django ORM lookup items so completion remains
             // useful as a last resort.
             const virtualItems = virtualLookupCompletionItems(
+              daemon,
               lookupReceiver,
               lookupContext.prefix,
               lookupContext.method,
@@ -2789,12 +3071,15 @@ export function registerPythonProviders(
               lookupContext.method
             );
             const completions = sortedItems.map((item, index) => {
+              const terminalTransform = item.fieldKind === 'lookup_transform' &&
+                !FILTER_LOOKUP_METHODS.has(lookupContext.method) &&
+                !lookupTransformHasContinuation(daemon, lookupReceiver, lookupContext.prefix, item, lookupContext.method);
               const completion = new vscode.CompletionItem(
                 lookupCompletionLabel(item),
                 lookupCompletionKind(item)
               );
               completion.detail = lookupCompletionDetail(item);
-              completion.insertText = lookupCompletionInsertText(
+              completion.insertText = terminalTransform ? item.name : lookupCompletionInsertText(
                 lookupContext.method,
                 item
               );
@@ -2815,7 +3100,7 @@ export function registerPythonProviders(
                 lookupContext.method,
                 baseModelLabel
               );
-              completion.command = lookupCompletionCommand(
+              completion.command = terminalTransform ? undefined : lookupCompletionCommand(
                 lookupContext.method,
                 item
               );
@@ -3079,6 +3364,10 @@ export function registerPythonProviders(
             return cancelledCompletionResult(token);
           }
           if (memberContext) {
+            if (trace) trace.receiver = {
+              modelLabel: memberContext.receiver.modelLabel, kind: memberContext.receiver.kind,
+              expression: memberContext.receiverExpression, prefix: memberContext.prefix,
+            };
             const classSource =
               memberContext.receiver.classSource ??
               (memberContext.receiver.kind === 'instance'
@@ -3124,6 +3413,7 @@ export function registerPythonProviders(
             if (token.isCancellationRequested) {
               return cancelledCompletionResult(token);
             }
+            if (trace) trace.memberNames = result.items.map(item => item.name);
             const mergedItems = mergeVirtualOrmMemberItems(
               mergeOrmMemberItemsByName(
                 result.items,
@@ -3262,16 +3552,18 @@ export function registerPythonProviders(
             completion.range = classInstanceContext.range;
             return completion;
           });
-        } catch {
+        } catch (error) {
+          if (trace) trace.error = String(error);
           return undefined;
         }
         }))),
-        disposalSignal.catch(() => undefined),
-        tokenAbort,
-        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), COMP_TIMEOUT_MS)),
+        scope.cancelled,
         ]);
-        compAbort.abort();
-        clearTimeout(compTimeout);
+        if (trace) {
+          const items = compResult instanceof vscode.CompletionList ? compResult.items
+            : Array.isArray(compResult) ? compResult : [];
+          trace.outputNames = items.map(item => typeof item.label === 'string' ? item.label : item.label.label);
+        }
         const hasCompletionItems = compResult instanceof vscode.CompletionList
           ? compResult.items.length > 0
           : Array.isArray(compResult) && compResult.length > 0;
@@ -3284,33 +3576,41 @@ export function registerPythonProviders(
         }
         return compResult;
         } catch (error) {
+          if (trace) trace.error = String(error);
           daemon.logDiagnostic(`[completion:error] ${error instanceof Error ? error.message : String(error)}`);
           return undefined;
         } finally {
+          requestScope?.dispose();
+          if (trace) {
+            trace.finishedAt = Date.now();
+            trace.cancelled = token.isCancellationRequested;
+          }
           activeCompletionCount--;
+          activeInteractiveRequestCount--;
         }
       },
-    },
-    "'",
-    '"',
-    '.',
-    '_',
-    '(',
-    ','
-  );
+    };
+  const completionProvider = providerOwner
+    ? new vscode.Disposable(() => {})
+    : vscode.languages.registerCompletionItemProvider(
+      pythonSelector,
+      completionImplementation,
+      "'", '"', '.', '_', '(', ','
+    );
 
-  const signatureHelpProvider = vscode.languages.registerSignatureHelpProvider(
-    pythonSelector,
-    {
+  const signatureHelpImplementation: vscode.SignatureHelpProvider = {
       async provideSignatureHelp(document, position, token, context) {
+        activeInteractiveRequestCount++;
+        let requestScope: ProviderRequestScope | undefined;
+        try {
         if (providersDisposed || token.isCancellationRequested) {
           return undefined;
         }
-        const sigTokenAbort = new Promise<undefined>((resolve) => {
-          token.onCancellationRequested(() => resolve(undefined));
-        });
-        return Promise.race([
-        daemon.withRequestSource('signature', async () => {
+        const scope = requestOwner.begin(token);
+        requestScope = scope;
+        const isCancelled = () => providersDisposed || token.isCancellationRequested || scope.signal.aborted || daemon.isAborted();
+        return await Promise.race([
+        daemon.withAbortSignal(scope.signal, () => daemon.withRequestSource('signature', async () => {
           const signatureContext = directFieldSignatureHelpContext(
             document,
             position
@@ -3321,7 +3621,7 @@ export function registerPythonProviders(
 
           try {
             await daemon.ensureStarted(document.uri);
-            if (token.isCancellationRequested) {
+            if (isCancelled()) {
               return undefined;
             }
 
@@ -3329,9 +3629,10 @@ export function registerPythonProviders(
               daemon,
               document,
               signatureContext.receiverExpression,
-              position
-            );
-            if (!baseModelLabel) {
+            position
+          );
+          daemon.logDiagnostic(`[signature] receiver=${signatureContext.receiverExpression} model=${baseModelLabel ?? '<unresolved>'} trigger=${context.triggerKind}`);
+          if (!baseModelLabel || isCancelled()) {
               return undefined;
             }
 
@@ -3357,7 +3658,7 @@ export function registerPythonProviders(
               '',
               'filter'
             );
-            if (token.isCancellationRequested) {
+            if (isCancelled()) {
               return undefined;
             }
 
@@ -3370,37 +3671,49 @@ export function registerPythonProviders(
           } catch {
             return undefined;
           }
-        }),
-        disposalSignal.catch(() => undefined),
-        sigTokenAbort,
+        })),
+        scope.cancelled,
         ]);
+        } finally {
+          requestScope?.dispose();
+          activeInteractiveRequestCount--;
+        }
       },
-    },
-    {
+    };
+  const signatureHelpProvider = providerOwner
+    ? new vscode.Disposable(() => {})
+    : vscode.languages.registerSignatureHelpProvider(
+      pythonSelector,
+      signatureHelpImplementation,
+      {
       // Participate in automatic signature dispatch so this provider can
       // suppress overlapping parameter hints specifically for resolved ORM
       // calls. Explicit Parameter Hints invocation remains fully supported.
       triggerCharacters: ['(', ','],
       retriggerCharacters: [','],
-    }
-  );
+      }
+    );
 
-  const hoverProvider = vscode.languages.registerHoverProvider(
-    pythonSelector,
-    {
+  const hoverImplementation: vscode.HoverProvider = {
       async provideHover(document, position, token) {
+        const trace: HoverTraceForTesting | undefined = process.env.DJLS_TEST_CAPTURE_LOGS === '1'
+          ? { uri: document.uri.toString(), line: position.line, character: position.character,
+            startedAt: Date.now(), startedMonotonicMs: performance.now() }
+          : undefined;
+        if (trace) {
+          hoverTracesForTesting.push(trace);
+          if (hoverTracesForTesting.length > 16) hoverTracesForTesting.shift();
+        }
         daemon.logDiagnostic(`[hover:enter] ${document.uri.fsPath.split('/').slice(-2).join('/')}:${position.line}:${position.character}`);
+        activeInteractiveRequestCount++;
+        let requestScope: ProviderRequestScope | undefined;
         try {
         if (providersDisposed || token.isCancellationRequested) {
           daemon.logDiagnostic(`[hover] skip disposed=${providersDisposed} cancelled=${token.isCancellationRequested}`);
           return undefined;
         }
         const hoverStart = performance.now();
-        // Race hover body against disposal signal + token cancellation so that
-        // tab switches immediately abort in-flight daemon awaits.
-        const tokenAbort = new Promise<undefined>((resolve) => {
-          token.onCancellationRequested(() => resolve(undefined));
-        });
+        const cacheOwner = captureReceiverCacheOwner(daemon, document);
         // Hard timeout: if all resolution paths haven't completed within this
         // budget, bail out.  Most successful hovers complete in <200ms; the
         // timeout protects against event-loop starvation when many concurrent
@@ -3413,25 +3726,17 @@ export function registerPythonProviders(
         // (see lookupRecvInfo cache below), so the cap only bites the first
         // hover of an unresolvable expression.
         const HOVER_HARD_TIMEOUT_MS = 1_200;
-        const hoverTimeout = new Promise<undefined>((resolve) => {
-          setTimeout(() => resolve(undefined), HOVER_HARD_TIMEOUT_MS);
-        });
-        // AbortController: when the hover is cancelled (token, timeout, or
-        // disposal), abort the signal.  This propagates into cachedRequest()
-        // via AsyncLocalStorage so orphaned resolution bodies immediately
-        // stop issuing new IPC calls.
-        const hoverAbort = new AbortController();
-        token.onCancellationRequested(() => hoverAbort.abort());
-        const abortOnTimeout = setTimeout(() => hoverAbort.abort(), HOVER_HARD_TIMEOUT_MS);
+        const scope = requestOwner.begin(token, HOVER_HARD_TIMEOUT_MS);
+        requestScope = scope;
         const hoverDeadline = hoverStart + HOVER_HARD_TIMEOUT_MS;
         const hoverResult = await Promise.race([
         daemon.withDeadline(hoverDeadline, () =>
-        daemon.withAbortSignal(hoverAbort.signal, () =>
+        daemon.withAbortSignal(scope.signal, () =>
         daemon.withRequestSource('hover', async () => {
         const isCancelled = () =>
           providersDisposed ||
           token.isCancellationRequested ||
-          hoverAbort.signal.aborted ||
+          scope.signal.aborted ||
           (performance.now() - hoverStart) >= HOVER_HARD_TIMEOUT_MS;
         const ensureStarted = createEnsureStartedOnce(daemon, document.uri);
         // Slow-hover phase tracking: only logs when total elapsed > 200ms
@@ -3521,7 +3826,7 @@ export function registerPythonProviders(
               // with no virtual fields — and caching it would persist that failure
               // (result=none) for the whole document version. Let it retry when idle.
               if (!daemon.isAborted()) {
-                setCachedOrmReceiver(document, recvCacheKey, lookupReceiver);
+                setCachedOrmReceiver(daemon, document, recvCacheKey, lookupReceiver, cacheOwner);
               }
             }
             if (!lookupReceiver) {
@@ -3532,6 +3837,7 @@ export function registerPythonProviders(
             if (isCancelled()) { return undefined; }
             const resolution =
               resolveVirtualLookupPath(
+                daemon,
                 lookupReceiver,
                 lookupLiteral.value,
                 lookupLiteral.method
@@ -3923,44 +4229,51 @@ export function registerPythonProviders(
         logSlowPhases();
         return undefined;
         }))),
-        disposalSignal.catch(() => undefined),
-        tokenAbort,
-        hoverTimeout,
+        scope.cancelled,
         ]);
-        hoverAbort.abort();
-        clearTimeout(abortOnTimeout);
         const elapsed = (performance.now() - hoverStart).toFixed(0);
         const timedOut = !hoverResult && Number(elapsed) >= HOVER_HARD_TIMEOUT_MS;
         const shortPath = document.uri.fsPath.split('/').slice(-2).join('/');
         daemon.logDiagnostic(`[hover] ${shortPath}:${position.line}:${position.character} ${elapsed}ms result=${hoverResult ? 'hover' : 'none'} disposed=${providersDisposed}${timedOut ? ' TIMEOUT' : ''}`);
+        if (trace) trace.returnedHover = Boolean(hoverResult);
         return hoverResult;
         } catch (error) {
+          if (trace) trace.error = error instanceof Error ? error.message : String(error);
           daemon.logDiagnostic(`[hover:error] ${error instanceof Error ? error.message : String(error)}`);
           return undefined;
+        } finally {
+          requestScope?.dispose();
+          activeInteractiveRequestCount--;
+          if (trace) {
+            trace.cancelled = token.isCancellationRequested;
+            trace.disposed = providersDisposed;
+            trace.finishedAt = Date.now();
+            // Last synchronous work in this callback, after logging and cleanup.
+            // Promise settlement and workbench rendering are separate boundaries.
+            trace.finishedMonotonicMs = performance.now();
+          }
         }
       },
-    }
-  );
+    };
 
-  const definitionProvider = vscode.languages.registerDefinitionProvider(
-    pythonSelector,
-    {
+  const definitionImplementation: vscode.DefinitionProvider = {
       async provideDefinition(document, position, token) {
         daemon.logDiagnostic(`[definition:enter] ${document.uri.fsPath.split('/').slice(-2).join('/')}:${position.line}:${position.character}`);
+        activeInteractiveRequestCount++;
+        let requestScope: ProviderRequestScope | undefined;
         try {
         if (providersDisposed || token.isCancellationRequested) {
           return undefined;
         }
         const defStart = performance.now();
         const DEF_TIMEOUT_MS = 3_000;
-        const defAbort = new AbortController();
-        token.onCancellationRequested(() => defAbort.abort());
-        const defTimeout = setTimeout(() => defAbort.abort(), DEF_TIMEOUT_MS);
+        const scope = requestOwner.begin(token, DEF_TIMEOUT_MS);
+        requestScope = scope;
         const defResult = await Promise.race([
         daemon.withDeadline(defStart + DEF_TIMEOUT_MS, () =>
-        daemon.withAbortSignal(defAbort.signal, () =>
+        daemon.withAbortSignal(scope.signal, () =>
         daemon.withRequestSource('definition', async () => {
-        const isDefCancelled = () => providersDisposed || token.isCancellationRequested || defAbort.signal.aborted || (performance.now() - defStart) >= DEF_TIMEOUT_MS;
+        const isDefCancelled = () => providersDisposed || token.isCancellationRequested || scope.signal.aborted || (performance.now() - defStart) >= DEF_TIMEOUT_MS;
         const ensureStarted = createEnsureStartedOnce(daemon, document.uri);
         const relationLiteral = relationHoverLiteral(document, position);
         if (relationLiteral) {
@@ -4020,6 +4333,7 @@ export function registerPythonProviders(
             const baseModelLabel = lookupReceiver.modelLabel;
             const resolution =
               resolveVirtualLookupPath(
+                daemon,
                 lookupReceiver,
                 lookupLiteral.value,
                 lookupLiteral.method
@@ -4276,41 +4590,67 @@ export function registerPythonProviders(
 
         return undefined;
         }))),
-        disposalSignal.catch(() => undefined),
-        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), DEF_TIMEOUT_MS)),
+        scope.cancelled,
         ]);
-        defAbort.abort();
-        clearTimeout(defTimeout);
         return defResult;
         } catch (error) {
           daemon.logDiagnostic(`[definition:error] ${error instanceof Error ? error.message : String(error)}`);
           return undefined;
+        } finally {
+          requestScope?.dispose();
+          activeInteractiveRequestCount--;
         }
       },
-    }
-  );
+    };
+  const definitionProvider = providerOwner
+    ? new vscode.Disposable(() => {})
+    : vscode.languages.registerDefinitionProvider(pythonSelector, definitionImplementation);
 
-  const inlayHintsProvider = vscode.languages.registerInlayHintsProvider(
-    pythonSelector,
-    {
+  const inlayHintsChanged = new vscode.EventEmitter<void>();
+  const inlayHintsImplementation: vscode.InlayHintsProvider = {
+      onDidChangeInlayHints: inlayHintsChanged.event,
       async provideInlayHints(document, range, token) {
+        activeInteractiveRequestCount++;
+        const trace: InlayTraceForTesting | undefined = process.env.DJLS_TEST_CAPTURE_LOGS === '1'
+          ? { uri: document.uri.toString(), startLine: range.start.line, endLine: range.end.line,
+              startedAt: Date.now(), daemonPhase: daemon.getState().phase, samples: [] }
+          : undefined;
+        if (trace) {
+          inlayTracesForTesting.push(trace);
+          if (inlayTracesForTesting.length > 32) inlayTracesForTesting.shift();
+        }
+        let requestScope: ProviderRequestScope | undefined;
+        try {
         if (providersDisposed || token.isCancellationRequested) {
           return undefined;
         }
         if (!areLookupInlayHintsEnabled(document.uri)) {
           return undefined;
         }
+        // State and model changes refresh hints once a session is usable.
+        // Background hints must not wait for foreground daemon startup.
+        if (!daemon.isReady()) {
+          return [];
+        }
         const candidates = collectInlayLookupCandidates(document, range);
+        if (trace) trace.candidates = candidates.length;
         if (candidates.length === 0) {
           return [];
         }
+        const scope = requestOwner.begin(token);
+        requestScope = scope;
+        const isCancelled = () => providersDisposed || token.isCancellationRequested
+          || scope.signal.aborted || daemon.isAborted();
+        return await Promise.race([
+        daemon.withAbortSignal(scope.signal, async () => {
         const ensureStarted = createEnsureStartedOnce(daemon, document.uri);
         try {
-          await ensureStarted();
-        } catch {
+          await daemon.withRequestSource('diagnostic', ensureStarted);
+        } catch (error) {
+          if (trace) trace.startupError = String(error);
           return [];
         }
-        if (providersDisposed || token.isCancellationRequested) {
+        if (isCancelled()) {
           return [];
         }
         // Background, diagnostic-sourced resolution: we never need source
@@ -4328,13 +4668,16 @@ export function registerPythonProviders(
             OrmReceiverInfo | undefined
           >();
           for (const candidate of candidates) {
-            if (providersDisposed || token.isCancellationRequested) {
+            if (isCancelled()) {
               break;
             }
+            const sample = trace && trace.samples.length < 8 ? { line: candidate.probe.line } as InlayTraceForTesting['samples'][number] : undefined;
+            if (sample) trace!.samples.push(sample);
             const literal = keywordLookupLiteral(document, candidate.probe);
             if (!literal) {
               continue;
             }
+            if (sample) { sample.lookup = literal.value; sample.receiver = literal.receiverExpression; }
             try {
               let receiver: OrmReceiverInfo | undefined;
               if (receiverMemo.has(literal.receiverExpression)) {
@@ -4348,6 +4691,7 @@ export function registerPythonProviders(
                 );
                 receiverMemo.set(literal.receiverExpression, receiver);
               }
+              if (sample) sample.modelLabel = receiver?.modelLabel;
               if (!receiver) {
                 continue;
               }
@@ -4358,6 +4702,7 @@ export function registerPythonProviders(
               } else {
                 const resolution =
                   resolveVirtualLookupPath(
+                    daemon,
                     receiver,
                     literal.value,
                     literal.method
@@ -4368,8 +4713,13 @@ export function registerPythonProviders(
                     literal.method,
                     true
                   ));
+                if (sample) { sample.resolved = resolution.resolved; sample.reason = resolution.reason; }
                 label = inlayTypeLabelForResolution(resolution);
                 memo.set(memoKey, label);
+              }
+              if (sample) sample.label = label;
+              if (isCancelled()) {
+                break;
               }
               if (!label) {
                 continue;
@@ -4381,26 +4731,46 @@ export function registerPythonProviders(
               );
               hint.paddingLeft = true;
               hints.push(hint);
-            } catch {
+            } catch (error) {
+              if (sample) sample.error = String(error);
               // Skip this candidate; never let one failure drop the rest.
             }
           }
+          if (trace) trace.hintCount = hints.length;
           return hints;
         });
+        }),
+        scope.cancelled,
+        ]);
+        } finally {
+          if (trace) {
+            trace.finishedAt = Date.now();
+            trace.cancelled = token.isCancellationRequested || requestScope?.signal.aborted === true;
+            trace.disposed = providersDisposed;
+          }
+          requestScope?.dispose();
+          activeInteractiveRequestCount--;
+        }
       },
-    }
-  );
+    };
+  const inlayHintsProvider = providerOwner
+    ? new vscode.Disposable(() => {})
+    : vscode.languages.registerInlayHintsProvider(pythonSelector, inlayHintsImplementation);
 
   if (canRunDiagnostics()) {
     scheduleTrackedDiagnosticsRefresh();
   }
 
-  return [
+  const registrations = [
     completionProvider,
     signatureHelpProvider,
-    hoverProvider,
     definitionProvider,
     inlayHintsProvider,
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!providersDisposed && event.affectsConfiguration(`${CONFIGURATION_SECTION}.inlayHints.enabled`)) {
+        inlayHintsChanged.fire();
+      }
+    }),
     vscode.workspace.onDidOpenTextDocument((document) => {
       if (diagnosticsDisposed) {
         return;
@@ -4447,6 +4817,28 @@ export function registerPythonProviders(
       daemon.logDiagnostic('[diagnostics:trigger] tracked-refresh source=visible-editors-changed delay=500ms');
       scheduleTrackedDiagnosticsRefresh(500);
     }),
+    vscode.window.onDidChangeTextEditorVisibleRanges((event) => {
+      const document = event.textEditor.document;
+      if (diagnosticsDisposed || !canRunDiagnostics() || document.isClosed
+        || getExtensionSettings(document.uri).diagnosticsFullDocument
+        || !shouldAnalyzeDocument(document, daemon.getState().workspaceRoot)) {
+        return;
+      }
+      const range = diagnosticViewportRange(document, event.visibleRanges[0]);
+      if (!range.useVisibleRangeScan) return;
+      const key = document.uri.toString();
+      const rangeKey = `${range.startLine}:${range.endLine}`;
+      if (diagnosticViewportKeys.get(key) === rangeKey) return;
+      diagnosticViewportKeys.set(key, rangeKey);
+      // Scrolling changes the work to validate without changing document.version.
+      lastDiagnosedDocumentVersions.delete(key);
+      partialDiagnosticResults.delete(key);
+      if (activeDiagnosticScans.has(key)) {
+        pendingDiagnosticRefreshes.set(key, document);
+      } else {
+        scheduleDiagnosticsRefresh(document, 500, 'visible-range-changed');
+      }
+    }),
     vscode.workspace.onDidCloseTextDocument((document) => {
       if (!diagnosticsDisposed) {
         diagnosticCollection.delete(document.uri);
@@ -4454,9 +4846,17 @@ export function registerPythonProviders(
       const key = document.uri.toString();
       lastDiagnosedDocumentVersions.delete(key);
       partialDiagnosticResults.delete(key);
+      if (pendingDiagnosticRefreshes.get(key) === document) {
+        pendingDiagnosticRefreshes.delete(key);
+      }
+      diagnosticViewportKeys.delete(key);
       _ormReceiverCacheByDocument.delete(key);
       _lookupReceiverCacheByDocument.delete(key);
+      receiverDocumentOwners.delete(document);
+      lookupContextValidationCaches.delete(document);
       _scanCacheAcrossRegistrations.delete(key);
+      _receiverCachesAcrossRegistrations.delete(key);
+      _lookupResolutionCachesAcrossRegistrations.delete(key);
       const timer = diagnosticTimers.get(key);
       if (timer) {
         clearTimeout(timer);
@@ -4473,6 +4873,7 @@ export function registerPythonProviders(
         return;
       }
       resetProviderResolutionCaches();
+      inlayHintsChanged.fire();
       if (!diagnosticsEnabled) {
         diagnosticCollection.clear();
         lastDiagnosedDocumentVersions.clear();
@@ -4512,6 +4913,7 @@ export function registerPythonProviders(
       // just-added field as unknown.
       resetProviderResolutionCaches();
       clearLookupResolutionAndReceiverCachesAcrossRegistrations();
+      inlayHintsChanged.fire();
       if (!diagnosticsEnabled) {
         return;
       }
@@ -4523,11 +4925,13 @@ export function registerPythonProviders(
     new vscode.Disposable(() => {
       providersDisposed = true;
       diagnosticsDisposed = true;
-      fireDisposalSignal?.();
+      requestOwner.dispose();
+      inlayHintsChanged.dispose();
       clearScheduledDiagnostics();
       lastDiagnosedDocumentVersions.clear();
       partialDiagnosticResults.clear();
       activeDiagnosticScans.clear();
+      diagnosticViewportKeys.clear();
       for (const timer of parameterHintDismissTimers) {
         clearTimeout(timer);
       }
@@ -4535,6 +4939,18 @@ export function registerPythonProviders(
       diagnosticCollection.dispose();
     }),
   ];
+  // Commit the new delegate after the replacement's registrations exist.
+  // Disposing the previous bundle cannot remove this newer delegate.
+  registrations.push(providerOwner
+    ? providerOwner.setProviders({
+      hover: hoverImplementation,
+      completion: completionImplementation,
+      definition: definitionImplementation,
+      signatureHelp: signatureHelpImplementation,
+      inlayHints: inlayHintsImplementation,
+    })
+    : vscode.languages.registerHoverProvider(pythonSelector, hoverImplementation));
+  return registrations;
 }
 
 function lookupCompletionLabel(
@@ -4715,6 +5131,9 @@ function resolveActiveDirectFieldSignatureParameter(
 }
 
 function lookupCompletionOwnerField(item: LookupPathItem): string | undefined {
+  if (item.source === ANNOTATED_MEMBER_SOURCE && item.fieldPath) {
+    return `${lookupCompletionShortModelLabel(item.modelLabel)}.${item.fieldPath}`;
+  }
   const fieldPath = item.fieldPath ?? item.name;
   const fieldName = fieldPath.split('__').filter(Boolean).at(-1);
   if (!fieldName) {
@@ -5460,8 +5879,8 @@ function bareStringLookupCompletionContext(
 ): LookupContext | undefined {
   // The cursor must sit just after an open quote + (partial) field path:
   // `"`, `"tmeta`, `"tmeta__`, `"tmeta__th`, etc.
-  const openMatch = prefixText.match(/(['"])([A-Za-z_]?[\w]*(?:__[\w]*)*)$/);
-  if (!openMatch) {
+  const openMatch = prefixText.match(/(['"])([^'"\\\r\n]*)$/);
+  if (!openMatch || openStringContentStart(prefixText) !== prefixText.length - openMatch[2].length) {
     return undefined;
   }
   const currentValue = openMatch[2] ?? '';
@@ -5619,7 +6038,7 @@ function expressionPathCompletionContext(
   const lineText = document.lineAt(position.line).text;
   const prefixText = lineText.slice(0, position.character);
   const match = prefixText.match(EXPRESSION_STRING_COMPLETION_PATTERN);
-  if (!match) {
+  if (!match || openStringContentStart(prefixText) !== prefixText.length - match[2].length) {
     return undefined;
   }
 
@@ -5787,7 +6206,7 @@ function directFieldSignatureKeywordText(
       ? trimmedArgument.slice(0, equalsIndex)
       : trimmedArgument;
   const keyword = rawKeyword.trim();
-  if (!/^[A-Za-z_][\w]*$/.test(keyword)) {
+  if (!isPythonIdentifier(keyword)) {
     return undefined;
   }
 
@@ -5931,7 +6350,7 @@ function quotedFieldPathAtPosition(
   lineText: string,
   character: number
 ): { content: string; start: number } | undefined {
-  const re = /(['"])([A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*)\1/g;
+  const re = /(['"])([^'"\\\r\n]+)\1/g;
   let match: RegExpExecArray | null;
   while ((match = re.exec(lineText)) !== null) {
     const contentStart = match.index + 1;
@@ -6116,6 +6535,7 @@ function expressionPathHoverLiteral(
 
   for (const match of lineText.matchAll(EXPRESSION_STRING_HOVER_PATTERN)) {
     const value = match[2];
+    if (!value) continue;
     const start = (match.index ?? 0) + 1;
     const end = start + value.length;
 
@@ -6153,7 +6573,7 @@ function keywordLookupLiteral(
   const fullText = getDocumentText(document);
   const wordRange = document.getWordRangeAtPosition(
     position,
-    /[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/
+    PYTHON_IDENTIFIER_RE
   );
   if (!wordRange) {
     return undefined;
@@ -6349,7 +6769,7 @@ function metaConstraintLookupLiteral(
   const fullText = getDocumentText(document);
   const wordRange = document.getWordRangeAtPosition(
     position,
-    /[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/
+    PYTHON_IDENTIFIER_RE
   );
   if (!wordRange) {
     return undefined;
@@ -6927,7 +7347,9 @@ async function resolveReceiverInstanceHoverAtPosition(
   );
   markdown.appendMarkdown(`Model: \`${target.label}\`\n\n`);
   markdown.appendMarkdown(`Module: \`${target.module}\``);
+  markdown.appendMarkdown(`\n\nResolved symbol: \`${relationTargetQualifiedSymbol(target)}\``);
   appendImportFilePath(markdown, target.filePath);
+  markdown.appendMarkdown('\n\nClass category: `django`');
   return new vscode.Hover(markdown, receiverExpression.range);
 }
 
@@ -7709,6 +8131,7 @@ async function runWithConcurrency<T>(
 }
 
 function resetProviderResolutionCaches(): void {
+  receiverCacheRevision++;
   allRelationTargetsCache = new WeakMap<AnalysisDaemon, Promise<RelationTargetsResult>>();
   staticQuerySetClassSourceCache = new WeakMap<
     AnalysisDaemon,
@@ -7761,7 +8184,12 @@ async function resolveClassDefinitionForModelLabel(
 ): Promise<ClassDefinitionSource | undefined> {
   if (daemon.isAborted()) { return undefined; }
   const targets = await listAllRelationTargets(daemon);
-  const target = targets.items.find((item) => item.label === modelLabel);
+  let target = targets.items.find((item) => item.label === modelLabel);
+  if (!target?.filePath) {
+    // Surface-backed native results can arrive before AST locations. Custom
+    // annotations need the method's source even during that warm-up window.
+    target = (await daemon.resolveRelationTarget(modelLabel)).target;
+  }
   if (!target?.filePath) {
     return undefined;
   }
@@ -7934,6 +8362,7 @@ function hasSuppressingPartialLookupCompletion(
 }
 
 function virtualLookupCompletionItems(
+  daemon: AnalysisDaemon,
   receiver: OrmReceiverInfo,
   prefix: string,
   method: string
@@ -7944,53 +8373,56 @@ function virtualLookupCompletionItems(
   }
 
   const normalizedPrefix = normalizeVirtualLookupPrefix(prefix, method);
-  const segments = normalizedPrefix.split('__').filter(Boolean);
+  const separator = normalizedPrefix.lastIndexOf('__');
+  const leading = separator < 0 ? '' : normalizedPrefix.slice(0, separator + 2);
+  const items = virtualFields.filter((field) => field.name.startsWith(normalizedPrefix)).map((field) => ({
+    ...virtualFieldToLookupPathItem(field, receiver.modelLabel),
+    fieldKind: virtualLookupIndex(daemon.getLookupIndex(), receiver.modelLabel, ANNOTATION_ROOT,
+      field.fieldKind, field.output).models.get(receiver.modelLabel)?.fields.get(ANNOTATION_ROOT)?.fieldKind ?? field.fieldKind,
+    name: leading ? field.name.slice(leading.length) : field.name,
+  }));
+  const match = matchAnnotationAlias(virtualFields, normalizedPrefix);
+  if (!match || !match.suffix) return items;
+  const virtualField = match.field;
+
+  if (!supportsLookupTransforms(method)) {
+    return items;
+  }
+
+  const segments = `${ANNOTATION_ROOT}${match.suffix}`.split('__');
   const endsWithSeparator = normalizedPrefix.endsWith('__');
+  const partial = endsWithSeparator ? '' : (segments.pop() ?? '');
+  if (endsWithSeparator) segments.pop();
+  const index = virtualLookupIndex(daemon.getLookupIndex(), receiver.modelLabel, ANNOTATION_ROOT, virtualField.fieldKind, virtualField.output);
+  const parsed = parseLookupChain(`${segments.join('__')}__`, receiver.modelLabel, index, method);
+  if (parsed.state === 'error' || parsed.resolvedPath.length < segments.length) return items;
+  return [...items, ...getCompletionCandidates(parsed, partial, index, method).map((candidate) => ({
+    ...virtualLookupOperatorItem(receiver.modelLabel, virtualField, candidate.name),
+    fieldKind: candidate.kind === 'transform' ? 'lookup_transform' : 'lookup_operator',
+    lookupOperator: candidate.kind === 'transform' ? undefined : candidate.name,
+  }))];
+}
 
-  if (segments.length === 0) {
-    return virtualFields
-      .filter((field) => field.name.startsWith(''))
-      .map((field) => virtualFieldToLookupPathItem(field, receiver.modelLabel));
+function lookupTransformHasContinuation(
+  daemon: AnalysisDaemon, receiver: OrmReceiverInfo, prefix: string, item: LookupPathItem, method: string,
+): boolean {
+  const normalized = normalizeVirtualLookupPrefix(prefix, method);
+  const separator = normalized.lastIndexOf('__');
+  let path = separator < 0 ? item.name : normalized.slice(0, separator + 2) + item.name;
+  let index = daemon.getLookupIndex();
+  const alias = matchAnnotationAlias(receiver.virtualFields ?? [], path);
+  if (alias) {
+    index = virtualLookupIndex(index, receiver.modelLabel, ANNOTATION_ROOT, alias.field.fieldKind, alias.field.output);
+    path = ANNOTATION_ROOT + alias.suffix;
   }
-
-  if (segments.length === 1 && !endsWithSeparator) {
-    return virtualFields
-      .filter((field) => field.name.startsWith(segments[0]))
-      .map((field) => virtualFieldToLookupPathItem(field, receiver.modelLabel));
-  }
-
-  const fieldName = segments[0];
-  const virtualField = virtualFields.find((field) => field.name === fieldName);
-  if (!virtualField) {
-    return [];
-  }
-
-  if (!supportsVirtualLookupOperators(method)) {
-    return [];
-  }
-
-  const operatorPrefix =
-    segments.length <= 1
-      ? ''
-      : endsWithSeparator
-        ? ''
-        : segments.slice(1).join('__');
-  if (segments.length > 2) {
-    return [];
-  }
-
-  return [...VIRTUAL_LOOKUP_OPERATORS]
-    .filter((operator) => operator.startsWith(operatorPrefix))
-    .map((operator) =>
-      virtualLookupOperatorItem(
-        receiver.modelLabel,
-        virtualField,
-        operator
-      )
-    );
+  const parsed = parseLookupChain(path, receiver.modelLabel, index, method);
+  const field = parsed.finalField;
+  if (parsed.state === 'error' || parsed.runtimeRequired || !field) return true;
+  return field.transforms.length > 0 || Boolean(field.lookupType?.dynamicTransform || field.lookupType?.runtimeTransforms);
 }
 
 function resolveVirtualLookupPath(
+  daemon: AnalysisDaemon,
   receiver: OrmReceiverInfo,
   value: string,
   method: string
@@ -8005,29 +8437,29 @@ function resolveVirtualLookupPath(
     return undefined;
   }
 
-  const segments = normalizedValue.split('__').filter(Boolean);
-  if (segments.length === 0) {
-    return undefined;
-  }
+  const match = matchAnnotationAlias(virtualFields, normalizedValue);
+  if (!match) return undefined;
+  const virtualField = match.field;
+  const segments = `${ANNOTATION_ROOT}${match.suffix}`.split('__');
 
-  const virtualField = virtualFields.find((field) => field.name === segments[0]);
-  if (!virtualField) {
-    return undefined;
-  }
-
-  const target = virtualFieldToLookupPathItem(virtualField, receiver.modelLabel);
+  const index = virtualLookupIndex(daemon.getLookupIndex(), receiver.modelLabel, ANNOTATION_ROOT, virtualField.fieldKind, virtualField.output);
+  const outputKind = index.models.get(receiver.modelLabel)?.fields.get(ANNOTATION_ROOT)?.fieldKind ?? virtualField.fieldKind;
+  const target = { ...virtualFieldToLookupPathItem(virtualField, receiver.modelLabel), fieldKind: outputKind };
   const resolvedSegments = [target];
 
-  if (segments.length === 1) {
+  if (!match.suffix) {
     return {
       resolved: true,
       target,
       resolvedSegments,
       baseModelLabel: receiver.modelLabel,
+      terminalType: outputKind === 'annotation' ? undefined : {
+        outputFieldKind: outputKind, pythonType: pythonTypeForKind(outputKind), isTransformed: false,
+      },
     };
   }
 
-  if (!supportsVirtualLookupOperators(method)) {
+  if (!supportsLookupTransforms(method)) {
     return {
       resolved: false,
       reason: 'non_relation_intermediate',
@@ -8037,33 +8469,32 @@ function resolveVirtualLookupPath(
     };
   }
 
-  if (segments.length > 2) {
+  const parsed = parseLookupChain(`${ANNOTATION_ROOT}${match.suffix}`, receiver.modelLabel, index, method);
+  if (parsed.runtimeRequired) {
+    return { resolved: true, target, resolvedSegments, baseModelLabel: receiver.modelLabel };
+  }
+  if (parsed.state === 'error' || parsed.resolvedPath.length < segments.length) {
     return {
       resolved: false,
       reason: 'invalid_lookup_operator',
       resolvedSegments,
-      missingSegment: segments[2],
+      missingSegment: segments[parsed.errorAt ?? parsed.resolvedPath.length],
       baseModelLabel: receiver.modelLabel,
     };
   }
 
-  const operator = segments[1];
-  if (![...VIRTUAL_LOOKUP_OPERATORS].includes(operator as (typeof VIRTUAL_LOOKUP_OPERATORS)[number])) {
-    return {
-      resolved: false,
-      reason: 'invalid_lookup_operator',
-      resolvedSegments,
-      missingSegment: operator,
-      baseModelLabel: receiver.modelLabel,
-    };
-  }
-
+  const kind = parsed.finalField?.fieldKind ?? virtualField.fieldKind;
+  const pythonType = pythonTypeForKind(kind);
   return {
     resolved: true,
     target,
     resolvedSegments,
     baseModelLabel: receiver.modelLabel,
-    lookupOperator: operator,
+    lookupOperator: parsed.finalLookup,
+    terminalType: { outputFieldKind: kind, pythonType,
+      isTransformed: parsed.resolvedPath.some((segment) => segment.kind === 'transform'),
+      lookupOperator: parsed.finalLookup,
+      operandPythonType: parsed.finalLookup ? operandPythonType(parsed.finalLookup, pythonType) : undefined },
   };
 }
 
@@ -8073,10 +8504,6 @@ function normalizeVirtualLookupPrefix(value: string, method: string): string {
     return trimmed.slice(1);
   }
   return trimmed;
-}
-
-function supportsVirtualLookupOperators(method: string): boolean {
-  return LOOKUP_OPERATOR_METHODS.has(method);
 }
 
 function virtualLookupOperatorItem(
@@ -8355,6 +8782,7 @@ function virtualFieldToLookupPathItem(
 ): LookupPathItem {
   return {
     name: field.name,
+    fieldPath: field.name,
     modelLabel,
     filePath: field.filePath,
     line: field.line,
@@ -8655,20 +9083,35 @@ function validateLookupContexts(
   contexts: LookupDiagnosticContext[],
   docText: string,
   isCancelled: () => boolean,
+  document: vscode.TextDocument,
 ): LookupDiagnosticContext[] {
+  let cache = lookupContextValidationCaches.get(document);
+  if (document.isClosed) {
+    lookupContextValidationCaches.delete(document);
+    cache = undefined;
+  } else if (!cache || cache.version !== document.version || cache.text !== docText) {
+    cache = { version: document.version, text: docText, decisions: new WeakMap() };
+    lookupContextValidationCaches.set(document, cache);
+  }
   const validated: LookupDiagnosticContext[] = [];
   for (const context of contexts) {
     if (isCancelled()) break;
-    const ctx = context as LookupDiagnosticContext & {
-      _needsCallContextValidation?: boolean;
-      _absoluteStart?: number;
-      _absoluteEnd?: number;
-      _isPrefetch?: boolean;
-      _isDictKey?: boolean;
-      _isFExpression?: boolean;
-      _isExpressionPath?: boolean;
-    };
+    const ctx = context as DeferredLookupDiagnosticContext;
     if (ctx._needsCallContextValidation && ctx._absoluteStart !== undefined) {
+      const previous = cache?.decisions.get(context);
+      if (previous
+        && previous.receiverExpression === ctx.receiverExpression
+        && previous.method === ctx.method
+        && previous._needsCallContextValidation === ctx._needsCallContextValidation
+        && previous._absoluteStart === ctx._absoluteStart
+        && previous._absoluteEnd === ctx._absoluteEnd
+        && previous._isPrefetch === ctx._isPrefetch
+        && previous._isDictKey === ctx._isDictKey
+        && previous._isFExpression === ctx._isFExpression
+        && previous._isExpressionPath === ctx._isExpressionPath) {
+        if (previous.valid) validated.push(context);
+        continue;
+      }
       let callContext: { receiverExpression: string; method: string } | undefined;
       if (ctx._isDictKey && ctx._absoluteEnd !== undefined) {
         const dictCtx = unpackedLookupDictCallContext(docText, ctx._absoluteStart, ctx._absoluteEnd);
@@ -8685,9 +9128,26 @@ function validateLookupContexts(
         const lookupCtx = querysetStringCallContext(docText, ctx._absoluteStart);
         callContext = lookupCtx && lookupCtx.method === context.method ? lookupCtx : undefined;
       }
+      if (callContext) {
+        context.receiverExpression = callContext.receiverExpression;
+        context.method = callContext.method;
+      }
+      // Successful validation mutates receiver/method (notably dictionary
+      // and expression contexts). Match the resulting state on reuse;
+      // any changed syntax input runs the original parser again.
+      cache?.decisions.set(context, {
+        valid: !!callContext,
+        receiverExpression: ctx.receiverExpression,
+        method: ctx.method,
+        _needsCallContextValidation: ctx._needsCallContextValidation,
+        _absoluteStart: ctx._absoluteStart,
+        _absoluteEnd: ctx._absoluteEnd,
+        _isPrefetch: ctx._isPrefetch,
+        _isDictKey: ctx._isDictKey,
+        _isFExpression: ctx._isFExpression,
+        _isExpressionPath: ctx._isExpressionPath,
+      });
       if (!callContext) continue;
-      context.receiverExpression = callContext.receiverExpression;
-      context.method = callContext.method;
     }
     validated.push(context);
   }
@@ -8889,6 +9349,7 @@ async function findLookupDiagnosticContexts(
 
     if (hasQuote) for (const match of lineText.matchAll(EXPRESSION_STRING_HOVER_PATTERN)) {
       const value = match[2];
+      if (!value) continue;
       const start = (match.index ?? 0) + 1;
       const absoluteStart = lineStartOffset + start;
       const absoluteEnd = absoluteStart + value.length + 1;
@@ -8916,7 +9377,7 @@ async function findLookupDiagnosticContexts(
     // keyword argument 는 `name=value` 패턴 — line 에 `=` 가 없으면 skip.
     // false-negative 안전: keyword arg 가 다른 형식으로 표현될 수 없음.
     const hasEqualsKeyword = lineText.indexOf('=') >= 0;
-    if (hasEqualsKeyword) for (const match of lineText.matchAll(/[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*/g)) {
+    if (hasEqualsKeyword) for (const match of lineText.matchAll(PYTHON_IDENTIFIER_GLOBAL_RE)) {
       const start = match.index ?? 0;
       const value = match[0];
       // captain identifier regex hotspot 차단: keywordLookupLiteral 안의
@@ -9246,7 +9707,6 @@ function buildDirectFieldDiagnostic(
 ): vscode.Diagnostic | undefined {
   if (
     resolution.resolved &&
-    resolution.target &&
     !resolution.lookupOperator &&
     !context.value.includes('__')
   ) {
@@ -9269,7 +9729,6 @@ function buildSchemaFieldDiagnostic(
 ): vscode.Diagnostic | undefined {
   if (
     resolution.resolved &&
-    resolution.target &&
     !resolution.lookupOperator &&
     !context.value.includes('__')
   ) {
@@ -9292,7 +9751,6 @@ function buildBulkUpdateFieldDiagnostic(
 ): vscode.Diagnostic | undefined {
   if (
     resolution.resolved &&
-    resolution.target &&
     !resolution.lookupOperator &&
     !context.value.includes('__')
   ) {
@@ -9338,20 +9796,23 @@ async function resolveOrmMemberCompletionContext(
       return undefined;
     }
 
-    const candidateVisited = new Set<string>();
     const dynamicReceiver = await resolveDynamicInstanceReceiverAtOffset(
       daemon,
       document,
       parsedAccess.receiverExpression,
       endOffset,
-      candidateVisited
+      new Set()
     );
     const staticReceiver = await resolveOrmReceiverAtOffset(
       daemon,
       document,
       parsedAccess.receiverExpression,
       endOffset,
-      candidateVisited
+      // This is a separate top-level resolution. A ready/reindex event can
+      // clear document caches while the dynamic member RPC is awaited; its
+      // completed visits must not suppress the static walk after that clear.
+      // Recursive calls within each walk still share the bounded visit set.
+      new Set()
     );
     const annotatedReceiver = await resolveAnnotatedReceiverForExpression(
       daemon,
@@ -9816,6 +10277,32 @@ function isPlausibleMemberReceiverExpression(value: string): boolean {
   return Boolean(normalized) && /^[A-Za-z_]/.test(normalized);
 }
 
+let receiverCacheRevision = 0;
+const receiverDocumentOwners = new WeakMap<vscode.TextDocument, object>();
+interface ReceiverCacheOwner {
+  version: number;
+  revision: number;
+  session: number;
+  documentOwner: object;
+}
+
+function captureReceiverCacheOwner(daemon: AnalysisDaemon, document: vscode.TextDocument): ReceiverCacheOwner {
+  let documentOwner = receiverDocumentOwners.get(document);
+  if (!documentOwner) {
+    documentOwner = {};
+    receiverDocumentOwners.set(document, documentOwner);
+  }
+  return { version: document.version, revision: receiverCacheRevision, session: daemon.getSessionRevision(), documentOwner };
+}
+
+function ownsReceiverCache(daemon: AnalysisDaemon, document: vscode.TextDocument, owner: ReceiverCacheOwner): boolean {
+  // Return the result to its original caller, but never reinstall it after
+  // metadata invalidation, an edit/close, or a daemon-session replacement.
+  return !document.isClosed && document.version === owner.version
+    && receiverCacheRevision === owner.revision && daemon.getSessionRevision() === owner.session
+    && receiverDocumentOwners.get(document) === owner.documentOwner;
+}
+
 const _ormReceiverCacheByDocument = new Map<string, { version: number; entries: Map<string, OrmReceiverInfo | undefined> }>();
 
 function getCachedOrmReceiver(
@@ -9834,10 +10321,13 @@ function getCachedOrmReceiver(
 }
 
 function setCachedOrmReceiver(
+  daemon: AnalysisDaemon,
   document: vscode.TextDocument,
   expression: string,
-  result: OrmReceiverInfo | undefined
+  result: OrmReceiverInfo | undefined,
+  owner: ReceiverCacheOwner
 ): void {
+  if (!ownsReceiverCache(daemon, document, owner)) return;
   const docKey = document.uri.toString();
   let docCache = _ormReceiverCacheByDocument.get(docKey);
   if (!docCache || docCache.version !== document.version) {
@@ -9872,10 +10362,13 @@ function getCachedLookupReceiver(
 }
 
 function setCachedLookupReceiver(
+  daemon: AnalysisDaemon,
   document: vscode.TextDocument,
   expression: string,
-  result: OrmReceiverInfo | undefined
+  result: OrmReceiverInfo | undefined,
+  owner: ReceiverCacheOwner
 ): void {
+  if (!ownsReceiverCache(daemon, document, owner)) return;
   const docKey = document.uri.toString();
   let docCache = _lookupReceiverCacheByDocument.get(docKey);
   if (!docCache || docCache.version !== document.version) {
@@ -9912,6 +10405,8 @@ async function resolveOrmReceiverAtOffset(
     return cached;
   }
 
+  const cacheOwner = captureReceiverCacheOwner(daemon, document);
+
   const result = await resolveOrmReceiverAtOffsetCore(
     daemon,
     document,
@@ -9920,10 +10415,9 @@ async function resolveOrmReceiverAtOffset(
     visited
   );
 
-  // Don't cache a result produced after an abort — it is a spurious `undefined`
-  // that would pin this expression as unresolvable for the document version.
+  // Aborts and ownership changes must not pin old results in the current cache.
   if (!daemon.isAborted()) {
-    setCachedOrmReceiver(document, cacheKey, result);
+    setCachedOrmReceiver(daemon, document, cacheKey, result, cacheOwner);
   }
   return result;
 }
@@ -11114,7 +11608,11 @@ async function resolveVirtualFieldsFromCustomMethod(
   );
   perDaemon.set(cacheKey, computed);
   try {
-    return await computed;
+    const fields = await computed;
+    // Source locations can still be warming up. An empty answer must not
+    // prevent the next completion request from discovering the method body.
+    if (fields.length === 0 && perDaemon.get(cacheKey) === computed) perDaemon.delete(cacheKey);
+    return fields;
   } catch (error) {
     // Do not poison the cache with a rejected promise.
     if (perDaemon.get(cacheKey) === computed) {
@@ -11130,6 +11628,13 @@ async function resolveVirtualFieldsFromCustomMethodUncached(
   methodName: string,
   modelLabel: string
 ): Promise<VirtualOrmField[]> {
+  const configuredQueryset = await resolveQuerySetClassSourceForModelLabel(daemon, modelLabel);
+  if (configuredQueryset) {
+    const configuredMethod = await resolveMethodDefinitionInClassHierarchy(
+      daemon, configuredQueryset, methodName, new Set(),
+    );
+    if (configuredMethod) return extractAnnotatedVirtualFieldsFromMethodBody(configuredMethod);
+  }
   const shortModel = modelLabel.includes('.')
     ? modelLabel.split('.').at(-1)!
     : modelLabel;
@@ -11144,33 +11649,32 @@ async function resolveVirtualFieldsFromCustomMethodUncached(
 
   // Resolve the custom QuerySet/Manager class IN THE MODEL'S MODULE (where it is
   // defined/imported), by convention name.
-  let querysetClassSource: ClassDefinitionSource | undefined;
   for (const className of [`${shortModel}QuerySet`, `${shortModel}Manager`]) {
-    querysetClassSource = await resolveClassDefinitionFromTypeAnnotation(
+    const querysetClassSource = await resolveClassDefinitionFromTypeAnnotation(
       daemon,
       modelClassSource.document,
       className,
       modelClassSource.beforeOffset
     );
-    if (querysetClassSource || daemon.isAborted()) {
-      break;
+    if (daemon.isAborted()) return [];
+    if (!querysetClassSource) continue;
+    const methodSource = await resolveMethodDefinitionInClassHierarchy(
+      daemon, querysetClassSource, methodName, new Set(),
+    );
+    if (methodSource) {
+      return extractAnnotatedVirtualFieldsFromMethodBody(methodSource);
+    }
+    const factoryQueryset = await resolveQuerySetClassSourceFromManagerClass(
+      daemon, querysetClassSource, new Set(),
+    );
+    if (factoryQueryset) {
+      const factoryMethod = await resolveMethodDefinitionInClassHierarchy(
+        daemon, factoryQueryset, methodName, new Set(),
+      );
+      if (factoryMethod) return extractAnnotatedVirtualFieldsFromMethodBody(factoryMethod);
     }
   }
-  if (!querysetClassSource) {
-    return [];
-  }
-
-  const methodSource = await resolveMethodDefinitionInClassHierarchy(
-    daemon,
-    querysetClassSource,
-    methodName,
-    new Set()
-  );
-  if (!methodSource) {
-    return [];
-  }
-
-  return extractAnnotatedVirtualFieldsFromMethodBody(methodSource);
+  return [];
 }
 
 /**
@@ -11360,7 +11864,7 @@ async function collectVirtualFieldsForReceiverExpression(
     return [];
   }
 
-  const collected: VirtualOrmField[] = [];
+  const collected: VirtualOrmField[][] = [];
   let offset = beforeOffset;
   const seen = new Set<string>();
   for (let depth = 0; depth < 48; depth += 1) {
@@ -11376,13 +11880,12 @@ async function collectVirtualFieldsForReceiverExpression(
       break;
     }
     seen.add(guardKey);
-
-    collected.push(
-      ...(await extractVirtualFieldsFromChainExpression(
+    collected.unshift(
+      await extractVirtualFieldsFromChainExpression(
         daemon,
         modelLabel,
         assignment.expression
-      ))
+      )
     );
 
     const root = receiverRootIdentifier(assignment.expression);
@@ -11402,7 +11905,7 @@ async function collectVirtualFieldsForReceiverExpression(
     // upward (its same-line self-ref guard handles the boundary).
   }
 
-  return dedupeVirtualFields(collected);
+  return dedupeVirtualFields(collected.flat());
 }
 
 function parseVirtualFieldsFromAnnotatedCall(
@@ -11429,12 +11932,14 @@ function parseVirtualFieldsFromAnnotatedCall(
   for (const argument of splitTopLevelExpressions(callDetails.argsText)) {
     const equalsIndex = findTopLevelEqualsIndex(argument);
     if (equalsIndex <= 0) {
+      const alias = positionalAggregateAlias(argument);
+      if (alias) fields.push(buildVirtualFieldFromExpression(alias, argument, instanceAvailable));
       continue;
     }
 
     const name = argument.slice(0, equalsIndex).trim();
     const value = argument.slice(equalsIndex + 1).trim();
-    if (!/^[A-Za-z_][\w]*$/.test(name) || !value) {
+    if (!isPythonIdentifier(name) || !value) {
       continue;
     }
 
@@ -11442,6 +11947,28 @@ function parseVirtualFieldsFromAnnotatedCall(
   }
 
   return fields;
+}
+
+function positionalAggregateAlias(expression: string): string | undefined {
+  const call = parseCallExpressionDetails(expression);
+  const name = call?.parsedCall.kind === 'function' ? call.parsedCall.functionName
+    : call?.parsedCall.kind === 'member' ? call.parsedCall.memberName : undefined;
+  if (!call || !name) return undefined;
+  const args = splitTopLevelExpressions(call.argsText);
+  const positional = args.filter((arg) => findTopLevelEqualsIndex(arg) < 0);
+  if (positional.length !== 1) return undefined;
+  if (args.some((arg) => /^\s*(?:filter|order_by|ordering)\s*=/.test(arg) &&
+      arg.slice(arg.indexOf('=') + 1).trim() !== 'None')) return undefined;
+  let source = positional[0].trim();
+  const fCall = parseCallExpressionDetails(source);
+  if (fCall) {
+    const functionName = fCall.parsedCall.kind === 'function' ? fCall.parsedCall.functionName
+      : fCall.parsedCall.kind === 'member' ? fCall.parsedCall.memberName : undefined;
+    if (functionName !== 'F' || splitTopLevelExpressions(fCall.argsText).length !== 1) return undefined;
+    source = fCall.argsText.trim();
+  }
+  const literal = source.match(/^(['"])([^'"\\]+)\1$/);
+  return literal ? defaultAggregateAlias(name, literal[2]) : undefined;
 }
 
 function buildVirtualFieldFromExpression(
@@ -11462,19 +11989,95 @@ function buildVirtualFieldFromExpression(
     detail: expressionName
       ? `Annotated ${expressionName}() expression`
       : 'Annotated expression',
-    fieldKind: inferVirtualFieldKind(expressionName),
+    fieldKind: explicitExpressionOutputKind(call?.argsText) ?? inferVirtualFieldKind(expressionName),
     source: ANNOTATED_MEMBER_SOURCE,
     instanceAvailable,
     expressionName,
+    output: expressionOutputSpec(expression),
   };
+}
+
+function expressionOutputSpec(expression: string): AnnotationOutputSpec {
+  const call = parseCallExpressionDetails(expression);
+  if (!call) return { fieldKind: 'annotation' };
+  const name = call.parsedCall.kind === 'function' ? call.parsedCall.functionName
+    : call.parsedCall.kind === 'member' ? call.parsedCall.memberName : '';
+  const args = splitTopLevelExpressions(call.argsText);
+  const positional = args.filter(arg => findTopLevelEqualsIndex(arg) < 0);
+  const output = args.find(arg => /^\s*output_field\s*=/.test(arg));
+  const explicit = output?.slice(output.indexOf('=') + 1).trim() ?? (name === 'Cast' ? positional[1] : undefined);
+  if (explicit) return fieldConstructorSpec(explicit) ?? { fieldKind: 'annotation' };
+  const first = positional[0]?.trim() ?? '';
+  const nested = parseCallExpressionDetails(first);
+  const nestedName = nested?.parsedCall.kind === 'function' ? nested.parsedCall.functionName
+    : nested?.parsedCall.kind === 'member' ? nested.parsedCall.memberName : undefined;
+  const source = nestedName === 'F' ? nested!.argsText.trim() : first;
+  const path = source.match(/^(['"])([^'"\\]+)\1$/)?.[2];
+  const sourceOutput: AnnotationOutputSpec = path ? { fieldKind: 'annotation', sourcePath: path }
+    : nested ? expressionOutputSpec(first) : { fieldKind: 'annotation' };
+  if (name === 'ArrayAgg') return { fieldKind: 'ArrayField', baseField: sourceOutput };
+  if (['F', 'Sum', 'Min', 'Max', 'BitAnd', 'BitOr', 'BitXor', 'Lower', 'Upper'].includes(name)) return sourceOutput;
+  if (name === 'Avg') return { ...sourceOutput, average: true };
+  if (name === 'Value') {
+    if (/^(['"])[^'"\\]*\1$/.test(first)) return { fieldKind: 'CharField' };
+    if (first === 'True' || first === 'False') return { fieldKind: 'BooleanField' };
+    if (/^[+-]?\d+$/.test(first)) return { fieldKind: 'IntegerField' };
+    if (/^[+-]?(?:\d+\.\d*|\d*\.\d+)(?:e[+-]?\d+)?$/i.test(first)) return { fieldKind: 'FloatField' };
+  }
+  if (name.startsWith('Extract')) return { fieldKind: 'IntegerField' };
+  if (['UUID4', 'UUID7'].includes(name)) return { fieldKind: 'UUIDField' };
+  if (['JSONBAgg', 'JSONNull'].includes(name)) return { fieldKind: 'JSONField' };
+  return { fieldKind: inferVirtualFieldKind(name) };
+}
+
+function fieldConstructorSpec(expression: string): AnnotationOutputSpec | undefined {
+  const call = parseCallExpressionDetails(expression);
+  const name = call?.parsedCall.kind === 'function' ? call.parsedCall.functionName
+    : call?.parsedCall.kind === 'member' ? call.parsedCall.memberName : undefined;
+  if (!call || !name?.endsWith('Field')) return undefined;
+  if (name !== 'ArrayField') return { fieldKind: name };
+  const args = splitTopLevelExpressions(call.argsText);
+  const baseArgument = args.find(arg => /^\s*base_field\s*=/.test(arg));
+  const baseExpression = baseArgument?.slice(baseArgument.indexOf('=') + 1).trim()
+    ?? args.find(arg => findTopLevelEqualsIndex(arg) < 0);
+  return { fieldKind: name, baseField: baseExpression ? fieldConstructorSpec(baseExpression) : undefined };
+}
+
+function explicitExpressionOutputKind(argsText: string | undefined): string | undefined {
+  if (!argsText) return undefined;
+  const argument = splitTopLevelExpressions(argsText).find((part) => /^\s*output_field\s*=/.test(part));
+  const value = argument?.slice(argument.indexOf('=') + 1).trim();
+  const call = value ? parseCallExpressionDetails(value) : undefined;
+  const name = call?.parsedCall.kind === 'function' ? call.parsedCall.functionName
+    : call?.parsedCall.kind === 'member' ? call.parsedCall.memberName : undefined;
+  return name?.endsWith('Field') ? name : undefined;
 }
 
 function inferVirtualFieldKind(expressionName: string | undefined): string {
   switch (expressionName) {
     case 'Count':
+    case 'Length':
+    case 'BitAnd':
+    case 'BitOr':
+    case 'BitXor':
+    case 'ExtractYear':
+    case 'ExtractIsoYear':
+    case 'ExtractWeekDay':
+    case 'ExtractIsoWeekDay':
       return 'IntegerField';
     case 'Exists':
       return 'BooleanField';
+    case 'TruncDate':
+      return 'DateField';
+    case 'TruncTime':
+      return 'TimeField';
+    case 'Now':
+      return 'DateTimeField';
+    case 'StringAgg':
+      return 'CharField';
+    case 'JSONObject':
+    case 'JSONArray':
+      return 'JSONField';
     case 'Avg':
     case 'Sum':
     case 'Min':
@@ -11780,7 +12383,7 @@ function receiverFromIterableReceiver(
 
 function receiverInfoKey(receiver: OrmReceiverInfo): string {
   return `${receiver.kind}:${receiver.modelLabel}:${receiver.managerName ?? ''}:${(receiver.virtualFields ?? [])
-    .map((field) => field.name)
+    .map((field) => `${field.name}:${field.fieldKind}:${JSON.stringify(field.output ?? {})}`)
     .sort()
     .join(',')}:${receiver.classSource?.document.uri.toString() ?? ''}:${receiver.classSource?.classDef.name ?? ''}`;
 }
@@ -11899,6 +12502,7 @@ function tryFastPathReceiverKind(
     if (receiverKind === 'manager' || receiverKind === 'queryset') {
       // QuerySet/Manager builtin methods 의 return kind 매핑.
       const queryReturn = inferBuiltinManagerOrQuerysetReturnKind(name);
+      if (!djangoBuiltinAvailable(name, daemon.getState().runtime?.djangoVersion)) return undefined;
       if (queryReturn === undefined) {
         return undefined;  // 알 수 없는 method — IPC fallback
       }
@@ -11922,24 +12526,24 @@ function tryFastPathReceiverKind(
  * 와 BUILTIN_MANAGER_METHODS 에서 확정적으로 알려진 것만. fast-path 안전성
  * 우선이라 unknown 은 undefined 반환 (IPC fallback).
  */
-function inferBuiltinManagerOrQuerysetReturnKind(
-  methodName: string,
-): OrmReceiverInfo['kind'] | undefined {
-  // 가장 흔한 lookup-accepting QuerySet methods. captain log 의 대다수 사용.
-  const querysetReturning: ReadonlySet<string> = new Set([
+const BUILTIN_QUERYSET_RETURNING = new Set([
     'filter', 'exclude', 'all', 'annotate', 'alias', 'order_by',
     'select_related', 'prefetch_related', 'only', 'defer', 'distinct',
     'using', 'reverse', 'extra', 'union', 'intersection', 'difference',
-    'none', 'select_for_update',
+    'none', 'select_for_update', 'fetch_mode',
     // .values()/.values_list() return a ValuesQuerySet — still a queryset that
     // accepts a trailing .annotate(_x=...) whose alias must resolve as a lookup.
     'values', 'values_list',
-  ]);
-  const instanceReturning: ReadonlySet<string> = new Set([
+]);
+const BUILTIN_INSTANCE_RETURNING = new Set([
     'first', 'last', 'get', 'earliest', 'latest', 'create',
-  ]);
-  if (querysetReturning.has(methodName)) return 'queryset';
-  if (instanceReturning.has(methodName)) return 'instance';
+]);
+
+function inferBuiltinManagerOrQuerysetReturnKind(
+  methodName: string,
+): OrmReceiverInfo['kind'] | undefined {
+  if (BUILTIN_QUERYSET_RETURNING.has(methodName)) return 'queryset';
+  if (BUILTIN_INSTANCE_RETURNING.has(methodName)) return 'instance';
   return undefined;
 }
 
@@ -12268,6 +12872,7 @@ async function resolveLookupReceiverAtOffset(
     // else fall through to a fresh resolution.
   }
 
+  const cacheOwner = captureReceiverCacheOwner(daemon, document);
   const result = await resolveLookupReceiverAtOffsetCore(
     daemon,
     document,
@@ -12277,7 +12882,7 @@ async function resolveLookupReceiverAtOffset(
   );
 
   if (!daemon.isAborted()) {
-    setCachedLookupReceiver(document, cacheKey, result);
+    setCachedLookupReceiver(daemon, document, cacheKey, result, cacheOwner);
   }
   return result;
 }
@@ -14412,7 +15017,11 @@ async function resolveImportedModelDefinitionDocument(
   symbolName: string
 ): Promise<{ document: vscode.TextDocument; symbolName: string } | undefined> {
   if (daemon.isAborted()) { return undefined; }
+  const sessionRevision = daemon.getSessionRevision();
   const targets = await listAllRelationTargets(daemon);
+  if (daemon.isAborted() || daemon.getSessionRevision() !== sessionRevision) {
+    return undefined;
+  }
   const sameNameTargets = targets.items.filter(
     (item) => item.objectName === symbolName
   );
@@ -14420,17 +15029,34 @@ async function resolveImportedModelDefinitionDocument(
     return undefined;
   }
 
-  const preferredTarget =
+  let preferredTarget =
     preferredImportedModelDefinitionTarget(sameNameTargets, moduleName) ??
     (sameNameTargets.length === 1 ? sameNameTargets[0] : undefined);
+  if (preferredTarget && !preferredTarget.filePath) {
+    // A cached surface-backed list can predate native AST source locations.
+    // Recover only the selected model's source without mutating that list.
+    const resolution = await daemon.resolveRelationTarget(preferredTarget.label);
+    if (
+      daemon.isAborted() ||
+      daemon.getSessionRevision() !== sessionRevision ||
+      !resolution.resolved ||
+      resolution.target?.label !== preferredTarget.label ||
+      resolution.target.objectName !== preferredTarget.objectName
+    ) {
+      return undefined;
+    }
+    preferredTarget = resolution.target;
+  }
   if (!preferredTarget?.filePath) {
     return undefined;
   }
 
+  const document = await vscode.workspace.openTextDocument(preferredTarget.filePath);
+  if (daemon.isAborted() || daemon.getSessionRevision() !== sessionRevision) {
+    return undefined;
+  }
   return {
-    document: await vscode.workspace.openTextDocument(
-      preferredTarget.filePath
-    ),
+    document,
     symbolName: preferredTarget.objectName,
   };
 }
@@ -18216,11 +18842,7 @@ function lookupFilterText(
 }
 
 function scanKeywordTokenStart(textBefore: string): number {
-  let index = textBefore.length;
-  while (index > 0 && /[A-Za-z0-9_]/.test(textBefore[index - 1])) {
-    index -= 1;
-  }
-  return index;
+  return lookupKeywordStart(textBefore);
 }
 
 function isDynamicLookupDictKey(value: string): boolean {
@@ -18230,12 +18852,12 @@ function isDynamicLookupDictKey(value: string): boolean {
 function isLookupKeywordCandidate(value: string): boolean {
   return (
     value.length === 0 ||
-    /^[A-Za-z_][\w]*(?:__[A-Za-z_][\w]*)*(?:__)?$/.test(value)
+    isPythonIdentifier(value)
   );
 }
 
 function isDirectFieldKeywordCandidate(value: string): boolean {
-  return value.length === 0 || /^[A-Za-z_][\w]*$/.test(value);
+  return value.length === 0 || isPythonIdentifier(value);
 }
 
 function querysetKeywordCallContext(
@@ -18694,6 +19316,7 @@ function topLevelStatementStarts(
   let bracketDepth = 0;
   let braceDepth = 0;
   let activeQuote: '"' | "'" | undefined;
+  let quoteLength = 1;
   let escaped = false;
 
   for (let index = 0; index < beforeOffset; index += 1) {
@@ -18713,14 +19336,24 @@ function topLevelStatementStarts(
         continue;
       }
 
-      if (char === activeQuote) {
+      if (char === activeQuote && (quoteLength === 1 || text.startsWith(activeQuote.repeat(3), index))) {
         activeQuote = undefined;
+        index += quoteLength - 1;
       }
+      continue;
+    }
+
+    if (char === '#') {
+      const newline = text.indexOf('\n', index + 1);
+      if (newline < 0 || newline >= beforeOffset) break;
+      index = newline - 1;
       continue;
     }
 
     if (char === "'" || char === '"') {
       activeQuote = char;
+      quoteLength = text.startsWith(char.repeat(3), index) ? 3 : 1;
+      index += quoteLength - 1;
       continue;
     }
 

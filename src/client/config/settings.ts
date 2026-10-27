@@ -4,6 +4,19 @@ import * as vscode from 'vscode';
 
 export const CONFIGURATION_SECTION = 'djangoOrmIntellisense';
 
+// Preserve existing restart behavior for every other contributed setting,
+// including a change delivered in the same event as an inlay display toggle.
+const DAEMON_RESTART_CONFIGURATION_KEYS = [
+  'autoStart',
+  'pythonInterpreter',
+  'settingsModule',
+  'workspaceRoot',
+  'logLevel',
+  'diagnostics.enabled',
+  'diagnostics.fullDocument',
+  'pylance.autoApplyStubOverrides',
+];
+
 export interface ExtensionSettings {
   pythonInterpreter?: string;
   settingsModule?: string;
@@ -27,14 +40,20 @@ export function getExtensionSettings(
     CONFIGURATION_SECTION,
     effectiveScope
   );
+  // Window settings share one value across resource scopes. An explicit null
+  // scope avoids VS Code warning on every read from a project configuration.
+  const windowConfiguration = vscode.workspace.getConfiguration(
+    CONFIGURATION_SECTION,
+    null
+  );
   const pythonInterpreter = configuration.get<string>('pythonInterpreter')?.trim();
   const settingsModule = configuration.get<string>('settingsModule')?.trim();
   const workspaceRoot = resolveWorkspaceRootSetting(
     configuration.get<string>('workspaceRoot')?.trim(),
     requestedScope
   );
-  const logLevel = configuration.get<'off' | 'info' | 'debug'>('logLevel', 'info');
-  const autoStart = configuration.get<boolean>('autoStart', false);
+  const logLevel = windowConfiguration.get<'off' | 'info' | 'debug'>('logLevel', 'info');
+  const autoStart = windowConfiguration.get<boolean>('autoStart', false);
   const diagnosticsEnabled = configuration.get<boolean>(
     'diagnostics.enabled',
     true
@@ -147,6 +166,11 @@ export function isRelevantConfigurationChange(
     scopes.some((scope) => event.affectsConfiguration(section, scope));
 
   return (
-    affectsConfiguration(CONFIGURATION_SECTION)
+    affectsConfiguration(CONFIGURATION_SECTION) &&
+    (
+      !affectsConfiguration(`${CONFIGURATION_SECTION}.inlayHints.enabled`) ||
+      DAEMON_RESTART_CONFIGURATION_KEYS.some(key =>
+        affectsConfiguration(`${CONFIGURATION_SECTION}.${key}`))
+    )
   );
 }

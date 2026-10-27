@@ -31,18 +31,27 @@ import { provideCompletions } from './completionProvider.js';
 import {
   buildWorkspaceIndex,
   diffSurfaceIndex,
+  applyStaticFallbackDelta,
+  includeStaticFallbackChanges,
   updateWorkspaceIndexIncremental,
   type SurfaceIndex,
   type SurfaceIndexDiff,
   type StaticFallback,
 } from './workspaceIndexer.js';
-import { loadSurfaceCache, saveSurfaceCache } from './nativeCache.js';
+import { loadSurfaceCache, saveSurfaceCacheAsync, type SurfaceCachePayload } from './nativeCache.js';
+import { SurfaceCacheWriter } from './surfaceCacheWriter.js';
+import { SurfaceCachePrewarmer } from './surfaceCachePrewarmer.js';
+import { isSurfaceCacheContext, type SurfaceCacheContext, type SurfaceSourceProvenance } from '../client/surfaceSourceProvenance';
+import { SaveReindexTracker } from './saveReindexTracker.js';
+import { applyLookupCatalogDelta, type LookupCatalogDelta } from './lookupCatalog.js';
 import { parseLookupChain, getCompletionCandidates } from './lookupResolver.js';
 import { recordTiming, incrementCounter, setGauge, getAllStats, getAllCounters, getAllGauges } from './perfTracker.js';
 import { CompletionItemKind } from 'vscode-languageserver/node';
 import type { CompletionItem } from 'vscode-languageserver/node';
 import * as fs from 'fs';
 import * as path from 'path';
+import { SurfaceSnapshotDecoder } from '../client/daemon/surfaceSnapshotTransport';
+import type { SurfaceIndexChangedNotificationMessage } from '../client/protocol';
 
 type CompletionLabelDetails = {
   detail?: string;
@@ -62,8 +71,7 @@ const documents = new TextDocuments(TextDocument);
 
 let workspaceRoot: string | null = null;
 
-/** Set of file URIs that have been modified but not yet re-indexed. */
-const dirtyFiles = new Set<string>();
+const saveReindexTracker = new SaveReindexTracker();
 
 /**
  * The workspace index.  Initialised empty; populated by the background
@@ -94,12 +102,17 @@ const COMPLETION_CACHE_MAX = 256;
 // ---------------------------------------------------------------------------
 
 let previousSurfaceIndex: SurfaceIndex | null = null;
+let previousModelNames: string[] = [];
+let previousSourceProvenance: SurfaceSourceProvenance | null = null;
+let nativeCacheContext: SurfaceCacheContext | null = null;
 let previousCustomLookups: Record<string, string[]> | undefined;
 let previousCustomLookupsFingerprint: string | undefined;
 let previousStaticFallback: StaticFallback | undefined;
 let previousStaticFallbackFingerprint: string | null | undefined;
 const modelVersions = new Map<string, number>();
 const modelFingerprints = new Map<string, string>();
+// This baseline belongs to full-snapshot transport, independently of source deltas.
+const surfaceSnapshotDecoder = new SurfaceSnapshotDecoder();
 
 // ---------------------------------------------------------------------------
 // Usage frequency tracking (for completion ranking, persisted across sessions)
@@ -208,6 +221,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 
   return {
     capabilities: {
+      experimental: { djangoSurfaceSnapshotTransport: 1 },
       textDocumentSync: TextDocumentSyncKind.Incremental,
       completionProvider: {
         resolveProvider: false,
@@ -226,32 +240,29 @@ connection.onInitialized(() => {
 
   loadUsageFrequency();
 
-  // Pre-warm from the Rust bincode cache so completions are available
-  // before the Python daemon finishes its own startup. The authoritative
-  // surfaceIndex arrives via django/updateSurfaceIndex and overwrites
-  // this; a stale cache only affects the first ~1 second.
-  tryPrewarmFromNativeCache();
+  // The resolved interpreter/settings context arrives before Python setup.
+  // The worker verifies producer-bound sources before exposing a cache hint.
 
   connection.console.log('[ls] initialized — starting workspace indexing');
   void startWorkspaceIndexing();
 });
 
-function tryPrewarmFromNativeCache(): void {
-  if (!workspaceRoot) return;
-  if (previousSurfaceIndex !== null) return;
+const nativeCachePrewarmer = new SurfaceCachePrewarmer<SurfaceCachePayload>({
+  load: async context => {
+    const start = performance.now();
+    const cached = await loadSurfaceCache(context.workspaceRoot, context);
+    connection.console.log(`[ls] native cache pre-warm: ${cached ? 'validated' : 'miss'} (${(performance.now() - start).toFixed(1)}ms)`);
+    return cached;
+  },
+  hasResident: () => previousSurfaceIndex !== null,
+  apply: cached => {
   const _t0 = performance.now();
-  const cached = loadSurfaceCache(workspaceRoot);
-  if (!cached) {
-    connection.console.log(
-      `[ls] native cache pre-warm: miss (${(performance.now() - _t0).toFixed(1)}ms)`,
-    );
-    return;
-  }
   const built = buildWorkspaceIndex(
     cached.surfaceIndex,
     cached.modelNames,
     cached.customLookups,
     cached.staticFallback,
+    cached.lookupCatalog,
   );
   workspaceIndex.models = built.models;
   workspaceIndex.perFile = built.perFile;
@@ -259,7 +270,11 @@ function tryPrewarmFromNativeCache(): void {
   workspaceIndex.fieldTrieByModel = built.fieldTrieByModel;
   workspaceIndex.lookupTrie = built.lookupTrie;
   workspaceIndex.transformTrie = built.transformTrie;
+  workspaceIndex.lookupCatalog = built.lookupCatalog;
+  workspaceIndex.lookupTypes = built.lookupTypes;
   previousSurfaceIndex = cached.surfaceIndex;
+  previousModelNames = cached.modelNames;
+  previousSourceProvenance = cached.sourceProvenance ?? null;
   previousCustomLookups = cached.customLookups;
   previousCustomLookupsFingerprint = cached.customLookupsFingerprint;
   previousStaticFallback = cached.staticFallback;
@@ -277,7 +292,25 @@ function tryPrewarmFromNativeCache(): void {
   connection.console.log(
     `[ls] native cache pre-warm: ${built.models.size} models ${_elapsed.toFixed(1)}ms`,
   );
-}
+  },
+});
+
+connection.onRequest('django/setSurfaceCacheContext', (value: unknown) => {
+  const context = isSurfaceCacheContext(value) ? value : null;
+  if (JSON.stringify(context) !== JSON.stringify(nativeCacheContext) && previousSurfaceIndex !== null) {
+    surfaceCacheWriter.clear();
+    replaceWorkspaceIndexFromSurface({ surfaceIndex: {}, modelNames: [] });
+    previousSurfaceIndex = null;
+    previousSourceProvenance = null;
+    previousModelNames = [];
+    surfaceSnapshotDecoder.reset();
+    modelVersions.clear();
+    completionCache.clear();
+  }
+  nativeCacheContext = context;
+  nativeCachePrewarmer.update(context);
+  return { applied: true };
+});
 
 /**
  * Placeholder for the initial workspace scan.  In Phase 0 this logs and
@@ -301,6 +334,7 @@ async function startWorkspaceIndexing(): Promise<void> {
 }
 
 function replaceWorkspaceIndexFromSurface(params: {
+  lookupCatalog?: import('./lookupCatalog').LookupCatalogPayload;
   surfaceIndex: SurfaceIndex;
   modelNames?: string[];
   customLookups?: Record<string, string[]>;
@@ -314,6 +348,7 @@ function replaceWorkspaceIndexFromSurface(params: {
     params.modelNames ?? [],
     params.customLookups,
     params.staticFallback,
+    params.lookupCatalog,
   );
   workspaceIndex.models = built.models;
   workspaceIndex.perFile = built.perFile;
@@ -321,6 +356,8 @@ function replaceWorkspaceIndexFromSurface(params: {
   workspaceIndex.fieldTrieByModel = built.fieldTrieByModel;
   workspaceIndex.lookupTrie = built.lookupTrie;
   workspaceIndex.transformTrie = built.transformTrie;
+  workspaceIndex.lookupCatalog = built.lookupCatalog;
+  workspaceIndex.lookupTypes = built.lookupTypes;
   previousSurfaceIndex = params.surfaceIndex;
   previousCustomLookups = params.customLookups;
   previousCustomLookupsFingerprint = params.customLookupsFingerprint;
@@ -336,32 +373,54 @@ function replaceWorkspaceIndexFromSurface(params: {
   return built.models.size;
 }
 
-function persistSurfaceCacheSnapshot(modelNames?: string[]): void {
-  if (!workspaceRoot || previousSurfaceIndex === null) {
+const surfaceCacheWriter = new SurfaceCacheWriter<void>(async () => {
+  if (previousSurfaceIndex === null || !previousSourceProvenance) return;
+  await saveSurfaceCacheAsync(previousSourceProvenance.root, {
+    sourceProvenance: previousSourceProvenance,
+    surfaceIndex: previousSurfaceIndex,
+    modelNames: previousModelNames,
+    surfaceFingerprints: Object.fromEntries(modelFingerprints),
+    customLookups: previousCustomLookups,
+    lookupCatalog: workspaceIndex.lookupCatalog,
+    customLookupsFingerprint: previousCustomLookupsFingerprint,
+    staticFallback: previousStaticFallback,
+    staticFallbackFingerprint: previousStaticFallbackFingerprint,
+  });
+});
+
+function persistSurfaceCacheSnapshot(): void {
+  if (previousSurfaceIndex === null || !previousSourceProvenance) {
     return;
   }
-  try {
-    saveSurfaceCache(workspaceRoot, {
-      surfaceIndex: previousSurfaceIndex,
-      modelNames: modelNames ?? [],
-      surfaceFingerprints: Object.fromEntries(modelFingerprints),
-      customLookups: previousCustomLookups,
-      customLookupsFingerprint: previousCustomLookupsFingerprint,
-      staticFallback: previousStaticFallback,
-      staticFallbackFingerprint: previousStaticFallbackFingerprint,
-    });
-  } catch (err) {
-    connection.console.warn(
-      `[ls] native cache save failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
+  // Capture resident state when this request starts; older pending requests
+  // are replaced so a delayed native save cannot accumulate serializations.
+  surfaceCacheWriter.schedule();
 }
 
 // ---------------------------------------------------------------------------
 // Surface index notification from extension (Python daemon → LS)
 // ---------------------------------------------------------------------------
 
-connection.onNotification('django/updateSurfaceIndex', (params: {
+connection.onRequest('django/clearSurfaceIndex', () => {
+  nativeCachePrewarmer.invalidate();
+  previousSourceProvenance = null;
+  previousModelNames = [];
+  // Retire only resident session data. Keep the last source-validated disk
+  // cache for the next startup; an empty retirement must never replace it.
+  surfaceCacheWriter.clear();
+  replaceWorkspaceIndexFromSurface({ surfaceIndex: {}, modelNames: [] });
+  previousSurfaceIndex = null;
+  surfaceSnapshotDecoder.reset();
+  completionCache.clear();
+  modelVersions.clear();
+  setGauge('models.total', 0);
+  setGauge('tries.built', 0);
+  return { applied: true };
+});
+
+function applySurfaceIndex(params: {
+  sourceProvenance?: SurfaceSourceProvenance | null;
+  lookupCatalog?: import('./lookupCatalog').LookupCatalogPayload;
   surfaceIndex: SurfaceIndex;
   modelNames?: string[];
   surfaceFingerprints?: Record<string, string>;
@@ -369,7 +428,9 @@ connection.onNotification('django/updateSurfaceIndex', (params: {
   customLookupsFingerprint?: string;
   staticFallback?: StaticFallback;
   staticFallbackFingerprint?: string | null;
-}) => {
+}): { applied: boolean } {
+  nativeCachePrewarmer.invalidate();
+  previousSourceProvenance = null;
   const _t0 = performance.now();
   const surfaceKeys = Object.keys(params.surfaceIndex);
   const customLookupCount = params.customLookups
@@ -401,27 +462,25 @@ connection.onNotification('django/updateSurfaceIndex', (params: {
     );
     const totalChanges = diff.added.length + diff.removed.length + diff.changed.length;
 
-    if (totalChanges === 0) {
+    // Whole snapshots remain authoritative when only registry/catalog overlays
+    // change, a producer omits a global fingerprint, or short-name order moves.
+    // Source deltas can also change these public values between wire snapshots.
+    const lookupMetadataChanged = previousCustomLookupsFingerprint !== params.customLookupsFingerprint
+      || JSON.stringify(previousCustomLookups) !== JSON.stringify(params.customLookups)
+      || JSON.stringify(workspaceIndex.lookupCatalog) !== JSON.stringify(params.lookupCatalog);
+    const staticFallbackChanged =
+      previousStaticFallbackFingerprint !== (params.staticFallbackFingerprint ?? null)
+      || JSON.stringify(previousStaticFallback ?? null) !== JSON.stringify(params.staticFallback ?? null);
+    const modelOrderChanged = JSON.stringify(Object.keys(previousSurfaceIndex)) !== JSON.stringify(surfaceKeys);
+    if (lookupMetadataChanged || staticFallbackChanged || modelOrderChanged) {
+      completionCache.clear();
+      replaceWorkspaceIndexFromSurface(params);
+    } else if (totalChanges === 0) {
       // No-op: surfaceIndex is identical
       incrementCounter('index.noop_update');
       const _noop = performance.now() - _t0;
       connection.console.log(`[ls] incremental update: no-op ${_noop.toFixed(1)}ms`);
     } else {
-      const staticFallbackChanged =
-        previousStaticFallbackFingerprint !== (params.staticFallbackFingerprint ?? null);
-      if (staticFallbackChanged) {
-        completionCache.clear();
-        const modelCount = replaceWorkspaceIndexFromSurface(params);
-        const _buildMs = performance.now() - _t0;
-        recordTiming('index.build', _buildMs);
-        connection.console.log(
-          `[ls] full rebuild (staticFallback changed): ${modelCount} models ${_buildMs.toFixed(0)}ms`
-        );
-        setGauge('models.total', workspaceIndex.models.size);
-        setGauge('tries.built', workspaceIndex.fieldTrieByModel.size);
-        persistSurfaceCacheSnapshot(params.modelNames);
-        return;
-      }
       updateWorkspaceIndexIncremental(
         workspaceIndex,
         params.surfaceIndex,
@@ -429,6 +488,7 @@ connection.onNotification('django/updateSurfaceIndex', (params: {
         params.customLookups,
         previousCustomLookups,
         params.staticFallback,
+        params.lookupCatalog,
       );
 
       // Bump version for changed/added models (removed ones no longer exist)
@@ -448,6 +508,8 @@ connection.onNotification('django/updateSurfaceIndex', (params: {
   }
 
   previousSurfaceIndex = params.surfaceIndex;
+  previousSourceProvenance = params.sourceProvenance ?? null;
+  previousModelNames = params.modelNames ?? [];
   previousCustomLookups = params.customLookups;
   previousCustomLookupsFingerprint = params.customLookupsFingerprint;
   previousStaticFallback = params.staticFallback;
@@ -455,21 +517,53 @@ connection.onNotification('django/updateSurfaceIndex', (params: {
   setGauge('models.total', workspaceIndex.models.size);
   setGauge('tries.built', workspaceIndex.fieldTrieByModel.size);
 
-  persistSurfaceCacheSnapshot(params.modelNames);
-});
+  persistSurfaceCacheSnapshot();
+  return { applied: true };
+}
 
-connection.onNotification('django/updateSurfaceIndexDelta', (params: {
+function recoverFailedSurfaceUpdate<T>(apply: (params: T) => { applied: boolean }): (params: T) => { applied: boolean } {
+  return params => {
+    try {
+      return apply(params);
+    } catch (error) {
+      // A failed incremental build may already have advanced its surface
+      // fingerprints. The next full snapshot must rebuild, even if those
+      // fingerprints match, rather than acknowledge a damaged index as a no-op.
+      previousSurfaceIndex = null;
+      previousSourceProvenance = null;
+      nativeCachePrewarmer.invalidate();
+      surfaceSnapshotDecoder.reset();
+      completionCache.clear();
+      throw error;
+    }
+  };
+}
+
+const applySurfaceIndexSafely = recoverFailedSurfaceUpdate((params: NonNullable<SurfaceIndexChangedNotificationMessage['params']>) => {
+  const complete = surfaceSnapshotDecoder.decode(params);
+  if (!complete.surfaceIndex) throw new Error('Full surface snapshot is missing.');
+  return applySurfaceIndex(complete as Parameters<typeof applySurfaceIndex>[0]);
+});
+connection.onNotification('django/updateSurfaceIndex', applySurfaceIndexSafely);
+connection.onRequest('django/updateSurfaceIndex', applySurfaceIndexSafely);
+
+function applySurfaceIndexDelta(params: {
+  lookupCatalogDelta?: LookupCatalogDelta;
   surfaceIndexDelta: SurfaceIndex;
   surfaceFingerprints?: Record<string, string>;
   addedLabels?: string[];
   changedLabels?: string[];
   removedLabels?: string[];
   staticFallback?: StaticFallback | null;
+  staticFallbackDelta?: StaticFallback;
+  removedStaticFallbackLabels?: string[];
   staticFallbackFingerprint?: string | null;
-}) => {
+}): { applied: boolean } {
+  nativeCachePrewarmer.invalidate();
+  previousSourceProvenance = null;
   if (previousSurfaceIndex === null) {
     connection.console.warn('[ls] surfaceIndex delta ignored before initial snapshot');
-    return;
+    return { applied: false };
   }
 
   const _t0 = performance.now();
@@ -477,11 +571,23 @@ connection.onNotification('django/updateSurfaceIndexDelta', (params: {
   const changed = params.changedLabels ?? [];
   const removed = params.removedLabels ?? [];
   const totalChanges = added.length + changed.length + removed.length;
-  if (totalChanges === 0) {
+  const hasFallbackDeltaChanges = Boolean(Object.keys(params.staticFallbackDelta ?? {}).length
+    || params.removedStaticFallbackLabels?.length);
+  const hasUnfingerprintedFallback = params.staticFallback !== undefined
+    && params.staticFallbackFingerprint == null;
+  const nextStaticFallbackFingerprint = params.staticFallbackFingerprint !== undefined
+    ? params.staticFallbackFingerprint
+    : hasFallbackDeltaChanges || hasUnfingerprintedFallback ? null : previousStaticFallbackFingerprint ?? null;
+  const staticFallbackChanged = (previousStaticFallbackFingerprint ?? null) !== nextStaticFallbackFingerprint
+    || hasUnfingerprintedFallback;
+  if (totalChanges === 0 && !Object.keys(params.lookupCatalogDelta ?? {}).length
+    && !hasFallbackDeltaChanges && !staticFallbackChanged) {
     incrementCounter('index.noop_update');
     connection.console.log('[ls] incremental delta update: no-op');
-    return;
+    return { applied: true };
   }
+
+  if (params.lookupCatalogDelta) applyLookupCatalogDelta(workspaceIndex, params.lookupCatalogDelta);
 
   for (const label of removed) {
     delete previousSurfaceIndex[label];
@@ -500,17 +606,18 @@ connection.onNotification('django/updateSurfaceIndexDelta', (params: {
     );
   }
 
-  const staticFallbackChanged =
-    previousStaticFallbackFingerprint !== (params.staticFallbackFingerprint ?? previousStaticFallbackFingerprint ?? null);
-  if (staticFallbackChanged) {
-    previousStaticFallback = params.staticFallback ?? undefined;
-    previousStaticFallbackFingerprint = params.staticFallbackFingerprint ?? null;
+  if (staticFallbackChanged && (params.staticFallbackDelta === undefined || params.staticFallback !== undefined)) {
+    previousStaticFallback = params.staticFallbackDelta !== undefined
+      ? applyStaticFallbackDelta(params.staticFallback ?? undefined, params.staticFallbackDelta, params.removedStaticFallbackLabels)
+      : params.staticFallback ?? undefined;
+    previousStaticFallbackFingerprint = nextStaticFallbackFingerprint;
     completionCache.clear();
     const modelCount = replaceWorkspaceIndexFromSurface({
       surfaceIndex: previousSurfaceIndex,
       surfaceFingerprints: Object.fromEntries(modelFingerprints),
       customLookups: previousCustomLookups,
       customLookupsFingerprint: previousCustomLookupsFingerprint,
+      lookupCatalog: workspaceIndex.lookupCatalog,
       staticFallback: previousStaticFallback,
       staticFallbackFingerprint: previousStaticFallbackFingerprint,
     });
@@ -522,21 +629,34 @@ connection.onNotification('django/updateSurfaceIndexDelta', (params: {
     setGauge('models.total', workspaceIndex.models.size);
     setGauge('tries.built', workspaceIndex.fieldTrieByModel.size);
     persistSurfaceCacheSnapshot();
-    return;
+    return { applied: true };
   }
+
+  if (params.staticFallbackDelta !== undefined) {
+    previousStaticFallback = applyStaticFallbackDelta(
+      params.staticFallback !== undefined ? params.staticFallback ?? undefined : previousStaticFallback,
+      params.staticFallbackDelta, params.removedStaticFallbackLabels,
+    );
+    previousStaticFallbackFingerprint = nextStaticFallbackFingerprint;
+  }
+  const modelDiff = includeStaticFallbackChanges(
+    workspaceIndex, previousSurfaceIndex, previousStaticFallback,
+    { added, changed, removed }, params.staticFallbackDelta, params.removedStaticFallbackLabels,
+  );
 
   updateWorkspaceIndexIncremental(
     workspaceIndex,
     previousSurfaceIndex,
-    { added, changed, removed },
+    modelDiff,
     previousCustomLookups,
     previousCustomLookups,
     previousStaticFallback,
   );
 
-  for (const label of [...added, ...changed]) {
+  for (const label of [...modelDiff.added, ...modelDiff.changed]) {
     modelVersions.set(label, (modelVersions.get(label) ?? 0) + 1);
   }
+  for (const label of modelDiff.removed) modelVersions.delete(label);
 
   const _buildMs = performance.now() - _t0;
   recordTiming('index.build', _buildMs);
@@ -546,7 +666,12 @@ connection.onNotification('django/updateSurfaceIndexDelta', (params: {
   setGauge('models.total', workspaceIndex.models.size);
   setGauge('tries.built', workspaceIndex.fieldTrieByModel.size);
   persistSurfaceCacheSnapshot();
-});
+  return { applied: true };
+}
+
+const applySurfaceIndexDeltaSafely = recoverFailedSurfaceUpdate(applySurfaceIndexDelta);
+connection.onNotification('django/updateSurfaceIndexDelta', applySurfaceIndexDeltaSafely);
+connection.onRequest('django/updateSurfaceIndexDelta', applySurfaceIndexDeltaSafely);
 
 // ---------------------------------------------------------------------------
 // Document events
@@ -555,54 +680,15 @@ connection.onNotification('django/updateSurfaceIndexDelta', (params: {
 // ---------------------------------------------------------------------------
 // 초기 동기화 폭주 감지 (burst detection)
 // ---------------------------------------------------------------------------
-// VS Code는 LS 시작 시 열린/캐시된 모든 문서에 대해 didChange를 보낸다.
-// 11858 파일 프로젝트에서 이 과정이 수십 초 이상 걸릴 수 있다.
-// 고정 grace period 대신, 이벤트 빈도 기반으로 초기 동기화를 감지한다:
-//   - BURST_WINDOW_MS 내에 BURST_THRESHOLD개 이상 고유 파일이 변경되면 burst
-//   - burst 중인 이벤트는 무시 (dirtyFiles에 추가하지 않음)
-//   - burst가 아닌 단발성 변경만 실제 편집으로 처리
-
-const BURST_WINDOW_MS = 2000;   // 2초 윈도우
-const BURST_THRESHOLD = 10;     // 2초 내 10개 이상 고유 파일 → burst
-
-let _burstWindowStart = Date.now();
-let _burstWindowUris = new Set<string>();
-let _totalSkipped = 0;
-let _initialSyncDone = false;
-
-documents.onDidChangeContent((change) => {
-  const now = Date.now();
-  const uri = change.document.uri;
-
-  // 윈도우 갱신: 이전 윈도우가 만료되면 리셋
-  if (now - _burstWindowStart > BURST_WINDOW_MS) {
-    // 이전 윈도우가 burst가 아니었으면 초기 동기화 종료
-    if (_burstWindowUris.size < BURST_THRESHOLD && _totalSkipped > 0 && !_initialSyncDone) {
-      _initialSyncDone = true;
-      connection.console.log(
-        `[ls] initial sync settled: skipped ${_totalSkipped} didChange events`
-      );
-    }
-    _burstWindowStart = now;
-    _burstWindowUris = new Set<string>();
-  }
-
-  _burstWindowUris.add(uri);
-
-  // burst 감지: 현재 윈도우에서 고유 파일 수가 threshold 이상
-  if (_burstWindowUris.size >= BURST_THRESHOLD) {
-    _totalSkipped++;
-    return; // 초기 동기화 burst — 무시
-  }
-
-  // 초기 동기화가 완전히 끝나지 않았어도, 단발성 변경은 허용
-  dirtyFiles.add(uri);
-});
+// TextDocuments emits onDidOpen before its initial onDidChangeContent event.
+// Suppress that event explicitly; edit bursts must never discard real saves.
+documents.onDidOpen(event => saveReindexTracker.opened(event.document.uri));
+documents.onDidChangeContent(event => saveReindexTracker.changed(event.document.uri));
+documents.onDidClose(event => saveReindexTracker.closed(event.document.uri));
 
 documents.onDidSave((event) => {
   const uri = event.document.uri;
-  if (dirtyFiles.has(uri)) {
-    dirtyFiles.delete(uri);
+  if (saveReindexTracker.saved(uri)) {
     void reindexFile(uri);
   }
 });
@@ -798,7 +884,7 @@ function extractCompletionContext(
   let parsedLookup: ParsedLookup;
   if (segments.length > 1) {
     // Multiple segments: resolve all but the last, keep last as partial
-    parsedLookup = parseLookupChain(resolvedExpression, currentModel, workspaceIndex);
+    parsedLookup = parseLookupChain(`${resolvedExpression}__`, currentModel, workspaceIndex, detectCompletionMethod(lineText));
   } else {
     // Single segment: nothing to resolve yet, FSM starts from model
     parsedLookup = {
@@ -940,15 +1026,22 @@ interface ValidateLookupPathResult {
 
 connection.onRequest('django/validateLookupPaths', (params: ValidateLookupPathsParams): ValidateLookupPathResult[] => {
   const _t0 = performance.now();
-  const results = params.paths.map(({ baseModelLabel, value }) => {
+  const results = params.paths.map(({ baseModelLabel, value, method }) => {
     if (!workspaceIndex.models.has(baseModelLabel)) {
       return { resolved: true };  // Unknown model — skip (don't flag as error)
     }
 
-    const parsed = parseLookupChain(value, baseModelLabel, workspaceIndex);
+    const parsed = parseLookupChain(value, baseModelLabel, workspaceIndex, method);
+    if (parsed.runtimeRequired) return { resolved: true };
 
-    if (parsed.state === 'error') {
-      const errorIdx = parsed.errorAt ?? parsed.segments.length - 1;
+    // The parser also serves completion: an unknown final segment is partial.
+    // A validation request must resolve every nonempty segment, as the client
+    // local validator does. Keep trailing empty completion segments accepted.
+    if (parsed.state === 'error' || (
+      parsed.state === 'partial'
+      && parsed.resolvedPath.length < parsed.segments.filter(Boolean).length
+    )) {
+      const errorIdx = parsed.errorAt ?? parsed.resolvedPath.length;
       const errorSegment = parsed.segments[errorIdx] ?? value;
       const lastResolved = parsed.resolvedPath[parsed.resolvedPath.length - 1];
 

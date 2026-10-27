@@ -23,6 +23,7 @@ import {
   getTransformsForField,
 } from './fieldLookups.js';
 import { recordTiming, incrementCounter } from './perfTracker.js';
+import { applyLookupCatalog, type LookupCatalogPayload } from './lookupCatalog.js';
 
 // ---------------------------------------------------------------------------
 // Radix Trie helpers (minimal implementation against RadixTrieNode<T>)
@@ -166,45 +167,18 @@ function extractTargetModel(returnKind: string | null, returnModelLabel: string 
 
 function buildLookupTrie(customLookups?: Record<string, string[]>): RadixTrieNode<LookupInfo> {
   const root = createTrieNode<LookupInfo>();
-  const seen = new Set<string>();
-
-  for (const [fieldKind, lookups] of Object.entries(FIELD_LOOKUPS)) {
-    for (const lookupName of lookups) {
-      if (!seen.has(lookupName)) {
-        seen.add(lookupName);
-        // Collect all field kinds that support this lookup.
-        const applicableFieldKinds: string[] = [];
-        for (const [fk, fkLookups] of Object.entries(FIELD_LOOKUPS)) {
-          if (fkLookups.includes(lookupName)) {
-            applicableFieldKinds.push(fk);
-          }
-        }
-        const info: LookupInfo = {
-          name: lookupName,
-          applicableFieldKinds,
-          source: 'builtin',
-        };
-        trieInsert(root, lookupName, info);
+  const byName = new Map<string, LookupInfo>();
+  for (const [table, source] of [[FIELD_LOOKUPS, 'builtin'], [customLookups ?? {}, 'custom']] as const) {
+    for (const [kind, names] of Object.entries(table)) {
+      for (const name of names) {
+        if (source === 'builtin' && getTransformsForField(kind).includes(name)) continue;
+        const info = byName.get(name) ?? { name, applicableFieldKinds: [], source };
+        if (!info.applicableFieldKinds.includes(kind)) info.applicableFieldKinds.push(kind);
+        byName.set(name, info);
       }
     }
   }
-
-  // Add custom lookups registered via register_lookup()
-  if (customLookups) {
-    for (const [fieldKind, lookupNames] of Object.entries(customLookups)) {
-      for (const lookupName of lookupNames) {
-        if (!seen.has(lookupName)) {
-          seen.add(lookupName);
-          const info: LookupInfo = {
-            name: lookupName,
-            applicableFieldKinds: [fieldKind],
-            source: 'custom',
-          };
-          trieInsert(root, lookupName, info);
-        }
-      }
-    }
-  }
+  for (const [name, info] of byName) trieInsert(root, name, info);
 
   return root;
 }
@@ -256,6 +230,42 @@ export interface SurfaceIndexDiff {
   added: string[];
   removed: string[];
   changed: string[];
+  /** Models entering/leaving surface coverage can change short-name priority. */
+  coverageChanged?: string[];
+}
+
+/** Include fallback changes and transitions between surface/fallback coverage. */
+export function includeStaticFallbackChanges(
+  index: WorkspaceIndex,
+  surfaceIndex: SurfaceIndex,
+  staticFallback: StaticFallback | undefined,
+  diff: SurfaceIndexDiff,
+  fallbackDelta: StaticFallback = {},
+  removedFallbackLabels: string[] = [],
+): SurfaceIndexDiff {
+  const result: SurfaceIndexDiff = { added: [], changed: [], removed: [],
+    coverageChanged: [...diff.added, ...diff.removed] };
+  const labels = new Set([
+    ...diff.added, ...diff.changed, ...diff.removed,
+    ...Object.keys(fallbackDelta), ...removedFallbackLabels,
+  ]);
+  for (const label of labels) {
+    if (!surfaceIndex[label] && !staticFallback?.[label]) result.removed.push(label);
+    else if (index.models.has(label)) result.changed.push(label);
+    else result.added.push(label);
+  }
+  return result;
+}
+
+export function applyStaticFallbackDelta(
+  current: StaticFallback | null | undefined,
+  delta: StaticFallback,
+  removed: string[] = [],
+): StaticFallback {
+  const next = current ?? {};
+  for (const label of removed) delete next[label];
+  Object.assign(next, delta);
+  return next;
 }
 
 /**
@@ -277,16 +287,12 @@ export function diffSurfaceIndex(
   const removed: string[] = [];
   const changed: string[] = [];
 
-  const prevKeys = new Set(Object.keys(prev));
   const nextKeys = Object.keys(next);
 
   // Build new fingerprints and detect added/changed
-  const newFingerprints = new Map<string, string>();
   for (const label of nextKeys) {
     const fp = nextFingerprints?.[label] ?? JSON.stringify(next[label]);
-    newFingerprints.set(label, fp);
-
-    if (!prevKeys.has(label)) {
+    if (!Object.hasOwn(prev, label)) {
       added.push(label);
     } else {
       const oldFp = fingerprints.get(label);
@@ -294,20 +300,15 @@ export function diffSurfaceIndex(
         changed.push(label);
       }
     }
+    fingerprints.set(label, fp);
   }
 
   // Detect removed
-  const nextKeySet = new Set(nextKeys);
-  for (const label of prevKeys) {
-    if (!nextKeySet.has(label)) {
+  for (const label of Object.keys(prev)) {
+    if (!Object.hasOwn(next, label)) {
       removed.push(label);
+      fingerprints.delete(label);
     }
-  }
-
-  // Update fingerprint cache to reflect new state
-  fingerprints.clear();
-  for (const [k, v] of newFingerprints) {
-    fingerprints.set(k, v);
   }
 
   recordTiming('index.diff', performance.now() - _t0);
@@ -330,40 +331,43 @@ export function updateWorkspaceIndexIncremental(
   customLookups?: Record<string, string[]>,
   prevCustomLookups?: Record<string, string[]>,
   staticFallback?: StaticFallback,
+  lookupCatalog?: LookupCatalogPayload,
 ): void {
   const _t0 = performance.now();
+  const previousModels = new Map([...diff.added, ...diff.changed, ...diff.removed]
+    .map(label => [label, index.models.get(label)] as const));
 
   // --- Removed models ---
   for (const label of diff.removed) {
-    const model = index.models.get(label);
-    if (model) {
-      index.modelLabelByName.delete(model.objectName);
-    }
     index.models.delete(label);
     index.fieldTrieByModel.delete(label);
+    const fallback = staticFallback?.[label];
+    if (fallback) {
+      index.models.set(label, buildStaticFallbackModelInfo(label, fallback, customLookups));
+    }
   }
 
   // --- Added models ---
   for (const label of diff.added) {
     const receivers = surfaceIndex[label];
-    if (!receivers) continue;
-    const modelInfo = buildSurfaceModelInfo(label, receivers, customLookups, staticFallback);
+    const fallback = staticFallback?.[label];
+    if (!receivers && !fallback) continue;
+    const modelInfo = receivers
+      ? buildSurfaceModelInfo(label, receivers, customLookups, staticFallback)
+      : buildStaticFallbackModelInfo(label, fallback!, customLookups);
     index.models.set(label, modelInfo);
-    index.modelLabelByName.set(modelInfo.objectName, label);
     // Field trie is NOT built here — lazy on first access
   }
 
   // --- Changed models ---
   for (const label of diff.changed) {
     const receivers = surfaceIndex[label];
-    if (!receivers) continue;
-    const oldModel = index.models.get(label);
-    if (oldModel) {
-      index.modelLabelByName.delete(oldModel.objectName);
-    }
-    const modelInfo = buildSurfaceModelInfo(label, receivers, customLookups, staticFallback);
+    const fallback = staticFallback?.[label];
+    if (!receivers && !fallback) continue;
+    const modelInfo = receivers
+      ? buildSurfaceModelInfo(label, receivers, customLookups, staticFallback)
+      : buildStaticFallbackModelInfo(label, fallback!, customLookups);
     index.models.set(label, modelInfo);
-    index.modelLabelByName.set(modelInfo.objectName, label);
     // Invalidate cached field trie so it's rebuilt lazily
     index.fieldTrieByModel.delete(label);
   }
@@ -373,7 +377,32 @@ export function updateWorkspaceIndexIncremental(
   if (lookupsChanged) {
     index.lookupTrie = buildLookupTrie(customLookups);
     index.transformTrie = buildTransformTrie();
+    // Lookup-only registration changes also affect unchanged models.
+    for (const [label, receivers] of Object.entries(surfaceIndex)) {
+      index.models.set(label, buildSurfaceModelInfo(label, receivers, customLookups, staticFallback));
+      index.fieldTrieByModel.delete(label);
+    }
+    for (const [label, fallback] of Object.entries(staticFallback ?? {})) {
+      if (!Object.hasOwn(surfaceIndex, label)) {
+        index.models.set(label, buildStaticFallbackModelInfo(label, fallback, customLookups));
+        index.fieldTrieByModel.delete(label);
+      }
+    }
   }
+  if (lookupCatalog || index.lookupCatalog) {
+    applyLookupCatalog(index, lookupCatalog ?? index.lookupCatalog,
+      lookupsChanged ? undefined : [...diff.added, ...diff.changed]);
+  }
+
+  // Preserve workspace/built-in name precedence, including runtime-only
+  // entries and fallback-only additions/removals.
+  if (diff.coverageChanged?.length || diff.added.length || diff.removed.length || [...previousModels].some(([label, previous]) => {
+    const next = index.models.get(label);
+    return Boolean(previous) !== Boolean(next) || previous?.runtimeOnly !== next?.runtimeOnly;
+  })) {
+    index.modelLabelByName = buildModelLabelByName(Object.keys(surfaceIndex), staticFallback, 'last');
+  }
+  normalizeModelRelationTargets(index.models, index.modelLabelByName, previousModels.keys());
 
   recordTiming('index.incremental', performance.now() - _t0);
   incrementCounter('index.incremental_update');
@@ -410,6 +439,23 @@ export function getOrBuildFieldTrie(
 // ---------------------------------------------------------------------------
 // Single model builder (shared by full build and incremental update)
 // ---------------------------------------------------------------------------
+
+function addPrimaryKeyFields(fields: Map<string, FieldInfo>): void {
+  // A supplied pk describes the real primary key, including the absence of id.
+  if (fields.has('pk')) return;
+  const id = fields.get('id');
+  if (id) {
+    fields.set('pk', { ...id, name: 'pk' });
+    return;
+  }
+  for (const name of ['pk', 'id']) fields.set(name, {
+    name,
+    fieldKind: 'BigAutoField',
+    isRelation: false,
+    lookups: getLookupsForField('BigAutoField'),
+    transforms: getTransformsForField('BigAutoField'),
+  });
+}
 
 function buildModelInfo(
   modelLabel: string,
@@ -464,7 +510,7 @@ function buildModelInfo(
       // marks reverse OneToOne as forward, which breaks graph traversal
       // (`Author.profile` reverse relation → Profile).
       const direction: 'forward' | 'reverse' =
-        memberKind === 'reverse_relation' || returnKind === 'related_manager'
+        memberKind === 'reverse_relation' || (memberKind === undefined && returnKind === 'related_manager')
           ? 'reverse'
           : 'forward';
 
@@ -502,36 +548,7 @@ function buildModelInfo(
     }
   }
 
-  // Synthesize the `pk` primary-key alias so lookup completions /
-  // diagnostics can treat it as a valid field identifier. Django
-  // exposes `pk` on every concrete model as a shortcut to whatever
-  // field is declared `primary_key=True` (or the auto-created
-  // BigAutoField since Django 3.2).
-  if (!fields.has('pk')) {
-    const pkField: FieldInfo = {
-      name: 'pk',
-      fieldKind: 'BigAutoField',
-      isRelation: false,
-      lookups: getLookupsForField('BigAutoField'),
-      transforms: getTransformsForField('BigAutoField'),
-    };
-    fields.set('pk', pkField);
-  }
-
-  // Synthesize an `id` field when absent. Django auto-creates a
-  // BigAutoField primary key named `id` unless the model declares
-  // its own primary_key field. The surface may omit it when runtime
-  // inspection is unavailable.
-  if (!fields.has('id')) {
-    const idField: FieldInfo = {
-      name: 'id',
-      fieldKind: 'BigAutoField',
-      isRelation: false,
-      lookups: getLookupsForField('BigAutoField'),
-      transforms: getTransformsForField('BigAutoField'),
-    };
-    fields.set('id', idField);
-  }
+  addPrimaryKeyFields(fields);
 
   return {
     label: modelLabel,
@@ -583,8 +600,13 @@ function normalizeRelationTargetLabel(
 function normalizeModelRelationTargets(
   models: Map<string, ModelInfo>,
   modelLabelByName: Map<string, string>,
+  labels?: Iterable<string>,
 ): void {
-  for (const [modelLabel, modelInfo] of models) {
+  const entries = labels
+    ? Array.from(labels, label => [label, models.get(label)] as const)
+    : models;
+  for (const [modelLabel, modelInfo] of entries) {
+    if (!modelInfo) continue;
     for (const relationInfo of modelInfo.relations.values()) {
       relationInfo.targetModelLabel = normalizeRelationTargetLabel(
         modelLabel,
@@ -815,25 +837,7 @@ function buildStaticFallbackModelInfo(
     });
   }
 
-  if (!fields.has('pk')) {
-    fields.set('pk', {
-      name: 'pk',
-      fieldKind: 'BigAutoField',
-      isRelation: false,
-      lookups: getLookupsForField('BigAutoField'),
-      transforms: getTransformsForField('BigAutoField'),
-    });
-  }
-
-  if (!fields.has('id')) {
-    fields.set('id', {
-      name: 'id',
-      fieldKind: 'BigAutoField',
-      isRelation: false,
-      lookups: getLookupsForField('BigAutoField'),
-      transforms: getTransformsForField('BigAutoField'),
-    });
-  }
+  addPrimaryKeyFields(fields);
 
   return {
     label,
@@ -854,6 +858,7 @@ export function buildWorkspaceIndex(
   modelNames: string[],
   customLookups?: Record<string, string[]>,
   staticFallback?: StaticFallback,
+  lookupCatalog?: LookupCatalogPayload,
 ): WorkspaceIndex {
   const _t0 = performance.now();
   const models = new Map<string, ModelInfo>();
@@ -899,7 +904,7 @@ export function buildWorkspaceIndex(
   }
   incrementCounter('index.full_rebuild');
 
-  return {
+  const index: WorkspaceIndex = {
     models,
     perFile: new Map<string, FileIndexEntry>(),
     modelLabelByName,
@@ -907,6 +912,8 @@ export function buildWorkspaceIndex(
     lookupTrie,
     transformTrie,
   };
+  applyLookupCatalog(index, lookupCatalog);
+  return index;
 }
 
 /**

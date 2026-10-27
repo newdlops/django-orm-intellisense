@@ -31,6 +31,7 @@ pub struct BuiltinMethodInfo {
     pub description: &'static str,
     pub return_kind: BuiltinReturnKind,
     pub category: BuiltinCategory,
+    pub member_kind: &'static str,
 }
 
 const fn m(
@@ -46,14 +47,23 @@ const fn m(
         description,
         return_kind,
         category,
+        member_kind: "method",
     }
 }
+
+pub const QUERYSET_BUILTIN_PROPERTIES: &[BuiltinMethodInfo] = &[BuiltinMethodInfo {
+    name: "totally_ordered", signature: ": bool",
+    description: "Whether this QuerySet has deterministic ordering.",
+    return_kind: BuiltinReturnKind::Scalar, category: BuiltinCategory::Utility,
+    member_kind: "property",
+}];
 
 use BuiltinCategory::{Aggregate, Crud, Query, Utility};
 use BuiltinReturnKind::{Instance, None as RetNone, Queryset, Scalar, Unknown};
 
 pub const QUERYSET_BUILTIN_METHODS: &[BuiltinMethodInfo] = &[
     m("all", "() -> QuerySet", "Return a copy of the current QuerySet.", Queryset, Query),
+    m("fetch_mode", "(mode) -> QuerySet", "Set the field fetch mode for instances returned by this QuerySet (Django 6.1+).", Queryset, Query),
     m("alias", "(**kwargs) -> QuerySet", "Same as annotate(), but instead of annotating objects in the QuerySet, save the expression for later reuse with other QuerySet methods.", Queryset, Query),
     m("annotate", "(*args, **kwargs) -> QuerySet", "Annotate each object in the QuerySet with the provided expressions.", Queryset, Query),
     m("filter", "(*args, **kwargs) -> QuerySet", "Return a new QuerySet containing objects that match the given lookup parameters.", Queryset, Query),
@@ -242,7 +252,7 @@ mod tests {
     #[test]
     fn counts_match_python_port() {
         assert!(QUERYSET_BUILTIN_METHODS.len() >= 40);
-        assert!(MANAGER_BUILTIN_METHODS.len() >= 1);
+        assert!(!MANAGER_BUILTIN_METHODS.is_empty());
         assert!(INSTANCE_BUILTIN_METHODS.len() >= 10);
     }
 

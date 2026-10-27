@@ -15,6 +15,7 @@ import {
   updateWorkspaceIndexIncremental,
   getOrBuildFieldTrie,
   type SurfaceIndex,
+  type SurfaceMemberTuple,
 } from '../server/workspaceIndexer.js';
 import { getCompletionCandidates } from '../server/lookupResolver.js';
 import type { ParsedLookup } from '../server/types.js';
@@ -23,43 +24,35 @@ import type { ParsedLookup } from '../server/types.js';
 // Synthetic data generation
 // ---------------------------------------------------------------------------
 
-const FIELD_TYPES: Array<[string, string | null]> = [
-  ['str', null],
-  ['int', null],
-  ['bool', null],
-  ['datetime', null],
-  ['float', null],
-  ['Decimal', null],
-  ['UUID', null],
-  ['date', null],
-];
+const FIELD_TYPES = ['CharField', 'IntegerField', 'BooleanField', 'DateTimeField',
+  'FloatField', 'DecimalField', 'UUIDField', 'DateField'];
 
 function generateSurfaceIndex(modelCount: number): SurfaceIndex {
   const index: SurfaceIndex = {};
 
   for (let i = 0; i < modelCount; i++) {
     const label = `app${Math.floor(i / 100)}.Model${i}`;
-    const instanceMembers: Record<string, [string, string | null]> = {};
+    const instanceMembers: Record<string, SurfaceMemberTuple> = {};
 
     // 20 scalar fields
     for (let f = 0; f < 20; f++) {
       const fieldType = FIELD_TYPES[f % FIELD_TYPES.length];
-      instanceMembers[`field_${f}`] = fieldType;
+      instanceMembers[`field_${f}`] = ['scalar', null, 'field', fieldType];
     }
 
     // 3 forward FK relations
     for (let r = 0; r < 3; r++) {
       const targetIdx = (i + r + 1) % modelCount;
       const targetLabel = `app${Math.floor(targetIdx / 100)}.Model${targetIdx}`;
-      instanceMembers[`fk_${r}`] = [`ForeignKey[${targetLabel}]`, 'instance'];
-      instanceMembers[`fk_${r}_id`] = ['int', null];
+      instanceMembers[`fk_${r}`] = ['instance', targetLabel, 'relation', 'ForeignKey'];
+      instanceMembers[`fk_${r}_id`] = ['scalar', null, 'field', 'IntegerField'];
     }
 
     // 2 reverse relations
     for (let rv = 0; rv < 2; rv++) {
       const sourceIdx = (i + modelCount - rv - 1) % modelCount;
       const sourceLabel = `app${Math.floor(sourceIdx / 100)}.Model${sourceIdx}`;
-      instanceMembers[`reverse_${rv}_set`] = [`RelatedManager[${sourceLabel}]`, 'related_manager'];
+      instanceMembers[`reverse_${rv}_set`] = ['related_manager', sourceLabel, 'reverse_relation', 'reverse_ForeignKey'];
     }
 
     index[label] = { instance: instanceMembers };
@@ -216,7 +209,9 @@ function runBenchmark(modelCount: number, quiet = false): BenchmarkResult {
     fingerprints.set(label, JSON.stringify(surfaceIndex[label]));
   }
   const t2 = performance.now();
-  const noopDiff = diffSurfaceIndex(surfaceIndex, surfaceIndex, fingerprints);
+  // Production sends fingerprints computed by the daemon with each snapshot.
+  const wireFingerprints = Object.fromEntries(fingerprints);
+  const noopDiff = diffSurfaceIndex(surfaceIndex, surfaceIndex, fingerprints, wireFingerprints);
   const noopMs = performance.now() - t2;
   log(`diffSurfaceIndex (no-op): ${formatMs(noopMs)} (${noopDiff.added.length}+${noopDiff.changed.length}~${noopDiff.removed.length}-)`);
 
@@ -226,14 +221,15 @@ function runBenchmark(modelCount: number, quiet = false): BenchmarkResult {
   modifiedIndex[firstLabel] = {
     instance: {
       ...surfaceIndex[firstLabel].instance,
-      new_field: ['str', null],
+      new_field: ['scalar', null, 'field', 'CharField'],
     },
   };
   for (const label of Object.keys(surfaceIndex)) {
     fingerprints.set(label, JSON.stringify(surfaceIndex[label]));
   }
   const t3 = performance.now();
-  const oneDiff = diffSurfaceIndex(surfaceIndex, modifiedIndex, fingerprints);
+  const modifiedFingerprints = { ...wireFingerprints, [firstLabel]: JSON.stringify(modifiedIndex[firstLabel]) };
+  const oneDiff = diffSurfaceIndex(surfaceIndex, modifiedIndex, fingerprints, modifiedFingerprints);
   const oneDiffMs = performance.now() - t3;
   log(`diffSurfaceIndex (1 changed): ${formatMs(oneDiffMs)} (${oneDiff.added.length}+${oneDiff.changed.length}~${oneDiff.removed.length}-)`);
 

@@ -4,7 +4,7 @@
 
 use rustpython_ast::text_size::TextRange;
 use rustpython_ast::{self as ast, Expr, Ranged, Stmt};
-use rustpython_parser::source_code::{LineIndex, OneIndexed, SourceCode};
+use rustpython_parser::source_code::{LineIndex, SourceCode};
 
 use super::types::{
     is_django_field_class, is_relation_field_kind, DefinitionLocation, ImportBinding,
@@ -92,8 +92,24 @@ impl<'a> Visitor<'a> {
     }
 
     fn location_of(&self, range: TextRange) -> (u32, u32) {
-        let loc = self.src.source_location(range.start());
-        (raw_line(loc.row), raw_col(loc.column))
+        let offset = range.start();
+        let row = self.src.line_index(offset);
+        let prefix = self.src.slice(TextRange::new(self.src.line_start(row), offset));
+        // Public source locations are one-based; the editor subtracts one.
+        // rustpython's SourceLocation counts Unicode scalars, whereas VS Code
+        // columns count UTF-16 units. Borrow the prefix without retaining or
+        // copying source, and exclude a leading UTF-8 BOM as the parser does.
+        let prefix = if row.get() == 1 {
+            prefix.strip_prefix('\u{feff}').unwrap_or(prefix)
+        } else {
+            prefix
+        };
+        let column = if prefix.is_ascii() {
+            prefix.len()
+        } else {
+            prefix.encode_utf16().count()
+        };
+        (row.get(), column as u32 + 1)
     }
 
     fn visit_stmts(&mut self, stmts: &[Stmt]) {
@@ -230,14 +246,12 @@ impl<'a> Visitor<'a> {
                 ));
             }
             Stmt::Assign(a) => {
-                if let Some(target) = a.targets.first() {
-                    if let Expr::Name(n) = target {
-                        let name = n.id.as_str().to_string();
-                        if name == "__all__" {
-                            self.explicit_all = extract_string_sequence(&a.value);
-                        }
-                        self.defined_symbols.push(name);
+                if let Some(Expr::Name(n)) = a.targets.first() {
+                    let name = n.id.as_str().to_string();
+                    if name == "__all__" {
+                        self.explicit_all = extract_string_sequence(&a.value);
                     }
+                    self.defined_symbols.push(name);
                 }
                 // Track `FooField = models.CharField` style aliases at
                 // module scope so class bodies can detect them later.
@@ -419,17 +433,6 @@ fn classify_decorators(decorators: &[Expr], is_async: bool) -> String {
     }
 }
 
-fn raw_line(row: OneIndexed) -> u32 {
-    u32::try_from(row.get()).unwrap_or(u32::MAX)
-}
-
-fn raw_col(col: OneIndexed) -> u32 {
-    // OneIndexed -> 0-indexed column for editor convention. Python AST
-    // returns col_offset 0-indexed, so subtract 1.
-    let v = col.get();
-    u32::try_from(v.saturating_sub(1)).unwrap_or(0)
-}
-
 fn split_first_dot(s: &str) -> (String, Option<String>) {
     match s.find('.') {
         Some(idx) => (s[..idx].to_string(), Some(s[idx + 1..].to_string())),
@@ -584,6 +587,7 @@ fn extract_keyword_expr<'a>(call: &'a ast::ExprCall, name: &str) -> Option<&'a E
 ///   - level=0 → absolute (return `imported` as-is)
 ///   - level≥1 → strip `level-1` trailing segments from the current
 ///     package and prepend them to `imported`
+///
 /// For `__init__.py` files, the "current package" equals the module
 /// name; for regular `.py` files, it is the module name minus the
 /// final segment.

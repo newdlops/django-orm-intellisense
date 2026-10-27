@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 
 @dataclass(frozen=True)
@@ -12,6 +13,22 @@ class BuiltinMethodInfo:
     description: str
     return_kind: str  # queryset | instance | scalar | none | bool | unknown
     category: str  # query | crud | aggregate | utility
+    member_kind: str = 'method'
+
+
+def django_builtin_available(name: str, version: str | None) -> bool:
+    if name not in {'fetch_mode', 'totally_ordered'}:
+        return True
+    parts = re.match(r'^(\d+)(?:\.(\d+))?', version or '')
+    return bool(parts and (int(parts[1]), int(parts[2] or 0)) >= (6, 1))
+
+
+QUERYSET_BUILTIN_PROPERTIES = {
+    'totally_ordered': BuiltinMethodInfo(
+        'totally_ordered', ': bool', 'Whether this QuerySet has deterministic ordering.',
+        'scalar', 'utility', member_kind='property',
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -20,6 +37,7 @@ class BuiltinMethodInfo:
 
 QUERYSET_BUILTIN_METHODS: dict[str, BuiltinMethodInfo] = {m.name: m for m in [
     BuiltinMethodInfo('all', '() -> QuerySet', 'Return a copy of the current QuerySet.', 'queryset', 'query'),
+    BuiltinMethodInfo('fetch_mode', '(mode) -> QuerySet', 'Set the field fetch mode for instances returned by this QuerySet (Django 6.1+).', 'queryset', 'query'),
     BuiltinMethodInfo('alias', '(**kwargs) -> QuerySet', 'Same as annotate(), but instead of annotating objects in the QuerySet, save the expression for later reuse with other QuerySet methods.', 'queryset', 'query'),
     BuiltinMethodInfo('annotate', '(*args, **kwargs) -> QuerySet', 'Annotate each object in the QuerySet with the provided expressions.', 'queryset', 'query'),
     BuiltinMethodInfo('filter', '(*args, **kwargs) -> QuerySet', 'Return a new QuerySet containing objects that match the given lookup parameters.', 'queryset', 'query'),

@@ -6,8 +6,10 @@ import os
 import sys
 import threading
 from dataclasses import dataclass
+from typing import Callable
 
 _RUNTIME_FIELD_REGISTRY: dict[tuple[str, str], object] = {}
+_RUNTIME_LOOKUP_FIELD_ALIASES: dict[tuple[str, str], object] = {}
 _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE: str | None = None
 _RUNTIME_FIELD_REGISTRY_READY = False
 # 옵션 A2 — daemon initialize 가 background thread 로 registry pre-warm 을
@@ -23,12 +25,27 @@ _RUNTIME_FIELD_REGISTRY_LOCK_TIMEOUT_S = float(
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RuntimeRelationSummary:
     name: str
     related_model_label: str | None
     direction: str
     field_kind: str
+
+    def __getstate__(self):
+        return (
+            self.name, self.related_model_label, self.direction, self.field_kind,
+        )
+
+    def __setstate__(self, state):
+        (
+            name, related_model_label, direction, field_kind,
+        ) = state
+        assign = object.__setattr__
+        assign(self, 'name', name)
+        assign(self, 'related_model_label', related_model_label)
+        assign(self, 'direction', direction)
+        assign(self, 'field_kind', field_kind)
 
     def to_dict(self) -> dict[str, str | None]:
         return {
@@ -48,13 +65,31 @@ class RuntimeRelationSummary:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RuntimeFieldSummary:
     name: str
     field_kind: str
     is_relation: bool
     related_model_label: str | None
     direction: str | None
+
+    def __getstate__(self):
+        return (
+            self.name, self.field_kind, self.is_relation, self.related_model_label,
+            self.direction,
+        )
+
+    def __setstate__(self, state):
+        (
+            name, field_kind, is_relation, related_model_label,
+            direction,
+        ) = state
+        assign = object.__setattr__
+        assign(self, 'name', name)
+        assign(self, 'field_kind', field_kind)
+        assign(self, 'is_relation', is_relation)
+        assign(self, 'related_model_label', related_model_label)
+        assign(self, 'direction', direction)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -100,7 +135,15 @@ class RuntimeModelSummary:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> RuntimeModelSummary:
+    def from_dict(cls, payload: dict[str, object], *,
+                  _reuse_from: RuntimeModelSummary | None = None,
+                  _scalar_field_pool: dict | None = None) -> RuntimeModelSummary:
+        # Snapshot only the candidate sequences. Neither this summary nor its
+        # mutable lists may cross into a newly restored graph as shared owners.
+        fields = tuple(_reuse_from.fields) if (type(_reuse_from) is RuntimeModelSummary
+            and type(_reuse_from.fields) is list) else ()
+        relations = tuple(_reuse_from.relations) if (type(_reuse_from) is RuntimeModelSummary
+            and type(_reuse_from.relations) is list) else ()
         return cls(
             label=str(payload['label']),
             module=str(payload['module']),
@@ -110,17 +153,78 @@ class RuntimeModelSummary:
                 str(name) for name in payload.get('reverseRelationNames', [])
             ],
             fields=[
-                RuntimeFieldSummary.from_dict(dict(field))
-                for field in payload.get('fields', [])
+                fields[position] if (position < len(fields)
+                    and _runtime_field_summary_matches_cache(fields[position], field))
+                else _runtime_scalar_field_from_cache(field, _scalar_field_pool)
+                if _scalar_field_pool is not None
+                else RuntimeFieldSummary.from_dict(dict(field))
+                for position, field in enumerate(payload.get('fields', []))
                 if isinstance(field, dict)
             ],
             relations=[
-                RuntimeRelationSummary.from_dict(dict(relation))
-                for relation in payload.get('relations', [])
+                relations[position] if (position < len(relations)
+                    and _runtime_relation_summary_matches_cache(relations[position], relation))
+                else RuntimeRelationSummary.from_dict(dict(relation))
+                for position, relation in enumerate(payload.get('relations', []))
                 if isinstance(relation, dict)
             ],
             manager_names=[str(name) for name in payload.get('managerNames', [])],
         )
+
+
+_RUNTIME_FIELD_SUMMARY_KEYS = frozenset(('name', 'fieldKind', 'isRelation', 'relatedModelLabel', 'direction'))
+_RUNTIME_RELATION_SUMMARY_KEYS = frozenset(('name', 'relatedModelLabel', 'direction', 'fieldKind'))
+
+
+
+def _runtime_scalar_field_from_cache(payload, pool):
+    # A pool belongs to one inspection read. Only complete primitive scalar
+    # values cross model/preview lists; mutable owners never enter the pool.
+    if (type(payload) is dict and payload.keys() == _RUNTIME_FIELD_SUMMARY_KEYS
+            and payload['isRelation'] is False
+            and payload['relatedModelLabel'] is None and payload['direction'] is None):
+        name, kind = payload['name'], payload['fieldKind']
+        if type(name) is str and len(name) <= 256 and type(kind) is str and len(kind) <= 256:
+            key = (name, kind)
+            field = pool.get(key)
+            if field is None:
+                field = RuntimeFieldSummary(name, kind, False, None, None)
+                if len(pool) < 4096:
+                    pool[key] = field
+            return field
+    # Coercible, future, partial, relation and owner-bearing inputs retain
+    # their normal conversion, defensive copy and original exception order.
+    return RuntimeFieldSummary.from_dict(dict(payload))
+
+
+def _runtime_field_summary_matches_cache(value, payload):
+    # Frozen records can still be constructed with mutable values or str
+    # subclasses retaining arbitrary owners. Coercion and future shapes keep
+    # the ordinary from_dict behavior instead of sharing those inputs.
+    if (type(value) is not RuntimeFieldSummary or type(payload) is not dict
+            or payload.keys() != _RUNTIME_FIELD_SUMMARY_KEYS):
+        return False
+    return (type(value.name) is str and type(value.field_kind) is str and type(value.is_relation) is bool
+        and (value.related_model_label is None or type(value.related_model_label) is str and value.related_model_label != '')
+        and (value.direction is None or type(value.direction) is str and value.direction != '')
+        and type(payload['name']) is str and type(payload['fieldKind']) is str and type(payload['isRelation']) is bool
+        and type(payload['relatedModelLabel']) is type(value.related_model_label)
+        and type(payload['direction']) is type(value.direction)
+        and payload['name'] == value.name and payload['fieldKind'] == value.field_kind
+        and payload['isRelation'] == value.is_relation and payload['relatedModelLabel'] == value.related_model_label
+        and payload['direction'] == value.direction)
+
+
+def _runtime_relation_summary_matches_cache(value, payload):
+    if (type(value) is not RuntimeRelationSummary or type(payload) is not dict
+            or payload.keys() != _RUNTIME_RELATION_SUMMARY_KEYS):
+        return False
+    return (type(value.name) is str and type(value.field_kind) is str and type(value.direction) is str
+        and (value.related_model_label is None or type(value.related_model_label) is str and value.related_model_label != '')
+        and type(payload['name']) is str and type(payload['fieldKind']) is str and type(payload['direction']) is str
+        and type(payload['relatedModelLabel']) is type(value.related_model_label)
+        and payload['name'] == value.name and payload['fieldKind'] == value.field_kind
+        and payload['direction'] == value.direction and payload['relatedModelLabel'] == value.related_model_label)
 
 
 @dataclass(frozen=True)
@@ -137,9 +241,18 @@ class RuntimeInspection:
     relation_count: int
     reverse_relation_count: int
     manager_count: int
-    model_catalog: list[RuntimeModelSummary]
+    model_catalog: tuple[RuntimeModelSummary, ...]
     model_preview: list[RuntimeModelSummary]
     custom_lookups: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    lookup_catalog: dict[str, object] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Membership and frozen model labels/modules form the graph-map key.
+        # Callers may supply a list, but cannot mutate a published snapshot by
+        # editing that list after construction. Lookup-only replacements keep
+        # this tuple identity, so label maps remain reusable.
+        if not isinstance(self.model_catalog, tuple):
+            object.__setattr__(self, 'model_catalog', tuple(self.model_catalog))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -175,23 +288,31 @@ class RuntimeInspection:
             'modelCatalog': [model.to_dict() for model in self.model_catalog],
             'modelPreview': [model.to_dict() for model in self.model_preview],
             'customLookups': {k: list(v) for k, v in self.custom_lookups.items()},
+            'lookupCatalog': self.lookup_catalog,
         }
 
     @classmethod
     def from_cache_dict(cls, payload: dict[str, object]) -> RuntimeInspection:
+        from .lookup_catalog import compact_lookup_catalog
         raw_model_catalog = payload.get('modelCatalog') or []
         raw_model_preview = payload.get('modelPreview') or []
 
-        model_catalog = [
-            _sanitize_runtime_model_summary(RuntimeModelSummary.from_dict(dict(model)))
-            for model in raw_model_catalog
-            if isinstance(model, dict)
-        ]
-        model_preview = [
-            _sanitize_runtime_model_summary(RuntimeModelSummary.from_dict(dict(model)))
-            for model in raw_model_preview
-            if isinstance(model, dict)
-        ]
+        scalar_field_pool = {}
+        try:
+            model_catalog = [
+                _sanitize_runtime_model_summary(RuntimeModelSummary.from_dict(
+                    dict(model), _scalar_field_pool=scalar_field_pool))
+                for model in raw_model_catalog
+                if isinstance(model, dict)
+            ]
+            model_preview = [
+                _sanitize_runtime_model_summary(RuntimeModelSummary.from_dict(
+                    dict(model), _scalar_field_pool=scalar_field_pool))
+                for model in raw_model_preview
+                if isinstance(model, dict)
+            ]
+        finally:
+            scalar_field_pool.clear()
 
         if not model_preview:
             model_preview = model_catalog[:10]
@@ -209,14 +330,37 @@ class RuntimeInspection:
             relation_count=int(payload['relationCount']),
             reverse_relation_count=int(payload['reverseRelationCount']),
             manager_count=int(payload['managerCount']),
-            model_catalog=model_catalog,
+            model_catalog=tuple(model_catalog),
             model_preview=model_preview,
             custom_lookups={
                 str(k): [str(v) for v in vs]
                 for k, vs in (payload.get('customLookups') or {}).items()
                 if isinstance(vs, list)
             },
+            lookup_catalog=compact_lookup_catalog(dict(payload.get('lookupCatalog') or {})),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeModelMetadata:
+    app_count: int
+    model_count: int
+    field_count: int
+    relation_count: int
+    reverse_relation_count: int
+    manager_count: int
+    models: tuple[RuntimeModelSummary, ...]
+
+    def to_health_dict(self) -> dict[str, object]:
+        return {
+            'appCount': self.app_count,
+            'modelCount': self.model_count,
+            'fieldCount': self.field_count,
+            'relationCount': self.relation_count,
+            'reverseRelationCount': self.reverse_relation_count,
+            'managerCount': self.manager_count,
+            'modelPreview': [model.to_dict() for model in self.models[:10]],
+        }
 
 
 def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
@@ -235,7 +379,7 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
             relation_count=0,
             reverse_relation_count=0,
             manager_count=0,
-            model_catalog=[],
+            model_catalog=(),
             model_preview=[],
         )
 
@@ -258,7 +402,7 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
             relation_count=0,
             reverse_relation_count=0,
             manager_count=0,
-            model_catalog=[],
+            model_catalog=(),
             model_preview=[],
         )
 
@@ -280,10 +424,50 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
             relation_count=0,
             reverse_relation_count=0,
             manager_count=0,
-            model_catalog=[],
+            model_catalog=(),
             model_preview=[],
         )
 
+    runtime_field_registry: dict[tuple[str, str], object] = {}
+    metadata = collect_runtime_model_metadata(field_registry=runtime_field_registry)
+    _set_runtime_field_registry(settings_module, runtime_field_registry)
+
+    custom_lookups = _collect_custom_lookups()
+    from .lookup_catalog import collect_lookup_catalog
+    lookup_catalog = collect_lookup_catalog(runtime_field_registry)
+
+    return RuntimeInspection(
+        python_executable=sys.executable,
+        django_importable=True,
+        django_version=django_version,
+        bootstrap_status='ready',
+        settings_module=settings_module,
+        bootstrap_error=None,
+        app_count=metadata.app_count,
+        model_count=metadata.model_count,
+        field_count=metadata.field_count,
+        relation_count=metadata.relation_count,
+        reverse_relation_count=metadata.reverse_relation_count,
+        manager_count=metadata.manager_count,
+        model_catalog=metadata.models,
+        model_preview=list(metadata.models[:10]),
+        custom_lookups=custom_lookups,
+        lookup_catalog=lookup_catalog,
+    )
+
+
+def collect_runtime_model_metadata(
+    *,
+    model_limit: int | None = None,
+    field_registry: dict[tuple[str, str], object] | None = None,
+    model_reference: dict[tuple[str, str], RuntimeModelSummary] | None = None,
+) -> RuntimeModelMetadata:
+    """Summarize the ready process's models without collecting lookup catalogues.
+
+    A fresh member worker requests all counts, ten preview rows, and summaries
+    that differ from its original catalogue. The cold inspector requests every
+    model and the actual Django field registry.
+    """
     from django.apps import apps  # type: ignore
 
     app_labels: set[str] = set()
@@ -292,24 +476,28 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
     reverse_relation_count = 0
     manager_count = 0
     model_preview: list[RuntimeModelSummary] = []
-    runtime_field_registry: dict[tuple[str, str], object] = {}
-
-    for model in sorted(
+    models = sorted(
         apps.get_models(),
         key=lambda candidate: (
             candidate._meta.app_label,  # type: ignore[attr-defined]
             candidate._meta.object_name,  # type: ignore[attr-defined]
         ),
-    ):
+    )
+    for model in models:
         meta = model._meta
         app_labels.add(meta.app_label)
+        include_model = model_limit is None or len(model_preview) < model_limit
+        if not include_model and model_reference is not None:
+            include_model = not _runtime_model_matches_metadata(model,
+                model_reference.get((model.__module__, meta.object_name)))
         field_names: list[str] = []
         relation_names: list[str] = []
         reverse_relation_names: list[str] = []
         fields: list[RuntimeFieldSummary] = []
         relations: list[RuntimeRelationSummary] = []
-        manager_names = [manager.name for manager in meta.managers]
-        manager_count += len(manager_names)
+        managers = meta.managers
+        manager_names = [manager.name for manager in managers] if include_model else []
+        manager_count += len(managers)
 
         for field in meta.get_fields(include_hidden=True):
             if getattr(field, 'auto_created', False) and not getattr(field, 'concrete', True):
@@ -320,9 +508,12 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
                 # `instance._salary_account` but `.values("salary_account__...")`.
                 # Register BOTH so lookups and attribute access both resolve.
                 for reverse_name in _reverse_relation_names(field):
-                    runtime_field_registry[(f'{meta.app_label}.{meta.object_name}', reverse_name)] = field
-                    reverse_relation_names.append(reverse_name)
+                    if field_registry is not None:
+                        field_registry[(f'{meta.app_label}.{meta.object_name}', reverse_name)] = field
                     reverse_relation_count += 1
+                    if not include_model:
+                        continue
+                    reverse_relation_names.append(reverse_name)
                     fields.append(
                         RuntimeFieldSummary(
                             name=reverse_name,
@@ -342,26 +533,30 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
                     )
                 continue
 
-            field_names.append(field.name)
             field_count += 1
-            _register_runtime_field(
-                runtime_field_registry,
-                model_label=f'{meta.app_label}.{meta.object_name}',
-                field=field,
-            )
-            fields.append(
-                RuntimeFieldSummary(
-                    name=str(field.name),
-                    field_kind=field.__class__.__name__,
-                    is_relation=bool(getattr(field, 'is_relation', False)),
-                    related_model_label=_related_model_label(field),
-                    direction='forward' if getattr(field, 'is_relation', False) else None,
+            if field_registry is not None:
+                _register_runtime_field(
+                    field_registry,
+                    model_label=f'{meta.app_label}.{meta.object_name}',
+                    field=field,
                 )
-            )
+            if include_model:
+                field_names.append(field.name)
+                fields.append(
+                    RuntimeFieldSummary(
+                        name=str(field.name),
+                        field_kind=field.__class__.__name__,
+                        is_relation=bool(getattr(field, 'is_relation', False)),
+                        related_model_label=_related_model_label(field),
+                        direction='forward' if getattr(field, 'is_relation', False) else None,
+                    )
+                )
 
             if getattr(field, 'is_relation', False) and getattr(field, 'related_model', None) is not None:
-                relation_names.append(field.name)
                 relation_count += 1
+                if not include_model:
+                    continue
+                relation_names.append(field.name)
                 relations.append(
                     RuntimeRelationSummary(
                         name=str(field.name),
@@ -371,6 +566,8 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
                     )
                 )
 
+        if not include_model:
+            continue
         model_preview.append(
             RuntimeModelSummary(
                 label=f'{meta.app_label}.{meta.object_name}',
@@ -384,27 +581,44 @@ def inspect_runtime(settings_module: str | None) -> RuntimeInspection:
             )
         )
 
-    _set_runtime_field_registry(settings_module, runtime_field_registry)
-
-    custom_lookups = _collect_custom_lookups()
-
-    return RuntimeInspection(
-        python_executable=sys.executable,
-        django_importable=True,
-        django_version=django_version,
-        bootstrap_status='ready',
-        settings_module=settings_module,
-        bootstrap_error=None,
+    return RuntimeModelMetadata(
         app_count=len(app_labels),
-        model_count=len(model_preview),
+        model_count=len(models),
         field_count=field_count,
         relation_count=relation_count,
         reverse_relation_count=reverse_relation_count,
         manager_count=manager_count,
-        model_catalog=model_preview,
-        model_preview=model_preview[:10],
-        custom_lookups=custom_lookups,
+        models=tuple(model_preview),
     )
+
+
+def _runtime_model_matches_metadata(model, reference: RuntimeModelSummary | None) -> bool:
+    """Compare reflection records without allocating unchanged model summaries."""
+    meta = model._meta
+    if (reference is None or reference.label != meta.label or reference.module != model.__module__
+            or reference.manager_names != [manager.name for manager in meta.managers]):
+        return False
+    position = 0
+    def matches(name, kind, relation, related, direction):
+        nonlocal position
+        if position >= len(reference.fields):
+            return False
+        field = reference.fields[position]
+        position += 1
+        return (field.name == name and field.field_kind == kind and field.is_relation == relation
+            and field.related_model_label == related and field.direction == direction)
+    for field in meta.get_fields(include_hidden=True):
+        if getattr(field, 'auto_created', False) and not getattr(field, 'concrete', True):
+            for name in _reverse_relation_names(field):
+                if not matches(name, _relation_field_kind(field, reverse=True), True,
+                        _related_model_label(field), 'reverse'):
+                    return False
+        else:
+            relation = bool(getattr(field, 'is_relation', False))
+            if not matches(str(field.name), field.__class__.__name__, relation,
+                    _related_model_label(field), 'forward' if relation else None):
+                return False
+    return position == len(reference.fields)
 
 
 def _collect_custom_lookups() -> dict[str, list[str]]:
@@ -483,8 +697,16 @@ def create_pending_runtime_inspection(
         relation_count=0,
         reverse_relation_count=0,
         manager_count=0,
-        model_catalog=[],
+        model_catalog=(),
         model_preview=[],
+    )
+
+
+def runtime_field_registry_is_ready(settings_module: str | None) -> bool:
+    """Check availability without starting or waiting for a registry build."""
+    return (
+        _RUNTIME_FIELD_REGISTRY_READY
+        and _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE == settings_module
     )
 
 
@@ -493,13 +715,22 @@ def get_runtime_field(
     *,
     model_label: str,
     field_name: str,
+    for_lookup: bool = False,
 ) -> object | None:
     _ensure_runtime_field_registry(settings_module)
+    if for_lookup:
+        alias = _RUNTIME_LOOKUP_FIELD_ALIASES.get((model_label, field_name))
+        if alias is not None:
+            return alias
     return _RUNTIME_FIELD_REGISTRY.get((model_label, field_name))
 
 
-def _ensure_runtime_field_registry(settings_module: str | None) -> None:
+def _ensure_runtime_field_registry(settings_module: str | None, *,
+        cancelled: Callable[[], bool] | None = None) -> None:
     global _RUNTIME_FIELD_REGISTRY_READY
+
+    if cancelled is not None and cancelled():
+        return
 
     # Fast path — lock 없이 ready 체크. 동시 호출 시 중복 build 가능성은
     # acceptable: 그 다음 lock 안에서 다시 체크해서 false-positive 차단.
@@ -516,7 +747,7 @@ def _ensure_runtime_field_registry(settings_module: str | None) -> None:
     # 트레이드오프: transform chain (date__year__gte 같은) 인식 안 됨. captain
     # 의 일반 lookup 들은 단순 operator 라 fallback 으로 충분.
     mode = os.environ.get('DJLS_RUNTIME_REGISTRY_MODE', 'full').lower()
-    if mode in ('skip', 'subprocess'):
+    if mode in ('skip', 'subprocess') and cancelled is None:
         with _RUNTIME_FIELD_REGISTRY_LOCK:
             if (
                 _RUNTIME_FIELD_REGISTRY_READY
@@ -530,10 +761,22 @@ def _ensure_runtime_field_registry(settings_module: str | None) -> None:
     # 진입할 수 있으므로 lock 으로 직렬화. 첫 진입 thread 만 build, 나머지는
     # ready 까지 wait. E1+ — captain 의 14초 build 동안 main thread IPC handler
     # 가 12.7s 폭주하는 것을 timeout 으로 차단. acquire 실패 시 fallback path.
-    acquired = _RUNTIME_FIELD_REGISTRY_LOCK.acquire(
-        timeout=_RUNTIME_FIELD_REGISTRY_LOCK_TIMEOUT_S,
-    )
+    if cancelled is None:
+        acquired = _RUNTIME_FIELD_REGISTRY_LOCK.acquire(
+            timeout=_RUNTIME_FIELD_REGISTRY_LOCK_TIMEOUT_S,
+        )
+    else:
+        # A background owner needs completion rather than a foreground
+        # fallback. Short waits let replaced/stopped owners release their
+        # source-import context without logging a false ready transition.
+        acquired = False
+        while not cancelled():
+            if _RUNTIME_FIELD_REGISTRY_LOCK.acquire(timeout=0.05):
+                acquired = True
+                break
     if not acquired:
+        if cancelled is not None:
+            return
         # registry build 가 lock 잡고 진행 중 — wait 포기하고 caller 에 즉시
         # 제어 반환. lookup_paths 의 _runtime_lookup_field 가 registry 비어
         # 있으면 None 반환하고 fallback 진입. 정확도 trade-off: transform
@@ -547,12 +790,17 @@ def _ensure_runtime_field_registry(settings_module: str | None) -> None:
         )
         return
     try:
+        if cancelled is not None and cancelled():
+            return
         if (
             _RUNTIME_FIELD_REGISTRY_READY
             and _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE == settings_module
         ):
             return
-        _ensure_runtime_field_registry_locked(settings_module)
+        if mode in ('skip', 'subprocess'):
+            _mark_registry_skipped(settings_module, mode=mode)
+        else:
+            _ensure_runtime_field_registry_locked(settings_module)
     finally:
         _RUNTIME_FIELD_REGISTRY_LOCK.release()
 
@@ -650,8 +898,7 @@ def _ensure_runtime_field_registry_locked(settings_module: str | None) -> None:
         for field in meta.get_fields(include_hidden=True):
             field_count += 1
             if getattr(field, 'auto_created', False) and not getattr(field, 'concrete', True):
-                reverse_name = _relation_name(field)
-                if reverse_name:
+                for reverse_name in _reverse_relation_names(field):
                     runtime_field_registry[(model_label, reverse_name)] = field
                 continue
 
@@ -684,8 +931,16 @@ def _set_runtime_field_registry(
     global _RUNTIME_FIELD_REGISTRY
     global _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE
     global _RUNTIME_FIELD_REGISTRY_READY
+    global _RUNTIME_LOOKUP_FIELD_ALIASES
 
+    aliases = {}
+    for (label, name), field in registry.items():
+        if name == getattr(field, 'name', None):
+            attname = _relation_attname(field)
+            if attname:
+                aliases[(label, attname)] = field
     _RUNTIME_FIELD_REGISTRY = registry
+    _RUNTIME_LOOKUP_FIELD_ALIASES = aliases
     _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE = settings_module
     _RUNTIME_FIELD_REGISTRY_READY = True
 
@@ -696,6 +951,7 @@ def _clear_runtime_field_registry() -> None:
     global _RUNTIME_FIELD_REGISTRY_READY
 
     _RUNTIME_FIELD_REGISTRY = {}
+    _RUNTIME_LOOKUP_FIELD_ALIASES.clear()
     _RUNTIME_FIELD_REGISTRY_SETTINGS_MODULE = None
     _RUNTIME_FIELD_REGISTRY_READY = False
 

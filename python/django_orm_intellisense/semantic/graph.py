@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field, replace
 
 from ..discovery.workspace import WorkspaceProfile
 from ..runtime.inspector import (
@@ -12,7 +12,7 @@ from ..runtime.inspector import (
 from ..static_index.indexer import FieldCandidate, ModelCandidate, StaticIndex
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ModelGraphNode:
     label: str
     app_label: str
@@ -29,14 +29,69 @@ class ModelGraphNode:
     model_candidate: ModelCandidate | None
     runtime_model: RuntimeModelSummary | None
 
+    def __post_init__(self):
+        # AppConfig.label / Meta.app_label may differ from the source package.
+        object.__setattr__(self, 'app_label', self.label.rsplit('.', 1)[0])
 
-@dataclass(frozen=True)
+    def __getstate__(self):
+        return (
+            self.label, self.app_label, self.object_name, self.module,
+            self.import_path, self.file_path, self.line, self.column,
+            self.field_names, self.relation_names, self.reverse_relation_names, self.manager_names,
+            self.model_candidate, self.runtime_model,
+        )
+
+    def __setstate__(self, state):
+        (
+            label, app_label, object_name, module,
+            import_path, file_path, line, column,
+            field_names, relation_names, reverse_relation_names, manager_names,
+            model_candidate, runtime_model,
+        ) = state
+        assign = object.__setattr__
+        assign(self, 'label', label)
+        assign(self, 'app_label', label.rsplit('.', 1)[0])
+        assign(self, 'object_name', object_name)
+        assign(self, 'module', module)
+        assign(self, 'import_path', import_path)
+        assign(self, 'file_path', file_path)
+        assign(self, 'line', line)
+        assign(self, 'column', column)
+        assign(self, 'field_names', field_names)
+        assign(self, 'relation_names', relation_names)
+        assign(self, 'reverse_relation_names', reverse_relation_names)
+        assign(self, 'manager_names', manager_names)
+        assign(self, 'model_candidate', model_candidate)
+        assign(self, 'runtime_model', runtime_model)
+
+
+
+@dataclass(frozen=True, slots=True)
 class ModelGraphEdge:
     source_label: str
     target_label: str
     direction: str
     field_names: tuple[str, ...]
     field_kinds: tuple[str, ...]
+
+    def __getstate__(self):
+        return (
+            self.source_label, self.target_label, self.direction, self.field_names,
+            self.field_kinds,
+        )
+
+    def __setstate__(self, state):
+        (
+            source_label, target_label, direction, field_names,
+            field_kinds,
+        ) = state
+        assign = object.__setattr__
+        assign(self, 'source_label', source_label)
+        assign(self, 'target_label', target_label)
+        assign(self, 'direction', direction)
+        assign(self, 'field_names', field_names)
+        assign(self, 'field_kinds', field_kinds)
+
 
 
 @dataclass(frozen=True)
@@ -46,6 +101,22 @@ class ModelGraph:
     nodes_by_object_name: dict[str, tuple[ModelGraphNode, ...]]
     node_by_import_path: dict[str, ModelGraphNode]
     edges_by_source_label: dict[str, tuple[ModelGraphEdge, ...]]
+    # Edit-time overrides/tombstones outlive the runtime snapshot they amend.
+    # These are intentionally not persisted in cold-start graph caches.
+    static_field_overrides: dict[str, dict[str, FieldCandidate | None]] = dataclass_field(default_factory=dict)
+    removed_static_model_labels: frozenset[str] = frozenset()
+    _label_map_cache: tuple[object, dict[str, str]] | None = dataclass_field(
+        default=None, init=False, compare=False, repr=False)
+
+    def static_to_graph_labels(self, static_index: StaticIndex) -> dict[str, str]:
+        """Read-only label join, memoized for this graph and candidate table."""
+        token = static_index._model_candidates_by_label
+        cached = self._label_map_cache
+        if cached is not None and cached[0] is token:
+            return cached[1]
+        labels = _join_static_graph_labels(static_index, self)
+        object.__setattr__(self, '_label_map_cache', (token, labels))
+        return labels
 
     def fields_for_model(self, model_label: str) -> list[FieldCandidate]:
         return list(self.fields_by_model_label.get(model_label, {}).values())
@@ -275,7 +346,7 @@ def rebuild_model_graph_for_labels(
     (
         _old_runtime_model_by_label,
         old_runtime_label_by_static_label,
-        _old_static_label_by_runtime_label,
+        old_static_label_by_runtime_label,
     ) = _runtime_graph_maps(old_static_index, runtime)
 
     affected_graph_labels: set[str] = set()
@@ -283,10 +354,20 @@ def rebuild_model_graph_for_labels(
         affected_graph_labels.add(label)
         affected_graph_labels.add(runtime_label_by_static_label.get(label, label))
         affected_graph_labels.add(old_runtime_label_by_static_label.get(label, label))
+        # The supplied runtime snapshot can already have a new app label.
+        # Locate the old graph key from the graph's actual nodes as well;
+        # joining old static candidates to the new catalog cannot recover it.
+        candidate = old_static_index.find_model_candidate(label)
+        if candidate is not None:
+            affected_graph_labels.update(node.label
+                for node in current_graph.nodes_by_object_name.get(candidate.object_name, ())
+                if node.module == candidate.module)
 
     fields_by_model_label = dict(current_graph.fields_by_model_label)
     nodes_by_label = dict(current_graph.nodes_by_label)
     edges_by_source_label = dict(current_graph.edges_by_source_label)
+    static_field_overrides = dict(current_graph.static_field_overrides)
+    removed_static_model_labels = set(current_graph.removed_static_model_labels) & runtime_model_by_label.keys()
 
     for model_label in affected_graph_labels:
         fields_by_model_label.pop(model_label, None)
@@ -294,14 +375,67 @@ def rebuild_model_graph_for_labels(
         edges_by_source_label.pop(model_label, None)
 
     for model_label in sorted(affected_graph_labels):
+        if runtime_label_by_static_label.get(model_label, model_label) != model_label:
+            # The static label is an alias of the runtime node. Rebuilding it
+            # as a second node makes short-name resolution ambiguous. Its old
+            # entry was removed above, including legacy duplicate snapshots.
+            continue
         static_source_label = _resolve_static_source_label(
             model_label=model_label,
             static_index=static_index,
             static_label_by_runtime_label=static_label_by_runtime_label,
         )
         runtime_model = runtime_model_by_label.get(model_label)
-        if runtime_model is None and static_index.find_model_candidate(static_source_label) is None:
+        old_source_label = old_static_label_by_runtime_label.get(model_label, model_label)
+        candidate = static_index.find_model_candidate(static_source_label)
+        if candidate is not None and candidate.is_abstract:
+            static_field_overrides.pop(model_label, None)
+            if runtime_model is not None:
+                removed_static_model_labels.add(model_label)
             continue
+        if (old_static_index.find_model_candidate(old_source_label) is not None
+                and static_index.find_model_candidate(static_source_label) is None):
+            static_field_overrides.pop(model_label, None)
+            if runtime_model is not None:
+                removed_static_model_labels.add(model_label)
+            continue  # A cached runtime class cannot resurrect a deleted model.
+        if model_label in removed_static_model_labels:
+            if static_index.find_model_candidate(static_source_label) is None:
+                continue
+            removed_static_model_labels.discard(model_label)
+        if runtime_model is None and static_index.find_model_candidate(static_source_label) is None:
+            static_field_overrides.pop(model_label, None)
+            continue
+
+        old_fields = {field.name: field for field in old_static_index.fields_for_model(old_source_label)}
+        new_fields = {field.name: field for field in static_index.fields_for_model(static_source_label)}
+        overrides = dict(static_field_overrides.get(model_label, {}))
+        def signature(field: FieldCandidate | None) -> tuple | None:
+            if field is None:
+                return None
+            return (field.field_kind, field.is_relation, field.relation_direction,
+                    field.related_model_label, field.related_name, field.related_query_name,
+                    field.constructor_fingerprint)
+        for name in old_fields.keys() | new_fields.keys():
+            old, new = old_fields.get(name), new_fields.get(name)
+            if signature(old) == signature(new):
+                if name in overrides and new is not None:
+                    overrides[name] = replace(new, source='static_edit')
+                continue
+            if old is not None and old.is_relation:
+                for alias in (old.related_name, old.related_query_name):
+                    if alias:
+                        overrides[alias] = None
+                if old.relation_direction != 'reverse' and old.field_kind in {'ForeignKey', 'OneToOneField', 'ParentalKey'}:
+                    overrides[f'{name}_id'] = None
+            overrides[name] = replace(new, source='static_edit') if new is not None else None
+        runtime_names = {field.name for field in runtime_model.fields} if runtime_model else set()
+        overrides = {name: value for name, value in overrides.items()
+                     if value is not None or name in runtime_names}
+        if overrides:
+            static_field_overrides[model_label] = overrides
+        else:
+            static_field_overrides.pop(model_label, None)
 
         fields_by_name = _build_fields_by_name(
             static_index=static_index,
@@ -310,6 +444,7 @@ def rebuild_model_graph_for_labels(
             static_source_label=static_source_label,
             runtime_model_by_label=runtime_model_by_label,
             runtime_label_by_static_label=runtime_label_by_static_label,
+            static_overrides=overrides,
         )
         if fields_by_name:
             fields_by_model_label[model_label] = fields_by_name
@@ -326,20 +461,29 @@ def rebuild_model_graph_for_labels(
         if model_label in rebuilt_edges:
             edges_by_source_label[model_label] = rebuilt_edges[model_label]
 
-    nodes_by_object_name = _index_nodes_by_object_name(nodes_by_label)
-    node_by_import_path = {
-        node.import_path: node
-        for node in nodes_by_label.values()
-        if node.import_path
-    }
+    nodes_by_object_name, node_by_import_path = _reindex_changed_graph_nodes(
+        current_graph, nodes_by_label, affected_graph_labels)
 
-    return ModelGraph(
+    result = ModelGraph(
         fields_by_model_label=fields_by_model_label,
         nodes_by_label=nodes_by_label,
         nodes_by_object_name=nodes_by_object_name,
         node_by_import_path=node_by_import_path,
         edges_by_source_label=edges_by_source_label,
+        static_field_overrides=static_field_overrides,
+        removed_static_model_labels=frozenset(removed_static_model_labels),
     )
+    if (current_graph._label_map_cache is not None
+            and old_static_index._model_candidates_by_label is static_index._model_candidates_by_label):
+        def link_key(node: ModelGraphNode | None) -> tuple[str, str, str] | None:
+            return (node.label, node.module, node.object_name) if node is not None else None
+        def unique_link(node: ModelGraphNode | None) -> bool:
+            return node is None or not any(other.label != node.label and other.module == node.module
+                for other in current_graph.nodes_by_object_name.get(node.object_name, ()))
+        if all(link_key(current_graph.nodes_by_label.get(label)) == link_key(nodes_by_label.get(label))
+               and unique_link(current_graph.nodes_by_label.get(label)) for label in affected_graph_labels):
+            object.__setattr__(result, '_label_map_cache', current_graph._label_map_cache)
+    return result
 
 
 def _build_model_graph_node(
@@ -408,6 +552,26 @@ def _build_model_graph_node(
     )
 
 
+def _join_static_graph_labels(static_index: StaticIndex, graph: ModelGraph) -> dict[str, str]:
+    nodes_by_module_and_name = {}
+    for label, node in graph.nodes_by_label.items():
+        if node.module:
+            nodes_by_module_and_name.setdefault((node.module, node.object_name), label)
+    labels = {}
+    for candidate in static_index.model_candidates:
+        label = nodes_by_module_and_name.get((candidate.module, candidate.object_name))
+        if label and label != candidate.label:
+            labels[candidate.label] = label
+    return labels
+
+
+@dataclass(frozen=True)
+class _RuntimeGraphMapCache:
+    catalog: tuple[RuntimeModelSummary, ...]
+    maps: tuple[dict[str, RuntimeModelSummary], dict[str, str], dict[str, str]]
+    models: object = None
+
+
 def _runtime_graph_maps(
     static_index: StaticIndex,
     runtime: RuntimeInspection,
@@ -416,13 +580,39 @@ def _runtime_graph_maps(
     dict[str, str],
     dict[str, str],
 ]:
+    cached = static_index._runtime_graph_map_cache
+    snapshot = getattr(static_index, '_runtime_member_snapshot', None)
+    models = getattr(snapshot, 'models', None) if (snapshot is not None
+        and snapshot.runtime_identity == (runtime.python_executable, runtime.settings_module, runtime.django_version)) else None
+    if (isinstance(cached, _RuntimeGraphMapCache) and cached.catalog is runtime.model_catalog
+            and getattr(cached, 'models', None) is models):
+        return cached.maps
+    maps = _build_runtime_graph_maps(static_index, runtime)
+    static_index._runtime_graph_map_cache = _RuntimeGraphMapCache(runtime.model_catalog, maps, models)
+    return maps
+
+
+def _build_runtime_graph_maps(
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+) -> tuple[dict[str, RuntimeModelSummary], dict[str, str], dict[str, str]]:
+    models = runtime.model_catalog
+    snapshot = getattr(static_index, '_runtime_member_snapshot', None)
+    captured = getattr(snapshot, 'models', None) if (snapshot is not None
+        and snapshot.runtime_identity == (runtime.python_executable, runtime.settings_module, runtime.django_version)) else None
+    if captured:
+        # Fresh pure summaries add/rename models without replacing the parent
+        # process's original Django registry or core runtime catalogue owner.
+        by_path = {(model.module, _model_object_name(model.label)): model for model in models}
+        by_path.update(captured)
+        models = tuple(by_path.values())
     runtime_model_by_label = {
         model.label: model
-        for model in runtime.model_catalog
+        for model in models
     }
     runtime_label_by_module_and_name = {
         (model.module, _model_object_name(model.label)): model.label
-        for model in runtime.model_catalog
+        for model in models
     }
     runtime_label_by_static_label = {
         candidate.label: runtime_label
@@ -463,6 +653,7 @@ def _build_fields_by_name(
     static_source_label: str,
     runtime_model_by_label: dict[str, RuntimeModelSummary],
     runtime_label_by_static_label: dict[str, str],
+    static_overrides: dict[str, FieldCandidate | None] | None = None,
 ) -> dict[str, FieldCandidate]:
     fields_by_name = {
         field.name: _remap_field_candidate_labels(
@@ -483,11 +674,22 @@ def _build_fields_by_name(
 
         for runtime_field in runtime_model.fields:
             existing = fields_by_name.get(runtime_field.name)
+            related_name = existing.related_name if existing is not None else None
+            related_query_name = existing.related_query_name if existing is not None else None
+            if runtime_field.direction == 'reverse':
+                relation = get_runtime_field(runtime.settings_module, model_label=model_label,
+                                             field_name=runtime_field.name)
+                if relation is not None:
+                    related_name = getattr(relation, 'get_accessor_name', lambda: related_name)()
+                    related_query_name = getattr(getattr(relation, 'field', None),
+                                                 'related_query_name', lambda: related_query_name)()
             if (
                 existing is not None
                 and existing.is_relation == runtime_field.is_relation
                 and existing.related_model_label == runtime_field.related_model_label
                 and existing.field_kind == runtime_field.field_kind
+                and existing.related_name == related_name
+                and existing.related_query_name == related_query_name
             ):
                 continue
 
@@ -502,9 +704,18 @@ def _build_fields_by_name(
                 relation_direction=runtime_field.direction,
                 related_model_label=runtime_field.related_model_label,
                 declared_model_label=existing.declared_model_label if existing is not None else model_label,
-                related_name=existing.related_name if existing is not None else None,
-                related_query_name=existing.related_query_name if existing is not None else None,
+                related_name=related_name,
+                related_query_name=related_query_name,
                 source='runtime',
+            )
+
+    for name, override in (static_overrides or {}).items():
+        if override is None:
+            fields_by_name.pop(name, None)
+        else:
+            fields_by_name[name] = _remap_field_candidate_labels(
+                override, target_model_label=model_label,
+                runtime_label_by_static_label=runtime_label_by_static_label,
             )
 
     _add_related_query_alias_fields(fields_by_name=fields_by_name)
@@ -527,6 +738,49 @@ def _build_fields_by_name(
             fields_by_name=fields_by_name,
         )
     return fields_by_name
+
+
+def _reindex_changed_graph_nodes(
+    previous: ModelGraph,
+    nodes_by_label: dict[str, ModelGraphNode],
+    labels: set[str],
+) -> tuple[dict[str, tuple[ModelGraphNode, ...]], dict[str, ModelGraphNode]]:
+    """Keep unrelated frozen name groups and import-path entries intact."""
+    changed_nodes = [node for label in sorted(labels)
+                     if (node := nodes_by_label.get(label)) is not None]
+    old_nodes = [node for label in labels
+                 if (node := previous.nodes_by_label.get(label)) is not None]
+    names = {node.object_name for node in old_nodes + changed_nodes}
+    paths = {node.import_path for node in old_nodes + changed_nodes if node.import_path}
+    by_name = dict(previous.nodes_by_object_name)
+    by_path = dict(previous.node_by_import_path)
+    changed_by_name: dict[str, list[ModelGraphNode]] = {}
+    for node in changed_nodes:
+        changed_by_name.setdefault(node.object_name, []).append(node)
+    for name in names:
+        nodes = [node for node in by_name.get(name, ()) if node.label not in labels]
+        nodes.extend(changed_by_name.get(name, ()))
+        if nodes:
+            by_name[name] = tuple(sorted(nodes, key=lambda node: node.label))
+        else:
+            by_name.pop(name, None)
+    candidates_by_path: dict[str, list[ModelGraphNode]] = {}
+    for name in names:
+        for node in by_name.get(name, ()):
+            if node.import_path in paths:
+                candidates_by_path.setdefault(node.import_path, []).append(node)
+    for path in paths:
+        candidates = candidates_by_path.get(path, ())
+        if not candidates:
+            by_path.pop(path, None)
+        elif len(candidates) == 1:
+            by_path[path] = candidates[0]
+        else:
+            # Full construction uses the last node in dictionary order for
+            # duplicate import paths. Preserve that unusual collision rule.
+            by_path[path] = next(node for label in reversed(nodes_by_label)
+                if (node := nodes_by_label[label]).import_path == path)
+    return by_name, by_path
 
 
 def _index_nodes_by_object_name(
@@ -612,28 +866,16 @@ def _remap_field_candidate_labels(
     target_model_label: str,
     runtime_label_by_static_label: dict[str, str],
 ) -> FieldCandidate:
-    return FieldCandidate(
+    related_model_label = runtime_label_by_static_label.get(field.related_model_label, field.related_model_label)
+    declared_model_label = runtime_label_by_static_label.get(field.declared_model_label, field.declared_model_label)
+    if (field.model_label == target_model_label and field.related_model_label == related_model_label
+            and field.declared_model_label == declared_model_label):
+        return field
+    return replace(
+        field,
         model_label=target_model_label,
-        name=field.name,
-        file_path=field.file_path,
-        line=field.line,
-        column=field.column,
-        field_kind=field.field_kind,
-        is_relation=field.is_relation,
-        relation_direction=field.relation_direction,
-        related_model_label=(
-            runtime_label_by_static_label.get(field.related_model_label, field.related_model_label)
-            if field.related_model_label is not None
-            else None
-        ),
-        declared_model_label=(
-            runtime_label_by_static_label.get(field.declared_model_label, field.declared_model_label)
-            if field.declared_model_label is not None
-            else None
-        ),
-        related_name=field.related_name,
-        related_query_name=field.related_query_name,
-        source=field.source,
+        related_model_label=related_model_label,
+        declared_model_label=declared_model_label,
     )
 
 
@@ -656,13 +898,30 @@ def _add_implicit_primary_key_fields(
     during the deferred-runtime window.  Diagnostics run in that window and
     must not report valid ``id``/``pk`` lookups as unknown.
 
-    Once runtime inspection is ready, its field catalog is authoritative and
-    this fallback is not used.  That preserves models with a custom primary
-    key, which genuinely do not have an ``id`` attribute.
+    Literal source primary keys take precedence while inspection is pending.
+    Once runtime inspection is ready, its field catalog is authoritative.
     """
     model_candidate = static_index.find_model_candidate(static_source_label)
     if model_candidate is None:
         model_candidate = static_index.find_model_candidate(model_label)
+
+    options = static_index.primary_key_option_fields()
+    if options:
+        from ..runtime.source_fields import field_primary_key_from_source
+        for field in fields_by_name.values():
+            declared_label = field.declared_model_label or static_source_label
+            if (declared_label, field.name) not in options:
+                continue
+            declared_model = static_index.find_model_candidate(declared_label)
+            if declared_model is not None and field_primary_key_from_source(
+                field, module_name=declared_model.module,
+            ) is True:
+                fields_by_name.setdefault('pk', replace(field, name='pk'))
+                return
+
+    if 'id' in fields_by_name:
+        fields_by_name.setdefault('pk', replace(fields_by_name['id'], name='pk'))
+        return
 
     anchor_field = next(iter(fields_by_name.values()), None)
     if model_candidate is not None:
@@ -721,20 +980,9 @@ def _add_primary_key_alias_field(
     if source_field is None:
         return
 
-    fields_by_name['pk'] = FieldCandidate(
-        model_label=source_field.model_label,
-        name='pk',
-        file_path=source_field.file_path,
-        line=source_field.line,
-        column=source_field.column,
-        field_kind=source_field.field_kind,
-        is_relation=source_field.is_relation,
-        relation_direction=source_field.relation_direction,
-        related_model_label=source_field.related_model_label,
-        declared_model_label=source_field.declared_model_label,
-        related_name=source_field.related_name,
-        related_query_name=source_field.related_query_name,
-        source='runtime',
+    fields_by_name['pk'] = replace(
+        source_field, name='pk',
+        source=source_field.source if source_field.source == 'static_edit' else 'runtime',
     )
 
 

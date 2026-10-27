@@ -9,7 +9,7 @@
 //! no IPC hop.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
@@ -101,7 +101,9 @@ fn prepend_module(
     }
     ExportResolution {
         requested_module: requested_module.to_string(),
-        symbol: symbol.map(String::from).unwrap_or_else(|| resolution.symbol.clone()),
+        symbol: symbol
+            .map(String::from)
+            .unwrap_or_else(|| resolution.symbol.clone()),
         resolved: resolution.resolved,
         origin_module: resolution.origin_module.clone(),
         origin_symbol: resolution.origin_symbol.clone(),
@@ -114,9 +116,10 @@ fn prepend_module(
 }
 
 /// Per-`StaticIndex` cache of `module_name → symbol_exports`. Keyed
-/// by the `modules` slice pointer so a rebuild invalidates cleanly.
-type ExportCacheEntry = HashMap<String, HashMap<String, ExportResolution>>;
-type ExportCache = HashMap<usize, ExportCacheEntry>;
+/// by a generation token. Allocators can reuse a former modules slice address.
+type ExportCacheEntry = HashMap<String, Arc<HashMap<String, ExportResolution>>>;
+type ExportCache = HashMap<u64, ExportCacheEntry>;
+const MAX_CACHED_INDICES: usize = 4;
 
 fn export_cache() -> &'static Mutex<ExportCache> {
     use std::sync::OnceLock;
@@ -132,40 +135,46 @@ pub fn clear_export_cache() {
     }
 }
 
-fn cache_key(index: &StaticIndex) -> usize {
-    index.modules.as_ptr() as usize
+fn cache_key(index: &StaticIndex) -> u64 {
+    index.cache_generation
 }
 
 fn resolve_module_exports(
     index: &StaticIndex,
     module_name: &str,
     stack: &mut BTreeSet<String>,
-) -> HashMap<String, ExportResolution> {
+) -> Arc<HashMap<String, ExportResolution>> {
     // Cache hit?
     {
         if let Ok(guard) = export_cache().lock() {
             if let Some(per_index) = guard.get(&cache_key(index)) {
                 if let Some(hit) = per_index.get(module_name) {
-                    return hit.clone();
+                    return Arc::clone(hit);
                 }
             }
         }
     }
 
     if stack.contains(module_name) {
-        return HashMap::new();
+        return Arc::new(HashMap::new());
     }
 
     let module = match find_module(index, module_name) {
         Some(m) => m,
-        None => return HashMap::new(),
+        None => return Arc::new(HashMap::new()),
     };
 
     let mut exports: HashMap<String, ExportResolution> = HashMap::new();
     stack.insert(module_name.to_string());
 
+    let locations: HashMap<&str, _> = module
+        .symbol_definitions
+        .iter()
+        .map(|(name, location)| (name.as_str(), location))
+        .collect();
     for symbol in &module.defined_symbols {
-        let (fp, line, col) = symbol_location(module, symbol)
+        let (fp, line, col) = locations
+            .get(symbol.as_str())
             .map(|l| (l.file_path.clone(), l.line, l.column))
             .unwrap_or_else(|| (module.file_path.clone(), 1, 1));
         exports.insert(
@@ -191,11 +200,15 @@ fn resolve_module_exports(
 
     stack.remove(module_name);
 
-    let filtered = apply_export_filter(module, exports);
+    let filtered = Arc::new(apply_export_filter(module, exports));
 
     if let Ok(mut guard) = export_cache().lock() {
         let per_index = guard.entry(cache_key(index)).or_default();
-        per_index.insert(module_name.to_string(), filtered.clone());
+        per_index.insert(module_name.to_string(), Arc::clone(&filtered));
+        while guard.len() > MAX_CACHED_INDICES {
+            let oldest = *guard.keys().min().unwrap();
+            guard.remove(&oldest);
+        }
     }
 
     filtered
@@ -210,12 +223,12 @@ fn handle_binding_export(
 ) {
     if binding.is_star {
         let star_exports = resolve_module_exports(index, &binding.module, stack);
-        for (name, res) in star_exports {
+        for (name, res) in star_exports.iter() {
             if name.starts_with('_') {
                 continue;
             }
             exports.entry(name.clone()).or_insert_with(|| {
-                prepend_module(&res, module_name, module_name, "star_import", None)
+                prepend_module(res, module_name, module_name, "star_import", None)
             });
         }
         return;
@@ -310,8 +323,7 @@ fn resolve_direct_module_attribute(
 
     stack.insert(key.clone());
 
-    let bindings = module.import_bindings.clone();
-    for binding in &bindings {
+    for binding in &module.import_bindings {
         if binding.is_star {
             let mut inner_stack = BTreeSet::new();
             let star_exports = resolve_module_exports(index, &binding.module, &mut inner_stack);
@@ -462,14 +474,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write(root, files);
-        let paths: Vec<std::path::PathBuf> = files
-            .iter()
-            .map(|(rel, _)| root.join(rel))
-            .collect();
+        let paths: Vec<std::path::PathBuf> = files.iter().map(|(rel, _)| root.join(rel)).collect();
         let idx = build_static_index_resolved(root, &paths);
         // Leak the tempdir so paths survive tests (content already read).
         std::mem::forget(dir);
         idx
+    }
+
+    #[test]
+    fn export_cache_retains_at_most_four_index_generations() {
+        for generation in 0..12 {
+            let source = format!("class Item{generation}:\n    pass\n");
+            let index = build_index_for(&[("pkg/models.py", &source)]);
+            assert!(
+                resolve_export_origin(&index, "pkg.models", &format!("Item{generation}")).resolved
+            );
+            assert!(export_cache().lock().unwrap().len() <= MAX_CACHED_INDICES);
+        }
     }
 
     #[test]
@@ -493,10 +514,7 @@ mod tests {
                 "shop/models.py",
                 "from django.db import models\n\nclass User(models.Model):\n    pass\n",
             ),
-            (
-                "shop/__init__.py",
-                "from .models import User\n",
-            ),
+            ("shop/__init__.py", "from .models import User\n"),
         ]);
         let res = resolve_export_origin(&idx, "shop", "User");
         assert!(res.resolved, "got {:?}", res);
@@ -509,14 +527,8 @@ mod tests {
     fn alias_renames_symbol() {
         clear_export_cache();
         let idx = build_index_for(&[
-            (
-                "pkg/impl.py",
-                "class Widget:\n    pass\n",
-            ),
-            (
-                "pkg/__init__.py",
-                "from .impl import Widget as Gadget\n",
-            ),
+            ("pkg/impl.py", "class Widget:\n    pass\n"),
+            ("pkg/__init__.py", "from .impl import Widget as Gadget\n"),
         ]);
         let res = resolve_export_origin(&idx, "pkg", "Gadget");
         assert!(res.resolved);
@@ -525,17 +537,47 @@ mod tests {
     }
 
     #[test]
+    fn export_cache_tracks_replacement_clone_and_deserialization() {
+        let mut index = build_index_for(&[
+            ("pkg/a.py", "class A:\n    pass\n"),
+            ("pkg/__init__.py", "from .a import A\n"),
+        ]);
+        assert_eq!(
+            resolve_export_origin(&index, "pkg", "A")
+                .origin_module
+                .as_deref(),
+            Some("pkg.a")
+        );
+        let replacement = build_index_for(&[
+            ("pkg/b.py", "class A:\n    pass\n"),
+            ("pkg/__init__.py", "from .b import A\n"),
+        ]);
+        index.replace_modules(replacement.modules);
+        assert_eq!(
+            resolve_export_origin(&index, "pkg", "A")
+                .origin_module
+                .as_deref(),
+            Some("pkg.b")
+        );
+        let cloned = index.clone();
+        assert_ne!(index.cache_generation, cloned.cache_generation);
+        let restored: StaticIndex =
+            serde_json::from_str(&serde_json::to_string(&index).unwrap()).unwrap();
+        assert_ne!(index.cache_generation, restored.cache_generation);
+        assert_eq!(
+            resolve_export_origin(&restored, "pkg", "A")
+                .origin_module
+                .as_deref(),
+            Some("pkg.b")
+        );
+    }
+
+    #[test]
     fn explicit_all_filters_export_map() {
         clear_export_cache();
         let idx = build_index_for(&[
-            (
-                "pkg/a.py",
-                "class A:\n    pass\nclass B:\n    pass\n",
-            ),
-            (
-                "pkg/__init__.py",
-                "from .a import A, B\n__all__ = ['A']\n",
-            ),
+            ("pkg/a.py", "class A:\n    pass\nclass B:\n    pass\n"),
+            ("pkg/__init__.py", "from .a import A, B\n__all__ = ['A']\n"),
         ]);
         // A is in __all__, so resolved via the export map (resolution_kind="imported").
         let a = resolve_export_origin(&idx, "pkg", "A");
@@ -551,10 +593,7 @@ mod tests {
     #[test]
     fn unknown_symbol_returns_unresolved() {
         clear_export_cache();
-        let idx = build_index_for(&[(
-            "shop/models.py",
-            "from django.db import models\n",
-        )]);
+        let idx = build_index_for(&[("shop/models.py", "from django.db import models\n")]);
         let res = resolve_export_origin(&idx, "shop.models", "NonExistent");
         assert!(!res.resolved);
         assert_eq!(res.resolution_kind, "unresolved");
@@ -562,10 +601,7 @@ mod tests {
 
     #[test]
     fn resolve_module_returns_file_path() {
-        let idx = build_index_for(&[(
-            "pkg/foo.py",
-            "class Foo:\n    pass\n",
-        )]);
+        let idx = build_index_for(&[("pkg/foo.py", "class Foo:\n    pass\n")]);
         let res = resolve_module(&idx, "pkg.foo");
         assert!(res.resolved);
         assert!(res.file_path.as_deref().unwrap().ends_with("pkg/foo.py"));

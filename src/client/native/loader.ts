@@ -23,6 +23,36 @@ export interface PythonSourceSnapshot {
   directoryFingerprints: Array<[string, string]>;
 }
 
+/** Filesystem state only; metadata requires a separate producer/source binding. */
+export interface PythonSourceFingerprintV2 {
+  fingerprintVersion: 2;
+  root: string;
+  fingerprint: string;
+  fileCount: number;
+}
+
+export interface PythonSourceProof extends PythonSourceFingerprintV2 {
+  membershipVersion: 1;
+  membershipFingerprint: string;
+}
+
+export interface PythonSourceSnapshotV2 {
+  fingerprintVersion: 2;
+  root: string;
+  fingerprint: string;
+  entries: Array<{
+    relativePath: string;
+    /** Exact decimal strings, including values outside JS integer precision. */
+    size: string;
+    mtimeNs: string;
+    ctimeNs: string;
+    device: string;
+    inode: string;
+    fingerprint: string;
+  }>;
+  directoryFingerprints: Array<[string, string]>;
+}
+
 export interface NativeInitResult {
   root: string;
   modelCount: number;
@@ -47,6 +77,7 @@ export interface NativeStateInfo {
 }
 
 export interface NativeBindings {
+  saveCacheBlobChunksAsync?(path: string, metadata: Buffer, chunks: Buffer[]): Promise<void>;
   hello(name: string): string;
   nativeVersion(): string;
   saveCacheBlob(path: string, metadata: Buffer, payload: Buffer): void;
@@ -54,6 +85,11 @@ export interface NativeBindings {
   workspaceCacheDir(cacheRoot: string, workspaceRoot: string): string;
   cacheSchemaVersion(): number;
   snapshotPythonSources(root: string, extraRoots?: string[]): PythonSourceSnapshot;
+  /** Throws on unsupported platforms/incomplete inventories; never use the
+   * legacy API as a substitute when this optional v2 capability is absent. */
+  snapshotPythonSourcesV2?(root: string, extraRoots?: string[]): PythonSourceSnapshotV2;
+  fingerprintPythonSourcesV2Async?(root: string, extraRoots?: string[]): Promise<PythonSourceFingerprintV2>;
+  fingerprintPythonSourceProofAsync?(root: string, extraRoots?: string[]): Promise<PythonSourceProof>;
   fileFingerprint(relativePath: string, size: number, mtimeNs: string): string;
   buildStaticIndexJson(root: string, files: string[]): Buffer;
   parseModuleJson(root: string, filePath: string): Buffer | null;
@@ -62,8 +98,12 @@ export interface NativeBindings {
   // Fast-path resident state for analysisDaemon routing.
   nativeInit(root: string, forceRebuild?: boolean): NativeInitResult;
   nativeInitFromSurface(root: string, surfaceBytes: Buffer): NativeInitResult;
+  nativeInitFromSurfaceAsync?(root: string, surfaceBytes: Buffer): Promise<NativeInitResult | null>;
+  nativeInitFromSurfaceChunksAsync?(root: string, chunks: Buffer[]): Promise<NativeInitResult | null>;
   nativeDrop(): void;
+  nativeDropAsync?(): Promise<void>;
   nativeStateInfo(): NativeStateInfo;
+  nativeLiveStateCount?(): number;
   nativeResolveRelationTarget(value: string): Buffer | null;
   nativeListRelationTargets(prefix?: string | null): Buffer | null;
   nativeResolveLookupPath(
@@ -95,6 +135,7 @@ export interface NativeBindings {
   nativeResolveModule(moduleName: string): Buffer | null;
   // Async napi task — resolves to whether the AST modules were ensured.
   nativeEnsureAstModules(root: string): Promise<boolean>;
+  nativeInvalidateAstModules?(): void;
 }
 
 let cached: NativeBindings | undefined;

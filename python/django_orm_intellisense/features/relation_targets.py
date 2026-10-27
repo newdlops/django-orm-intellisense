@@ -12,13 +12,8 @@ def list_relation_targets(
     values = [
         _target_dict(model_graph, node)
         for node in model_graph.nodes_by_label.values()
+        if not normalized_prefix or _matches_node_prefix(node, normalized_prefix)
     ]
-    if normalized_prefix:
-        values = [
-            target
-            for target in values
-            if _matches_prefix(target, normalized_prefix)
-        ]
 
     values.sort(
         key=lambda target: (
@@ -140,3 +135,12 @@ def _matches_prefix(target: dict[str, object], normalized_prefix: str) -> bool:
         or str(target['module']).lower().startswith(normalized_prefix)
         or str(target.get('importPath') or '').lower().startswith(normalized_prefix)
     )
+
+
+def _matches_node_prefix(node: ModelGraphNode, normalized_prefix: str) -> bool:
+    # Filter cheap identity strings before building preview arrays/source data.
+    # Keep the same case/label/module/import semantics as the wire predicate.
+    return (str(node.label).lower().startswith(normalized_prefix)
+        or str(node.object_name).lower().startswith(normalized_prefix)
+        or str(node.module).lower().startswith(normalized_prefix)
+        or str(node.import_path or '').lower().startswith(normalized_prefix))

@@ -68,6 +68,33 @@ def build_health_snapshot(
     return snapshot
 
 
+def refresh_health_snapshot(
+    previous: dict[str, object],
+    *,
+    static_index: StaticIndex,
+    runtime: RuntimeInspection,
+    semantic_graph: SemanticGraphSummary,
+    runtime_metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Publish current diagnostics while preserving the prior snapshot's owner.
+
+    Reindexing updates static counts immediately. Runtime metadata comes only
+    from a verified fresh child, so a later source commit keeps those counts
+    instead of restoring the parent's original Django classes' summaries.
+    """
+    phase = _compute_phase(static_index, runtime)
+    result = {
+        **previous,
+        'phase': phase,
+        'detail': _compute_detail(phase, static_index, runtime),
+        'staticIndex': {**previous.get('staticIndex', {}), **static_index.to_dict()},
+        'semanticGraph': {**previous.get('semanticGraph', {}), **semantic_graph.to_dict()},
+    }
+    if runtime_metadata is not None:
+        result['runtime'] = {**previous.get('runtime', {}), **runtime_metadata}
+    return result
+
+
 def _compute_phase(
     static_index: StaticIndex,
     runtime: RuntimeInspection,

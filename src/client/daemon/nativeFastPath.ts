@@ -18,6 +18,7 @@
 
 import { tryLoadNative, type NativeBindings } from '../native/loader';
 import type { SurfaceIndex } from '../../server/workspaceIndexer';
+import type { ModelInfo, WorkspaceIndex } from '../../server/types';
 import type {
   ExportOriginResolution,
   ModuleResolution,
@@ -40,6 +41,7 @@ let initInProgress: Promise<boolean> | null = null;
 let currentRoot: string | null = null;
 let stateSource: 'ast' | 'surface' | null = null;
 let disabled = false;
+let initGeneration = 0;
 
 function getNative(): NativeBindings | undefined {
   if (!attempted) {
@@ -58,6 +60,8 @@ export interface NativeFastPathInitOptions {
 export interface NativeFastPathSurfaceOptions {
   workspaceRoot: string;
   surfaceIndex: SurfaceIndex;
+  /** Complete field coverage, including models awaiting runtime surfaces. */
+  workspaceIndex?: WorkspaceIndex;
   log?: Logger;
   reason?: string;
 }
@@ -98,6 +102,8 @@ export async function ensureNativeFastPath(
     return initInProgress;
   }
 
+  const generation = ++initGeneration;
+
   const work = (async () => {
     try {
       const res = n.nativeInit(options.workspaceRoot, options.forceRebuild ?? false);
@@ -106,6 +112,7 @@ export async function ensureNativeFastPath(
       stateSource = 'ast';
       // AST init populates modules directly, so downstream export
       // queries can run without a separate ensure call.
+      resetNativeAstModulesFlag();
       astModulesEnsured = true;
       options.log?.(
         'info',
@@ -120,7 +127,7 @@ export async function ensureNativeFastPath(
       disabled = true; // don't retry on every call
       return false;
     } finally {
-      initInProgress = null;
+      if (generation === initGeneration) initInProgress = null;
     }
   })();
   initInProgress = work;
@@ -132,10 +139,12 @@ export function isNativeFastPathReady(): boolean {
 }
 
 export function dropNativeFastPath(): void {
+  ++initGeneration;
   const n = getNative();
   if (n) {
     try {
-      n.nativeDrop();
+      if (n.nativeDropAsync) void n.nativeDropAsync().catch(() => {});
+      else n.nativeDrop();
     } catch {
       // non-critical
     }
@@ -144,8 +153,43 @@ export function dropNativeFastPath(): void {
   currentRoot = null;
   stateSource = null;
   initInProgress = null;
-  astModulesEnsured = false;
-  astModulesEnsuring = null;
+  resetNativeAstModulesFlag();
+}
+
+function modelInstanceFields(model: ModelInfo): SurfaceIndex[string]['instance'] {
+  const instance: SurfaceIndex[string]['instance'] = {};
+  for (const [name, field] of model.fields) {
+    const relation = model.relations.get(name) ?? model.reverseRelations.get(name);
+    const toOne = relation && ['ForeignKey', 'OneToOneField', 'ParentalKey', 'reverse_OneToOneField'].includes(field.fieldKind);
+    instance[name] = [relation ? toOne ? 'instance' : 'related_manager' : 'scalar',
+      relation?.targetModelLabel ?? null,
+      relation ? relation.direction === 'reverse' ? 'reverse_relation' : 'relation' : 'field',
+      field.fieldKind];
+  }
+  return instance;
+}
+
+async function serializeSurface(
+  entries: Array<[string, SurfaceIndex[string] | ModelInfo]>, generation: number,
+): Promise<Buffer[] | undefined> {
+  const chunks: Buffer[] = [Buffer.from('{')];
+  let sliceStart = performance.now();
+  for (let i = 0; i < entries.length; i++) {
+    const [label, receivers] = entries[i];
+    // Resident queries only consume instance fields. Manager/queryset surfaces
+    // stay in the client/Python path and do not need another native copy.
+    const instance = 'fields' in receivers && receivers.fields instanceof Map
+      ? modelInstanceFields(receivers as ModelInfo)
+      : (receivers as SurfaceIndex[string]).instance ?? {};
+    chunks.push(Buffer.from(`${i ? ',' : ''}${JSON.stringify(label)}:${JSON.stringify({ instance })}`));
+    if (performance.now() - sliceStart >= 4) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      if (generation !== initGeneration) return undefined;
+      sliceStart = performance.now();
+    }
+  }
+  chunks.push(Buffer.from('}'));
+  return chunks;
 }
 
 /**
@@ -153,9 +197,9 @@ export function dropNativeFastPath(): void {
  *
  * This is the authoritative fast-path input during the Rust migration:
  * Python owns high-coverage Django semantics, while Rust serves the
- * already-built surface with microsecond query latency. Empty surface
- * data intentionally disables the native fast path so queries fall back
- * to Python instead of returning AST-only false negatives.
+ * complete local field index with microsecond query latency. During runtime
+ * warm-up this includes static fallback models. Without a supplied local
+ * index, an empty surface disables native queries to avoid false negatives.
  */
 export async function hydrateNativeFastPathFromSurface(
   options: NativeFastPathSurfaceOptions,
@@ -164,20 +208,39 @@ export async function hydrateNativeFastPathFromSurface(
   const n = getNative();
   if (!n) return false;
 
-  const modelCount = Object.keys(options.surfaceIndex).length;
+  // Entries are replaced, rather than mutated, by incremental surface updates.
+  // Capture them before yielding so one payload cannot mix two revisions.
+  const entries = options.workspaceIndex
+    ? Array.from(options.workspaceIndex.models.entries())
+    : Object.entries(options.surfaceIndex);
+  const modelCount = entries.length;
   if (modelCount === 0) {
     dropNativeFastPath();
-    options.log?.('info', `[fastpath] native surface hydrate skipped (${options.reason ?? 'unknown'}): empty surfaceIndex`);
+    options.log?.('info', `[fastpath] native surface hydrate skipped (${options.reason ?? 'unknown'}): no models`);
     return false;
   }
 
+  const generation = ++initGeneration;
+  initialized = false;
+  currentRoot = options.workspaceRoot;
+  stateSource = null;
+  resetNativeAstModulesFlag();
+
   const work = (async () => {
     try {
-      const surfaceJson = JSON.stringify(options.surfaceIndex);
-      const res = n.nativeInitFromSurface(
-        options.workspaceRoot,
-        Buffer.from(surfaceJson, 'utf-8'),
-      );
+      const serializeStart = performance.now();
+      const surfaceChunks = await serializeSurface(entries, generation);
+      if (!surfaceChunks || generation !== initGeneration) return false;
+      const serializeMs = performance.now() - serializeStart;
+      const dispatchStart = performance.now();
+      const pending = n.nativeInitFromSurfaceChunksAsync
+        ? n.nativeInitFromSurfaceChunksAsync(options.workspaceRoot, surfaceChunks)
+        : n.nativeInitFromSurfaceAsync
+          ? n.nativeInitFromSurfaceAsync(options.workspaceRoot, Buffer.concat(surfaceChunks))
+          : n.nativeInitFromSurface(options.workspaceRoot, Buffer.concat(surfaceChunks));
+      const dispatchMs = performance.now() - dispatchStart;
+      const res = await pending;
+      if (!res || generation !== initGeneration) return false;
       initialized = true;
       currentRoot = options.workspaceRoot;
       stateSource = 'surface';
@@ -188,10 +251,12 @@ export async function hydrateNativeFastPathFromSurface(
       options.log?.(
         'info',
         `[fastpath] nativeInitFromSurface reason=${options.reason ?? 'unknown'} ` +
-          `${formatInitStats(res)} payloadKb=${(surfaceJson.length / 1024).toFixed(1)}`,
+          `${formatInitStats(res)} payloadKb=${(surfaceChunks.reduce((total, chunk) => total + chunk.length, 0) / 1024).toFixed(1)} ` +
+          `serializeMs=${serializeMs.toFixed(1)} dispatchMs=${dispatchMs.toFixed(1)}`,
       );
       return true;
     } catch (err) {
+      if (generation !== initGeneration) return false;
       dropNativeFastPath();
       options.log?.(
         'warn',
@@ -199,7 +264,7 @@ export async function hydrateNativeFastPathFromSurface(
       );
       return false;
     } finally {
-      initInProgress = null;
+      if (generation === initGeneration) initInProgress = null;
     }
   })();
   initInProgress = work;
@@ -361,7 +426,7 @@ export function nativeResolveExportOrigin(
   moduleName: string,
   symbol: string,
 ): ExportOriginResolution | undefined {
-  if (!initialized || disabled) return undefined;
+  if (!initialized || disabled || !astModulesEnsured) return undefined;
   const n = getNative();
   if (!n) return undefined;
   try {
@@ -381,7 +446,7 @@ export function nativeResolveExportOrigin(
 export function nativeResolveModule(
   moduleName: string,
 ): ModuleResolution | undefined {
-  if (!initialized || disabled) return undefined;
+  if (!initialized || disabled || !astModulesEnsured) return undefined;
   const n = getNative();
   if (!n) return undefined;
   try {
@@ -396,6 +461,7 @@ export function nativeResolveModule(
 
 let astModulesEnsured = false;
 let astModulesEnsuring: Promise<boolean> | null = null;
+let astGeneration = 0;
 
 /**
  * Populate `modules` on the resident Rust state by running the AST
@@ -407,22 +473,32 @@ export function ensureNativeAstModules(
   workspaceRoot: string,
   log?: Logger,
 ): Promise<boolean> {
-  if (disabled) return Promise.resolve(false);
+  if (disabled || !initialized || currentRoot !== workspaceRoot) return Promise.resolve(false);
   if (astModulesEnsured && currentRoot === workspaceRoot) {
     return Promise.resolve(true);
   }
   if (astModulesEnsuring) return astModulesEnsuring;
   const n = getNative();
   if (!n) return Promise.resolve(false);
+  const generation = astGeneration;
+  const stateGeneration = initGeneration;
 
   astModulesEnsuring = new Promise<boolean>((resolve) => {
     setImmediate(async () => {
+      if (generation !== astGeneration || stateGeneration !== initGeneration) {
+        resolve(false);
+        return;
+      }
       const started = performance.now();
       try {
         // Async napi task: the multi-second AST snapshot + index build runs on
         // the libuv threadpool, so it no longer blocks the Node event loop (which
         // previously defeated hover hard-timeouts during the post-surface ensure).
         const ok = await n.nativeEnsureAstModules(workspaceRoot);
+        if (generation !== astGeneration || stateGeneration !== initGeneration) {
+          resolve(false);
+          return;
+        }
         const elapsedMs = performance.now() - started;
         astModulesEnsured = ok;
         log?.(
@@ -435,18 +511,57 @@ export function ensureNativeAstModules(
           'warn',
           `[fastpath] nativeEnsureAstModules failed: ${err instanceof Error ? err.message : String(err)}`,
         );
-        astModulesEnsured = false;
+        if (generation === astGeneration) astModulesEnsured = false;
         resolve(false);
       } finally {
-        astModulesEnsuring = null;
+        if (generation === astGeneration) astModulesEnsuring = null;
       }
     });
   });
   return astModulesEnsuring;
 }
 
-/** Reset the AST-modules ensure flag. Call when workspace root changes. */
+/** Join source preparation already running for this native state. No new work
+ * starts here; foreground lookups retain their own cancellation and deadline.
+ * Recheck isCurrent after awaiting: invalidation can precede the continuation. */
+export function waitForPendingNativeAstModules(
+  workspaceRoot: string,
+  signal?: AbortSignal,
+  deadlineMs?: number,
+): { readonly promise: Promise<boolean>; readonly isCurrent: () => boolean } | undefined {
+  const pending = astModulesEnsuring;
+  if (disabled || !initialized || currentRoot !== workspaceRoot || !pending) return undefined;
+  const generation = astGeneration;
+  const stateGeneration = initGeneration;
+  const isCurrent = (): boolean => generation === astGeneration && stateGeneration === initGeneration
+    && initialized && !disabled && currentRoot === workspaceRoot;
+  if (signal?.aborted || (deadlineMs !== undefined && performance.now() >= deadlineMs)) {
+    return { promise: Promise.resolve(false), isCurrent };
+  }
+  const promise = new Promise<boolean>(resolve => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve(ok && isCurrent());
+    };
+    const onAbort = (): void => finish(false);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (deadlineMs !== undefined) {
+      timer = setTimeout(() => finish(false), Math.max(0, Math.ceil(deadlineMs - performance.now())));
+    }
+    pending.then(finish, () => finish(false));
+  });
+  return { promise, isCurrent };
+}
+
+/** Invalidate AST answers and any background merge after a source edit. */
 export function resetNativeAstModulesFlag(): void {
+  ++astGeneration;
   astModulesEnsured = false;
   astModulesEnsuring = null;
+  getNative()?.nativeInvalidateAstModules?.();
 }

@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::features::django_builtins::{
     BuiltinMethodInfo, BuiltinReturnKind, INSTANCE_BUILTIN_METHODS, MANAGER_BUILTIN_METHODS,
     QUERYSET_BUILTIN_METHODS,
+    QUERYSET_BUILTIN_PROPERTIES,
 };
 use crate::static_index::{FieldCandidate, ModelCandidate, ProjectMethod, StaticIndex};
 
@@ -110,7 +111,7 @@ fn field_member_item(field: &FieldCandidate) -> OrmMemberItem {
 fn builtin_item(info: &BuiltinMethodInfo, model_label: &str, receiver_kind: &str) -> OrmMemberItem {
     OrmMemberItem {
         name: info.name.to_string(),
-        member_kind: "method".into(),
+        member_kind: info.member_kind.into(),
         model_label: model_label.to_string(),
         receiver_kind: receiver_kind.to_string(),
         detail: info.description.to_string(),
@@ -128,7 +129,8 @@ fn builtin_item(info: &BuiltinMethodInfo, model_label: &str, receiver_kind: &str
         file_path: None,
         line: None,
         column: None,
-        field_kind: None,
+        field_kind: (info.member_kind == "property" && info.name == "totally_ordered")
+            .then(|| "BooleanField".into()),
         is_relation: false,
         signature: Some(info.signature.to_string()),
     }
@@ -202,10 +204,9 @@ fn instance_surface_with_fields(
     // should be preferred by the caller's sort.
     if let Some(index) = static_index {
         for method in methods_for_model(index, model_label) {
-            if !matches!(method.kind.as_str(), "classmethod" | "staticmethod") {
-                if seen.insert(method.name.clone()) {
-                    out.push(project_method_item(method, "instance"));
-                }
+            if !matches!(method.kind.as_str(), "classmethod" | "staticmethod")
+                && seen.insert(method.name.clone()) {
+                out.push(project_method_item(method, "instance"));
             }
         }
     }
@@ -239,7 +240,7 @@ fn queryset_surface(static_index: &StaticIndex, model_label: &str) -> Vec<OrmMem
     let _ = static_index;
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for info in QUERYSET_BUILTIN_METHODS {
+    for info in QUERYSET_BUILTIN_METHODS.iter().chain(QUERYSET_BUILTIN_PROPERTIES.iter()) {
         if seen.insert(info.name.to_string()) {
             out.push(builtin_item(info, model_label, "queryset"));
         }
@@ -287,10 +288,9 @@ fn model_class_surface(
     // Project-level @classmethod / @staticmethod declarations on the
     // model class surface directly on `Model.<name>`.
     for method in methods_for_model(static_index, &model_candidate.label) {
-        if matches!(method.kind.as_str(), "classmethod" | "staticmethod") {
-            if seen.insert(method.name.clone()) {
-                out.push(project_method_item(method, "model_class"));
-            }
+        if matches!(method.kind.as_str(), "classmethod" | "staticmethod")
+            && seen.insert(method.name.clone()) {
+            out.push(project_method_item(method, "model_class"));
         }
     }
     out
@@ -515,7 +515,7 @@ pub fn list_orm_member_completions(
         }
         "queryset" => {
             let mut v: Vec<OrmMemberItem> = Vec::new();
-            for info in QUERYSET_BUILTIN_METHODS {
+            for info in QUERYSET_BUILTIN_METHODS.iter().chain(QUERYSET_BUILTIN_PROPERTIES.iter()) {
                 v.push(builtin_item(info, model_label, "queryset"));
             }
             for item in v.iter_mut() {
@@ -588,6 +588,11 @@ mod tests {
         let buyer = inst.get("buyer").unwrap();
         assert_eq!(buyer[0].as_deref(), Some("instance"));
         assert_eq!(buyer[1].as_deref(), Some("shop.User"));
+        let queryset = order.get("queryset").unwrap();
+        let property = queryset.get("totally_ordered").unwrap();
+        assert_eq!(property[2].as_deref(), Some("property"));
+        assert_eq!(property[3].as_deref(), Some("BooleanField"));
+        assert!(!order.get("manager").unwrap().contains_key("totally_ordered"));
     }
 
     #[test]

@@ -107,9 +107,10 @@ class CaptainLookupPathSlowLogTest(unittest.TestCase):
                 import time
                 original = lookup_paths._resolve_lookup_chain
 
-                def _slow_chain(*, runtime, field, segments):  # type: ignore[no-untyped-def]
+                def _slow_chain(*, runtime, field, segments, method='filter', use_initial_catalog=False):  # type: ignore[no-untyped-def]
                     time.sleep(injected_chain_ms / 1000)
-                    return original(runtime=runtime, field=field, segments=segments)
+                    return original(runtime=runtime, field=field, segments=segments, method=method,
+                                    use_initial_catalog=use_initial_catalog)
 
                 with patch.object(
                     lookup_paths, '_resolve_lookup_chain', _slow_chain,

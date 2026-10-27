@@ -3,9 +3,9 @@
 //! `iter_python_files`, `snapshot_python_sources`, and the
 //! `_file_fingerprint` / `_build_directory_fingerprints` primitives.
 //!
-//! Fingerprint byte-format is kept compatible with the Python side so
-//! caches written by either implementation remain interchangeable during
-//! the transition window.
+//! These legacy fingerprints include size and mtime only. They are not
+//! interchangeable with Python's current source fingerprints, which also
+//! include filesystem identity metadata.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ const SKIP_DIRS: &[&str] = &[
     "venv",
 ];
 
-fn is_skipped_dir_name(name: &str) -> bool {
+pub(crate) fn is_skipped_dir_name(name: &str) -> bool {
     if name.starts_with('.') && name.len() > 1 {
         // hidden (matches python's `name.startswith('.')`); '.' and '..'
         // aren't reached by walkdir so they're fine.
@@ -66,8 +66,8 @@ pub struct PythonSourceSnapshot {
     pub directory_fingerprints: Vec<(String, String)>,
 }
 
-/// Walk `root` and return sorted .py paths, skipping SKIP_DIRS and any
-/// hidden directory. Matches Python `iter_python_files`.
+/// Walk `root` and return sorted regular .py paths, skipping SKIP_DIRS and
+/// hidden directories. Symlink files are not followed.
 pub fn iter_python_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let walker = WalkDir::new(root).follow_links(false).into_iter();
@@ -100,8 +100,8 @@ pub fn iter_python_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Stat all files in parallel, compute per-file and per-directory
-/// fingerprints. Matches `snapshot_python_sources` semantically.
+/// Stat all files in parallel and compute legacy per-file and per-directory
+/// fingerprints.
 pub fn snapshot_python_sources(root: &Path, extra_roots: &[&Path]) -> PythonSourceSnapshot {
     let mut files = iter_python_files(root);
     for extra in extra_roots {
@@ -188,8 +188,8 @@ fn hex_digest(bytes: &[u8]) -> String {
     out
 }
 
-/// SHA-256 over `relative_path \0 size : mtime_ns`. Byte-identical to
-/// `_file_fingerprint` on the Python side — verified by tests.
+/// SHA-256 over `relative_path \0 size : mtime_ns`. Keeps the legacy native
+/// file-fingerprint format; Python's current format includes more metadata.
 pub fn file_fingerprint(relative_path: &str, size: u64, mtime_ns: i128) -> String {
     let mut h = Sha256::new();
     h.update(relative_path.as_bytes());
@@ -201,8 +201,7 @@ pub fn file_fingerprint(relative_path: &str, size: u64, mtime_ns: i128) -> Strin
 }
 
 /// Bottom-up SHA-256 digest over each directory's files and child
-/// directories. Matches `_build_directory_fingerprints` on the Python
-/// side exactly: entries sorted by name, separators `F\0name\0fp\0` and
+/// directories. Entries are sorted by name, with separators `F\0name\0fp\0` and
 /// `D\0name\0fp\0`.
 pub fn build_directory_fingerprints(entries: &[PythonSourceEntry]) -> Vec<(String, String)> {
     use std::collections::{BTreeMap, HashSet};
@@ -249,8 +248,10 @@ pub fn build_directory_fingerprints(entries: &[PythonSourceEntry]) -> Vec<(Strin
     // fingerprinted before parents).
     let mut ordered: Vec<String> = directories.into_iter().collect();
     ordered.sort_by(|a, b| {
-        let da = a.bytes().filter(|&c| c == b'/').count();
-        let db = b.bytes().filter(|&c| c == b'/').count();
+        // The empty root has depth zero; first-level folders have depth one
+        // even though their names contain no slash.
+        let da = a.bytes().filter(|&c| c == b'/').count() + usize::from(!a.is_empty());
+        let db = b.bytes().filter(|&c| c == b'/').count() + usize::from(!b.is_empty());
         db.cmp(&da).then(a.cmp(b))
     });
 
@@ -324,13 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn file_fingerprint_matches_python_format() {
-        // Reference values generated via:
-        //   python -c "from django_orm_intellisense.discovery.workspace \
-        //     import _file_fingerprint; \
-        //     print(_file_fingerprint(relative_path='app/models.py', size=42, mtime_ns=1_234_567_890))"
-        // We can't run Python here, so we just verify the deterministic
-        // shape.
+    fn file_fingerprint_is_stable_and_sensitive_to_inputs() {
         let fp1 = file_fingerprint("app/models.py", 42, 1_234_567_890);
         let fp2 = file_fingerprint("app/models.py", 42, 1_234_567_890);
         assert_eq!(fp1, fp2);
@@ -365,5 +360,50 @@ mod tests {
         // Root fingerprint is stable across two runs of unchanged files.
         let snap2 = snapshot_python_sources(root, &[]);
         assert_eq!(snap.fingerprint, snap2.fingerprint);
+    }
+
+    #[test]
+    fn root_fingerprint_includes_first_level_children() {
+        let entries = vec![PythonSourceEntry {
+            relative_path: "app/models.py".into(),
+            size: 1,
+            mtime_ns: 1,
+            fingerprint: "first".into(),
+        }];
+        let fingerprints = build_directory_fingerprints(&entries);
+        let app = hex_digest(&Sha256::digest(b"F\0models.py\0first\0"));
+        let root = hex_digest(&Sha256::digest(format!("D\0app\0{app}\0").as_bytes()));
+        assert_eq!(
+            fingerprints,
+            vec![(String::new(), root), ("app".into(), app)]
+        );
+    }
+
+    #[test]
+    fn snapshot_root_changes_for_nested_file_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("app/deep")).unwrap();
+        fs::write(root.join("manage.py"), "root = 1").unwrap();
+        fs::write(root.join("app/models.py"), "model = 1").unwrap();
+        fs::write(root.join("app/deep/fields.py"), "field = 1").unwrap();
+        let initial = snapshot_python_sources(root, &[]);
+
+        fs::write(root.join("app/models.py"), "model = 12345").unwrap();
+        let edited = snapshot_python_sources(root, &[]);
+        assert_ne!(initial.fingerprint, edited.fingerprint);
+
+        fs::write(root.join("app/deep/fields.py"), "field = 12345").unwrap();
+        let deep_edited = snapshot_python_sources(root, &[]);
+        assert_ne!(edited.fingerprint, deep_edited.fingerprint);
+
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::write(root.join("other/models.py"), "other = 1").unwrap();
+        let added = snapshot_python_sources(root, &[]);
+        assert_ne!(deep_edited.fingerprint, added.fingerprint);
+
+        fs::remove_file(root.join("other/models.py")).unwrap();
+        let removed = snapshot_python_sources(root, &[]);
+        assert_eq!(deep_edited.fingerprint, removed.fingerprint);
     }
 }

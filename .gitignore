@@ -13,6 +13,13 @@ __pycache__/
 .claude
 target/
 native/*/index.node
+native/*/source-watcher.node
+native/worker-parent/
+/bench/
+.superpowers/
+.codex/
+.codeidx/
+.portmanager/
 .zoek-rs
 .lh
 /.claude/

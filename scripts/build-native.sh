@@ -72,4 +72,10 @@ if [[ "$UNAME_S" == "Darwin" ]]; then
   codesign --force --sign - "$DEST_DIR/index.node" >/dev/null
 fi
 
+bash "$ROOT/scripts/build-source-watcher.sh"
+
+if [[ "$UNAME_S" == "Darwin" ]]; then
+  python3 -B "$ROOT/scripts/build-worker-parent.py"
+fi
+
 echo "wrote $DEST_DIR/index.node"

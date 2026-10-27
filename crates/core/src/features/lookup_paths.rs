@@ -31,6 +31,7 @@ pub const FILTER_LOOKUP_METHODS: &[&str] = &[
     "get",
     "get_or_create",
     "update_or_create",
+    "aget", "aget_or_create", "aupdate_or_create",
 ];
 pub const DEFAULT_LOOKUP_OPERATORS: &[&str] = &[
     "exact",
@@ -50,17 +51,6 @@ pub const DEFAULT_LOOKUP_OPERATORS: &[&str] = &[
     "isnull",
     "regex",
     "iregex",
-    "date",
-    "year",
-    "month",
-    "day",
-    "week",
-    "week_day",
-    "quarter",
-    "time",
-    "hour",
-    "minute",
-    "second",
 ];
 
 pub fn is_filter_method(method: &str) -> bool {
@@ -455,7 +445,23 @@ pub struct LookupPathCompletionsResult {
 }
 
 fn allows_related_query_aliases(method: &str) -> bool {
-    !is_attribute_path_method(method)
+    method != "prefetch_related"
+}
+
+fn field_allowed_for_method(field: &FieldCandidate, method: &str) -> bool {
+    let reverse = field.relation_direction.as_deref() == Some("reverse");
+    if ["only", "defer"].contains(&method) && reverse {
+        return field.related_query_name.as_deref().is_none_or(|name| name == field.name);
+    }
+    if !is_relation_only_method(method) { return true; }
+    if !field.is_relation { return true; }
+    let kind = field.field_kind.strip_prefix("reverse_").unwrap_or(&field.field_kind);
+    if method == "select_related" {
+        if !["ForeignKey", "ParentalKey", "OneToOneField"].contains(&kind)
+            || (reverse && kind != "OneToOneField") { return false; }
+        return !reverse || field.related_query_name.as_deref().is_none_or(|name| name == field.name);
+    }
+    !reverse || field.related_name.as_deref().is_none_or(|name| name == field.name)
 }
 
 fn is_hidden_lookup_field_name(name: &str) -> bool {
@@ -501,6 +507,7 @@ fn lookup_fields_for_method<'g>(
     fields
         .iter()
         .filter(|f| !is_hidden_lookup_field_name(&f.name))
+        .filter(|f| field_allowed_for_method(f, method))
         .filter(|f| allow_alias || !is_related_query_alias_field(graph, model_label, f))
         .collect()
 }
@@ -515,6 +522,7 @@ fn lookup_field_for_method<'g>(
     if is_hidden_lookup_field_name(&field.name) {
         return None;
     }
+    if !field_allowed_for_method(field, method) { return None; }
     if !allows_related_query_aliases(method)
         && is_related_query_alias_field(graph, model_label, field)
     {
@@ -763,10 +771,8 @@ fn analyze_lookup_completion_context(
     }
 }
 
-// Per-graph descendant-completion cache. Keyed by (graph_addr,
-// model_label, method, relation_only). Cleared when the caller passes
-// a graph with a different memory address.
-type DescendantCacheKey = (usize, String, String, bool);
+// Graph generations survive moves and distinguish replacements at the same address.
+type DescendantCacheKey = (u64, String, String, bool);
 type DescendantCacheVal = Vec<LookupPathItem>;
 
 fn descendant_cache() -> &'static Mutex<BTreeMap<DescendantCacheKey, DescendantCacheVal>> {
@@ -789,9 +795,8 @@ fn descendant_completion_items(
     method: &str,
     relation_only: bool,
 ) -> Vec<LookupPathItem> {
-    let graph_addr = graph as *const _ as usize;
     let key = (
-        graph_addr,
+        graph.cache_generation,
         model_label.to_string(),
         method.to_string(),
         relation_only,
@@ -829,11 +834,16 @@ fn descendant_completion_items(
 }
 
 fn lookup_chain_completion_items(
+    graph: &ModelGraph,
     owner_model_label: &str,
     field_path: Option<&str>,
     current_partial: &str,
 ) -> Vec<LookupPathItem> {
-    DEFAULT_LOOKUP_OPERATORS
+    let kind = field_path.and_then(|name| graph.find_field(owner_model_label, name))
+        .map(|field| field.field_kind.as_str()).unwrap_or("");
+    let mut operators: Vec<&str> = DEFAULT_LOOKUP_OPERATORS.to_vec();
+    operators.extend(FIELD_TRANSFORMS.iter().filter(|(_, _, inputs)| inputs.contains(&kind)).map(|(name, _, _)| *name));
+    operators
         .iter()
         .filter(|op| op.starts_with(current_partial))
         .map(|op| lookup_operator_item(owner_model_label, op, field_path))
@@ -846,7 +856,9 @@ fn prefixed_lookup_chain_items(
 ) -> Vec<LookupPathItem> {
     let mut items_by_name: BTreeMap<String, LookupPathItem> = BTreeMap::new();
     for field in fields {
-        for operator in DEFAULT_LOOKUP_OPERATORS {
+        let mut operators: Vec<&str> = DEFAULT_LOOKUP_OPERATORS.to_vec();
+        operators.extend(FIELD_TRANSFORMS.iter().filter(|(_, _, inputs)| inputs.contains(&field.field_kind.as_str())).map(|(name, _, _)| *name));
+        for operator in operators {
             let path_name = format!("{}__{}", field.name, operator);
             items_by_name.entry(path_name.clone()).or_insert_with(|| {
                 let mut item =
@@ -935,6 +947,7 @@ pub fn list_lookup_path_completions(
                     traversal.lookup_field_name.as_deref(),
                 ) {
                     items.extend(lookup_chain_completion_items(
+                        graph,
                         owner,
                         traversal.lookup_field_name.as_deref(),
                         &current_partial,
@@ -948,6 +961,7 @@ pub fn list_lookup_path_completions(
                 traversal.lookup_field_name.as_deref(),
             ) {
                 items.extend(lookup_chain_completion_items(
+                    graph,
                     owner,
                     traversal.lookup_field_name.as_deref(),
                     &current_partial,
@@ -1136,6 +1150,24 @@ mod tests {
     }
 
     #[test]
+    fn descendant_cache_does_not_survive_graph_replacement() {
+        let mut graph = sample_graph();
+        let original_address = &graph as *const _;
+        let first = list_lookup_path_completions(&graph, "shop.Order", "", "filter");
+        assert!(completion_names(&first.items).contains(&"buyer__email".to_string()));
+        let mut replacement = sample_graph();
+        let field = replacement.fields_by_model_label.get_mut("shop.User").unwrap()
+            .iter_mut().find(|field| field.name == "email").unwrap();
+        field.name = "new_email".into();
+        graph = replacement;
+        assert_eq!(original_address, &graph as *const _);
+        let second = list_lookup_path_completions(&graph, "shop.Order", "", "filter");
+        let names = completion_names(&second.items);
+        assert!(names.contains(&"buyer__new_email".to_string()));
+        assert!(!names.contains(&"buyer__email".to_string()));
+    }
+
+    #[test]
     fn completion_segment_missing_reports_unresolved() {
         clear_descendant_cache();
         let g = sample_graph();
@@ -1248,6 +1280,15 @@ mod tests {
                 matches!(r, LookupResolution::Unresolved { .. }),
                 "expected `{chain}` to be unresolved (not a built-in transform), got {r:?}"
             );
+        }
+    }
+
+    #[test]
+    fn date_transforms_do_not_apply_to_text_or_numeric_fields() {
+        let graph = dated_graph();
+        for path in ["title__year", "author__age__date", "author__age__iso_year"] {
+            assert!(matches!(resolve_lookup_path(&graph, "blog.Entry", path, "filter"),
+                LookupResolution::Unresolved { .. }));
         }
     }
 

@@ -240,9 +240,11 @@ pub fn synthesize_reverse_relations(
         let Some(reverse_name) = derive_reverse_name(f, &source_model.object_name) else {
             continue;
         };
-        out.push(FieldCandidate {
+        let query_name = f.related_query_name.clone().or_else(|| f.related_name.clone())
+            .unwrap_or_else(|| source_model.object_name.to_lowercase());
+        let reverse = FieldCandidate {
             model_label: target_label.to_string(),
-            name: reverse_name,
+            name: reverse_name.clone(),
             file_path: f.file_path.clone(),
             line: f.line,
             column: f.column,
@@ -257,10 +259,14 @@ pub fn synthesize_reverse_relations(
             relation_direction: Some("reverse".into()),
             related_model_label: Some(f.model_label.clone()),
             declared_model_label: Some(f.model_label.clone()),
-            related_name: f.related_name.clone(),
-            related_query_name: f.related_query_name.clone(),
+            related_name: Some(reverse_name.clone()),
+            related_query_name: Some(query_name.clone()),
             source: "static".into(),
-        });
+        };
+        out.push(reverse.clone());
+        if query_name != reverse_name {
+            out.push(FieldCandidate { name: query_name, source: "related_query_alias".into(), ..reverse });
+        }
     }
     out
 }
@@ -534,8 +540,10 @@ mod tests {
                 f.model_label == "shop.User" && f.relation_direction.as_deref() == Some("reverse")
             })
             .collect();
-        assert_eq!(reverse.len(), 1);
+        assert_eq!(reverse.len(), 2);
         assert_eq!(reverse[0].name, "order_set");
+        assert_eq!(reverse[1].name, "order");
+        assert_eq!(reverse[1].source, "related_query_alias");
         assert_eq!(
             reverse[0].related_model_label.as_deref(),
             Some("shop.Order")

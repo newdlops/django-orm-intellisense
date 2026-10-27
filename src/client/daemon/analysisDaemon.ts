@@ -1,10 +1,21 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { AsyncLocalStorage } from 'async_hooks';
+import { withKnownNativeMemberReturn } from './ormMemberConfidence';
+import { applyLookupCatalogDelta } from '../../server/lookupCatalog';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
+import { SurfaceSnapshotDecoder } from './surfaceSnapshotTransport';
+import { SourceConfigurationRequests } from './sourceConfigurationRequests';
+import type { SourceObservationContext } from '../sourceObservation';
+import { captureNativeSourceBoundary } from '../native/sourceWatcher';
+import { daemonProcessLaunch } from './nativeProcessLaunch';
+import { prepareNativeDaemonState, type NativeDaemonStateOwner } from './nativeDaemonState';
+import { isSurfaceSourceProvenance, type SurfaceCacheContext, type SurfaceSourceProvenance } from '../surfaceSourceProvenance';
+import { fingerprintLaunchEnvironment } from '../launchEnvironment';
 import * as vscode from 'vscode';
 import { getExtensionSettings } from '../config/settings';
+import { normalizeSourcePath } from '../sourceWatcher';
 import {
   decompressIpcEnvelope,
   isCompressedEnvelope,
@@ -14,6 +25,8 @@ import {
   isNativeFastPathReady,
   dropNativeFastPath,
   ensureNativeAstModules,
+  waitForPendingNativeAstModules,
+  resetNativeAstModulesFlag,
   nativeResolveRelationTarget,
   nativeListRelationTargets,
   nativeResolveLookupPath,
@@ -41,6 +54,7 @@ import type {
   OrmMemberResolution,
   OrmReceiverKind,
   ReindexFileResult,
+  DeletedSourceFilesResult,
   RelationTargetResolution,
   RelationTargetsResult,
   RequestMessage,
@@ -51,11 +65,15 @@ import {
   buildModelLabelByName,
   buildWorkspaceIndex,
   diffSurfaceIndex,
+  applyStaticFallbackDelta,
+  includeStaticFallbackChanges,
   updateWorkspaceIndexIncremental,
   type StaticFallback,
   type SurfaceIndex,
 } from '../../server/workspaceIndexer';
-import { parseLookupChain, getCompletionCandidates } from '../../server/lookupResolver';
+import { parseLookupChain, getCompletionCandidates, supportsLookupTransforms, FILTER_LOOKUP_METHODS, relationAllowedForMethod } from '../../server/lookupResolver';
+import { operandPythonType, pythonTypeForKind } from '../../server/fieldLookups';
+import { djangoBuiltinAvailable } from '../../server/djangoVersion';
 import type {
   FieldInfo,
   ModelInfo,
@@ -76,13 +94,7 @@ const LOCAL_LOOKUP_RELATION_ONLY_METHODS = new Set([
   'prefetch_related',
 ]);
 const LOCAL_LOOKUP_ALIAS_SENSITIVE_METHODS = new Set<string>();
-const LOCAL_LOOKUP_OPERATOR_METHODS = new Set([
-  'filter',
-  'exclude',
-  'get',
-  'get_or_create',
-  'update_or_create',
-]);
+const LOCAL_LOOKUP_OPERATOR_METHODS = FILTER_LOOKUP_METHODS;
 const LOCAL_LOOKUP_CHAIN_DEPTH = 2;
 
 function normalizeLookupPathValue(value: string, method: string): string {
@@ -96,6 +108,7 @@ const LOCAL_QUERYSET_RETURNING_METHODS = [
   'filter', 'exclude', 'all', 'annotate', 'alias', 'order_by', 'only',
   'defer', 'select_related', 'prefetch_related', 'distinct', 'using',
   'reverse', 'none', 'select_for_update', 'get_queryset',
+  'fetch_mode',
 ];
 const LOCAL_INSTANCE_RETURNING_METHODS = [
   'get', 'first', 'last', 'earliest', 'latest', 'create',
@@ -314,6 +327,7 @@ export function dropModelFromAllIndicesForTesting(
 
 export class AnalysisDaemon implements vscode.Disposable {
   private readonly stateEmitter = new vscode.EventEmitter<HealthSnapshot>();
+  private readonly surfaceSnapshotEmitter = new vscode.EventEmitter<void>();
   private readonly modelsReindexedEmitter = new vscode.EventEmitter<void>();
   private readonly pendingRequests = new Map<string, PendingRequest>();
   private readonly responseCache = new Map<string, { promise: Promise<unknown>; createdAt: number; source?: IpcRequestSource }>();
@@ -323,10 +337,16 @@ export class AnalysisDaemon implements vscode.Disposable {
   private readonly deadlineContext = new AsyncLocalStorage<number>();
   private readonly output: vscode.OutputChannel;
   private process?: ChildProcessWithoutNullStreams;
+  private nativeStateOwners = new WeakMap<ChildProcessWithoutNullStreams, NativeDaemonStateOwner>();
   private stdoutReader?: readline.Interface;
   private requestSequence = 0;
+  private sessionRevision = 0;
+  private lifecycleRevision = 0;
+  private metadataRetired = false;
   private startPromise?: Promise<HealthSnapshot>;
+  private cancelStart?: (error: Error) => void;
   private restartPromise?: Promise<HealthSnapshot>;
+  private restartRevision = 0;
   private restartQueued = false;
   private queuedRestartScope?: vscode.ConfigurationScope;
   private stopRequested = false;
@@ -349,9 +369,21 @@ export class AnalysisDaemon implements vscode.Disposable {
   surfaceIndex: SurfaceIndex = {};
   surfaceFingerprints: Record<string, string> = {};
   customLookups: Record<string, string[]> = {};
+  lookupCatalog?: import('../../server/lookupCatalog').LookupCatalogPayload;
   customLookupsFingerprint?: string;
   staticFallback: StaticFallback | null = null;
   staticFallbackFingerprint: string | null = null;
+  sourceProvenance: SurfaceSourceProvenance | null = null;
+  private surfaceCacheContext: SurfaceCacheContext | null = null;
+  private editableSourceRoots: string[] = [];
+  private sourceObservationContext?: SourceObservationContext;
+  private readonly sourceConfigurationRequests = new SourceConfigurationRequests();
+  private initializationPending = false;
+  private pendingSourceObservationBoundary?: string;
+  private surfaceSnapshotDecoder = new SurfaceSnapshotDecoder();
+  private surfaceResyncPromise?: Promise<void>;
+  private surfaceResyncNeeded = false;
+  private surfaceResyncRetry?: NodeJS.Timeout;
   private localWorkspaceIndex: WorkspaceIndex = createEmptyWorkspaceIndex();
   private localModelFingerprints = new Map<string, string>();
   private lastLaunchContext?: LaunchContext;
@@ -374,6 +406,15 @@ export class AnalysisDaemon implements vscode.Disposable {
     return this.stateEmitter.event;
   }
 
+  getSurfaceCacheContext(): SurfaceCacheContext | null {
+    return this.surfaceCacheContext;
+  }
+
+  /** Fires when a complete authoritative surface snapshot replaces metadata. */
+  get onDidReplaceSurfaceSnapshot(): vscode.Event<void> {
+    return this.surfaceSnapshotEmitter.event;
+  }
+
   /**
    * Fires after a reindex changed model definitions. File-watcher reindexes
    * (branch switch, external edit) never raise a save event, so this is the
@@ -387,8 +428,30 @@ export class AnalysisDaemon implements vscode.Disposable {
     return this.currentState;
   }
 
+  getEditableSourceRoots(): readonly string[] {
+    return this.editableSourceRoots;
+  }
+
+  getSourceObservationContext(): SourceObservationContext | undefined {
+    return this.sourceObservationContext;
+  }
+
+  isSourceConfigurationRefreshing(): boolean {
+    return this.sourceConfigurationRequests.refreshing;
+  }
+
+  /** Changes whenever a daemon process starts or is invalidated. */
+  getSessionRevision(): number {
+    return this.sessionRevision;
+  }
+
+  /** A retired session publishes an empty in-memory LS state until new metadata arrives. */
+  isMetadataRetired(): boolean {
+    return this.metadataRetired;
+  }
+
   isReady(): boolean {
-    return this.process !== null && (
+    return Boolean(this.process) && !this.sourceConfigurationRequests.refreshing && (
       this.currentState.phase === 'ready' ||
       this.currentState.phase === 'degraded'
     );
@@ -428,6 +491,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       Array.from(this.modelNames),
       this.customLookups,
       this.effectiveStaticFallback(),
+      this.lookupCatalog,
     );
     this._shortNameFromFullLabelIndex = null;
     this.localModelFingerprints.clear();
@@ -475,6 +539,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       this.customLookups,
       this.customLookups,
       this.effectiveStaticFallback(),
+      this.lookupCatalog,
     );
     this._shortNameFromFullLabelIndex = null;
     this.surfaceIndex = nextSurfaceIndex;
@@ -651,6 +716,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     void hydrateNativeFastPathFromSurface({
       workspaceRoot,
       surfaceIndex: this.surfaceIndex,
+      workspaceIndex: this.localWorkspaceIndex,
       reason,
       log: (level, message) => {
         this.log(level === 'info' ? 'info' : 'info', message);
@@ -669,6 +735,11 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   async start(scope?: vscode.ConfigurationScope): Promise<HealthSnapshot> {
+    if (this.restartPromise) return this.restartPromise;
+    return this.startSession(scope);
+  }
+
+  private async startSession(scope?: vscode.ConfigurationScope): Promise<HealthSnapshot> {
     if (this.startPromise) {
       return this.startPromise;
     }
@@ -677,19 +748,26 @@ export class AnalysisDaemon implements vscode.Disposable {
       return this.refreshHealth();
     }
 
-    const startPromise = this.startProcess(scope);
+    let cancel!: (error: Error) => void;
+    const cancelled = new Promise<never>((_resolve, reject) => { cancel = reject; });
+    // The underlying work may be uncooperative. Its lifecycle guards prevent
+    // late adoption; public waiters must still settle when the session stops.
+    const startPromise = Promise.race([this.startProcess(scope), cancelled]);
     this.startPromise = startPromise;
+    this.cancelStart = cancel;
 
     try {
       return await startPromise;
     } finally {
       if (this.startPromise === startPromise) {
         this.startPromise = undefined;
+        this.cancelStart = undefined;
       }
     }
   }
 
   async refreshHealth(): Promise<HealthSnapshot> {
+    if (this.restartPromise) return this.restartPromise;
     if (this.startPromise) {
       return this.startPromise;
     }
@@ -698,6 +776,8 @@ export class AnalysisDaemon implements vscode.Disposable {
       return this.currentState;
     }
 
+    const child = this.process;
+    const session = this.sessionRevision;
     const snapshot = this.decorateSnapshot(
       await this.request<HealthSnapshot>(
         'health',
@@ -707,11 +787,35 @@ export class AnalysisDaemon implements vscode.Disposable {
         'health'
       )
     );
-    this.updateState(snapshot);
+    if (session !== this.sessionRevision || this.process !== child) {
+      throw new Error('Health result belongs to an inactive daemon session.');
+    }
+    // A status query does not change resolver metadata. Keep warmed provider
+    // caches when every health value is unchanged; explicit healthChanged
+    // notifications still invalidate them when the runtime registry is ready.
+    if (JSON.stringify(snapshot) !== JSON.stringify(this.currentState)) {
+      this.updateState(snapshot);
+    }
     return snapshot;
   }
 
   async ensureStarted(scope?: vscode.ConfigurationScope): Promise<void> {
+    if (this.sourceConfigurationRequests.refreshing) {
+      await this.sourceConfigurationRequests.waitForCurrent(REQUEST_TIMEOUT_MS, this.abortSignalContext.getStore());
+      return;
+    }
+    // Background diagnostics share the active process; they must never undo
+    // a foreground project switch with a stale document's startup scope.
+    if (this.currentRequestSource() === 'diagnostic') {
+      const pending = this.restartPromise ?? this.startPromise;
+      if (pending) await pending;
+      if (!this.isReady()) throw new Error('Background analysis requires a ready daemon session.');
+      return;
+    }
+    if (this.restartPromise) {
+      await this.restartPromise;
+      return;
+    }
     if (this.startPromise) {
       await this.startPromise;
       if (
@@ -743,33 +847,30 @@ export class AnalysisDaemon implements vscode.Disposable {
       return this.restartPromise;
     }
 
+    const revision = ++this.restartRevision;
     const restartPromise = (async () => {
       let nextScope = scope;
       let lastSnapshot: HealthSnapshot | undefined;
       let lastError: unknown;
 
       while (true) {
+        if (revision !== this.restartRevision) throw new Error('Daemon restart belongs to an inactive daemon session.');
         this.restartQueued = false;
         const restartScope = nextScope;
         nextScope = undefined;
 
-        await this.stop();
-        if (this.startPromise) {
-          try {
-            await this.startPromise;
-          } catch {
-            // Ignore the terminated start attempt and continue with the queued restart.
-          }
-        }
+        await this.stopProcess();
+        if (revision !== this.restartRevision) throw new Error('Daemon restart belongs to an inactive daemon session.');
 
         try {
-          lastSnapshot = await this.start(restartScope);
+          lastSnapshot = await this.startSession(restartScope);
           lastError = undefined;
         } catch (error) {
           lastSnapshot = undefined;
           lastError = error;
         }
 
+        if (revision !== this.restartRevision) throw new Error('Daemon restart belongs to an inactive daemon session.');
         if (!this.restartQueued) {
           if (lastSnapshot) {
             return lastSnapshot;
@@ -789,6 +890,53 @@ export class AnalysisDaemon implements vscode.Disposable {
       if (this.restartPromise === restartPromise) {
         this.restartPromise = undefined;
       }
+    }
+  }
+
+  async refreshSourceConfiguration(ownsSource: () => boolean = () => true): Promise<HealthSnapshot> {
+    const child = this.process, launch = this.lastLaunchContext, session = this.sessionRevision;
+    const current = (): boolean => Boolean(child && launch && this.process === child
+      && this.sessionRevision === session && !this.stopRequested && ownsSource());
+    if (!current() || !launch) throw new Error('Source configuration belongs to an inactive daemon session.');
+    const promise = this.sourceConfigurationRequests.refresh(
+      INITIALIZE_REQUEST_TIMEOUT_MS,
+      () => {
+        this.initializationPending = true;
+        this.retireMetadata();
+        this.updateState({...this.currentState, phase: 'starting', detail: 'Refreshing source configuration.'});
+      },
+      async remaining => {
+        if (!current()) throw new Error('Source configuration belongs to an inactive daemon session.');
+        this.pendingSourceObservationBoundary = captureNativeSourceBoundary();
+        const result = await this.request<InitializeResult>('initialize', {
+          workspaceRoot: launch.workspaceRoot, settingsModule: launch.settingsModule,
+          deferRuntime: true, surfaceSnapshotTransport: 1, sourceObservationTransport: 1, initializeSurfaceTransport: 1,
+        }, remaining, false, 'initialSync');
+        if (!current()) throw new Error('Source configuration belongs to an inactive daemon session.');
+        return result;
+      },
+      result => {
+        if (!current()) throw new Error('Source configuration belongs to an inactive daemon session.');
+        this.initializationPending = false;
+        this.surfaceSnapshotDecoder.reset();
+        this.adoptInitializeResult(result, 'source-configuration');
+        return result;
+      },
+    );
+    try {
+      await promise;
+      if (!current()) throw new Error('Source configuration belongs to an inactive daemon session.');
+      const snapshot = this.currentState;
+      this.updateState(snapshot);
+      this.surfaceSnapshotEmitter.fire();
+      this.requestSurfaceSnapshotResync();
+      return snapshot;
+    } catch (error) {
+      if (current()) {
+        this.initializationPending = false;
+        this.updateStateFromError(error);
+      }
+      throw error;
     }
   }
 
@@ -932,24 +1080,85 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
   }
 
-  async reindexFile(filePath: string): Promise<ReindexFileResult> {
+  async deletedSourceFiles(filePath: string): Promise<readonly string[]> {
+    const result = await this.request<DeletedSourceFilesResult>(
+      'deletedSourceFiles', { filePath }, INITIALIZE_REQUEST_TIMEOUT_MS, false, 'reindex'
+    );
+    if (result.error) throw new Error(result.error);
+    return result.filePaths ?? [];
+  }
+
+  async reindexFile(filePath: string, isCurrentSourceOwner?: () => boolean): Promise<ReindexFileResult> {
+    return this.reindexSourcePath('reindexFile', filePath, isCurrentSourceOwner);
+  }
+
+  async reindexSourceRoot(filePath: string, isCurrentSourceOwner?: () => boolean): Promise<ReindexFileResult> {
+    return this.reindexSourcePath('reindexSourceRoot', filePath, isCurrentSourceOwner);
+  }
+
+  async reindexSourceDirectory(filePath: string, isCurrentSourceOwner?: () => boolean): Promise<ReindexFileResult> {
+    return this.reindexSourcePath('reindexSourceDirectory', filePath, isCurrentSourceOwner);
+  }
+
+  private async reindexSourcePath(
+    method: 'reindexFile' | 'reindexSourceRoot' | 'reindexSourceDirectory',
+    filePath: string,
+    isCurrentSourceOwner?: () => boolean,
+  ): Promise<ReindexFileResult> {
+    const sessionRevision = this.sessionRevision;
     const result = await this.request<ReindexFileResult>(
-      'reindexFile',
+      method,
       { filePath },
       INITIALIZE_REQUEST_TIMEOUT_MS,
       false,
       'reindex'
     );
+    if (sessionRevision !== this.sessionRevision) {
+      throw new Error('Source reindex result belongs to an inactive daemon session.');
+    }
+    if (isCurrentSourceOwner && !isCurrentSourceOwner()) {
+      // Python may already have committed this edit. Fetch current state,
+      // since a same-source retry can legitimately contain no delta.
+      if (this.isReady() && !this.isMetadataRetired()) {
+        this.surfaceResyncNeeded = true;
+        this.requestSurfaceSnapshotResync();
+      }
+      const error = new Error('Source reindex result belongs to an inactive source watcher owner.');
+      if (result && typeof result === 'object' && !Array.isArray(result) && !result.error) {
+        // The reply can already be committed in Python. Keep only an owned
+        // path hint so a returned registration can read current source.
+        Object.assign(error, { sourceReindexOwnerRetired: { filePath, sessionRevision } });
+      }
+      throw error;
+    }
+    if (result.error) {
+      throw new Error(result.error);
+    }
 
-    // Fast path: no model changes detected — skip all processing
     if (result.unchanged) {
+      // Only a verified source duplicate leaves resolver metadata untouched.
+      // Surface-only no-ops can still change exports and source locations.
+      if (result.sourceUnchanged === true) return result;
+      this.sourceProvenance = null;
+      this.clearResponseCache();
+      resetNativeAstModulesFlag();
+      const workspaceRoot = this.lastLaunchContext?.workspaceRoot;
+      if (workspaceRoot) void ensureNativeAstModules(workspaceRoot);
+      this.modelsReindexedEmitter.fire();
       return result;
     }
 
+    this.sourceProvenance = null;
     const addedLabels = result.addedLabels ?? [];
     const changedLabels = result.changedLabels ?? [];
     const removedLabels = result.removedLabels ?? [];
-    const nextStaticFallback = result.staticFallback ?? null;
+    if (result.lookupCatalogDelta) {
+      this.lookupCatalog = applyLookupCatalogDelta(this.localWorkspaceIndex, result.lookupCatalogDelta);
+    }
+    const hasFallbackDelta = result.staticFallbackDelta !== undefined;
+    const nextStaticFallback = hasFallbackDelta
+      ? applyStaticFallbackDelta(this.staticFallback, result.staticFallbackDelta!, result.removedStaticFallbackLabels)
+      : result.staticFallback !== undefined ? result.staticFallback : this.staticFallback;
     const nextStaticFallbackFingerprint = result.staticFallbackFingerprint ?? null;
     if (result.surfaceIndexDelta) {
       this.applySurfaceIndexDelta(
@@ -965,20 +1174,28 @@ export class AnalysisDaemon implements vscode.Disposable {
         this.rebuildModelLabelByName();
         this.rebuildModelNames();
         this.rebuildLocalWorkspaceIndex();
-      } else if (this.staticFallbackFingerprint !== nextStaticFallbackFingerprint) {
+      } else if (!hasFallbackDelta && this.staticFallbackFingerprint !== nextStaticFallbackFingerprint) {
         this.staticFallback = nextStaticFallback;
         this.staticFallbackFingerprint = nextStaticFallbackFingerprint;
         this.rebuildModelLabelByName();
         this.rebuildModelNames();
         this.rebuildLocalWorkspaceIndex();
       } else {
+        this.staticFallback = nextStaticFallback;
+        const fallback = this.effectiveStaticFallback();
+        const diff = includeStaticFallbackChanges(
+          this.localWorkspaceIndex, this.surfaceIndex, fallback,
+          { added: addedLabels, changed: changedLabels, removed: removedLabels },
+          result.staticFallbackDelta, result.removedStaticFallbackLabels,
+        );
         updateWorkspaceIndexIncremental(
           this.localWorkspaceIndex,
           this.surfaceIndex,
-          { added: addedLabels, changed: changedLabels, removed: removedLabels },
+          diff,
           this.customLookups,
           this.customLookups,
-          this.effectiveStaticFallback(),
+          fallback,
+          this.lookupCatalog,
         );
         this._shortNameFromFullLabelIndex = null;
       }
@@ -1027,6 +1244,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     prefix: string,
     method: string
   ): LookupPathCompletionsResult | undefined {
+    if (this.lookupCatalog && prefix.includes('__')) return undefined;
     if (!isNativeFastPathReady()) return undefined;
     return nativeListLookupPathCompletions(baseModelLabel, prefix, method);
   }
@@ -1074,14 +1292,14 @@ export class AnalysisDaemon implements vscode.Disposable {
       method,
     );
     const parsed: ParsedLookup = completedSegments.length > 0
-      ? parseLookupChain(completedSegments.join('__'), baseModelLabel, index)
+      ? parseLookupChain(`${completedSegments.join('__')}__`, baseModelLabel, index, method)
       : {
           segments: [],
           resolvedPath: [],
           state: 'partial',
           startModel: baseModelLabel,
         };
-    if (parsed.state === 'error') {
+    if (parsed.state === 'error' || parsed.runtimeRequired) {
       return undefined;
     }
     if (
@@ -1102,7 +1320,7 @@ export class AnalysisDaemon implements vscode.Disposable {
 
     const itemsByName = new Map<string, LookupPathItem>();
     const includePrefixedLookupItems =
-      LOCAL_LOOKUP_OPERATOR_METHODS.has(method) &&
+      supportsLookupTransforms(method) &&
       (currentPartial.length > 0 || completedSegments.length === 0);
 
     if (
@@ -1124,6 +1342,7 @@ export class AnalysisDaemon implements vscode.Disposable {
           traversal.currentModelLabel,
           directItems,
           currentPartial,
+          method,
         )) {
           itemsByName.set(item.name, item);
         }
@@ -1146,6 +1365,8 @@ export class AnalysisDaemon implements vscode.Disposable {
           traversal.lookupFieldOwnerLabel,
           traversal.lookupField,
           currentPartial,
+          traversal.lookupField.name,
+          LOCAL_LOOKUP_OPERATOR_METHODS.has(method),
         )) {
           itemsByName.set(item.name, item);
         }
@@ -1155,6 +1376,8 @@ export class AnalysisDaemon implements vscode.Disposable {
         traversal.lookupFieldOwnerLabel,
         traversal.lookupField,
         currentPartial,
+        traversal.lookupField.name,
+        LOCAL_LOOKUP_OPERATOR_METHODS.has(method),
       )) {
         itemsByName.set(item.name, item);
       }
@@ -1167,6 +1390,10 @@ export class AnalysisDaemon implements vscode.Disposable {
     };
   }
 
+  getLookupIndex(): WorkspaceIndex {
+    return this.localWorkspaceIndex;
+  }
+
   async resolveLookupPath(
     baseModelLabel: string,
     value: string,
@@ -1175,13 +1402,103 @@ export class AnalysisDaemon implements vscode.Disposable {
   ): Promise<LookupPathResolution> {
     const normalizedValue = normalizeLookupPathValue(value, method);
     const source = this.currentRequestSource();
+    const sessionRevision = this.sessionRevision;
+    const assertCurrent = (): void => {
+      if (this.isAborted()) throw new Error('Aborted: resolveLookupPath');
+      if (sessionRevision !== this.sessionRevision) {
+        throw new Error('Native lookup preparation belongs to an inactive daemon session.');
+      }
+    };
     const allowLocationlessNative = background || source === 'diagnostic';
+    let pythonFallback: Promise<LookupPathResolution> | undefined;
+    const queryPython = (): Promise<LookupPathResolution> => pythonFallback ??= (async () => {
+      assertCurrent();
+      // Preserve the existing fallback and its test-only delay, including when
+      // a pending native preparation and more than one caller share this IPC.
+      const lookupDelayMs = parseInt(process.env.DJLS_TEST_RESOLVE_LOOKUP_PATH_DELAY_MS ?? '', 10);
+      if (Number.isFinite(lookupDelayMs) && lookupDelayMs > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, lookupDelayMs));
+      }
+      assertCurrent();
+      return this.cachedRequest<LookupPathResolution>('resolveLookupPath', {
+        baseModelLabel, value: normalizedValue, method,
+      }, background);
+    })();
+    const local = this.lookupCatalog?.fields?.[baseModelLabel]
+      ? this.resolveLookupPathLocal(baseModelLabel, normalizedValue, method)
+      : undefined;
+    if (local && (allowLocationlessNative || !local.resolved)) return local;
     // Native fast-path: static FSM walk on the resident model graph.
     // Python daemon was measured at up to 2.6s for one `title__startswith`
     // resolve. Only defer to Python when native can't answer (e.g.
     // custom runtime lookups registered via `register_lookup`).
     if (isNativeFastPathReady()) {
-      const native = nativeResolveLookupPath(baseModelLabel, normalizedValue, method);
+      let native = nativeResolveLookupPath(baseModelLabel, normalizedValue, method);
+      if (!allowLocationlessNative && native?.resolved && native.target && !native.target.filePath) {
+        const workspaceRoot = this.lastLaunchContext?.workspaceRoot;
+        const parentSignal = this.abortSignalContext.getStore();
+        const waiter = new AbortController();
+        const endWait = (): void => waiter.abort(parentSignal?.reason ?? 'Native lookup source wait ended');
+        parentSignal?.addEventListener('abort', endWait, { once: true });
+        if (parentSignal?.aborted) endWait();
+        let fallbackTurn: ReturnType<typeof setImmediate> | undefined;
+        let settleScheduledFallback: ((result: LookupAttempt) => void) | undefined;
+        type LookupAttempt = { kind: 'native'; value: LookupPathResolution | undefined }
+          | { kind: 'python'; value: LookupPathResolution }
+          | { kind: 'python-error'; error: unknown };
+        try {
+          const pending = workspaceRoot ? waitForPendingNativeAstModules(
+            workspaceRoot, waiter.signal, this.deadlineContext.getStore()
+          ) : undefined;
+          if (pending) {
+            const nativePreparation = pending.promise.then(prepared => {
+              assertCurrent();
+              return prepared && pending.isCurrent() && isNativeFastPathReady()
+                ? nativeResolveLookupPath(baseModelLabel, normalizedValue, method) : undefined;
+            });
+            const scheduledPython = new Promise<LookupAttempt>(resolve => {
+              settleScheduledFallback = resolve;
+              // Let native completion already queued for this turn win without
+              // an IPC. Otherwise don't spend the whole foreground deadline
+              // waiting for a multi-second source index before trying Python.
+              fallbackTurn = setImmediate(() => {
+                fallbackTurn = undefined;
+                void queryPython().then(
+                  value => resolve({ kind: 'python', value }),
+                  error => resolve({ kind: 'python-error', error }),
+                );
+              });
+            });
+            const first = await Promise.race<LookupAttempt>([
+              nativePreparation.then(value => ({ kind: 'native', value })), scheduledPython,
+            ]);
+            assertCurrent();
+            if (first.kind === 'python' && first.value.resolved) return first.value;
+            const preparedNative = first.kind === 'native' ? first.value : await nativePreparation;
+            assertCurrent();
+            if (preparedNative?.resolved && preparedNative.target?.filePath
+                && pending.isCurrent() && isNativeFastPathReady()) {
+              native = preparedNative;
+            } else {
+              // Failed/negative Python answers do not hide a native source
+              // answer that was already being prepared. Keep the original
+              // fallback failure object when neither path can answer.
+              if (first.kind === 'python-error') throw first.error;
+              const result = first.kind === 'python' ? first.value : await queryPython();
+              assertCurrent();
+              return result;
+            }
+          }
+        } finally {
+          parentSignal?.removeEventListener('abort', endWait);
+          endWait();
+          if (fallbackTurn !== undefined) {
+            clearImmediate(fallbackTurn);
+            // Settle the unstarted branch without issuing or cancelling IPC.
+            settleScheduledFallback?.({ kind: 'native', value: undefined });
+          }
+        }
+      }
       if (native) {
         if (
           native.resolved &&
@@ -1208,7 +1525,7 @@ export class AnalysisDaemon implements vscode.Disposable {
           native.target &&
           (native.target.filePath || allowLocationlessNative)
         ) {
-          return native;
+          return local ? { ...native, terminalType: local.terminalType, lookupOperator: local.lookupOperator } : native;
         }
         // For diagnostic-background calls, skip the Python fallback when
         // it cannot disagree: if the daemon's Django runtime is not bootstrapped
@@ -1229,20 +1546,7 @@ export class AnalysisDaemon implements vscode.Disposable {
         }
       }
     }
-    // Test-only knob: artificially slow the BG IPC so per-context
-    // timeout in the phase2-lookups loop can be exercised by E2E.
-    const lookupDelayMs = parseInt(
-      process.env.DJLS_TEST_RESOLVE_LOOKUP_PATH_DELAY_MS ?? '',
-      10
-    );
-    if (Number.isFinite(lookupDelayMs) && lookupDelayMs > 0) {
-      await new Promise<void>((resolve) => setTimeout(resolve, lookupDelayMs));
-    }
-    return this.cachedRequest<LookupPathResolution>('resolveLookupPath', {
-      baseModelLabel,
-      value: normalizedValue,
-      method,
-    }, background);
+    return queryPython();
   }
 
   async listOrmMemberCompletions(
@@ -1272,7 +1576,9 @@ export class AnalysisDaemon implements vscode.Disposable {
     managerName?: string
   ): OrmMemberCompletionsResult | undefined {
     if (!isNativeFastPathReady()) return undefined;
-    return nativeListOrmMemberCompletions(modelLabel, receiverKind, prefix, managerName);
+    const result = nativeListOrmMemberCompletions(modelLabel, receiverKind, prefix, managerName);
+    return result ? { ...result, items: result.items.filter((item) =>
+      item.source !== 'builtin' || djangoBuiltinAvailable(item.name, this.currentState.runtime?.djangoVersion)) } : undefined;
   }
 
   /**
@@ -1429,6 +1735,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       returnKind: string,
       returnModelLabel?: string
     ) => {
+      if (!djangoBuiltinAvailable(name, this.currentState.runtime?.djangoVersion)) return;
       if (normalizedPrefix && !name.startsWith(normalizedPrefix)) {
         return;
       }
@@ -1459,6 +1766,15 @@ export class AnalysisDaemon implements vscode.Disposable {
       }
       for (const name of LOCAL_SCALAR_QUERYSET_METHODS) {
         addMethod(name, 'Django queryset method', 'scalar');
+      }
+      if (receiverKind === 'queryset' &&
+          djangoBuiltinAvailable('totally_ordered', this.currentState.runtime?.djangoVersion) &&
+          'totally_ordered'.startsWith(normalizedPrefix)) {
+        items.push({
+          name: 'totally_ordered', memberKind: 'property', modelLabel, receiverKind,
+          detail: 'Whether this QuerySet has deterministic ordering.', source: 'builtin',
+          returnKind: 'scalar', fieldKind: 'BooleanField', signature: ': bool', isRelation: false,
+        });
       }
       return items;
     }
@@ -1587,9 +1903,13 @@ export class AnalysisDaemon implements vscode.Disposable {
     // member is not in the static surface — defer to Python for
     // project-defined methods and runtime managers.
     if (isNativeFastPathReady()) {
-      const native = nativeResolveOrmMember(modelLabel, receiverKind, name, managerName);
+      const native = withKnownNativeMemberReturn(
+        nativeResolveOrmMember(modelLabel, receiverKind, name, managerName),
+        managerName ? undefined : this.surfaceIndex[modelLabel]?.[receiverKind]?.[name]
+      );
       if (
         native &&
+        (native.item?.source !== 'builtin' || djangoBuiltinAvailable(name, this.currentState.runtime?.djangoVersion)) &&
         (
           native.item?.filePath ||
           native.item?.source === 'builtin' ||
@@ -1662,8 +1982,15 @@ export class AnalysisDaemon implements vscode.Disposable {
       this.currentState.runtime?.bootstrapStatus !== 'ready' ||
       process.env.DJLS_TEST_FORCE_RUNTIME_NOT_READY === '1';
 
+    for (const [index, item] of normalizedItems.entries()) {
+      if (this.lookupCatalog?.fields?.[item.baseModelLabel]) {
+        results[index] = this.resolveLookupPathLocal(item.baseModelLabel, item.value, item.method);
+      }
+    }
+
     if (isNativeFastPathReady()) {
       for (const [index, item] of normalizedItems.entries()) {
+        if (results[index]) continue;
         const native = nativeResolveLookupPath(
           item.baseModelLabel,
           item.value,
@@ -1704,6 +2031,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       }
     } else {
       for (const [index, item] of normalizedItems.entries()) {
+        if (results[index]) continue;
         if (skipPythonForUnresolved) {
           const local = this.resolveLookupPathLocal(
             item.baseModelLabel,
@@ -1757,7 +2085,8 @@ export class AnalysisDaemon implements vscode.Disposable {
     if (LOCAL_LOOKUP_RELATION_ONLY_METHODS.has(method)) {
       const relationOnly = this.resolveRelationOnlyLookupPathLocal(
         baseModelLabel,
-        normalizedValue
+        normalizedValue,
+        method,
       );
       if (relationOnly) {
         return relationOnly;
@@ -1767,8 +2096,10 @@ export class AnalysisDaemon implements vscode.Disposable {
     const parsed = parseLookupChain(
       normalizedValue,
       baseModelLabel,
-      this.localWorkspaceIndex
+      this.localWorkspaceIndex,
+      method,
     );
+    if (parsed.runtimeRequired) return undefined;
     const segments = parsed.segments.filter(Boolean);
     const resolvedCount = parsed.resolvedPath.length;
     const lastResolved = parsed.resolvedPath.at(-1);
@@ -1776,6 +2107,28 @@ export class AnalysisDaemon implements vscode.Disposable {
       LOCAL_LOOKUP_RELATION_ONLY_METHODS.has(method) &&
       parsed.finalField !== undefined &&
       !parsed.finalField.isRelation;
+    const outputField = parsed.finalField;
+    const terminalType = outputField && !outputField.isRelation ? {
+      outputFieldKind: outputField.fieldKind,
+      pythonType: pythonTypeForKind(outputField.fieldKind),
+      isTransformed: parsed.resolvedPath.some((segment) => segment.kind === 'transform'),
+      lookupOperator: parsed.finalLookup,
+      operandPythonType: parsed.finalLookup
+        ? operandPythonType(parsed.finalLookup, pythonTypeForKind(outputField.fieldKind)) : undefined,
+    } : undefined;
+    // Relation terminals have no scalar descriptor. Retain their model label
+    // from the resident index so background inlays need no display-target RPC.
+    const terminalRelation = parsed.finalLookup
+      ? parsed.resolvedPath.at(-2)
+      : lastResolved;
+    const target = !terminalType && terminalRelation && (
+      parsed.state === 'complete' || (parsed.state === 'partial' && resolvedCount >= segments.length)
+    ) && (
+      terminalRelation.kind === 'relation' || terminalRelation.kind === 'reverse_relation'
+    ) ? this.localLookupFieldItem(
+      terminalRelation.modelLabel ?? baseModelLabel,
+      terminalRelation.name,
+    ) : undefined;
 
     if (parsed.state === 'complete') {
       if (
@@ -1792,7 +2145,9 @@ export class AnalysisDaemon implements vscode.Disposable {
       return {
         resolved: true,
         baseModelLabel,
+        target,
         lookupOperator: parsed.finalLookup,
+        terminalType,
       };
     }
 
@@ -1811,7 +2166,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       ) {
         return { resolved: false, reason: 'relation_required', baseModelLabel };
       }
-      return { resolved: true, baseModelLabel };
+      return { resolved: true, baseModelLabel, target, terminalType };
     }
 
     if (parsed.state === 'partial' || parsed.state === 'error') {
@@ -1970,7 +2325,8 @@ export class AnalysisDaemon implements vscode.Disposable {
 
   private resolveRelationOnlyLookupPathLocal(
     baseModelLabel: string,
-    normalizedValue: string
+    normalizedValue: string,
+    method: string,
   ): LookupPathResolution | undefined {
     const segments = normalizedValue.split('__').filter(Boolean);
     if (segments.length === 0) {
@@ -1988,6 +2344,9 @@ export class AnalysisDaemon implements vscode.Disposable {
 
       const field = model.fields.get(segment);
       const relation = this.getLocalRelationInfo(currentModelLabel, segment);
+      if (relation && !relationAllowedForMethod(model, relation, method)) {
+        return { resolved: false, reason: 'relation_required', baseModelLabel, missingSegment: segment, resolvedSegments };
+      }
       const item = this.localLookupFieldItem(
         currentModelLabel,
         segment,
@@ -2086,7 +2445,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       const lookupField = this.localWorkspaceIndex.models
         .get(ownerModelLabel)
         ?.fields.get(lastResolved.name);
-      if (LOCAL_LOOKUP_OPERATOR_METHODS.has(method) && lookupField) {
+      if (supportsLookupTransforms(method) && lookupField) {
         return {
           completionMode: 'field_and_lookup',
           currentModelLabel: relation.targetModelLabel,
@@ -2104,7 +2463,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     if (
       (lastResolved.kind === 'field' || lastResolved.kind === 'transform') &&
       parsed.finalField &&
-      LOCAL_LOOKUP_OPERATOR_METHODS.has(method)
+      supportsLookupTransforms(method)
     ) {
       return {
         completionMode: 'lookup',
@@ -2152,6 +2511,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     currentModelLabel: string,
     directItems: LookupPathItem[],
     currentPartial: string,
+    method: string,
   ): LookupPathItem[] {
     const model = this.localWorkspaceIndex.models.get(currentModelLabel);
     if (!model) {
@@ -2184,6 +2544,7 @@ export class AnalysisDaemon implements vscode.Disposable {
         field,
         '',
         item.name,
+        LOCAL_LOOKUP_OPERATOR_METHODS.has(method),
       )) {
         const prefixedName = `${item.name}__${lookupItem.name}`;
         if (lowerPartial && !prefixedName.toLowerCase().startsWith(lowerPartial)) {
@@ -2219,6 +2580,10 @@ export class AnalysisDaemon implements vscode.Disposable {
       }
 
       for (const field of this.getLocalLookupFieldsForModel(modelLabel)) {
+        const model = this.localWorkspaceIndex.models.get(modelLabel);
+        const eligibleRelation = this.getLocalRelationInfo(modelLabel, field.name);
+        if (model && eligibleRelation && !relationAllowedForMethod(model, eligibleRelation, method)) continue;
+        if (relationOnly && (!model || !eligibleRelation || !relationAllowedForMethod(model, eligibleRelation, method))) continue;
         const pathParts = [...prefixParts, field.name];
         const pathName = pathParts.join('__');
         if (
@@ -2259,6 +2624,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     field: FieldInfo,
     currentPartial: string,
     fieldPath: string = field.name,
+    includeLookups = true,
   ): LookupPathItem[] {
     const lowerPartial = currentPartial.toLowerCase();
     const itemsByName = new Map<string, LookupPathItem>();
@@ -2273,7 +2639,8 @@ export class AnalysisDaemon implements vscode.Disposable {
       );
     }
 
-    for (const lookup of field.lookups) {
+    for (const lookup of includeLookups ? field.lookups : []) {
+      if (field.transforms.includes(lookup)) continue;
       if (lowerPartial && !lookup.toLowerCase().startsWith(lowerPartial)) {
         continue;
       }
@@ -2372,7 +2739,22 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   async stop(): Promise<void> {
+    this.restartRevision++;
+    this.restartQueued = false;
+    this.queuedRestartScope = undefined;
+    this.restartPromise = undefined;
+    await this.stopProcess();
+  }
+
+  private async stopProcess(): Promise<void> {
+    const lifecycle = ++this.lifecycleRevision;
+    this.surfaceCacheContext = null;
+    this.sessionRevision++;
     this.stopRequested = true;
+    const cancel = this.cancelStart;
+    this.startPromise = undefined;
+    this.cancelStart = undefined;
+    cancel?.(new Error('Daemon startup belongs to an inactive daemon session.'));
     this.clearResponseCache();
     this.rejectAllPending(new Error('Analysis daemon stopped.'));
     dropNativeFastPath();
@@ -2385,6 +2767,9 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
 
     await this.terminateProcess(child, stdoutReader);
+
+    // Process exit can unblock a new start before this asynchronous stop returns.
+    if (lifecycle !== this.lifecycleRevision) return;
 
     this.updateState({
       phase: 'stopped',
@@ -2405,6 +2790,7 @@ export class AnalysisDaemon implements vscode.Disposable {
   dispose(): void {
     void this.stop();
     this.stateEmitter.dispose();
+    this.surfaceSnapshotEmitter.dispose();
     this.modelsReindexedEmitter.dispose();
     dropNativeFastPath();
   }
@@ -2418,6 +2804,8 @@ export class AnalysisDaemon implements vscode.Disposable {
       return;
     }
 
+    const nativeOwner = this.nativeStateOwners.get(child);
+    nativeOwner?.beginStop();
     const waitForExit = (timeoutMs: number): Promise<boolean> =>
       new Promise((resolve) => {
         if (child.exitCode !== null || child.signalCode !== null) {
@@ -2455,15 +2843,34 @@ export class AnalysisDaemon implements vscode.Disposable {
       await waitForExit(800);
     }
 
+    await nativeOwner?.waitForStopCleanup();
     this.disposeProcessHandles(child, stdoutReader);
   }
 
   private async startProcess(
     scope?: vscode.ConfigurationScope
   ): Promise<HealthSnapshot> {
+    const lifecycle = ++this.lifecycleRevision;
+    this.surfaceCacheContext = null;
     this.clearResponseCache();
+    this.surfaceSnapshotDecoder.reset();
+    this.surfaceResyncPromise = undefined;
+    this.surfaceResyncNeeded = false;
+    clearTimeout(this.surfaceResyncRetry);
+    this.surfaceResyncRetry = undefined;
     const launchContext = await this.createLaunchContext(scope);
+    if (lifecycle !== this.lifecycleRevision) throw new Error('Daemon startup belongs to an inactive daemon session.');
     this.lastLaunchContext = launchContext;
+    const serverModuleRoot = path.join(this.context.extensionPath, 'python');
+    const environment = buildPythonEnvironment(serverModuleRoot, launchContext.pythonPath);
+    if (launchContext.settingsModule) {
+      environment.DJANGO_SETTINGS_MODULE = launchContext.settingsModule;
+    }
+    this.surfaceCacheContext = {
+      owner: String(lifecycle), workspaceRoot: launchContext.workspaceRoot,
+      pythonPath: launchContext.pythonPath, settingsModule: launchContext.settingsModule?.trim() || null,
+      launchEnvironmentFingerprint: fingerprintLaunchEnvironment(environment),
+    };
     this.stopRequested = false;
     this.updateState({
       phase: 'starting',
@@ -2476,26 +2883,34 @@ export class AnalysisDaemon implements vscode.Disposable {
       settingsModule: launchContext.settingsModule,
     });
 
-    const serverModuleRoot = path.join(this.context.extensionPath, 'python');
-    const environment = buildPythonEnvironment(
-      serverModuleRoot,
-      launchContext.pythonPath
-    );
-
-    if (launchContext.settingsModule) {
-      environment.DJANGO_SETTINGS_MODULE = launchContext.settingsModule;
+    const nativeLaunch = daemonProcessLaunch(this.context.extensionPath, launchContext.pythonPath);
+    const preparedState = nativeLaunch.stateChannel
+      ? prepareNativeDaemonState(environment.TMPDIR || '/tmp', nativeLaunch.command, message => this.log('info', message))
+      : undefined;
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(
+        nativeLaunch.command,
+        [...(preparedState?.argsPrefix ?? []),
+          '-m', 'django_orm_intellisense', '--stdio', '--workspace', launchContext.workspaceRoot],
+        {
+          cwd: launchContext.workspaceRoot,
+          env: environment,
+          stdio: preparedState?.stdio ?? 'pipe',
+          ...(nativeLaunch.argv0 ? { argv0: nativeLaunch.argv0 } : {}),
+        }
+      ) as ChildProcessWithoutNullStreams; // The first three descriptors are explicitly pipes.
+    } catch (error) {
+      await preparedState?.disposeUnspawned();
+      throw error;
+    } finally {
+      preparedState?.closeDescriptors();
     }
-
-    const child = spawn(
-      launchContext.pythonPath,
-      ['-m', 'django_orm_intellisense', '--stdio', '--workspace', launchContext.workspaceRoot],
-      {
-        cwd: launchContext.workspaceRoot,
-        env: environment,
-      }
-    );
+    const nativeOwner = preparedState?.bind(child);
+    if (nativeOwner) this.nativeStateOwners.set(child, nativeOwner);
 
     this.process = child;
+    this.sessionRevision++;
     const stdoutReader = readline.createInterface({ input: child.stdout });
     this.stdoutReader = stdoutReader;
 
@@ -2511,7 +2926,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       }
       this.rejectAllPending(error);
       this.disposeProcessHandles(child, stdoutReader);
-      this.updateStateFromError(error);
+      if (!this.stopRequested) this.updateStateFromError(error);
     });
 
     child.once('exit', (code, signal) => {
@@ -2565,46 +2980,89 @@ export class AnalysisDaemon implements vscode.Disposable {
     });
 
     stdoutReader.on('line', (line) => {
-      this.handleServerMessage(line);
+      if (this.process === child && !this.stopRequested) this.handleServerMessage(line);
     });
 
     try {
-      const initializeResult = await this.request<InitializeResult>(
+      this.pendingSourceObservationBoundary = captureNativeSourceBoundary();
+      const [initializeResult] = await Promise.all([this.request<InitializeResult>(
         'initialize',
         {
           workspaceRoot: launchContext.workspaceRoot,
           settingsModule: launchContext.settingsModule,
           deferRuntime: true,
+          surfaceSnapshotTransport: 1,
+          sourceObservationTransport: 1,
+          initializeSurfaceTransport: 1,
         },
         INITIALIZE_REQUEST_TIMEOUT_MS,
         false,
         'initialSync'
-      );
-      const snapshot = this.decorateSnapshot(initializeResult.health);
-      this.surfaceIndex = initializeResult.surfaceIndex ?? {};
-      this.surfaceFingerprints = initializeResult.surfaceFingerprints ?? {};
-      this.customLookups = initializeResult.customLookups ?? {};
-      this.customLookupsFingerprint = initializeResult.customLookupsFingerprint;
-      this.staticFallback = initializeResult.staticFallback ?? null;
-      this.staticFallbackFingerprint = initializeResult.staticFallbackFingerprint ?? null;
-      this.rebuildModelLabelByName();
-      this.rebuildModelNames();
-      this.rebuildLocalWorkspaceIndex();
-      console.log(`[PERF] daemon initialized: modelNames=${this.modelNames.size} surfaceIndex=${Object.keys(this.surfaceIndex).length} modelLabelByName=${this.modelLabelByName.size}`);
-      this.refreshNativeFastPathFromSurface('initialize');
-      this.updateState(snapshot);
+      ), nativeOwner?.ready]);
+      if (lifecycle !== this.lifecycleRevision || this.process !== child || this.stopRequested) {
+        throw new Error('Daemon initialization belongs to an inactive daemon session.');
+      }
+      const snapshot = this.adoptInitializeResult(initializeResult, 'initialize');
+      if (this.sourceObservationContext && !this.surfaceSnapshotDecoder.hasBaseline) this.requestSurfaceSnapshotResync();
       return snapshot;
     } catch (error) {
-      if (child.pid !== undefined) {
+      // Ownership readiness can fail before the initialize request settles.
+      // Reject only this still-current child's requests, before detaching it;
+      // a later session must retain its independent pending requests.
+      if (this.process === child) {
+        this.rejectAllPending(error instanceof Error ? error : new Error(String(error)));
+      }
+      if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
         this.intentionalExitProcessIds.add(child.pid);
       }
       this.disposeProcessHandles(child, stdoutReader);
       if (!child.killed) {
         child.kill();
       }
-      this.updateStateFromError(error);
+      if (lifecycle === this.lifecycleRevision) this.updateStateFromError(error);
       throw error;
     }
+  }
+
+  private adoptInitializeResult(initializeResult: InitializeResult, reason: string): HealthSnapshot {
+    initializeResult = this.surfaceSnapshotDecoder.decodeInitialize(initializeResult,
+      Boolean(initializeResult.sourceObservationContext) && isSurfaceSourceProvenance(initializeResult.sourceProvenance));
+    const snapshot = this.decorateSnapshot(initializeResult.health);
+    const editablePaths = [...new Set(
+      (initializeResult.venvInfo?.editableInstalls ?? []).map(entry => entry.path))];
+    this.editableSourceRoots = [...new Set(editablePaths.map(normalizeSourcePath))];
+    const context = initializeResult.sourceObservationContext;
+    if (context) {
+      this.editableSourceRoots = [...new Set(context.roots
+        .filter(root => root.canonical !== snapshot.workspaceRoot).map(root => root.canonical))];
+      const roots = context.roots.map(root => ({...root}));
+      const rawWorkspace = this.lastLaunchContext?.workspaceRoot;
+      if (rawWorkspace && !roots.some(root => root.raw === rawWorkspace)) {
+        roots.push({raw: rawWorkspace, canonical: snapshot.workspaceRoot ?? normalizeSourcePath(rawWorkspace)});
+      }
+      this.sourceObservationContext = Object.freeze({version: 1 as const,
+        boundary: this.pendingSourceObservationBoundary,
+        configurationFiles: Object.freeze([...new Set([...context.configurationFiles, ...roots.map(root => root.raw)])]),
+        sitePackages: Object.freeze([...context.sitePackages]),
+        roots: Object.freeze(roots.map(root => Object.freeze(root)))});
+    } else this.sourceObservationContext = undefined;
+    this.surfaceIndex = initializeResult.surfaceIndex ?? {};
+    this.sourceProvenance = initializeResult.sourceProvenance ?? null;
+    this.surfaceFingerprints = initializeResult.surfaceFingerprints ?? {};
+    this.customLookups = initializeResult.customLookups ?? {};
+    this.lookupCatalog = initializeResult.lookupCatalog;
+    this.customLookupsFingerprint = initializeResult.customLookupsFingerprint;
+    this.staticFallback = initializeResult.staticFallback ?? null;
+    this.staticFallbackFingerprint = initializeResult.staticFallbackFingerprint ?? null;
+    this.metadataRetired = false;
+    this.rebuildModelLabelByName();
+    this.rebuildModelNames();
+    this.rebuildLocalWorkspaceIndex();
+    console.log(`[PERF] daemon initialized: modelNames=${this.modelNames.size} surfaceIndex=${Object.keys(this.surfaceIndex).length} modelLabelByName=${this.modelLabelByName.size}`);
+    this.refreshNativeFastPathFromSurface(reason);
+    this.updateState(snapshot);
+    this.surfaceSnapshotEmitter.fire();
+    return snapshot;
   }
 
   private async createLaunchContext(
@@ -2641,6 +3099,25 @@ export class AnalysisDaemon implements vscode.Disposable {
   }
 
   private request<T>(
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs: number = REQUEST_TIMEOUT_MS,
+    background: boolean = false,
+    source: IpcRequestSource = this.currentRequestSource()
+  ): Promise<T> {
+    const child = this.process, session = this.sessionRevision;
+    if (!child || !child.stdin.writable) return this.requestRaw<T>(method, params, timeoutMs, background, source);
+    if (this.metadataRetired && this.sourceObservationContext && this.currentState.phase === 'error'
+        && method !== 'initialize') return Promise.reject(new Error('Source configuration is not ready.'));
+    return this.sourceConfigurationRequests.request(
+      method, timeoutMs,
+      remaining => this.requestRaw<T>(method, params, remaining, background, source),
+      () => this.process === child && this.sessionRevision === session && !this.stopRequested,
+      this.abortSignalContext.getStore(),
+    );
+  }
+
+  private requestRaw<T>(
     method: string,
     params: Record<string, unknown>,
     timeoutMs: number = REQUEST_TIMEOUT_MS,
@@ -2721,7 +3198,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     // This prevents orphaned hover resolution bodies from issuing new IPC
     // calls after the hover has been cancelled / timed out.
     if (this.isAborted()) {
-      this.output.appendLine(
+      this.writeOutputLine(
         `  [IPC:abort] ${method} rejected (aborted) pending=${this.pendingRequests.size}`
       );
       _trackCachedRequest();
@@ -2761,7 +3238,7 @@ export class AnalysisDaemon implements vscode.Disposable {
 
     // Reject if pending queue is full to prevent backpressure freeze
     if (this.pendingRequests.size >= MAX_PENDING_REQUESTS) {
-      this.output.appendLine(
+      this.writeOutputLine(
         `  [IPC] DROPPING ${method} (source=${source}): pending queue full (${this.pendingRequests.size}/${MAX_PENDING_REQUESTS})`
       );
       return Promise.reject(new Error(`Pending request queue full (${MAX_PENDING_REQUESTS}). Dropping ${method}.`));
@@ -2770,7 +3247,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     // Reject oversized payloads before serialization stalls the event loop
     const serializedParams = JSON.stringify(params);
     if (serializedParams.length > MAX_PAYLOAD_BYTES) {
-      this.output.appendLine(
+      this.writeOutputLine(
         `  [IPC] DROPPING ${method} (source=${source}): payload too large (${(serializedParams.length / 1024).toFixed(1)}KB > ${MAX_PAYLOAD_BYTES / 1024}KB)`
       );
       return Promise.reject(new Error(`Payload too large for ${method}: ${(serializedParams.length / 1024).toFixed(1)}KB`));
@@ -2780,7 +3257,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     const queueSize = this.pendingRequests.size;
     if (queueSize >= 5 && queueSize % 5 === 0) {
       const pending = [...this.pendingRequests.keys()].join(', ');
-      this.output.appendLine(
+      this.writeOutputLine(
         `  [IPC:queue] pending=${queueSize} adding=${method}(source=${source}) ids=[${pending}]`
       );
     }
@@ -2826,7 +3303,7 @@ export class AnalysisDaemon implements vscode.Disposable {
 
     const payloadKb = trimmed.length / 1024;
     if (payloadKb >= 10) {
-      this.output.appendLine(
+      this.writeOutputLine(
         `  [IPC:recv] ${message.id} payload=${payloadKb.toFixed(1)}KB`
       );
     }
@@ -2867,12 +3344,46 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
 
     if (!targetProcess || this.process === targetProcess) {
+      this.sourceConfigurationRequests.reset();
+      this.sourceObservationContext = undefined;
+      this.initializationPending = false;
+      this.pendingSourceObservationBoundary = undefined;
+      if (this.process) this.sessionRevision++;
       this.process = undefined;
+      this.surfaceCacheContext = null;
+      this.surfaceSnapshotDecoder.reset();
+      this.surfaceResyncPromise = undefined;
+      this.surfaceResyncNeeded = false;
+      clearTimeout(this.surfaceResyncRetry);
+      this.surfaceResyncRetry = undefined;
+      this.retireMetadata();
     }
 
     if (!targetReader || this.stdoutReader === targetReader) {
       this.stdoutReader = undefined;
     }
+  }
+
+  private retireMetadata(): void {
+    this.sourceProvenance = null;
+    this.clearResponseCache();
+    dropNativeFastPath();
+    if (this.metadataRetired) return;
+    this.surfaceIndex = {};
+    this.surfaceFingerprints = {};
+    this.customLookups = {};
+    this.lookupCatalog = undefined;
+    this.customLookupsFingerprint = undefined;
+    this.staticFallback = null;
+    this.staticFallbackFingerprint = null;
+    this.modelNames = new Set();
+    this.modelLabelByName = new Map();
+    this.localWorkspaceIndex = createEmptyWorkspaceIndex();
+    this.localModelFingerprints = new Map();
+    this._shortNameFromFullLabelIndex = null;
+    this.metadataRetired = true;
+    this.modelsReindexedEmitter.fire();
+    this.surfaceSnapshotEmitter.fire();
   }
 
   private updateState(snapshot: HealthSnapshot): void {
@@ -2941,9 +3452,18 @@ export class AnalysisDaemon implements vscode.Disposable {
     );
   }
 
+  private writeOutputLine(message: string): void {
+    try {
+      this.output.appendLine(message);
+    } catch {
+      // The SDK may dispose the channel before a child exits or its pipes
+      // finish. Diagnostics must not prevent rejection or handle cleanup.
+    }
+  }
+
   /** Write a diagnostic line to the output channel (always, regardless of logLevel). */
   logDiagnostic(message: string): void {
-    this.output.appendLine(message);
+    this.writeOutputLine(message);
     if (isTestLogCaptureEnabled()) {
       testLogBuffer.push(message);
       if (testLogBuffer.length > TEST_LOG_BUFFER_LIMIT) {
@@ -2962,7 +3482,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       return;
     }
 
-    this.output.appendLine(message);
+    this.writeOutputLine(message);
   }
 
   private clearResponseCache(): void {
@@ -3006,6 +3526,7 @@ export class AnalysisDaemon implements vscode.Disposable {
   private handleServerNotification(
     message: Extract<ServerMessage, { event: string }>
   ): void {
+    if (this.initializationPending) return;
     if (message.event === 'healthChanged') {
       if (!message.params?.health) {
         return;
@@ -3020,24 +3541,72 @@ export class AnalysisDaemon implements vscode.Disposable {
       return;
     }
 
+    if (message.params) {
+      try {
+        message = { ...message, params: this.surfaceSnapshotDecoder.decode(message.params) };
+        if (message.params?.surfaceIndex) {
+          this.surfaceResyncNeeded = false;
+          clearTimeout(this.surfaceResyncRetry);
+          this.surfaceResyncRetry = undefined;
+        }
+      } catch (error) {
+        this.surfaceSnapshotDecoder.reset();
+        this.sourceProvenance = null;
+        this.surfaceResyncNeeded = true;
+        this.log('info', `Surface snapshot requires resynchronization: ${error instanceof Error ? error.message : String(error)}`);
+        this.requestSurfaceSnapshotResync();
+        return;
+      }
+    }
+
     this.clearResponseCache();
+    // A partial/legacy publication cannot retain proof from another frame.
+    this.sourceProvenance = null;
     if (message.params?.surfaceIndex) {
       this.surfaceIndex = message.params.surfaceIndex;
+      this.sourceProvenance = message.params.sourceProvenance ?? null;
       this.surfaceFingerprints = message.params.surfaceFingerprints ?? {};
       this.customLookups = message.params.customLookups ?? {};
+      this.lookupCatalog = message.params.lookupCatalog;
       this.customLookupsFingerprint = message.params.customLookupsFingerprint;
       this.staticFallback = message.params.staticFallback ?? null;
       this.staticFallbackFingerprint = message.params.staticFallbackFingerprint ?? null;
+      this.metadataRetired = false;
       this.rebuildModelLabelByName();
       this.rebuildModelNames();
       this.rebuildLocalWorkspaceIndex();
       this.refreshNativeFastPathFromSurface('surfaceIndexChanged');
+      this.modelsReindexedEmitter.fire();
     }
 
     const nextSnapshot = message.params?.health
       ? this.decorateSnapshot(message.params.health)
       : this.currentState;
     this.updateState(nextSnapshot);
+    this.surfaceSnapshotEmitter.fire();
+  }
+
+  private requestSurfaceSnapshotResync(): void {
+    if (this.surfaceResyncPromise || !this.process) return;
+    clearTimeout(this.surfaceResyncRetry);
+    this.surfaceResyncRetry = undefined;
+    const session = this.sessionRevision;
+    const request = this.request<{ resynced: boolean }>('resyncSurfaceSnapshot', {},
+      INITIALIZE_REQUEST_TIMEOUT_MS, false, 'initialSync').then(() => {}, error => {
+        if (session === this.sessionRevision) this.log('info', `Surface resynchronization failed: ${String(error)}`);
+      }).finally(() => {
+        if (this.surfaceResyncPromise !== request) return;
+        this.surfaceResyncPromise = undefined;
+        if (this.surfaceResyncNeeded && session === this.sessionRevision && this.process) {
+          const timer = setTimeout(() => {
+            if (this.surfaceResyncRetry !== timer) return;
+            this.surfaceResyncRetry = undefined;
+            if (session === this.sessionRevision && this.surfaceResyncNeeded) this.requestSurfaceSnapshotResync();
+          }, 250);
+          this.surfaceResyncRetry = timer;
+        }
+      });
+    this.surfaceResyncPromise = request;
   }
 
   private parseServerMessage(line: string): ServerMessage | undefined {

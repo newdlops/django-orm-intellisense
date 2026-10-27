@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use napi::bindgen_prelude::{AsyncTask, Buffer, Error as NapiError, Result as NapiResult, Status};
@@ -10,16 +10,21 @@ use napi::{Env, Task};
 use napi_derive::napi;
 
 use django_orm_core::cache::{self, CacheError, CacheLoad};
-use django_orm_core::discovery;
 use django_orm_core::features;
 use django_orm_core::semantic::{build_model_graph, ModelGraph};
 use django_orm_core::static_index::{self, StaticIndex};
+use django_orm_core::{discovery, source_snapshot};
+
+type SurfaceIndexJson = std::collections::BTreeMap<
+    String,
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<Option<String>>>>,
+>;
 
 /// Process-global resolved workspace state. `native_init` populates it
 /// from a workspace root; fast-path query fns read under a shared lock.
 /// Rebuilds on subsequent `native_init` calls with a different root or
 /// explicit cache-bust flag.
-static NATIVE_STATE: RwLock<Option<NativeState>> = RwLock::new(None);
+static NATIVE_STATE: RwLock<Option<Arc<NativeState>>> = RwLock::new(None);
 
 /// Monotonic install counter. Bumped each time a fresh `NativeState` is
 /// installed (native_init / native_init_from_surface). `EnsureAstModulesTask`
@@ -27,12 +32,37 @@ static NATIVE_STATE: RwLock<Option<NativeState>> = RwLock::new(None);
 /// its off-thread parse, so a concurrent re-init/re-hydrate for the SAME root
 /// cannot be clobbered by the now-stale merge.
 static STATE_EPOCH: AtomicU64 = AtomicU64::new(1);
+// Reservations also invalidate work that has not installed its state yet.
+// A drop or a newer hydrate must win even if an older worker finishes last.
+static STATE_REQUEST: AtomicU64 = AtomicU64::new(0);
+static AST_REQUEST: AtomicU64 = AtomicU64::new(0);
+static LIVE_STATES: AtomicU64 = AtomicU64::new(0);
+
+struct StateLifetime;
+
+impl StateLifetime {
+    fn new() -> Self {
+        LIVE_STATES.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for StateLifetime {
+    fn drop(&mut self) {
+        LIVE_STATES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn next_state_request() -> u64 {
+    STATE_REQUEST.fetch_add(1, Ordering::SeqCst) + 1
+}
 
 fn next_state_epoch() -> u64 {
     STATE_EPOCH.fetch_add(1, Ordering::SeqCst)
 }
 
 struct NativeState {
+    _lifetime: StateLifetime,
     root: PathBuf,
     static_index: StaticIndex,
     graph: ModelGraph,
@@ -58,12 +88,44 @@ pub fn native_version() -> &'static str {
 pub fn save_cache_blob(path: String, metadata: Buffer, payload: Buffer) -> NapiResult<()> {
     let meta_bytes: &[u8] = &metadata;
     let payload_bytes: &[u8] = &payload;
-    cache::save(
-        &PathBuf::from(path),
-        &meta_bytes.to_vec(),
-        &payload_bytes.to_vec(),
-    )
-    .map_err(cache_to_napi)
+    cache::save_byte_chunks(&PathBuf::from(path), meta_bytes, &[payload_bytes])
+        .map_err(cache_to_napi)
+}
+
+pub struct CacheSaveTask {
+    path: PathBuf,
+    metadata: Vec<u8>,
+    chunks: Vec<Buffer>,
+}
+
+#[napi]
+impl Task for CacheSaveTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> NapiResult<()> {
+        cache::save_byte_chunks(&self.path, &self.metadata, &self.chunks).map_err(cache_to_napi)
+    }
+
+    fn resolve(&mut self, _env: Env, _output: ()) -> NapiResult<()> {
+        self.chunks.clear();
+        Ok(())
+    }
+}
+
+/// Stream serialized chunks into an atomic cache envelope on a worker.
+/// The caller must not modify the buffers until the promise resolves.
+#[napi]
+pub fn save_cache_blob_chunks_async(
+    path: String,
+    metadata: Buffer,
+    chunks: Vec<Buffer>,
+) -> AsyncTask<CacheSaveTask> {
+    AsyncTask::new(CacheSaveTask {
+        path: PathBuf::from(path),
+        metadata: metadata.to_vec(),
+        chunks,
+    })
 }
 
 /// Load a cache envelope. Returns `null` on miss, otherwise
@@ -175,6 +237,178 @@ pub fn file_fingerprint(relative_path: String, size: u32, mtime_ns: String) -> N
     ))
 }
 
+#[napi(object)]
+pub struct PythonSourceEntryV2Js {
+    pub relative_path: String,
+    pub size: String,
+    pub mtime_ns: String,
+    pub ctime_ns: String,
+    pub device: String,
+    pub inode: String,
+    pub fingerprint: String,
+}
+
+#[napi(object)]
+pub struct PythonSourceSnapshotV2Js {
+    pub fingerprint_version: u32,
+    pub root: String,
+    pub fingerprint: String,
+    pub entries: Vec<PythonSourceEntryV2Js>,
+    pub directory_fingerprints: Vec<Vec<String>>,
+}
+
+fn source_snapshot_error(error: std::io::Error) -> NapiError {
+    NapiError::new(
+        Status::GenericFailure,
+        format!("Source snapshot v2: {error}"),
+    )
+}
+
+fn source_snapshot_v2(
+    root: &str,
+    extra_roots: Vec<String>,
+) -> NapiResult<source_snapshot::SourceSnapshot> {
+    let extras: Vec<PathBuf> = extra_roots.into_iter().map(PathBuf::from).collect();
+    let references: Vec<&std::path::Path> = extras.iter().map(PathBuf::as_path).collect();
+    source_snapshot::snapshot_python_sources(std::path::Path::new(root), &references)
+        .map_err(source_snapshot_error)
+}
+
+/// Full versioned inventory for diagnostics. The legacy API stays unchanged.
+#[napi]
+pub fn snapshot_python_sources_v2(
+    root: String,
+    extra_roots: Option<Vec<String>>,
+) -> napi::Result<PythonSourceSnapshotV2Js> {
+    let snapshot = source_snapshot_v2(&root, extra_roots.unwrap_or_default())?;
+    Ok(PythonSourceSnapshotV2Js {
+        fingerprint_version: source_snapshot::FINGERPRINT_VERSION,
+        root: snapshot.root,
+        fingerprint: snapshot.fingerprint,
+        entries: snapshot
+            .entries
+            .into_iter()
+            .map(|entry| PythonSourceEntryV2Js {
+                relative_path: entry.relative_path,
+                size: entry.identity.size.to_string(),
+                mtime_ns: entry.identity.mtime_ns.to_string(),
+                ctime_ns: entry.identity.ctime_ns.to_string(),
+                device: entry.identity.device.to_string(),
+                inode: entry.identity.inode.to_string(),
+                fingerprint: entry.fingerprint,
+            })
+            .collect(),
+        directory_fingerprints: snapshot
+            .directory_fingerprints
+            .into_iter()
+            .map(|(name, value)| vec![name, value])
+            .collect(),
+    })
+}
+
+#[napi(object)]
+pub struct PythonSourceFingerprintV2Js {
+    pub fingerprint_version: u32,
+    pub root: String,
+    pub fingerprint: String,
+    pub file_count: u32,
+}
+
+pub struct SourceFingerprintTask {
+    root: String,
+    extra_roots: Vec<String>,
+}
+
+#[napi]
+impl Task for SourceFingerprintTask {
+    type Output = PythonSourceFingerprintV2Js;
+    type JsValue = PythonSourceFingerprintV2Js;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let snapshot = source_snapshot_v2(&self.root, std::mem::take(&mut self.extra_roots))?;
+        let file_count = u32::try_from(snapshot.entries.len())
+            .map_err(|_| NapiError::new(Status::GenericFailure, "Source inventory is too large"))?;
+        // Drop the full inventory on this worker. The JS side receives only
+        // the versioned fingerprint, never thousands of per-file objects.
+        Ok(PythonSourceFingerprintV2Js {
+            fingerprint_version: source_snapshot::FINGERPRINT_VERSION,
+            root: snapshot.root,
+            fingerprint: snapshot.fingerprint,
+            file_count,
+        })
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Filesystem state only; callers still need producer-bound metadata/context.
+#[napi]
+pub fn fingerprint_python_sources_v2_async(
+    root: String,
+    extra_roots: Option<Vec<String>>,
+) -> AsyncTask<SourceFingerprintTask> {
+    AsyncTask::new(SourceFingerprintTask {
+        root,
+        extra_roots: extra_roots.unwrap_or_default(),
+    })
+}
+
+#[napi(object)]
+pub struct PythonSourceProofJs {
+    pub fingerprint_version: u32,
+    pub membership_version: u32,
+    pub root: String,
+    pub fingerprint: String,
+    pub membership_fingerprint: String,
+    pub file_count: u32,
+}
+
+pub struct SourceProofTask {
+    root: String,
+    extra_roots: Vec<String>,
+}
+
+#[napi]
+impl Task for SourceProofTask {
+    type Output = PythonSourceProofJs;
+    type JsValue = PythonSourceProofJs;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let snapshot = source_snapshot_v2(&self.root, std::mem::take(&mut self.extra_roots))?;
+        let membership_fingerprint =
+            source_snapshot::membership_fingerprint(&snapshot).map_err(source_snapshot_error)?;
+        Ok(PythonSourceProofJs {
+            fingerprint_version: source_snapshot::FINGERPRINT_VERSION,
+            membership_version: source_snapshot::MEMBERSHIP_VERSION,
+            file_count: u32::try_from(snapshot.entries.len()).map_err(|_| {
+                NapiError::new(Status::GenericFailure, "Source inventory is too large")
+            })?,
+            root: snapshot.root,
+            fingerprint: snapshot.fingerprint,
+            membership_fingerprint,
+        })
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Complete stat and canonical witnesses, computed and released on a worker.
+/// These describe current files; the payload must carry its producer's proof.
+#[napi]
+pub fn fingerprint_python_source_proof_async(
+    root: String,
+    extra_roots: Option<Vec<String>>,
+) -> AsyncTask<SourceProofTask> {
+    AsyncTask::new(SourceProofTask {
+        root,
+        extra_roots: extra_roots.unwrap_or_default(),
+    })
+}
+
 /// Build a static index over the given workspace. Returns the index as
 /// JSON bytes (serde_json). The TS side parses what it needs — no
 /// structural napi coupling to the Rust type layout.
@@ -256,6 +490,7 @@ fn current_time_ms() -> u128 {
 /// call on the same root is a no-op hit.
 #[napi]
 pub fn native_init(root: String, force_rebuild: Option<bool>) -> NapiResult<NativeInitResult> {
+    next_state_request();
     let force = force_rebuild.unwrap_or(false);
     let root_path = PathBuf::from(&root);
 
@@ -288,12 +523,10 @@ pub fn native_init(root: String, force_rebuild: Option<bool>) -> NapiResult<Nati
     }
 
     let t0 = Instant::now();
-    let snap = discovery::snapshot_python_sources(&root_path, &[]);
-    let files: Vec<PathBuf> = snap
-        .entries
-        .iter()
-        .map(|e| root_path.join(&e.relative_path))
-        .collect();
+    // Parsing reads current contents; no source fingerprint is consumed here.
+    // Keep discovery's path exclusions/order without statting and hashing every
+    // file and directory merely to discard that metadata.
+    let files = discovery::iter_python_files(&root_path);
     let mut idx = static_index::build_static_index(&root_path, &files);
     let parsed_file_count = idx.modules.len() as u32;
     let parse_failure_count = files.len().saturating_sub(idx.modules.len()) as u32;
@@ -330,13 +563,14 @@ pub fn native_init(root: String, force_rebuild: Option<bool>) -> NapiResult<Nati
     };
 
     let mut guard = NATIVE_STATE.write().map_err(poisoned)?;
-    *guard = Some(NativeState {
+    *guard = Some(Arc::new(NativeState {
+        _lifetime: StateLifetime::new(),
         root: root_path,
         static_index: idx,
         graph,
         built_at_ms: current_time_ms(),
         epoch: next_state_epoch(),
-    });
+    }));
     features::clear_descendant_cache();
     features::clear_export_cache();
     Ok(result)
@@ -344,11 +578,45 @@ pub fn native_init(root: String, force_rebuild: Option<bool>) -> NapiResult<Nati
 
 #[napi]
 pub fn native_drop() {
+    next_state_request();
+    AST_REQUEST.fetch_add(1, Ordering::SeqCst);
     if let Ok(mut guard) = NATIVE_STATE.write() {
         *guard = None;
     }
     features::clear_descendant_cache();
     features::clear_export_cache();
+}
+
+pub struct DropStateTask {
+    state: Option<Arc<NativeState>>,
+    request: u64,
+}
+
+impl Task for DropStateTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> NapiResult<()> {
+        drop(self.state.take());
+        if STATE_REQUEST.load(Ordering::SeqCst) == self.request {
+            features::clear_descendant_cache();
+            features::clear_export_cache();
+        }
+        Ok(())
+    }
+
+    fn resolve(&mut self, _env: Env, _output: ()) -> NapiResult<()> {
+        Ok(())
+    }
+}
+
+/// Detach immediately; destroy the index and graph on the worker thread.
+#[napi]
+pub fn native_drop_async() -> AsyncTask<DropStateTask> {
+    let request = next_state_request();
+    AST_REQUEST.fetch_add(1, Ordering::SeqCst);
+    let state = NATIVE_STATE.write().ok().and_then(|mut guard| guard.take());
+    AsyncTask::new(DropStateTask { state, request })
 }
 
 /// Build the resident state from a Python-produced surfaceIndex. This
@@ -371,21 +639,31 @@ pub fn native_init_from_surface(
     root: String,
     surface_bytes: Buffer,
 ) -> NapiResult<NativeInitResult> {
-    use django_orm_core::static_index::{
-        DefinitionLocation, FieldCandidate, ModelCandidate, ModuleIndex, StaticIndex,
-    };
-    use std::collections::BTreeMap;
+    next_state_request();
+    let (mut state, result) = build_surface_state(root, &surface_bytes)?;
+    state.epoch = next_state_epoch();
+    let mut guard = NATIVE_STATE.write().map_err(poisoned)?;
+    *guard = Some(Arc::new(state));
+    features::clear_descendant_cache();
+    features::clear_export_cache();
+    Ok(result)
+}
+
+fn build_surface_state(
+    root: String,
+    surface_bytes: &[u8],
+) -> NapiResult<(NativeState, NativeInitResult)> {
+    use django_orm_core::static_index::{FieldCandidate, ModelCandidate, ModuleIndex, StaticIndex};
 
     let t0 = Instant::now();
     let root_path = PathBuf::from(&root);
 
-    let surface_json: BTreeMap<String, BTreeMap<String, BTreeMap<String, Vec<Option<String>>>>> =
-        serde_json::from_slice(&surface_bytes).map_err(|e| {
-            NapiError::new(
-                Status::InvalidArg,
-                format!("surfaceIndex JSON parse failed: {e}"),
-            )
-        })?;
+    let surface_json: SurfaceIndexJson = serde_json::from_slice(surface_bytes).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("surfaceIndex JSON parse failed: {e}"),
+        )
+    })?;
 
     let mut model_candidates: Vec<ModelCandidate> = Vec::with_capacity(surface_json.len());
     let mut fields: Vec<FieldCandidate> = Vec::new();
@@ -454,7 +732,16 @@ pub fn native_init_from_surface(
                         (true, Some(dir.to_string()), fk)
                     }
                     Some("related_manager") => {
-                        (true, Some("reverse".to_string()), "ReverseRelation")
+                        let is_reverse = is_reverse_member || member_kind.is_none();
+                        (
+                            true,
+                            Some(if is_reverse { "reverse" } else { "forward" }.to_string()),
+                            if is_reverse {
+                                "ReverseRelation"
+                            } else {
+                                "ManyToManyField"
+                            },
+                        )
                     }
                     Some("scalar") => (false, None, "Field"),
                     _ => continue,
@@ -486,17 +773,18 @@ pub fn native_init_from_surface(
         }
     }
 
-    // Synthesize Django-automatic fields that the runtime exposes
-    // but aren't always emitted into the surface payload:
-    //   - `pk` (primary key alias, BigAutoField on modern Django)
-    //   - `id` (default PK field name)
-    //   - `<fk>_id` (column attname for every forward FK / OneToOne)
-    // The hover / lookup assertions in the fixture suite depend on
-    // these being present on every concrete model.
-    use std::collections::HashSet;
+    // Preserve complete runtime fields, while filling defaults omitted by
+    // older partial surfaces. A supplied `pk` is authoritative: custom
+    // primary keys do not imply that a field named `id` exists.
+    use std::collections::{HashMap, HashSet};
     let existing_names: HashSet<(String, String)> = fields
         .iter()
         .map(|f| (f.model_label.clone(), f.name.clone()))
+        .collect();
+    let id_kinds: HashMap<String, String> = fields
+        .iter()
+        .filter(|f| f.name == "id")
+        .map(|f| (f.model_label.clone(), f.field_kind.clone()))
         .collect();
 
     let mut fk_attnames: Vec<(String, String)> = Vec::new();
@@ -532,6 +820,13 @@ pub fn native_init_from_surface(
         }
     }
     for candidate in &model_candidates {
+        if existing_names.contains(&(candidate.label.clone(), "pk".to_string())) {
+            continue;
+        }
+        let primary_key_kind = id_kinds
+            .get(&candidate.label)
+            .map(String::as_str)
+            .unwrap_or("BigAutoField");
         for synthetic in &["pk", "id"] {
             if !existing_names.contains(&(candidate.label.clone(), synthetic.to_string())) {
                 // Anchor the synthetic PK to the model class location
@@ -544,7 +839,7 @@ pub fn native_init_from_surface(
                     file_path: candidate.file_path.clone(),
                     line: candidate.line,
                     column: candidate.column,
-                    field_kind: "BigAutoField".into(),
+                    field_kind: primary_key_kind.into(),
                     is_relation: false,
                     relation_direction: None,
                     related_model_label: None,
@@ -561,6 +856,7 @@ pub fn native_init_from_surface(
     // only needs model_candidates + fields. Project methods are
     // populated later by `native_ensure_ast_modules`.
     let static_index = StaticIndex {
+        cache_generation: StaticIndex::default().cache_generation,
         model_candidates: model_candidates.clone(),
         fields,
         modules: Vec::<ModuleIndex>::new(),
@@ -591,19 +887,83 @@ pub fn native_init_from_surface(
         expanded_model_count: 0,
     };
 
-    let mut guard = NATIVE_STATE.write().map_err(poisoned)?;
-    *guard = Some(NativeState {
+    let state = NativeState {
+        _lifetime: StateLifetime::new(),
         root: root_path,
         static_index,
         graph,
         built_at_ms: current_time_ms(),
-        epoch: next_state_epoch(),
-    });
-    features::clear_descendant_cache();
-    // Silence unused import warning — DefinitionLocation is a type we
-    // may need once we accept richer field metadata from surface.
-    let _ = std::marker::PhantomData::<DefinitionLocation>;
-    Ok(result)
+        epoch: 0,
+    };
+    Ok((state, result))
+}
+
+pub struct SurfaceInitTask {
+    root: String,
+    surface_chunks: Vec<Vec<u8>>,
+    request: u64,
+}
+
+impl Task for SurfaceInitTask {
+    type Output = Option<NativeInitResult>;
+    type JsValue = Option<NativeInitResult>;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        if STATE_REQUEST.load(Ordering::SeqCst) != self.request {
+            return Ok(None);
+        }
+        let mut chunks = std::mem::take(&mut self.surface_chunks);
+        let bytes = if chunks.len() == 1 {
+            chunks.pop().unwrap()
+        } else {
+            chunks.concat()
+        };
+        let (mut state, result) = build_surface_state(self.root.clone(), &bytes)?;
+        let old_state = {
+            let mut guard = NATIVE_STATE.write().map_err(poisoned)?;
+            if STATE_REQUEST.load(Ordering::SeqCst) != self.request {
+                return Ok(None);
+            }
+            state.epoch = next_state_epoch();
+            guard.replace(Arc::new(state))
+        };
+        features::clear_descendant_cache();
+        features::clear_export_cache();
+        // Free the replaced index off the event loop and outside the state lock.
+        drop(old_state);
+        Ok(Some(result))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Parse, build and replace the resident surface on the libuv threadpool.
+/// Returns null when a newer initialization or native_drop superseded it.
+#[napi]
+pub fn native_init_from_surface_async(
+    root: String,
+    surface_bytes: Buffer,
+) -> AsyncTask<SurfaceInitTask> {
+    AsyncTask::new(SurfaceInitTask {
+        root,
+        surface_chunks: vec![surface_bytes.to_vec()],
+        request: next_state_request(),
+    })
+}
+
+/// Chunked input avoids allocating and concatenating a full JSON buffer on JS.
+#[napi]
+pub fn native_init_from_surface_chunks_async(
+    root: String,
+    chunks: Vec<Buffer>,
+) -> AsyncTask<SurfaceInitTask> {
+    AsyncTask::new(SurfaceInitTask {
+        root,
+        surface_chunks: chunks.iter().map(|chunk| chunk.to_vec()).collect(),
+        request: next_state_request(),
+    })
 }
 
 #[napi(object)]
@@ -637,6 +997,12 @@ pub fn native_state_info() -> NativeStateInfo {
     }
 }
 
+/// Includes snapshots held by workers; useful for detecting retained states.
+#[napi]
+pub fn native_live_state_count() -> u32 {
+    LIVE_STATES.load(Ordering::SeqCst) as u32
+}
+
 fn poisoned(_: impl std::fmt::Display) -> NapiError {
     NapiError::new(
         Status::GenericFailure,
@@ -645,6 +1011,9 @@ fn poisoned(_: impl std::fmt::Display) -> NapiError {
 }
 
 fn with_state<T>(f: impl FnOnce(&NativeState) -> NapiResult<T>) -> NapiResult<Option<T>> {
+    // Keep the short query under a read guard. Cloning the Arc here could
+    // make this JS-thread query the last owner after a worker replaces the
+    // state, causing hundreds of ms of destruction at the end of the query.
     let guard = NATIVE_STATE.read().map_err(poisoned)?;
     match guard.as_ref() {
         Some(s) => f(s).map(Some),
@@ -1094,15 +1463,17 @@ pub fn native_resolve_module(module_name: String) -> NapiResult<Option<Buffer>> 
 /// synchronously on the Node main thread blocked the event loop for ~2.2s, which
 /// defeated the hover hard-timeout (its setTimeout could not fire) and let
 /// unresolved hovers run to ~2.7s. `compute()` runs on the libuv threadpool: the
-/// heavy parse is lock-free, and only the brief NATIVE_STATE merge takes the
-/// write lock — so concurrent hover timers fire normally during the parse.
+/// Parsing, merging and graph construction use a private snapshot. Only the
+/// finished-state exchange takes the write lock; queries read the old state
+/// until that exchange without taking ownership of its destructor.
 pub struct EnsureAstModulesTask {
     root: String,
     /// Epoch of the NativeState this task intends to augment, captured before
     /// the off-thread parse. If a concurrent native_init / native_init_from_surface
     /// installs a new state (same or different root) during the parse, the epoch
     /// changes and the merge is skipped so it cannot clobber fresher state.
-    epoch: u64,
+    snapshot: Option<Arc<NativeState>>,
+    ast_request: u64,
 }
 
 impl Task for EnsureAstModulesTask {
@@ -1111,14 +1482,16 @@ impl Task for EnsureAstModulesTask {
 
     fn compute(&mut self) -> NapiResult<bool> {
         let root = self.root.clone();
-        let expected_epoch = self.epoch;
         let root_path = PathBuf::from(&root);
-        let snap = discovery::snapshot_python_sources(&root_path, &[]);
-        let files: Vec<PathBuf> = snap
-            .entries
-            .iter()
-            .map(|e| root_path.join(&e.relative_path))
-            .collect();
+        let Some(snapshot) = self.snapshot.take() else {
+            return Ok(false);
+        };
+        if snapshot.root != root_path || AST_REQUEST.load(Ordering::SeqCst) != self.ast_request {
+            return Ok(false);
+        }
+        // This augmentation needs paths and fresh parse results, not a cache
+        // fingerprint. Enumerate once and let parsing read current contents.
+        let files = discovery::iter_python_files(&root_path);
         // Use the *resolved* static index so inheritance expansion runs —
         // project-specific abstract base classes like `TimestampedModel(models.Model)`
         // only surface subclasses once `expand_via_inheritance` has walked
@@ -1127,17 +1500,18 @@ impl Task for EnsureAstModulesTask {
         // file_path/line merge downstream.
         let ast_index = static_index::build_static_index_resolved(&root_path, &files);
 
-        let mut guard = NATIVE_STATE.write().map_err(poisoned)?;
-        let Some(state) = guard.as_mut() else {
-            return Ok(false);
-        };
-        // Skip the merge if the state was re-installed (different root, or a
-        // re-init/re-hydrate for the same root) while we parsed off-thread —
-        // otherwise this now-stale parse would clobber the fresher state.
-        if state.root != root_path || state.epoch != expected_epoch {
+        if AST_REQUEST.load(Ordering::SeqCst) != self.ast_request {
             return Ok(false);
         }
-        state.static_index.modules = ast_index.modules;
+        let mut state = NativeState {
+            _lifetime: StateLifetime::new(),
+            root: snapshot.root.clone(),
+            static_index: snapshot.static_index.clone(),
+            graph: ModelGraph::default(),
+            built_at_ms: snapshot.built_at_ms,
+            epoch: 0,
+        };
+        state.static_index.replace_modules(ast_index.modules);
         // Project methods are extracted alongside modules. Surface hydrate
         // does not populate them, so refresh here too.
         state.static_index.methods = ast_index.methods;
@@ -1296,8 +1670,22 @@ impl Task for EnsureAstModulesTask {
         // Rebuild the graph so node file_path / line propagate to
         // `resolveRelationTarget` results.
         state.graph = build_model_graph(&state.static_index);
+        let old_state = {
+            let mut guard = NATIVE_STATE.write().map_err(poisoned)?;
+            let Some(current) = guard.as_ref() else {
+                return Ok(false);
+            };
+            if current.epoch != snapshot.epoch
+                || AST_REQUEST.load(Ordering::SeqCst) != self.ast_request
+            {
+                return Ok(false);
+            }
+            state.epoch = next_state_epoch();
+            guard.replace(Arc::new(state))
+        };
         features::clear_descendant_cache();
         features::clear_export_cache();
+        drop(old_state);
         Ok(true)
     }
 
@@ -1311,15 +1699,24 @@ impl Task for EnsureAstModulesTask {
 /// after the surface hydrate so `resolveExportOrigin` / `resolveModule` queries
 /// can be answered natively.
 #[napi]
+pub fn native_invalidate_ast_modules() {
+    AST_REQUEST.fetch_add(1, Ordering::SeqCst);
+    features::clear_export_cache();
+}
+
+#[napi]
 pub fn native_ensure_ast_modules(root: String) -> AsyncTask<EnsureAstModulesTask> {
     // Capture the epoch of the state we intend to augment (the surface hydrate
     // that prompted this ensure). Re-checked after the off-thread parse.
-    let epoch = NATIVE_STATE
+    let snapshot = NATIVE_STATE
         .read()
         .ok()
-        .and_then(|guard| guard.as_ref().map(|state| state.epoch))
-        .unwrap_or(0);
-    AsyncTask::new(EnsureAstModulesTask { root, epoch })
+        .and_then(|guard| guard.as_ref().map(Arc::clone));
+    AsyncTask::new(EnsureAstModulesTask {
+        root,
+        snapshot,
+        ast_request: AST_REQUEST.load(Ordering::SeqCst),
+    })
 }
 
 fn feature_info_to_item(

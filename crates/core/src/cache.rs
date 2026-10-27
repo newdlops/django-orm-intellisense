@@ -10,7 +10,7 @@
 //! call `load` which returns `Miss`).
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
@@ -95,6 +95,68 @@ where
     }
     fs::rename(&tmp_path, path)?;
     Ok(())
+}
+
+/// Persist byte blobs in the existing `Vec<u8>` envelope without joining or
+/// encoding a second complete payload. Chunks are borrowed only for this call.
+pub fn save_byte_chunks<T: AsRef<[u8]>>(
+    path: &Path,
+    metadata: &[u8],
+    chunks: &[T],
+) -> CacheResult<()> {
+    let payload_len = chunks.iter().try_fold(0usize, |length, chunk| {
+        length
+            .checked_add(chunk.as_ref().len())
+            .ok_or_else(|| std::io::Error::other("payload length overflow"))
+    })?;
+    let metadata_bytes = bincode::encode_to_vec(metadata, bincode::config::standard())?;
+    let header = EnvelopeHeader {
+        magic: MAGIC,
+        schema_version: CACHE_SCHEMA_VERSION,
+        metadata_len: u32::try_from(metadata_bytes.len())
+            .map_err(|_| std::io::Error::other("metadata exceeds u32::MAX"))?,
+    };
+    let header_bytes = bincode::encode_to_vec(header, bincode::config::standard())?;
+    let payload_prefix = bincode::encode_to_vec(payload_len, bincode::config::standard())?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    // Unique owned siblings prevent concurrent writers from truncating each
+    // other's temporary envelope. Failed writes/flushes/renames clean up on drop.
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".dorm-cache-")
+        .tempfile_in(parent)?;
+    {
+        let mut writer = BufWriter::with_capacity(64 * 1024, temporary.as_file_mut());
+        write_byte_chunks(
+            &mut writer,
+            &header_bytes,
+            &metadata_bytes,
+            &payload_prefix,
+            chunks,
+        )?;
+    }
+    temporary.as_file().sync_data()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn write_byte_chunks<T: AsRef<[u8]>, W: Write>(
+    writer: &mut W,
+    header: &[u8],
+    metadata: &[u8],
+    payload_prefix: &[u8],
+    chunks: &[T],
+) -> std::io::Result<()> {
+    writer.write_all(header)?;
+    writer.write_all(metadata)?;
+    writer.write_all(payload_prefix)?;
+    for chunk in chunks {
+        writer.write_all(chunk.as_ref())?;
+    }
+    writer.flush()
 }
 
 /// Load the envelope via mmap. Metadata is deserialized eagerly so the
@@ -287,5 +349,175 @@ mod tests {
         let name = a.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with("project-django-"));
         assert_eq!(name.rsplit_once('-').unwrap().1.len(), 16);
+    }
+
+    #[test]
+    fn byte_chunks_match_existing_envelope_and_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = dir.path().join("previous.bin");
+        let current = dir.path().join("current.bin");
+        for length in [0, 1, 250, 251, 255, 256, 65535, 65536, 131079] {
+            let metadata: Vec<u8> = (0..length.min(1024))
+                .map(|index| (index % 256) as u8)
+                .collect();
+            let payload: Vec<u8> = (0..length).map(|index| (index % 256) as u8).collect();
+            save(&previous, &metadata, &payload).unwrap();
+            for chunk_size in [1, 17, 65536] {
+                let mut chunks: Vec<&[u8]> = payload.chunks(chunk_size).collect();
+                chunks.insert(0, &[]);
+                chunks.push(&[]);
+                save_byte_chunks(&current, &metadata, &chunks).unwrap();
+                assert_eq!(
+                    fs::read(&previous).unwrap(),
+                    fs::read(&current).unwrap(),
+                    "existing Vec envelope differs for length{length}/chunk{chunk_size}"
+                );
+                let result: CacheLoad<Vec<u8>, Vec<u8>> =
+                    load(&current, |value| value == &metadata).unwrap();
+                match result {
+                    CacheLoad::Hit {
+                        metadata: got_metadata,
+                        payload: got_payload,
+                    } => {
+                        assert_eq!(got_metadata, metadata);
+                        assert_eq!(got_payload, payload);
+                    }
+                    CacheLoad::Miss => panic!("streamed byte envelope missed"),
+                }
+            }
+        }
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "owned temporary files leaked"
+        );
+    }
+
+    #[test]
+    fn byte_chunks_own_temporary_files_and_clean_failed_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cache.bin");
+        fs::create_dir(&target).unwrap();
+        let retained = target.join("retained");
+        fs::write(&retained, b"old owner").unwrap();
+        let unrelated = dir.path().join("cache.bin.tmp");
+        fs::write(&unrelated, b"unrelated writer").unwrap();
+        assert!(save_byte_chunks(&target, b"metadata", &[b"payload".as_slice()]).is_err());
+        assert_eq!(fs::read(&retained).unwrap(), b"old owner");
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated writer");
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "failed persist leaked owned sibling"
+        );
+    }
+
+    #[test]
+    fn concurrent_byte_chunk_writers_publish_complete_owned_envelopes() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cache.bin");
+        save_byte_chunks(&target, &[0], &[vec![0; 4096]]).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            for tag in [1u8, 2u8] {
+                let barrier = Arc::clone(&barrier);
+                let target = &target;
+                scope.spawn(move || {
+                    let bytes = vec![tag; 4096];
+                    let chunks = vec![bytes.as_slice(); 32];
+                    barrier.wait();
+                    for _ in 0..30 {
+                        save_byte_chunks(target, &[tag], &chunks).unwrap();
+                    }
+                });
+            }
+            barrier.wait();
+            for _ in 0..100 {
+                let result: CacheLoad<Vec<u8>, Vec<u8>> = load(&target, |_| true).unwrap();
+                match result {
+                    CacheLoad::Hit { metadata, payload } => {
+                        assert_eq!(metadata.len(), 1);
+                        assert!([0, 1, 2].contains(&metadata[0]));
+                        assert!(payload.iter().all(|byte| *byte == metadata[0]));
+                        assert_eq!(payload.len(), if metadata[0] == 0 { 4096 } else { 131072 });
+                    }
+                    CacheLoad::Miss => panic!("atomic target disappeared"),
+                }
+            }
+        });
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "concurrent siblings leaked"
+        );
+    }
+
+    #[test]
+    fn byte_chunk_writer_handles_short_writes_and_propagates_io_errors() {
+        struct LimitedWriter {
+            bytes: Vec<u8>,
+            remaining: usize,
+            fail_flush: bool,
+            zero_on_exhaustion: bool,
+        }
+        impl Write for LimitedWriter {
+            fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return if self.zero_on_exhaustion {
+                        Ok(0)
+                    } else {
+                        Err(std::io::Error::other("injected write failure"))
+                    };
+                }
+                let written = input.len().min(self.remaining).min(3);
+                self.bytes.extend_from_slice(&input[..written]);
+                self.remaining -= written;
+                Ok(written)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.fail_flush {
+                    Err(std::io::Error::other("injected flush failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let chunks = [b"payload-one".as_slice(), &[], b"payload-two".as_slice()];
+        let mut short = LimitedWriter {
+            bytes: vec![],
+            remaining: usize::MAX,
+            fail_flush: false,
+            zero_on_exhaustion: false,
+        };
+        write_byte_chunks(&mut short, b"header", b"meta", b"len", &chunks).unwrap();
+        assert_eq!(short.bytes, b"headermetalenpayload-onepayload-two");
+        for zero in [false, true] {
+            let mut failing = LimitedWriter {
+                bytes: vec![],
+                remaining: 18,
+                fail_flush: false,
+                zero_on_exhaustion: zero,
+            };
+            let error =
+                write_byte_chunks(&mut failing, b"header", b"meta", b"len", &chunks).unwrap_err();
+            assert_eq!(failing.bytes, short.bytes[..18]);
+            assert_eq!(
+                error.kind(),
+                if zero {
+                    std::io::ErrorKind::WriteZero
+                } else {
+                    std::io::ErrorKind::Other
+                }
+            );
+        }
+        let mut failing = LimitedWriter {
+            bytes: vec![],
+            remaining: usize::MAX,
+            fail_flush: true,
+            zero_on_exhaustion: false,
+        };
+        assert!(write_byte_chunks(&mut failing, b"header", b"meta", b"len", &chunks).is_err());
+        assert_eq!(failing.bytes, short.bytes);
     }
 }

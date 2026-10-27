@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -29,6 +30,11 @@ from django_orm_intellisense.static_index.indexer import (
     build_static_index,
     reindex_single_file,
 )
+from django_orm_intellisense.cache.store import load_cached_static_index, save_static_index
+from django_orm_intellisense.features.orm_members import build_surface_index
+from django_orm_intellisense.runtime.inspector import create_pending_runtime_inspection
+from django_orm_intellisense.semantic.graph import build_model_graph
+from django_orm_intellisense.server.app import DaemonServer
 
 # ---------------------------------------------------------------------------
 # Synthetic project generation
@@ -115,8 +121,11 @@ def format_ms(seconds: float) -> str:
     return f"{ms:.1f}ms" if ms >= 1 else f"{ms * 1000:.0f}µs"
 
 
-def run_benchmark(model_count: int, json_mode: bool = False) -> dict:
+def run_benchmark(model_count: int, json_mode: bool = False, profile_reindex: bool = False) -> dict:
     tmpdir = tempfile.mkdtemp(prefix="django_bench_")
+    cache_dir = tempfile.mkdtemp(prefix="django_bench_cache_")
+    previous_cache_dir = os.environ.get('DJANGO_ORM_INTELLISENSE_CACHE_DIR')
+    os.environ['DJANGO_ORM_INTELLISENSE_CACHE_DIR'] = cache_dir
     root = Path(tmpdir)
     results: dict = {"model_count": model_count}
 
@@ -145,12 +154,43 @@ def run_benchmark(model_count: int, json_mode: bool = False) -> dict:
         results["build_static_index_s"] = build_time
         results["model_candidate_count"] = len(static_index.model_candidates)
         results["field_count"] = len(static_index.fields)
+        assert len(static_index.model_candidates) == model_count
         if not json_mode:
             print(
                 f"build_static_index (full): {format_ms(build_time)} "
                 f"({len(static_index.model_candidates)} candidates, "
                 f"{len(static_index.fields)} fields)"
             )
+
+        # Cache hit and daemon slice rebuilding are separate from index-only
+        # timings; neither should silently regress while the hot parser passes.
+        t = time.perf_counter()
+        save_static_index(root, snapshot, static_index)
+        results['static_cache_write_s'] = time.perf_counter() - t
+        t = time.perf_counter()
+        cached_index, hit_kind = load_cached_static_index(root, snapshot)
+        results['static_cache_load_s'] = time.perf_counter() - t
+        results['static_cache_hit_kind'] = hit_kind
+        assert hit_kind == 'full' and cached_index is not None
+        assert cached_index.fields == static_index.fields
+        runtime = create_pending_runtime_inspection(None)
+        t = time.perf_counter()
+        graph = build_model_graph(static_index, runtime)
+        results['build_model_graph_s'] = time.perf_counter() - t
+        t = time.perf_counter()
+        surface = build_surface_index(static_index=static_index, runtime=runtime, model_graph=graph)
+        results['build_surface_s'] = time.perf_counter() - t
+        assert len(surface) == model_count
+        stdout = sys.stdout
+        try:
+            server = DaemonServer(root)
+        finally:
+            sys.stdout = stdout
+
+        def compute(path):
+            return server._compute_reindex(file_path=path, static_index=static_index,
+                runtime=runtime, previous_model_graph=graph,
+                existing_surface=surface, previous_static_fallback=None)
 
         # --- 4. reindex_single_file — fast path (non-model file change) ---
         # Create a non-model file and reindex it
@@ -161,6 +201,10 @@ def run_benchmark(model_count: int, json_mode: bool = False) -> dict:
         fast_path_time = time.perf_counter() - t3
         results["reindex_fast_path_s"] = fast_path_time
         results["reindex_fast_path_affected"] = len(old_labels | new_labels)
+        t = time.perf_counter()
+        helper_outcome = compute(utils_file)
+        results['daemon_helper_reindex_s'] = time.perf_counter() - t
+        assert helper_outcome.affected_labels is None
         if not json_mode:
             print(
                 f"reindex_single_file (fast path, non-model): {format_ms(fast_path_time)} "
@@ -178,6 +222,20 @@ def run_benchmark(model_count: int, json_mode: bool = False) -> dict:
         slow_path_time = time.perf_counter() - t4
         results["reindex_slow_path_s"] = slow_path_time
         results["reindex_slow_path_affected"] = len(old_labels2 | new_labels2)
+        assert any(field.name == 'new_field' for field in new_idx2.fields_for_model('app0.Model0'))
+        t = time.perf_counter()
+        if profile_reindex:
+            import cProfile
+            profile = cProfile.Profile()
+            profile.enable()
+        model_outcome = compute(model_file)
+        results['daemon_model_reindex_s'] = time.perf_counter() - t
+        if profile_reindex:
+            profile.disable()
+            import pstats
+            pstats.Stats(profile, stream=sys.stderr).sort_stats('cumtime').print_stats(24)
+        results['daemon_model_reindex_affected'] = model_outcome.affected_count
+        assert 'new_field' in model_outcome.surface_index_delta['app0.Model0']['instance']
         if not json_mode:
             print(
                 f"reindex_single_file (slow path, model changed): {format_ms(slow_path_time)} "
@@ -210,7 +268,12 @@ def run_benchmark(model_count: int, json_mode: bool = False) -> dict:
             )
 
     finally:
+        if previous_cache_dir is None:
+            os.environ.pop('DJANGO_ORM_INTELLISENSE_CACHE_DIR', None)
+        else:
+            os.environ['DJANGO_ORM_INTELLISENSE_CACHE_DIR'] = previous_cache_dir
         shutil.rmtree(tmpdir, ignore_errors=True)
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
     return results
 
@@ -222,6 +285,9 @@ def run_benchmark(model_count: int, json_mode: bool = False) -> dict:
 BUDGETS = {
     "reindex_fast_path_s": 0.020,   # 20ms
     "reindex_slow_path_s": 0.050,   # 50ms (includes _resolve_fields)
+    "daemon_helper_reindex_s": 0.020,
+    "daemon_model_reindex_s": 0.050,
+    "static_cache_load_s": 0.500,
 }
 
 
@@ -246,6 +312,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Django ORM Intellisense Python benchmark")
     parser.add_argument("--models", type=int, default=1500, help="Number of synthetic models")
     parser.add_argument("--json", action="store_true", help="Output JSON")
+    parser.add_argument("--profile", action="store_true", help="Profile daemon model reindex (timings include profiler overhead)")
     args = parser.parse_args()
 
     if not args.json:
@@ -253,7 +320,7 @@ def main() -> None:
         print(f"Python Daemon Benchmark: {args.models} models")
         print(f"{'=' * 60}\n")
 
-    results = run_benchmark(args.models, json_mode=args.json)
+    results = run_benchmark(args.models, json_mode=args.json, profile_reindex=args.profile)
     checks = check_budgets(results)
 
     if args.json:

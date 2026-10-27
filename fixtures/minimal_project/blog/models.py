@@ -562,3 +562,4 @@ class ProxyCompanyQuestionThreadMessage(models.Model):
 
 # Ensure Django discovers models defined in separate modules within this app.
 from blog.schema_examples import SchemaExample as SchemaExample  # noqa: F401,E402
+from blog.lookup_samples import LookupSample as LookupSample  # noqa: F401,E402

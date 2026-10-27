@@ -2,6 +2,8 @@
 // Django ORM Intellisense — Language Server Type Definitions
 // ============================================================================
 
+import type { LookupCatalogPayload, LookupTypePayload } from './lookupCatalog';
+
 // ---------------------------------------------------------------------------
 // Workspace Index
 // ---------------------------------------------------------------------------
@@ -11,6 +13,8 @@
  * for the entire workspace.
  */
 export interface WorkspaceIndex {
+  lookupCatalog?: LookupCatalogPayload;
+  lookupTypes?: Map<string, FieldInfo>;
   models: Map<string, ModelInfo>;
   perFile: Map<string, FileIndexEntry>;
   /** Maps a short model object name (e.g. "Company") to its app label (e.g. "db.Company"). */
@@ -61,6 +65,10 @@ export interface ModelInfo {
 }
 
 export interface FieldInfo {
+  /** Scalar output of F()/aggregate source columns, distinct from relation lookups. */
+  expressionField?: FieldInfo;
+  /** Installed Django registry, including per-instance overrides. */
+  lookupType?: LookupTypePayload;
   name: string;
   /** e.g. "CharField", "IntegerField", "ForeignKey" */
   fieldKind: string;
@@ -72,6 +80,8 @@ export interface FieldInfo {
 }
 
 export interface RelationInfo {
+  accessorName?: string;
+  queryName?: string;
   name: string;
   /** e.g. "ForeignKey", "OneToOneField", "ManyToManyField" */
   fieldKind: string;
@@ -104,6 +114,7 @@ export interface TransformInfo {
 // ---------------------------------------------------------------------------
 
 export interface ParsedLookup {
+  runtimeRequired?: boolean;
   segments: string[];
   resolvedPath: ResolvedSegment[];
   finalField?: FieldInfo;

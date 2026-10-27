@@ -2,6 +2,10 @@
 //! `static_index/indexer.py`. Field names use snake_case on the Rust
 //! side and camelCase on the wire (serde rename) so JSON from either
 //! side round-trips.
+//!
+//! Native AST producers emit one-based lines and UTF-16 columns for editor
+//! consumers. Zero is reserved for missing source locations; deserialization
+//! preserves caller-owned values without applying coordinate conversions.
 
 use serde::{Deserialize, Serialize};
 
@@ -254,12 +258,41 @@ pub struct ModuleIndex {
     pub methods: Vec<ProjectMethod>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StaticIndex {
+    #[serde(skip, default = "next_cache_generation")]
+    pub cache_generation: u64,
     pub model_candidates: Vec<ModelCandidate>,
     pub fields: Vec<FieldCandidate>,
     pub modules: Vec<ModuleIndex>,
     #[serde(default)]
     pub methods: Vec<ProjectMethod>,
+}
+
+fn next_cache_generation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Default for StaticIndex {
+    fn default() -> Self {
+        Self { cache_generation: next_cache_generation(), model_candidates: Vec::new(),
+            fields: Vec::new(), modules: Vec::new(), methods: Vec::new() }
+    }
+}
+
+impl Clone for StaticIndex {
+    fn clone(&self) -> Self {
+        Self { cache_generation: next_cache_generation(), model_candidates: self.model_candidates.clone(),
+            fields: self.fields.clone(), modules: self.modules.clone(), methods: self.methods.clone() }
+    }
+}
+
+impl StaticIndex {
+    pub fn replace_modules(&mut self, modules: Vec<ModuleIndex>) {
+        self.modules = modules;
+        self.cache_generation = next_cache_generation();
+    }
 }

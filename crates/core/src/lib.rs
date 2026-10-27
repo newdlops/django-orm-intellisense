@@ -2,6 +2,7 @@ pub mod cache;
 pub mod discovery;
 pub mod features;
 pub mod semantic;
+pub mod source_snapshot;
 pub mod static_index;
 
 pub fn hello(name: &str) -> String {

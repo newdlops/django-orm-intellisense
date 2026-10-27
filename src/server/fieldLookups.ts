@@ -83,7 +83,17 @@ export const FIELD_TRANSFORMS: Record<string, { outputFieldKind: string; applica
 };
 
 /** Default lookups for unknown or unrecognized field types. */
-export const DEFAULT_LOOKUPS = ['exact', 'in', 'isnull', 'gt', 'gte', 'lt', 'lte'];
+export const DEFAULT_LOOKUPS = [
+  'exact', 'iexact', 'contains', 'icontains', 'startswith', 'istartswith',
+  'endswith', 'iendswith', 'in', 'gt', 'gte', 'lt', 'lte', 'range', 'regex', 'iregex', 'isnull',
+];
+
+// Django registers these on Field itself. The live catalog supplies precise
+// instance overrides; a cold registry should still expose inherited operators.
+for (const [kind, names] of Object.entries(FIELD_LOOKUPS)) {
+  if (kind === 'ForeignKey' || kind === 'OneToOneField' || kind === 'ManyToManyField') continue;
+  FIELD_LOOKUPS[kind] = [...new Set([...DEFAULT_LOOKUPS, ...names])];
+}
 
 // ============================================================================
 // Field-kind -> Python type mapping
@@ -215,20 +225,29 @@ export function operandPythonType(
  * Falls back to DEFAULT_LOOKUPS for unrecognized field types.
  */
 export function getLookupsForField(fieldKind: string): string[] {
-  return FIELD_LOOKUPS[fieldKind] ?? DEFAULT_LOOKUPS;
+  return LOOKUPS_BY_KIND.get(fieldKind.replace(/^reverse_/, '')) ?? DEFAULT_LOOKUPS;
 }
 
 /**
  * Returns the names of transforms applicable to the given field kind.
  */
 export function getTransformsForField(fieldKind: string): string[] {
-  const result: string[] = [];
-  for (const [name, info] of Object.entries(FIELD_TRANSFORMS)) {
-    if (info.applicableFieldKinds.includes(fieldKind)) {
-      result.push(name);
-    }
+  return TRANSFORMS_BY_KIND.get(fieldKind) ?? EMPTY_TRANSFORMS;
+}
+
+const EMPTY_TRANSFORMS: string[] = [];
+const TRANSFORMS_BY_KIND = new Map<string, string[]>();
+for (const [name, info] of Object.entries(FIELD_TRANSFORMS)) {
+  for (const kind of info.applicableFieldKinds) {
+    const names = TRANSFORMS_BY_KIND.get(kind) ?? [];
+    names.push(name);
+    TRANSFORMS_BY_KIND.set(kind, names);
   }
-  return result;
+}
+const LOOKUPS_BY_KIND = new Map<string, string[]>();
+for (const [kind, names] of Object.entries(FIELD_LOOKUPS)) {
+  const transforms = getTransformsForField(kind);
+  LOOKUPS_BY_KIND.set(kind, names.filter((name) => !transforms.includes(name)));
 }
 
 /**

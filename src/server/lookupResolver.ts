@@ -15,6 +15,20 @@ import type {
   WorkspaceIndex,
 } from './types.js';
 import { CompressedRadixTrie } from './radixTrie.js';
+import { transformedField } from './lookupCatalog.js';
+
+export const FILTER_LOOKUP_METHODS = new Set([
+  'filter', 'exclude', 'get', 'get_or_create', 'update_or_create',
+  'aget', 'aget_or_create', 'aupdate_or_create',
+]);
+export const TRANSFORM_PATH_METHODS = new Set([
+  ...FILTER_LOOKUP_METHODS, 'values', 'values_list', 'order_by', 'distinct',
+  'dates', 'datetimes', 'earliest', 'latest', 'aearliest', 'alatest', 'f_expression',
+]);
+
+export function supportsLookupTransforms(method: string): boolean {
+  return TRANSFORM_PATH_METHODS.has(method) || method.startsWith('expression_path:');
+}
 
 export type FsmState = ResolutionState['fsmState'];
 
@@ -293,8 +307,9 @@ export function parseLookupChain(
   expression: string,
   startModel: string,
   index: WorkspaceIndex,
+  method?: string,
 ): ParsedLookup {
-  const result = _parseLookupChainInner(expression, startModel, index);
+  const result = _parseLookupChainInner(expression, startModel, index, method);
   result.startModel = startModel;
   return result;
 }
@@ -303,7 +318,10 @@ function _parseLookupChainInner(
   expression: string,
   startModel: string,
   index: WorkspaceIndex,
+  method?: string,
 ): ParsedLookup {
+  const allowLookups = method === undefined || FILTER_LOOKUP_METHODS.has(method);
+  const allowTransforms = method === undefined || supportsLookupTransforms(method);
   const _t0 = performance.now();
   const segments = expression.split('__');
   const resolvedPath: ResolvedSegment[] = [];
@@ -359,7 +377,7 @@ function _parseLookupChainInner(
 
       // Try forward relation first.
       const relation = findRelation(currentModel, seg);
-      if (relation) {
+      if (relation && relationAllowedForMethod(currentModel, relation, method)) {
         const fInfo = fieldInfoForRelation(currentModel, relation);
         resolvedPath.push({
           name: seg,
@@ -377,14 +395,14 @@ function _parseLookupChainInner(
 
       // Try reverse relation.
       const reverseRel = findReverseRelation(currentModel, seg);
-      if (reverseRel) {
+      if (reverseRel && relationAllowedForMethod(currentModel, reverseRel, method)) {
         resolvedPath.push({
           name: seg,
           kind: 'reverse_relation',
           modelLabel: state.currentModel,
         });
         state.currentModel = reverseRel.targetModelLabel;
-        state.currentField = undefined;
+        state.currentField = currentModel.fields.get(seg);
         state.fsmState = 'EXPECT_FIELD_OR_RELATION';
         continue;
       }
@@ -402,6 +420,29 @@ function _parseLookupChainInner(
         // After a scalar field, the next segment must be a transform or lookup.
         state.fsmState = 'EXPECT_TRANSFORM_OR_LOOKUP';
         continue;
+      }
+
+      // A relation also supports lookups (e.g. author__in). Target model
+      // fields take precedence, matching Django's relation traversal.
+      if (allowLookups && state.currentField && isLast && findLookup(state.currentField, seg, index)) {
+        resolvedPath.push({ name: seg, kind: 'lookup', fieldInfo: state.currentField });
+        return { segments, resolvedPath, finalField: state.currentField,
+          finalLookup: seg, state: 'complete' };
+      }
+      if (allowTransforms && state.currentField) {
+        const output = transformedField(state.currentField, seg, index);
+        if (output) {
+          const owner = resolvedPath.at(-1)?.modelLabel ?? state.currentModel;
+          state.currentField = output;
+          state.fsmState = 'EXPECT_TRANSFORM_OR_LOOKUP';
+          resolvedPath.push({ name: seg, kind: 'transform', modelLabel: owner, fieldInfo: output });
+          continue;
+        }
+        if (state.currentField.lookupType?.runtimeTransforms ||
+            state.currentField.lookupType?.transforms[seg] === null) {
+          return { segments, resolvedPath, finalField: state.currentField,
+            state: 'partial', runtimeRequired: true };
+        }
       }
 
       // Not found — if this is the last segment, it may be partial input.
@@ -437,7 +478,7 @@ function _parseLookupChainInner(
       }
 
       // Try lookup.
-      const lookup = findLookup(state.currentField, seg, index);
+      const lookup = allowLookups && isLast ? findLookup(state.currentField, seg, index) : undefined;
       if (lookup) {
         resolvedPath.push({
           name: seg,
@@ -466,25 +507,33 @@ function _parseLookupChainInner(
       }
 
       // Try transform.
-      const transform = findTransform(state.currentField, seg, index);
-      if (transform) {
-        resolvedPath.push({
-          name: seg,
-          kind: 'transform',
-          fieldInfo: state.currentField,
-        });
+      const runtimeOutput = allowTransforms ? transformedField(state.currentField, seg, index) : undefined;
+      const transform = !allowTransforms || state.currentField.lookupType
+        ? undefined
+        : findTransform(state.currentField, seg, index);
+      if (runtimeOutput || transform) {
         // After a transform, we get a new "virtual" field with the
         // transform's output kind. Build a synthetic FieldInfo.
-        state.currentField = {
+        state.currentField = runtimeOutput ?? {
           name: seg,
-          fieldKind: transform.outputFieldKind,
+          fieldKind: transform!.outputFieldKind,
           isRelation: false,
-          lookups: getLookupsForKind(transform.outputFieldKind, index),
-          transforms: getTransformsForKind(transform.outputFieldKind, index),
+          lookups: getLookupsForKind(transform!.outputFieldKind, index),
+          transforms: getTransformsForKind(transform!.outputFieldKind, index),
         };
+        resolvedPath.push({ name: seg, kind: 'transform', modelLabel: state.currentModel,
+          fieldInfo: state.currentField });
         // Transforms can chain or end with a lookup.
         state.fsmState = 'EXPECT_TRANSFORM_OR_LOOKUP';
         continue;
+      }
+
+      if (state.currentField.lookupType?.transforms[seg] === null ||
+          (state.currentField.lookupType?.dynamicTransform?.outputType === null) ||
+          state.currentField.lookupType?.runtimeTransforms ||
+          (allowLookups && isLast && state.currentField.lookupType?.runtimeLookups)) {
+        return { segments, resolvedPath, finalField: state.currentField,
+          state: 'partial', runtimeRequired: true };
       }
 
       // Not found — partial?
@@ -618,26 +667,41 @@ function getCandidateNames(
 // ---------------------------------------------------------------------------
 
 function getLookupsForKind(fieldKind: string, index: WorkspaceIndex): string[] {
-  const results = triePrefixCollect<LookupInfo>(index.lookupTrie, '', 200);
-  return results
+  let byKind = LOOKUPS_BY_TRIE.get(index.lookupTrie);
+  if (!byKind) { byKind = new Map(); LOOKUPS_BY_TRIE.set(index.lookupTrie, byKind); }
+  const cached = byKind.get(fieldKind);
+  if (cached) return cached;
+  const results = triePrefixCollect<LookupInfo>(index.lookupTrie, '', Infinity);
+  const names = results
     .filter(
       ({ payload }) =>
         payload.applicableFieldKinds.length === 0 ||
         payload.applicableFieldKinds.includes(fieldKind),
     )
     .map(({ payload }) => payload.name);
+  byKind.set(fieldKind, names);
+  return names;
 }
 
 function getTransformsForKind(fieldKind: string, index: WorkspaceIndex): string[] {
-  const results = triePrefixCollect<TransformInfo>(index.transformTrie, '', 200);
-  return results
+  let byKind = TRANSFORMS_BY_TRIE.get(index.transformTrie);
+  if (!byKind) { byKind = new Map(); TRANSFORMS_BY_TRIE.set(index.transformTrie, byKind); }
+  const cached = byKind.get(fieldKind);
+  if (cached) return cached;
+  const results = triePrefixCollect<TransformInfo>(index.transformTrie, '', Infinity);
+  const names = results
     .filter(
       ({ payload }) =>
         payload.applicableFieldKinds.length === 0 ||
         payload.applicableFieldKinds.includes(fieldKind),
     )
     .map(({ payload }) => payload.name);
+  byKind.set(fieldKind, names);
+  return names;
 }
+
+const LOOKUPS_BY_TRIE = new WeakMap<object, Map<string, string[]>>();
+const TRANSFORMS_BY_TRIE = new WeakMap<object, Map<string, string[]>>();
 
 function shortModelLabel(modelLabel: string): string {
   return modelLabel.split('.').at(-1) ?? modelLabel;
@@ -697,7 +761,7 @@ export function getCompletionCandidates(
 
     // Scalar fields.
     for (const [name, field] of model.fields) {
-      if (!field.isRelation && matchesPrefix(name, lowerPartial)) {
+      if (!isRelationOnlyCompletionMethod(method) && !field.isRelation && matchesPrefix(name, lowerPartial)) {
         hasPrefixMatch = true;
         candidates.push({
           name,
@@ -711,6 +775,7 @@ export function getCompletionCandidates(
 
     // Forward relations.
     for (const [name, rel] of model.relations) {
+      if (!relationAllowedForMethod(model, rel, method)) continue;
       if (matchesPrefix(name, lowerPartial)) {
         hasPrefixMatch = true;
         candidates.push({
@@ -725,12 +790,7 @@ export function getCompletionCandidates(
 
     // Reverse relations.
     for (const [name, rel] of model.reverseRelations) {
-      if (
-        isRelationOnlyCompletionMethod(method) &&
-        isLikelyRelatedQueryAlias(model, name, rel)
-      ) {
-        continue;
-      }
+      if (!relationAllowedForMethod(model, rel, method)) continue;
       if (matchesPrefix(name, lowerPartial)) {
         hasPrefixMatch = true;
         candidates.push({
@@ -750,6 +810,7 @@ export function getCompletionCandidates(
       for (const name of fuzzyResults) {
         const field = model.fields.get(name);
         const rel = model.relations.get(name) ?? model.reverseRelations.get(name);
+        if (isRelationOnlyCompletionMethod(method) && (!rel || !relationAllowedForMethod(model, rel, method))) continue;
         candidates.push({
           name,
           kind: field && !field.isRelation ? 'field' : 'relation',
@@ -767,7 +828,8 @@ export function getCompletionCandidates(
     let hasPrefixMatch = false;
 
     // Lookups.
-    for (const lookupName of field.lookups) {
+    for (const lookupName of method === undefined || FILTER_LOOKUP_METHODS.has(method) ? field.lookups : []) {
+      if (field.transforms.includes(lookupName)) continue;
       if (matchesPrefix(lookupName, lowerPartial)) {
         hasPrefixMatch = true;
         candidates.push({
@@ -781,7 +843,7 @@ export function getCompletionCandidates(
     }
 
     // Transforms.
-    for (const transformName of field.transforms) {
+    for (const transformName of method === undefined || supportsLookupTransforms(method) ? field.transforms : []) {
       if (matchesPrefix(transformName, lowerPartial)) {
         hasPrefixMatch = true;
         const tInfo = trieSearch<TransformInfo>(index.transformTrie, transformName);
@@ -847,6 +909,21 @@ function matchesPrefix(name: string, lowerPartial: string): boolean {
 
 function isRelationOnlyCompletionMethod(method: string | undefined): boolean {
   return method === 'select_related' || method === 'prefetch_related';
+}
+
+export function relationAllowedForMethod(model: ModelInfo, relation: RelationInfo, method?: string): boolean {
+  if ((method === 'only' || method === 'defer') && relation.direction === 'reverse') {
+    return !relation.queryName || relation.name === relation.queryName;
+  }
+  if (!isRelationOnlyCompletionMethod(method)) return true;
+  const reverse = relation.direction === 'reverse';
+  if (method === 'select_related') {
+    const kind = relation.fieldKind.replace(/^reverse_/, '');
+    if (!['ForeignKey', 'ParentalKey', 'OneToOneField'].includes(kind) || (reverse && kind !== 'OneToOneField')) return false;
+    return !reverse || !relation.queryName || relation.name === relation.queryName;
+  }
+  return !reverse || (relation.accessorName ? relation.name === relation.accessorName
+    : !isLikelyRelatedQueryAlias(model, relation.name, relation));
 }
 
 function isLikelyRelatedQueryAlias(
@@ -920,7 +997,7 @@ function inferState(
   if (lastResolved.kind === 'field' || lastResolved.kind === 'transform') {
     return {
       currentModel: lastResolved.modelLabel ?? '',
-      currentField: lastResolved.fieldInfo ?? parsed.finalField,
+      currentField: parsed.finalField ?? lastResolved.fieldInfo,
       position: parsed.resolvedPath.length,
       fsmState: 'EXPECT_TRANSFORM_OR_LOOKUP',
     };

@@ -128,6 +128,13 @@ class LookupTerminalTypeTest(unittest.TestCase):
         self.assertEqual(tt['lookupOperator'], 'gte')
         self.assertEqual(tt['operandPythonType'], 'int')
 
+    def test_static_fallback_rejects_date_transform_on_text(self) -> None:
+        self.assertFalse(self._resolve('title__year')['resolved'])
+
+    def test_static_field_projection_accepts_transform_without_lookup(self) -> None:
+        self.assertTrue(self._resolve('pubdate__year', 'values')['resolved'])
+        self.assertFalse(self._resolve('pubdate__year__gte', 'values')['resolved'])
+
     def test_chained_transforms(self) -> None:
         r = self._resolve('pubdate__date__year')
         self.assertTrue(r['resolved'])

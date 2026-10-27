@@ -10,6 +10,133 @@ function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`assertion failed: ${msg}`);
 }
 
+async function assertSurfacePrimaryKeys(n: ReturnType<typeof loadNative>, root: string): Promise<void> {
+  fs.mkdirSync(path.join(root, 'keys'));
+  fs.writeFileSync(path.join(root, 'keys/__init__.py'), '');
+  fs.writeFileSync(path.join(root, 'keys/models.py'), [
+    'from django.db import models',
+    'class Custom(models.Model):',
+    '    code = models.UUIDField(primary_key=True)',
+    'class Named(models.Model):',
+    '    id = models.UUIDField(primary_key=True)',
+    'class Legacy(models.Model):',
+    '    title = models.CharField(max_length=20)',
+  ].join('\n'));
+  const bytes = Buffer.from(JSON.stringify({
+    'keys.Custom': { instance: {
+      code: ['scalar', null, 'field', 'UUIDField'],
+      pk: ['scalar', null, 'field', 'UUIDField'],
+    } },
+    // Older partial surfaces may omit the primary-key alias or both defaults.
+    'keys.Named': { instance: { id: ['scalar', null, 'field', 'UUIDField'] } },
+    'keys.Legacy': { instance: { title: ['scalar', null, 'field', 'CharField'] } },
+  }));
+  assert(n.nativeInitFromSurfaceAsync && n.nativeInitFromSurfaceChunksAsync, 'async surface bindings available');
+  const initializers = [
+    () => n.nativeInitFromSurface(root, bytes),
+    () => n.nativeInitFromSurfaceAsync!(root, bytes),
+    () => n.nativeInitFromSurfaceChunksAsync!(root, [bytes.subarray(0, 17), bytes.subarray(17)]),
+  ];
+  const parse = (value: Buffer | null): any => {
+    assert(value !== null, 'initialized native query returns JSON');
+    return JSON.parse(value.toString('utf8'));
+  };
+  for (const initialize of initializers) {
+    assert(await initialize(), 'surface initialization succeeds');
+    for (const phase of ['surface', 'ast']) {
+      if (phase === 'ast') assert(await n.nativeEnsureAstModules(root), 'AST augmentation succeeds');
+      assert(parse(n.nativeResolveOrmMember('keys.Custom', 'instance', 'id', null)) === null,
+        `${phase}: a custom primary key must not acquire an id member`);
+      assert(!parse(n.nativeResolveLookupPath('keys.Custom', 'id__exact', 'filter')).resolved,
+        `${phase}: a nonexistent id lookup must remain unresolved`);
+      const members = parse(n.nativeListOrmMemberCompletions('keys.Custom', 'instance', 'id', null));
+      assert(!members.items.some((item: { name: string }) => item.name === 'id'),
+        `${phase}: member completion must not offer a nonexistent id`);
+      const lookups = parse(n.nativeListLookupPathCompletions('keys.Custom', 'i', 'filter'));
+      assert(!lookups.items.some((item: { name: string }) => item.name === 'id'),
+        `${phase}: lookup completion must not offer a nonexistent id`);
+      for (const [label, names, kind] of [
+        ['keys.Custom', ['code', 'pk'], 'UUIDField'],
+        ['keys.Named', ['id', 'pk'], 'UUIDField'],
+        ['keys.Legacy', ['id', 'pk'], 'BigAutoField'],
+      ] as const) {
+        for (const name of names) {
+          const member = parse(n.nativeResolveOrmMember(label, 'instance', name, null));
+          assert(member?.fieldKind === kind, `${phase}: ${label}.${name} retains ${kind}`);
+          const lookup = parse(n.nativeResolveLookupPath(label, name + '__exact', 'filter'));
+          assert(lookup.resolved && lookup.terminalType?.outputFieldKind === kind,
+            `${phase}: ${label}.${name} lookup retains ${kind}`);
+        }
+      }
+    }
+  }
+}
+
+async function assertAstFileDiscovery(n: ReturnType<typeof loadNative>): Promise<void> {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'django-orm-ast-discovery-'));
+  const decode = (buffer: Buffer | null): any => {
+    assert(buffer !== null, 'native discovery query returns JSON');
+    return JSON.parse(buffer.toString('utf8'));
+  };
+  try {
+    fs.mkdirSync(path.join(root, 'app'));
+    fs.writeFileSync(path.join(root, 'app/models.py'),
+      'from django.db import models\nclass Old(models.Model):\n    code = models.UUIDField(primary_key=True)\nclass New(Old):\n    pass\n');
+    for (const directory of ['.hidden', 'node_modules']) {
+      fs.mkdirSync(path.join(root, directory));
+      fs.writeFileSync(path.join(root, directory, 'ghost.py'), 'hidden = True\n');
+    }
+    const bytes = Buffer.from(JSON.stringify({ 'app.New': { instance: {
+      code: ['scalar', null, 'field', 'UUIDField'], pk: ['scalar', null, 'field', 'UUIDField'],
+    } } }));
+    assert(n.nativeInitFromSurfaceAsync && n.nativeInitFromSurfaceChunksAsync, 'async surface bindings available');
+    const initializers: Array<[string, () => unknown]> = [
+      ['ast', () => n.nativeInit(root, true)],
+      ['surface', () => n.nativeInitFromSurface(root, bytes)],
+      ['asyncSurface', () => n.nativeInitFromSurfaceAsync!(root, bytes)],
+      ['chunkedSurface', () => n.nativeInitFromSurfaceChunksAsync!(root, [bytes.subarray(0, 17), bytes.subarray(17)])],
+    ];
+    const alias = path.join(root, 'app/__init__.py'), extra = path.join(root, 'extra.py');
+    const fixedTime = 1_700_000_000;
+    for (const [mode, initialize] of initializers) {
+      const refresh = async (): Promise<void> => {
+        assert(await initialize(), `${mode}: initialization succeeds`);
+        if (mode !== 'ast') assert(await n.nativeEnsureAstModules(root), `${mode}: AST ensure succeeds`);
+        assert(!decode(n.nativeResolveModule('node_modules.ghost')).resolved, `${mode}: excluded directories stay excluded`);
+        assert(!decode(n.nativeResolveModule('.hidden.ghost')).resolved, `${mode}: hidden directories stay excluded`);
+      };
+      fs.writeFileSync(alias, 'from .models import Old as Visible\n');
+      fs.utimesSync(alias, fixedTime, fixedTime);
+      await refresh();
+      assert(decode(n.nativeResolveExportOrigin('app', 'Visible')).originSymbol === 'Old', `${mode}: original export`);
+      const size = fs.statSync(alias).size;
+      fs.writeFileSync(alias, 'from .models import New as Visible\n');
+      fs.utimesSync(alias, fixedTime, fixedTime);
+      assert(fs.statSync(alias).size === size && fs.statSync(alias).mtimeMs === fixedTime * 1000,
+        `${mode}: edit retains size and exact restored timestamp`);
+      await refresh();
+      assert(decode(n.nativeResolveExportOrigin('app', 'Visible')).originSymbol === 'New', `${mode}: current content wins over timestamps`);
+      fs.writeFileSync(extra, 'created = True\n');
+      await refresh();
+      assert(decode(n.nativeResolveModule('extra')).resolved, `${mode}: new source included`);
+      fs.unlinkSync(extra);
+      await refresh();
+      assert(!decode(n.nativeResolveModule('extra')).resolved, `${mode}: deleted source removed`);
+      fs.writeFileSync(extra, 'def unfinished(\n');
+      await refresh();
+      assert(!decode(n.nativeResolveModule('extra')).resolved, `${mode}: parse failure does not revive deleted module`);
+      fs.writeFileSync(extra, 'recovered = True\n');
+      await refresh();
+      assert(decode(n.nativeResolveModule('extra')).resolved, `${mode}: parser recovery included`);
+      fs.unlinkSync(extra);
+    }
+    console.log('native AST file discovery OK:4 initialization paths; same-size/restored-time export edit, creation/deletion, excluded directories and parse-failure recovery');
+  } finally {
+    n.nativeDrop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 async function main(): Promise<void> {
   const n = loadNative();
 
@@ -306,6 +433,9 @@ async function main(): Promise<void> {
       .items.map((i: { name: string }) => i.name);
     assert(clsNames.includes('from_json'), 'bulk class includes classmethod');
     assert(clsNames.includes('default_label'), 'bulk class includes staticmethod');
+
+    await assertSurfacePrimaryKeys(n, tmpDir);
+    await assertAstFileDiscovery(n);
 
     console.log(
       `fastpath napi OK: init=${init.elapsedMs}ms, ` +

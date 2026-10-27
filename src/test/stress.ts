@@ -19,6 +19,7 @@ import {
   updateWorkspaceIndexIncremental,
   getOrBuildFieldTrie,
   type SurfaceIndex,
+  type SurfaceMemberTuple,
 } from '../server/workspaceIndexer.js';
 import { getCompletionCandidates, parseLookupChain } from '../server/lookupResolver.js';
 import type { ParsedLookup } from '../server/types.js';
@@ -41,13 +42,11 @@ function mulberry32(seed: number): () => number {
 // Constants
 // ---------------------------------------------------------------------------
 
-const FIELD_TYPES: Array<[string, string | null]> = [
-  ['str', null], ['int', null], ['bool', null], ['datetime', null],
-  ['float', null], ['Decimal', null], ['UUID', null], ['date', null],
-  ['text', null], ['json', null], ['binary', null], ['email', null],
+const FIELD_TYPES = [
+  'CharField', 'IntegerField', 'BooleanField', 'DateTimeField',
+  'FloatField', 'DecimalField', 'UUIDField', 'DateField',
+  'TextField', 'JSONField', 'BinaryField', 'EmailField',
 ];
-
-const RECEIVER_KINDS = ['instance', 'model_class', 'manager', 'queryset', 'related_manager'] as const;
 
 // ---------------------------------------------------------------------------
 // Realistic surface index generator
@@ -86,7 +85,7 @@ function generateStressSurfaceIndex(modelCount: number, seed = 42): SurfaceIndex
   }
 
   for (let i = 0; i < modelCount; i++) {
-    const instanceMembers: Record<string, [string, string | null]> = {};
+    const instanceMembers: Record<string, SurfaceMemberTuple> = {};
     const modelClassMembers: Record<string, [string, string | null]> = {};
     const managerMembers: Record<string, [string, string | null]> = {};
     const querysetMembers: Record<string, [string, string | null]> = {};
@@ -95,36 +94,36 @@ function generateStressSurfaceIndex(modelCount: number, seed = 42): SurfaceIndex
     const fieldCount = randInt(5, 40);
     for (let f = 0; f < fieldCount; f++) {
       const ft = pick(FIELD_TYPES);
-      instanceMembers[`field_${f}`] = ft;
+      instanceMembers[`field_${f}`] = ['scalar', null, 'field', ft];
     }
 
     // Forward FK relations: 1~5
     const fkCount = randInt(1, 5);
     for (let r = 0; r < fkCount; r++) {
       const targetIdx = randInt(0, modelCount - 1);
-      instanceMembers[`fk_${r}`] = [`ForeignKey[${labels[targetIdx]}]`, 'instance'];
-      instanceMembers[`fk_${r}_id`] = ['int', null];
+      instanceMembers[`fk_${r}`] = ['instance', labels[targetIdx], 'relation', 'ForeignKey'];
+      instanceMembers[`fk_${r}_id`] = ['scalar', null, 'field', 'IntegerField'];
     }
 
     // M2M relations: 0~2
     const m2mCount = randInt(0, 2);
     for (let m = 0; m < m2mCount; m++) {
       const targetIdx = randInt(0, modelCount - 1);
-      instanceMembers[`m2m_${m}`] = [`ManyToManyRelatedManager[${labels[targetIdx]}]`, 'related_manager'];
+      instanceMembers[`m2m_${m}`] = ['related_manager', labels[targetIdx], 'relation', 'ManyToManyField'];
     }
 
     // Reverse FK relations: 0~8 (simulating reverse_*_set)
     const reverseCount = randInt(0, 8);
     for (let rv = 0; rv < reverseCount; rv++) {
       const sourceIdx = randInt(0, modelCount - 1);
-      instanceMembers[`reverse_${rv}_set`] = [`RelatedManager[${labels[sourceIdx]}]`, 'related_manager'];
+      instanceMembers[`reverse_${rv}_set`] = ['related_manager', labels[sourceIdx], 'reverse_relation', 'reverse_ForeignKey'];
     }
 
     // Inherited fields from parent
     if (baseOf.has(i)) {
       const parentIdx = baseOf.get(i)!;
-      instanceMembers['parent_ptr'] = [`OneToOneField[${labels[parentIdx]}]`, 'instance'];
-      instanceMembers['parent_ptr_id'] = ['int', null];
+      instanceMembers['parent_ptr'] = ['instance', labels[parentIdx], 'relation', 'OneToOneField'];
+      instanceMembers['parent_ptr_id'] = ['scalar', null, 'field', 'IntegerField'];
     }
 
     // Model class members (objects manager)
@@ -190,7 +189,8 @@ function percentile(sorted: number[], p: number): number {
 // Stress test runner
 // ---------------------------------------------------------------------------
 
-function runStressTest(modelCount: number): void {
+function runStressTest(modelCount: number) {
+  const sampleRandom = mulberry32(20261008);
   console.log(`\n${'='.repeat(70)}`);
   console.log(`  STRESS TEST: ${modelCount.toLocaleString()} models`);
   console.log(`${'='.repeat(70)}\n`);
@@ -208,6 +208,23 @@ function runStressTest(modelCount: number): void {
   const t1 = performance.now();
   const index = buildWorkspaceIndex(surfaceIndex, modelNames);
   const buildMs = performance.now() - t1;
+  const fieldKinds = new Set<string>();
+  let forwardRelations = 0;
+  let reverseRelations = 0;
+  for (const model of index.models.values()) {
+    for (const [name, tuple] of Object.entries(surfaceIndex[model.label].instance ?? {})) {
+      const field = model.fields.get(name);
+      if (!field || field.fieldKind !== tuple[3]) throw new Error(`Incorrect stress field: ${model.label}.${name}`);
+      fieldKinds.add(field.fieldKind);
+      if (tuple[2] === 'relation' && !model.relations.has(name)) throw new Error(`Missing forward relation: ${name}`);
+      if (tuple[2] === 'reverse_relation' && !model.reverseRelations.has(name)) throw new Error(`Missing reverse relation: ${name}`);
+    }
+    forwardRelations += model.relations.size;
+    reverseRelations += model.reverseRelations.size;
+    for (const relation of [...model.relations.values(), ...model.reverseRelations.values()]) {
+      if (!index.models.has(relation.targetModelLabel)) throw new Error(`Missing stress target: ${relation.targetModelLabel}`);
+    }
+  }
   console.log(`buildWorkspaceIndex: ${formatMs(buildMs)}`);
 
   // --- 3. Diff no-op ---
@@ -216,7 +233,9 @@ function runStressTest(modelCount: number): void {
     fingerprints.set(label, JSON.stringify(surfaceIndex[label]));
   }
   const t2 = performance.now();
-  diffSurfaceIndex(surfaceIndex, surfaceIndex, fingerprints);
+  const wireFingerprints = Object.fromEntries(fingerprints);
+  const noopDiff = diffSurfaceIndex(surfaceIndex, surfaceIndex, fingerprints, wireFingerprints);
+  if (noopDiff.added.length || noopDiff.changed.length || noopDiff.removed.length) throw new Error('No-op stress diff changed models');
   const diffMs = performance.now() - t2;
   console.log(`diffSurfaceIndex (no-op): ${formatMs(diffMs)}`);
 
@@ -226,16 +245,25 @@ function runStressTest(modelCount: number): void {
   for (const label of changedLabels) {
     modified[label] = {
       ...surfaceIndex[label],
-      instance: { ...surfaceIndex[label].instance, stress_new_field: ['str', null] },
+      instance: { ...surfaceIndex[label].instance, stress_new_field: ['scalar', null, 'field', 'CharField'] },
     };
   }
   for (const label of Object.keys(surfaceIndex)) {
     fingerprints.set(label, JSON.stringify(surfaceIndex[label]));
   }
+  const modifiedFingerprints = { ...wireFingerprints };
+  for (const label of changedLabels) modifiedFingerprints[label] = JSON.stringify(modified[label]);
   const t3 = performance.now();
-  const diff10 = diffSurfaceIndex(surfaceIndex, modified, fingerprints);
+  const diff10 = diffSurfaceIndex(surfaceIndex, modified, fingerprints, modifiedFingerprints);
+  const diff10Ms = performance.now() - t3;
+  if (diff10.changed.length !== changedLabels.length) throw new Error('Stress diff missed changed models');
+  const tUpdate = performance.now();
   updateWorkspaceIndexIncremental(index, modified, diff10);
-  const incrMs = performance.now() - t3;
+  const incrMs = performance.now() - tUpdate;
+  for (const label of changedLabels) {
+    if (!index.models.get(label)?.fields.has('stress_new_field')) throw new Error(`Stress update missed ${label}`);
+  }
+  console.log(`diffSurfaceIndex (10 changed): ${formatMs(diff10Ms)}`);
   console.log(`incrementalUpdate (10 changed): ${formatMs(incrMs)}`);
 
   // --- 5. Lazy trie build (sample 200) ---
@@ -243,7 +271,7 @@ function runStressTest(modelCount: number): void {
   const trieSample = 200;
   const trieTimings: number[] = [];
   for (let i = 0; i < trieSample; i++) {
-    const label = allLabels[Math.floor(Math.random() * allLabels.length)];
+    const label = allLabels[Math.floor(sampleRandom() * allLabels.length)];
     const tt = performance.now();
     getOrBuildFieldTrie(index, label);
     trieTimings.push(performance.now() - tt);
@@ -260,7 +288,7 @@ function runStressTest(modelCount: number): void {
   const completionSample = 200;
   const completionTimings: number[] = [];
   for (let i = 0; i < completionSample; i++) {
-    const label = allLabels[Math.floor(Math.random() * allLabels.length)];
+    const label = allLabels[Math.floor(sampleRandom() * allLabels.length)];
     const parsed: ParsedLookup = {
       segments: ['field_'],
       resolvedPath: [],
@@ -268,7 +296,7 @@ function runStressTest(modelCount: number): void {
       startModel: label,
     };
     const ct = performance.now();
-    getCompletionCandidates(parsed, 'field_', index);
+    if (getCompletionCandidates(parsed, 'field_', index).length === 0) throw new Error('Missing stress field completions');
     completionTimings.push(performance.now() - ct);
   }
   completionTimings.sort((a, b) => a - b);
@@ -284,13 +312,14 @@ function runStressTest(modelCount: number): void {
   const chainTimings: number[] = [];
   let chainResolved = 0;
   for (let i = 0; i < chainSample; i++) {
-    const label = allLabels[Math.floor(Math.random() * allLabels.length)];
+    const label = allLabels[Math.floor(sampleRandom() * allLabels.length)];
     const ct = performance.now();
     const result = parseLookupChain('fk_0__field_0', label, index);
     chainTimings.push(performance.now() - ct);
-    if (result.state !== 'error') chainResolved++;
+    if (result.state !== 'error' && result.resolvedPath.length === 2) chainResolved++;
   }
   chainTimings.sort((a, b) => a - b);
+  if (chainResolved !== chainSample) throw new Error(`Stress FK traversal only resolved ${chainResolved}/${chainSample}`);
   console.log(
     `parseLookupChain (fk_0__field_0, ${chainSample}): ` +
     `p50=${formatMs(percentile(chainTimings, 0.5))} ` +
@@ -302,13 +331,14 @@ function runStressTest(modelCount: number): void {
   const deepChainTimings: number[] = [];
   let deepResolved = 0;
   for (let i = 0; i < chainSample; i++) {
-    const label = allLabels[Math.floor(Math.random() * allLabels.length)];
+    const label = allLabels[Math.floor(sampleRandom() * allLabels.length)];
     const ct = performance.now();
     const result = parseLookupChain('fk_0__fk_0__fk_0__field_0', label, index);
     deepChainTimings.push(performance.now() - ct);
-    if (result.state !== 'error') deepResolved++;
+    if (result.state !== 'error' && result.resolvedPath.length === 4) deepResolved++;
   }
   deepChainTimings.sort((a, b) => a - b);
+  if (deepResolved !== chainSample) throw new Error(`Stress deep traversal only resolved ${deepResolved}/${chainSample}`);
   console.log(
     `parseLookupChain (3-hop FK, ${chainSample}): ` +
     `p50=${formatMs(percentile(deepChainTimings, 0.5))} ` +
@@ -316,20 +346,16 @@ function runStressTest(modelCount: number): void {
     `resolved=${deepResolved}/${chainSample}`
   );
 
-  // --- 9. Captain-style queryset chain (filter → exclude_deleted → values) ---
+  // --- 9. Completion after a fully resolved scalar field ---
   const chainQsSample = 200;
   const chainQsTimings: number[] = [];
   for (let i = 0; i < chainQsSample; i++) {
-    const label = allLabels[Math.floor(Math.random() * allLabels.length)];
-    // Simulate: Model.objects.filter(field_0=...) → completion on next segment
-    const parsed: ParsedLookup = {
-      segments: ['field_0__icontains'],
-      resolvedPath: [],
-      state: 'partial',
-      startModel: label,
-    };
+    const label = allLabels[Math.floor(sampleRandom() * allLabels.length)];
     const ct = performance.now();
-    getCompletionCandidates(parsed, 'icontains', index);
+    const parsed = parseLookupChain('field_0__', label, index);
+    if (parsed.resolvedPath.length !== 1 || getCompletionCandidates(parsed, 'e', index).length === 0) {
+      throw new Error('Missing stress scalar lookup completions');
+    }
     chainQsTimings.push(performance.now() - ct);
   }
   chainQsTimings.sort((a, b) => a - b);
@@ -343,7 +369,7 @@ function runStressTest(modelCount: number): void {
   const reverseSample = 200;
   const reverseTimings: number[] = [];
   for (let i = 0; i < reverseSample; i++) {
-    const label = allLabels[Math.floor(Math.random() * allLabels.length)];
+    const label = allLabels[Math.floor(sampleRandom() * allLabels.length)];
     const parsed: ParsedLookup = {
       segments: ['reverse_'],
       resolvedPath: [],
@@ -382,6 +408,16 @@ function runStressTest(modelCount: number): void {
   console.log(`  Reverse p95:     ${formatMs(percentile(reverseTimings, 0.95))}`);
   console.log(`  Heap delta:      ${heapMB.toFixed(0)}MB`);
   console.log(`${'─'.repeat(70)}\n`);
+  return {
+    timestamp: new Date().toISOString(), node: process.version, modelCount, seed: 42, samplingSeed: 20261008,
+    correctness: { changedModels: diff10.changed.length, forwardRelations, reverseRelations,
+      fieldKinds: [...fieldKinds].sort(), fkResolved: chainResolved, deepResolved, samples: chainSample },
+    metrics: { generateMs: genMs, buildMs, diffNoOpMs: diffMs, diff10Ms, incremental10Ms: incrMs,
+      trieP95Ms: percentile(trieTimings, 0.95), completionP95Ms: percentile(completionTimings, 0.95),
+      fkP95Ms: percentile(chainTimings, 0.95), deepP95Ms: percentile(deepChainTimings, 0.95),
+      scalarLookupP95Ms: percentile(chainQsTimings, 0.95), reverseP95Ms: percentile(reverseTimings, 0.95),
+      heapDeltaMB: heapMB, rssDeltaMB: rssMB, totalHeapMB: memAfter.heapUsed / 1024 / 1024 },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -390,4 +426,8 @@ function runStressTest(modelCount: number): void {
 
 const args = process.argv.slice(2);
 const count = parseInt(args.find(a => !a.startsWith('--')) || '100000', 10);
-runStressTest(count);
+if (!Number.isSafeInteger(count) || count <= 0) throw new Error('Model count must be a positive integer');
+const jsonMode = args.includes('--json');
+if (jsonMode) console.log = () => {};
+const result = runStressTest(count);
+if (jsonMode) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

@@ -12,6 +12,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as vm from 'vm';
+import * as ts from 'typescript';
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`assertion failed: ${msg}`);
@@ -78,25 +80,30 @@ function testFastPathBypassesIpcInCompiledArtifact(): void {
 
 function testCapturedManagerQuerysetReturns(): void {
   const content = loadProvidersJs();
-  // inferBuiltinManagerOrQuerysetReturnKind 안에 filter/get/all 등 핵심 method 포함
-  const start = content.indexOf('function inferBuiltinManagerOrQuerysetReturnKind');
-  assert(start >= 0, 'inferBuiltinManagerOrQuerysetReturnKind 함수 위치 찾기 실패');
-  const body = content.slice(start, start + 1500);
+  const source = ts.createSourceFile('pythonProviders.js', content, ts.ScriptTarget.ES2022, true, ts.ScriptKind.JS);
+  const dependencies = new Set(['BUILTIN_QUERYSET_RETURNING', 'BUILTIN_INSTANCE_RETURNING']);
+  const implementation = source.statements.filter(statement =>
+    (ts.isFunctionDeclaration(statement) && statement.name?.text === 'inferBuiltinManagerOrQuerysetReturnKind') ||
+    (ts.isVariableStatement(statement) && statement.declarationList.declarations.some(declaration =>
+      ts.isIdentifier(declaration.name) && dependencies.has(declaration.name.text))),
+  ).map(statement => statement.getText(source)).join('\n');
+  const script = new vm.Script(`${implementation}\ninferBuiltinManagerOrQuerysetReturnKind(methodName)`);
 
   const requiredQueryset = ['filter', 'exclude', 'all', 'annotate', 'order_by'];
   const requiredInstance = ['first', 'last', 'get', 'create'];
   for (const m of requiredQueryset) {
     assert(
-      body.includes(`'${m}'`),
-      `queryset returning method '${m}' 가 매핑에 포함되어야 captain 의 일반 chain cover. 발췌: ${body.slice(0, 400)}`,
+      script.runInNewContext({ methodName: m }) === 'queryset',
+      `queryset returning method '${m}' must resolve through the compiled fast path`,
     );
   }
   for (const m of requiredInstance) {
     assert(
-      body.includes(`'${m}'`),
-      `instance returning method '${m}' 가 매핑에 포함되어야 함`,
+      script.runInNewContext({ methodName: m }) === 'instance',
+      `instance returning method '${m}' must resolve through the compiled fast path`,
     );
   }
+  assert(script.runInNewContext({ methodName: 'unknown_custom_method' }) === undefined, 'unknown methods must use IPC fallback');
   console.log('  [ok] manager/queryset return kind 매핑에 핵심 method 포함');
 }
 

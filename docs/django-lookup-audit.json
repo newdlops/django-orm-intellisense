@@ -1,0 +1,95 @@
+{
+  "status": "complete",
+  "auditedAt": "2026-10-08",
+  "scope": "Installed registries, lookup paths, current ORM member changes, and the explicitly listed annotation and relation contexts.",
+  "objective": "Improve performance and audit dynamic lookup recommendations and current Django ORM support.",
+  "latestOfficialDjango": "6.1.2",
+  "sources": {
+    "release": "https://www.djangoproject.com/download/",
+    "releaseNotes": "https://docs.djangoproject.com/en/6.1/releases/6.1/",
+    "patchNotes": "https://docs.djangoproject.com/en/6.1/releases/6.1.2/",
+    "lookupRegistry": "https://docs.djangoproject.com/en/6.1/ref/models/lookups/",
+    "postgresFields": "https://docs.djangoproject.com/en/6.1/ref/contrib/postgres/fields/",
+    "gisLookups": "https://docs.djangoproject.com/en/6.1/ref/contrib/gis/geoquerysets/"
+  },
+  "implemented": [
+    "Per-field instance registrations and registry inheritance, without class-name promotion to sibling fields.",
+    "Transform expressions retain their own lookup registrations and output-field metadata across chains.",
+    "GeneratedField output types, actual primary-key aliases, FK attname lookup restrictions, and composite PK operators.",
+    "JSON key/index continuations and name collisions, including constructor and toString keys.",
+    "PostgreSQL array indices/slices/length, HStore keys, and range transforms.",
+    "Raster band metadata with finite shared descriptors for dynamically generated transform classes.",
+    "Transform paths in values, values_list, order_by, and expression contexts; async lookup contexts.",
+    "Typed annotation chains and configured Manager.from_queryset annotation methods.",
+    "Django 6.1 fetch_mode and BitAnd/BitOr/BitXor expression paths; condition-based constraint fixtures.",
+    "Lookup metadata cache invalidation, no 200-name truncation, shared type/transform tables, and cached trie lookups.",
+    "Positional aliases containing __, Unicode/numeric lookup contexts, and parameterized array annotations.",
+    "Version-aware totally_ordered property and fetch_mode; calendar-version parsing.",
+    "Scalar expression outputs for FK/generated columns and preserved source-instance registrations.",
+    "Single-valued select_related paths, prefetch accessors, only/defer query aliases, and correct forward ManyToMany direction.",
+    "Binding-aware receiver caches, latest annotation overwrite types, Rust cache generations, and retained temporary field identities.",
+    "Terminal projection transforms insert a complete value path without an unusable separator."
+  ],
+  "validation": {
+    "typescriptCompile": "passed",
+    "rustCoreTests": { "run": 78, "passed": 78 },
+    "django61PythonTests": { "run": 135, "passed": 133, "skipped": 2 },
+    "django60PythonTests": { "run": 135, "passed": 133, "skipped": 2 },
+    "django52PythonTests": { "run": 135, "passed": 133, "skipped": 2 },
+    "skippedTests": "Two historical/log-dependent checks; application lookup tests passed.",
+    "django61QueryOracleCases": 78,
+    "django60QueryOracleCases": 78,
+    "django52QueryOracleCases": 78,
+    "relationOracleCasesPerVersion": 40,
+    "testedDjangoVersions": ["6.1.2", "6.0.9", "5.2.18"],
+    "vscodeVersion": "1.115.0",
+    "vscodeDjango61Tests": { "run": 8, "passed": 8 },
+    "vscodeChecks": [
+      "instance lookups and dynamic transform continuations",
+      "ORM lookup completion, hover, and definition",
+      "custom field lookups",
+      "FK attname aliases",
+      "Q/F expression paths",
+      "Meta constraint condition paths",
+      "cross-file custom QuerySet annotations",
+      "Unicode literals and keywords",
+      "positional alias insertion and typed hover",
+      "annotation overwrite types and projection insertion",
+      "relation eligibility and accessor/query-name distinction"
+    ],
+    "nativeSmokeAndCacheTests": "passed",
+    "nativeDesktopVisualQA": {
+      "size": "1440 x 900", "result": "passed",
+      "checked": ["Visible gt/gte popup with LookupSample.id__count owner label", "Keyboard selection and dismissal without editing the fixture"]
+    },
+    "geoDjango": {
+      "version": "6.1.2", "backend": "SpatiaLite 5.0.1", "gdal": "3.6.2",
+      "executed": ["2D/3D NumDimensions", "num_dimensions projection/comparisons", "isempty filter and IsEmpty projection"],
+      "raster": "Real RasterField registry/band transforms; no raster SQL"
+    },
+    "performanceComparison": "bench/lookup-django61-before-after.json",
+    "performanceScales": "bench/lookup-django61-scale.json",
+    "performanceScalesAllPassed": true,
+    "performanceSpeedups": { "buildMs": 4.017433267329189, "chainNs": 6.587520098437412 },
+    "performanceNote": "Synthetic medians: 3000 models, 7 repetitions. Candidate extraction alone is about 5% slower (0.59us versus 0.56us); index building and chained lookup parsing improve substantially.",
+    "runtimeCatalogBenchmark": "python/benchmarks/bench_lookup_catalog.py",
+    "runtimeCatalogSample": {
+      "fields": 10000, "sharedTypes": 28, "medianMs": 35.92987504089251,
+      "jsonBytes": 161094, "repetitions": 5
+    }
+  },
+  "resolvedFindings": [
+    { "id": "positional_aggregate_aliases", "status": "fixed_and_validated" },
+    { "id": "queryset_totally_ordered", "status": "fixed_and_validated" },
+    { "id": "gis_real_runtime", "status": "validated_with_spatialite_and_real_raster_registry" },
+    { "id": "additional_context_audit", "status": "fixed_and_validated" }
+  ],
+  "remaining": [],
+  "limits": [
+    "Registry tests establish lookup availability and path/type resolution, not every backend's SQL support or RHS value validation.",
+    "PostgreSQL and raster SQL were not executed. Geometry SQL used SpatiaLite; composite-PK comparison cases used SQLite.",
+    "The catalog reflects registries loaded at project startup/reindex, not arbitrary later imports/registrations.",
+    "Complex/custom annotation expressions or aliased constructors that cannot be established statically remain advisory; project code is not executed to infer them.",
+    "Native desktop popup and keyboard behavior were inspected at one size. No browser/mobile/tablet or comprehensive theme/accessibility audit was performed."
+  ]
+}

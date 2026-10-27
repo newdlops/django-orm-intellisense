@@ -2,7 +2,7 @@
   "name": "django-orm-intellisense",
   "displayName": "Django ORM Intellisense",
   "description": "Framework-aware autocomplete, hover, go-to-definition, and optional diagnostics for Django ORM lookup paths, relation strings, and queryset chains.",
-  "version": "0.2.2027",
+  "version": "0.2.2028",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -147,6 +147,8 @@
     "benchmark": "node out/test/benchmark.js",
     "benchmark:full": "node out/test/benchmark.js --full",
     "benchmark:json": "node out/test/benchmark.js --full --json",
+    "benchmark:lookups": "npm run compile && node --expose-gc scripts/benchmark-lookups.cjs",
+    "benchmark:native": "node --expose-gc scripts/benchmark-native.cjs",
     "benchmark:python": "cd python && python -m benchmarks.bench_reindex",
     "stress": "node out/test/stress.js"
   },
