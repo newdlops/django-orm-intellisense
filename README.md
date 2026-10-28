@@ -100,8 +100,8 @@ Optional suppression of Pylance false positives for dynamic Django ORM attribute
 
 1. Install the extension from the VS Code Marketplace.
 2. Open a Django project in VS Code.
-3. Run **Django ORM: Select Python Interpreter** (`Cmd+Shift+P`) and choose the project's virtualenv.
-4. The extension discovers settings throughout the workspace, including nested Django projects and `src` layouts. Each project's declared `manage.py`, WSGI, or ASGI settings are analyzed independently, and their apps and models are available together. For ambiguous settings variants within one project, run **Django ORM: Select Settings Module**.
+3. The extension follows the Python environment selected in VS Code, then `python.defaultInterpreterPath`, then a project `.venv`, `venv`, `env`, or `.env` virtualenv. Use **Django ORM: Select Python Interpreter** (`Cmd+Shift+P`) when you need an explicit override. Python 3.10 or newer is required.
+4. The extension discovers settings throughout the workspace, including nested Django projects and `src` layouts. All concrete Django settings contribute apps and models, including several services sharing one project root. Shared base settings are followed through their consumers. **Django ORM: Select Settings Module** prioritizes a default without excluding the other settings; **Show Status** lists each registry's progress or failure.
 5. Start typing in a `filter()`, `values()`, or relation field — completions appear automatically.
 6. For eager warm-up instead of lazy first-use startup, set `djangoOrmIntellisense.autoStart` to `true`.
 
@@ -112,15 +112,15 @@ Optional suppression of Pylance false positives for dynamic Django ORM attribute
 | **Django ORM: Show Status** | Display daemon health, workspace info, and model index stats |
 | **Django ORM: Restart Daemon** | Restart the Python analysis daemon |
 | **Django ORM: Select Python Interpreter** | Choose the Python executable or virtualenv for analysis |
-| **Django ORM: Select Settings Module** | Choose which Django settings module to use |
+| **Django ORM: Select Settings Module** | Prioritize a Django settings module |
 | **Django ORM: Suppress Pylance False Positives** | Configure Pylance diagnostic overrides for dynamic ORM attributes |
 
 ## Configuration
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `djangoOrmIntellisense.pythonInterpreter` | `""` | Python interpreter or virtualenv path. Supports directory (`.venv`) or executable (`.venv/bin/python`) paths. |
-| `djangoOrmIntellisense.settingsModule` | `""` | `DJANGO_SETTINGS_MODULE` value. Auto-detected from `manage.py` if empty. |
+| `djangoOrmIntellisense.pythonInterpreter` | `""` | Optional override for automatic interpreter selection. Supports directory (`.venv`) or executable (`.venv/bin/python`) paths. Otherwise follows VS Code's selected/default interpreter or a project virtualenv. |
+| `djangoOrmIntellisense.settingsModule` | `""` | Prioritized `DJANGO_SETTINGS_MODULE`; defaults to the declared project setting. Other concrete settings remain included. |
 | `djangoOrmIntellisense.workspaceRoot` | `""` | Analysis root. Defaults to the containing VS Code workspace folder, including all nested Django projects. Set an explicit root to limit the analysis scope. |
 | `djangoOrmIntellisense.autoStart` | `false` | Auto-start the analysis daemon when a Python file is opened. Disabled by default so activation stays lightweight; providers start the daemon lazily on first use. |
 | `djangoOrmIntellisense.diagnostics.enabled` | `true` | Enable live Django ORM diagnostics. Diagnostics are lazy by default and run only after the analysis daemon is already started. |
@@ -128,7 +128,7 @@ Optional suppression of Pylance false positives for dynamic Django ORM attribute
 | `djangoOrmIntellisense.pylance.autoApplyStubOverrides` | `false` | Automatically write Django stub overrides and restart Pylance on activation. Disabled by default; use the configure command to apply overrides manually. |
 | `djangoOrmIntellisense.logLevel` | `"info"` | Daemon log verbosity (`off`, `info`, `debug`). |
 
-Independent projects keep separate Django registries, so duplicate app/model names and project-specific lookups do not overwrite each other. Runtime collection runs one project at a time in short-lived child processes, using the selected Python interpreter; its environment must contain the dependencies required by the projects. A failing settings module leaves the other projects available. Multi-project metadata stays in the current session rather than using the single-project startup cache.
+Every settings module gets an isolated Django registry. Within one project, common source models are deduplicated and settings-specific members and lookups are combined. Independent projects and different source classes with the same Django label keep separate identities. Parsed source modules and equal immutable member records are shared; registry collection runs serially in short-lived child processes, using the selected Python interpreter. Its environment must contain the dependencies required by the settings. A failing settings module preserves other results and remains visible in status. Multi-registry metadata stays in the current session rather than using the single-project startup cache.
 
 ## Architecture
 

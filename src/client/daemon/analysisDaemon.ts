@@ -14,6 +14,7 @@ import { daemonProcessLaunch } from './nativeProcessLaunch';
 import { prepareNativeDaemonState, type NativeDaemonStateOwner } from './nativeDaemonState';
 import { isSurfaceSourceProvenance, type SurfaceCacheContext, type SurfaceSourceProvenance } from '../surfaceSourceProvenance';
 import { fingerprintLaunchEnvironment } from '../launchEnvironment';
+import { PythonRuntimeCompatibility } from '../python/runtimeCompatibility';
 import * as vscode from 'vscode';
 import { getExtensionSettings } from '../config/settings';
 import { normalizeSourcePath } from '../sourceWatcher';
@@ -163,6 +164,7 @@ interface PendingRequest {
 }
 
 interface LaunchContext {
+  resource?: vscode.Uri;
   workspaceRoot: string;
   pythonPath: string;
   pythonSource: string;
@@ -401,6 +403,7 @@ export class AnalysisDaemon implements vscode.Disposable {
   private localModelFingerprints = new Map<string, string>();
   private lastLaunchContext?: LaunchContext;
   private interpreterCheck?: Promise<void>;
+  private readonly pythonCompatibility = new PythonRuntimeCompatibility();
   private currentState: HealthSnapshot = {
     phase: 'stopped',
     detail: 'Daemon has not been started yet.',
@@ -869,7 +872,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       return;
     }
 
-    await this.restartIfInterpreterChanged();
+    await this.restartIfInterpreterChanged(scope);
   }
 
   async restart(scope?: vscode.ConfigurationScope): Promise<HealthSnapshot> {
@@ -974,8 +977,12 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
   }
 
-  async restartIfInterpreterChanged(): Promise<void> {
-    if (!this.process || this.currentState.phase === 'starting') {
+  async restartIfInterpreterChanged(scope?: vscode.ConfigurationScope): Promise<void> {
+    const pending = this.restartPromise ?? this.startPromise;
+    if (pending) {
+      try { await pending; } catch { /* A newly available interpreter can recover a failed start. */ }
+    }
+    if (!this.lastLaunchContext || this.stopRequested || this.currentState.phase === 'stopped') {
       return;
     }
 
@@ -984,7 +991,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       return;
     }
 
-    this.interpreterCheck = this.checkForInterpreterChange();
+    this.interpreterCheck = this.checkForInterpreterChange(scope);
 
     try {
       await this.interpreterCheck;
@@ -2927,6 +2934,14 @@ export class AnalysisDaemon implements vscode.Disposable {
       settingsModule: launchContext.settingsModule,
     });
 
+    try {
+      await this.pythonCompatibility.check(launchContext.pythonPath, launchContext.workspaceRoot);
+    } catch (error) {
+      if (lifecycle === this.lifecycleRevision) this.updateStateFromError(error);
+      throw error;
+    }
+    if (lifecycle !== this.lifecycleRevision) throw new Error('Daemon startup belongs to an inactive daemon session.');
+
     const nativeLaunch = daemonProcessLaunch(this.context.extensionPath, launchContext.pythonPath);
     const preparedState = nativeLaunch.stateChannel
       ? prepareNativeDaemonState(environment.TMPDIR || '/tmp', nativeLaunch.command, message => this.log('info', message))
@@ -3113,8 +3128,10 @@ export class AnalysisDaemon implements vscode.Disposable {
   private async createLaunchContext(
     scope?: vscode.ConfigurationScope
   ): Promise<LaunchContext> {
+    const resource = scope && 'uri' in scope ? scope.uri : scope instanceof vscode.Uri ? scope
+      : vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
     const settings = getExtensionSettings(
-      scope ?? vscode.workspace.workspaceFolders?.[0]?.uri
+      resource ?? scope
     );
     const configuredWorkspaceRoot = settings.workspaceRoot
       ? path.resolve(settings.workspaceRoot)
@@ -3123,9 +3140,10 @@ export class AnalysisDaemon implements vscode.Disposable {
       (configuredWorkspaceRoot && pathExists(configuredWorkspaceRoot)
         ? configuredWorkspaceRoot
         : undefined) ??
+      (resource && vscode.workspace.getWorkspaceFolder(resource)?.uri.fsPath) ??
       vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ??
       this.context.extensionPath;
-    const interpreter = await resolvePythonInterpreter(settings);
+    const interpreter = await resolvePythonInterpreter({...settings, workspaceRoot}, resource);
     const validation = validatePythonInterpreterPath(interpreter.path);
 
     if (!validation.valid) {
@@ -3135,6 +3153,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     }
 
     return {
+      resource,
       workspaceRoot,
       pythonPath: validation.normalizedPath,
       pythonSource: interpreter.source,
@@ -3444,6 +3463,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     return {
       ...snapshot,
       workspaceRoot: snapshot.workspaceRoot ?? this.lastLaunchContext?.workspaceRoot,
+      pythonPath: snapshot.pythonPath ?? this.lastLaunchContext?.pythonPath,
       pythonSource: this.lastLaunchContext?.pythonSource,
       pythonSourceDetail: this.lastLaunchContext?.pythonSourceDetail,
       settingsModule: snapshot.settingsModule ?? this.lastLaunchContext?.settingsModule,
@@ -3469,13 +3489,20 @@ export class AnalysisDaemon implements vscode.Disposable {
     });
   }
 
-  private async checkForInterpreterChange(): Promise<void> {
-    if (!this.lastLaunchContext) {
+  private async checkForInterpreterChange(scope?: vscode.ConfigurationScope): Promise<void> {
+    const previous = this.lastLaunchContext;
+    const lifecycle = this.lifecycleRevision;
+    if (!previous) {
       return;
     }
 
-    const nextLaunchContext = await this.createLaunchContext();
-    if (nextLaunchContext.pythonPath === this.lastLaunchContext.pythonPath) {
+    const resource = scope ?? previous.resource ?? vscode.Uri.file(previous.workspaceRoot);
+    const nextLaunchContext = await this.createLaunchContext(resource);
+    if (lifecycle !== this.lifecycleRevision || this.lastLaunchContext !== previous || this.stopRequested
+        || this.currentState.phase === 'stopped') return;
+    if (nextLaunchContext.pythonPath === previous.pythonPath
+        && nextLaunchContext.workspaceRoot === previous.workspaceRoot
+        && nextLaunchContext.settingsModule === previous.settingsModule) {
       return;
     }
 
@@ -3483,7 +3510,7 @@ export class AnalysisDaemon implements vscode.Disposable {
       'info',
       `Detected Python interpreter change (${this.lastLaunchContext.pythonPath} -> ${nextLaunchContext.pythonPath}). Restarting analysis daemon.`
     );
-    await this.restart();
+    await this.restart(resource);
   }
 
   private async requiresScopedRestart(
@@ -3496,6 +3523,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     const nextLaunchContext = await this.createLaunchContext(scope);
     return (
       nextLaunchContext.workspaceRoot !== this.lastLaunchContext.workspaceRoot ||
+      nextLaunchContext.pythonPath !== this.lastLaunchContext.pythonPath ||
       (nextLaunchContext.settingsModule ?? '') !==
         (this.lastLaunchContext.settingsModule ?? '')
     );

@@ -1,7 +1,8 @@
 """Collect independent Django registries serially in owned child processes."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from copy import copy
 from pathlib import Path
 import os
 import pickle
@@ -30,12 +31,36 @@ class ProjectRuntime:
     source_snapshot: object = None
     source_membership: str | None = None
     dependencies: tuple[str, ...] = ()
+    app_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class ProjectRuntimeFailure:
     project: SettingsProject
     error: str
+
+
+def copy_source_index(index):
+    owned = copy(index)
+    owned._runtime_member_snapshot = None
+    owned._runtime_graph_map_cache = None
+    owned._runtime_source_epoch = None
+    return owned
+
+
+def scope_source_index(index, runtime):
+    by_label = {}
+    for candidate in index.model_candidates:
+        by_label.setdefault(candidate.label, []).append(candidate)
+    installed = {(model.module, model.label.rsplit('.', 1)[-1]) for model in runtime.model_catalog}
+    choices = {label: candidate.module for label, candidates in by_label.items() if len(candidates) > 1
+        for candidate in candidates if (candidate.module, candidate.object_name) in installed}
+    if choices == getattr(index, '_profile_model_modules', {}):
+        return index
+    scoped = replace(index, _profile_model_modules=choices)
+    if getattr(index, '_source_import_roots', ()):
+        scoped._source_import_roots = index._source_import_roots
+    return scoped
 
 
 def snapshot_project_sources(root: Path, files) -> PythonSourceSnapshot:
@@ -60,7 +85,7 @@ def project_owner(projects, path):
 
 def project_source_files(projects, project, files):
     return tuple(path for path in files
-        if (owner := project_owner(projects, path)) is None or owner == project)
+        if (owner := project_owner(projects, path)) is None or owner.root == project.root)
 
 
 def project_source_projection(root, snapshot, files):
@@ -84,7 +109,8 @@ def project_source_projection(root, snapshot, files):
 
 def collect_project_runtimes(projects, *, workspace_root, source_files,
                              stopping=None, is_current=lambda: True,
-                             timeout_seconds=30, extra_roots=(), all_projects=None):
+                             timeout_seconds=30, extra_roots=(), all_projects=None,
+                             static_indexes=None, static_snapshots=None):
     """Yield one project at a time; no Django classes or resident child survive."""
     stopping = stopping if stopping is not None else threading.Event()
     projects, source_files = tuple(projects), tuple(source_files)
@@ -100,7 +126,10 @@ def collect_project_runtimes(projects, *, workspace_root, source_files,
         except OSError as error:
             yield ProjectRuntimeFailure(project, 'Project source inventory changed before collection: ' + str(error))
             continue
-        state = (project, str(workspace_root), selected, ownership, expected, membership, tuple(extra_roots))
+        original = static_indexes.get(project.namespace) if static_indexes else None
+        seed = copy_source_index(original) if original is not None else None
+        seed_snapshot = static_snapshots.get(project.namespace) if static_snapshots else None
+        state = (project, str(workspace_root), selected, ownership, expected, membership, tuple(extra_roots), seed, seed_snapshot)
         with _private_state_file(state, 'djls-project-runtime-state-') as input_path:
             result_path = Path(input_path).with_name('result.pickle')
             log_path = result_path.with_suffix('.log')
@@ -121,12 +150,15 @@ def collect_project_runtimes(projects, *, workspace_root, source_files,
                 except OSError as error:
                     yield ProjectRuntimeFailure(project, 'Project runtime could not start: ' + str(error))
                     continue
-                cancelled, expired = False, False
+                cancelled, expired, completed = False, False, False
                 try:
                     lifetime.child_spawned()
                     while child.poll() is None:
                         if stopping.wait(0.02) or not is_current():
                             cancelled = True
+                            break
+                        if result_path.is_file():
+                            completed = True
                             break
                         if time.monotonic() >= deadline:
                             expired = True
@@ -141,7 +173,7 @@ def collect_project_runtimes(projects, *, workspace_root, source_files,
                             child.wait(timeout=1)
                 if cancelled or stopping.is_set() or not is_current():
                     return
-            if expired or child.returncode != 0:
+            if expired or child.returncode != 0 and not completed:
                 with log_path.open('rb') as stream:
                     stream.seek(max(0, log_path.stat().st_size - 4000))
                     detail = stream.read().decode('utf-8', errors='replace')
@@ -153,6 +185,12 @@ def collect_project_runtimes(projects, *, workspace_root, source_files,
                         value = pickle.load(stream)
                     if not isinstance(value, (ProjectRuntime, ProjectRuntimeFailure)) or value.project != project:
                         raise ValueError('Project runtime result does not belong to its requested project.')
+                    if isinstance(value, ProjectRuntime) and value.static_index is None:
+                        if seed is None:
+                            raise ValueError('Project result requires an unavailable static source seed.')
+                        owned = scope_source_index(copy_source_index(seed), value.inspection)
+                        owned._runtime_member_snapshot = value.members
+                        value = replace(value, static_index=owned)
                 except (OSError, EOFError, pickle.UnpicklingError, ValueError) as error:
                     value = ProjectRuntimeFailure(project, 'Project runtime did not return a valid result: ' + str(error))
         if stopping.is_set() or not is_current():
@@ -170,7 +208,10 @@ def project_worker_main(input_path, result_path):
     from ..semantic.graph import build_model_graph
     from ..static_index.indexer import build_static_index
     with Path(input_path).open('rb') as stream:
-        project, workspace_root, source_files, projects, expected, expected_membership, extra_roots = pickle.load(stream)
+        state = pickle.load(stream)
+        project, workspace_root, source_files, projects, expected, expected_membership, extra_roots = state[:7]
+        seed = state[7] if len(state) > 7 else None
+        seed_snapshot = state[8] if len(state) > 8 else None
     roots = tuple(dict.fromkeys((project.import_root, project.root, workspace_root, *map(str, extra_roots))))
     sys.path[:] = [*roots, *(entry for entry in sys.path if entry not in roots)]
     before_global = snapshot_python_sources(Path(workspace_root), extra_roots=list(extra_roots) or None, max_workers=1)
@@ -194,24 +235,39 @@ def project_worker_main(input_path, result_path):
         proof_files = tuple(path for path in before_global.files
             if (owner := project_owner(projects, path)) is None or owner.namespace in dependencies)
         source_files = tuple(dict.fromkeys((*source_files, *(path for path in before_global.files if path in imported))))
-        static = build_static_index(Path(project.import_root), python_files=source_files,
-                                    import_roots=roots)
+        covered = set(seed_snapshot.files) if seed_snapshot is not None else set()
+        reused_static = (seed is not None and set(source_files).issubset(covered)
+            and project_source_projection(Path(project.import_root), seed_snapshot, source_files).fingerprint
+                == project_source_projection(Path(project.import_root), before_global, source_files).fingerprint)
+        static = seed if reused_static else build_static_index(Path(project.import_root), python_files=source_files,
+                                                               import_roots=roots)
+        static = scope_source_index(static, runtime)
         graph = build_model_graph(static, runtime)
         members = (capture_current_runtime_members(static, runtime, graph)
                    if runtime.bootstrap_status == 'ready' else None)
         static._runtime_member_snapshot = members
         surface = prebuild_member_surface_cache(static, runtime, graph)
+        if runtime.bootstrap_status == 'ready':
+            from django.apps import apps
+            app_names = tuple(config.name for config in apps.get_app_configs())
+        else:
+            app_names = ()
     after_global = snapshot_python_sources(Path(workspace_root), extra_roots=list(extra_roots) or None, max_workers=1)
     before = project_source_projection(Path(project.import_root), before_global, proof_files)
     expected_scope = project_source_projection(Path(project.import_root), expected, proof_files)
     after_files = tuple(path for path in after_global.files
         if (owner := project_owner(projects, path)) is None or owner.namespace in dependencies)
     after = project_source_projection(Path(project.import_root), after_global, after_files)
-    value = (ProjectRuntime(project, static, runtime, graph, members, surface,
+    value = (ProjectRuntime(project, None if reused_static else static, runtime, graph, members, surface,
                             fingerprint_surface_index(surface), before,
-                            source_membership_fingerprint(before), tuple(sorted(dependencies)))
+                            source_membership_fingerprint(before), tuple(sorted(dependencies)), app_names)
              if expected_scope.fingerprint == before.fingerprint == after.fingerprint
              and expected_membership == before_membership == source_membership_fingerprint(after_global)
              else ProjectRuntimeFailure(project, 'Project source changed during runtime collection.'))
-    with Path(result_path).open('wb') as stream:
+    # Project imports may start non-daemon telemetry/logging threads. Publish
+    # only a closed complete snapshot; the owner can then reap this child
+    # without waiting for unrelated project shutdown hooks or background work.
+    pending_result = Path(result_path).with_suffix('.pending')
+    with pending_result.open('wb') as stream:
         pickle.dump(value, stream, protocol=pickle.HIGHEST_PROTOCOL)
+    pending_result.replace(result_path)

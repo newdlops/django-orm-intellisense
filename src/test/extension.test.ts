@@ -14526,7 +14526,7 @@ Post._meta.get_field('title').register_lookup(FieldSizeTransform)
     assert.strictEqual(validation.normalizedPath, developerPython);
   });
 
-  test('falls back only when pythonInterpreter is unset', async () => {
+  test('discovers an interpreter without an explicit extension override', async () => {
     const interpreter = await resolvePythonInterpreter({
       settingsModule: undefined,
       workspaceRoot: undefined,
@@ -14537,7 +14537,7 @@ Post._meta.get_field('title').register_lookup(FieldSizeTransform)
       pylanceAutoApplyStubOverrides: false,
     });
 
-    assert.strictEqual(interpreter.source, 'fallback');
+    assert.ok(['python-extension', 'python.defaultInterpreterPath', 'workspace-venv', 'fallback'].includes(interpreter.source));
     assert.ok(interpreter.path.length > 0);
   });
 

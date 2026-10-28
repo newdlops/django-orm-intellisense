@@ -35,18 +35,65 @@ class SettingsProject:
     selector: str | None
     namespace: str
     candidates: tuple[str, ...]
+    group_namespace: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
             'root': self.root, 'importRoot': self.import_root,
             'settingsModule': self.settings_module, 'selector': self.selector,
             'namespace': self.namespace, 'candidates': list(self.candidates),
+            'groupNamespace': self.group_namespace or self.namespace,
         }
+
+
+def _settings_profiles(candidates, selected):
+    """Find complete Django settings, retaining inherited fragments as sources.
+
+    Plain settings.py files from unrelated services are not Django registries.
+    Imported common/base modules are covered by their concrete consumers; they
+    are not configured independently unless explicitly declared/selected.
+    """
+    by_module = {source.module: source for source in candidates}
+    apps, imports, malformed = set(), {}, set()
+    for source in candidates:
+        references = set()
+        try:
+            tree = ast.parse(Path(source.file_path).read_text(encoding='utf-8-sig')) if source.file_path else None
+        except (OSError, UnicodeError, SyntaxError, RecursionError):
+            tree = None
+            malformed.add(source.module)
+        for node in ast.walk(tree) if tree else ():
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else ()
+            if any(isinstance(target, ast.Name) and target.id == 'INSTALLED_APPS' for target in targets):
+                apps.add(source.module)
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == 'INSTALLED_APPS'):
+                apps.add(source.module)
+            if isinstance(node, ast.ImportFrom) and any(alias.name in ('*', 'INSTALLED_APPS') for alias in node.names):
+                module = node.module or ''
+                if node.level:
+                    package = source.module if source.file_path and Path(source.file_path).name == '__init__.py' else source.module.rpartition('.')[0]
+                    parts = package.split('.')
+                    prefix = parts[:len(parts) - node.level + 1]
+                    module = '.'.join((*prefix, *((node.module or '').split('.') if node.module else ())))
+                if module in by_module:
+                    references.add(module)
+        imports[source.module] = references
+    while True:
+        expanded = apps | {module for module, references in imports.items() if references & apps}
+        if expanded == apps:
+            break
+        apps = expanded
+    inherited = {reference for module, references in imports.items() if module in apps for reference in references}
+    profiles = [source for source in candidates if source.entrypoints or source is selected
+                or source.module in apps and source.module not in inherited
+                or source.module in malformed and source.file_path and Path(source.file_path).name == 'settings.py']
+    return tuple(dict.fromkeys(profiles or [source for source in candidates if source.module in apps]))
 
 
 def settings_projects(root: Path, sources: tuple[SettingsSource, ...],
                       override: str | None = None) -> tuple[SettingsProject, ...]:
-    """Choose each project's own declared default while retaining every variant."""
+    """Collect every concrete settings registry; a declared default only orders it."""
     grouped: dict[str, list[SettingsSource]] = {}
     for source in sources:
         grouped.setdefault(source.project_root, []).append(source)
@@ -61,10 +108,18 @@ def settings_projects(root: Path, sources: tuple[SettingsSource, ...],
         selected = explicit or (declared[0] if declared else candidates[0] if len(candidates) == 1 else None)
         relative = Path(project_root).relative_to(root).as_posix()
         namespace = 'project_' + hashlib.sha256(relative.encode('utf-8')).hexdigest()[:16]
-        projects.append(SettingsProject(project_root,
-            selected.import_root or project_root if selected else project_root,
-            selected.module if selected else None, selected.selector if selected else None, namespace,
-            tuple(source.selector for source in candidates)))
+        profiles = _settings_profiles(candidates, selected)
+        if selected in profiles:
+            profiles = (selected, *(source for source in profiles if source is not selected))
+        if not profiles:
+            projects.append(SettingsProject(project_root, project_root, None, None, namespace,
+                tuple(source.selector for source in candidates), namespace))
+        for index, source in enumerate(profiles):
+            profile_namespace = namespace if index == 0 else namespace + '_settings_' + hashlib.sha256(
+                source.selector.encode('utf-8')).hexdigest()[:12]
+            projects.append(SettingsProject(project_root, source.import_root or project_root,
+                source.module, source.selector, profile_namespace,
+                tuple(candidate.selector for candidate in candidates), namespace))
     return tuple(projects)
 
 

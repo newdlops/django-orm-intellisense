@@ -4,7 +4,7 @@ const PYTHON_EXTENSION_ID = 'ms-python.python';
 const CANCELLED = Symbol('Python provider readiness cancelled');
 
 /** Release our continuation on scope changes without cancelling another extension's work. */
-function waitForPublicReady<T>(promise: PromiseLike<T>, signal: AbortSignal): Promise<T> {
+export function waitForPublicReady<T>(promise: PromiseLike<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(CANCELLED);
   return new Promise<T>((resolve, reject) => {
     const abort = () => {

@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.2.2030 — 2026-10-28
+
+- Analyze every concrete Django settings registry even when several settings
+  share one project root. A declared or explicit default prioritizes collection
+  without excluding the other services. Follow inherited settings statically
+  and keep unrelated non-Django settings out of registry collection.
+- Combine models, reverse relations, custom members and lookup descriptors;
+  deduplicate common source models and distinguish identical Django labels
+  owned by different sources. Refresh all dependent settings after a save.
+- Share parsed source modules and equal immutable member records. Run registry
+  collectors serially, verify source identity before reusing a static seed,
+  and report each settings module's ready, pending or failed state in status.
+- Keep ready model metadata when an optional manager's `get_queryset()` fails
+  during member inspection, falling back to its declared QuerySet class.
+- Allow a serial registry collector up to 60 seconds above 10,000 source files;
+  retain the 30-second bound for smaller workspaces and immediate cancellation.
+- Publish complete child snapshots atomically and reap owned collectors even
+  when project imports start unrelated background threads. Normalize document
+  source aliases before selecting a project.
+- Select the Python environment automatically from VS Code's public Python
+  selection API, its default interpreter setting, or a project virtualenv.
+  Explicit extension settings and legacy overrides retain precedence.
+- Follow initial Python readiness and environment changes, including recovery
+  after a failed fallback start. Keep unopened analysis lazy, coalesce overlapping
+  changes, and discard reconciliation after a stop or session replacement.
+- Resolve interpreters using the requesting file's workspace instead of another
+  active editor or the first workspace folder. Preserve virtualenv executable paths.
+- Retain a matching project virtualenv when the public selection reports its
+  resolved base executable, so project-installed dependencies remain visible.
+  Explicitly selected external virtualenvs keep their own package scope.
+- Check Python 3.10 compatibility before importing the daemon, with a shared
+  result that invalidates when the executable or version pins change. Report the
+  incompatible version directly instead of repeatedly crashing on module imports.
+- Show automatically selected interpreters in status and reserve the manual
+  interpreter recommendation for unresolved fallback selection.
+- Exclude local logs and emitted benchmark helpers from the extension package.
+
 ## 0.2.2029 — 2026-10-27
 
 - Discover settings across a repository, including independent nested Django

@@ -14,16 +14,17 @@ from django_orm_intellisense.runtime.projects import ProjectRuntime, collect_pro
 
 
 class ProjectPlanTest(unittest.TestCase):
-    def test_ambiguous_project_is_reported_instead_of_dropped(self):
+    def test_all_complete_settings_are_collected_without_an_entrypoint(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'api/config/settings').mkdir(parents=True)
             for name in ('dev.py', 'prod.py'):
                 (root / 'api/config/settings' / name).write_text('INSTALLED_APPS=[]\n')
             profile = discover_workspace(root)
-            project, = settings_projects(root, profile.settings_sources)
-            self.assertEqual(len(project.candidates), 2)
-            self.assertIsNone(project.settings_module)
+            projects = settings_projects(root, profile.settings_sources)
+            self.assertEqual({project.settings_module for project in projects}, {'config.settings.dev', 'config.settings.prod'})
+            self.assertTrue(all(len(project.candidates) == 2 for project in projects))
+            self.assertEqual(len({project.group_namespace for project in projects}), 1)
 
     def test_each_project_retains_its_declared_default_and_all_variants(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -183,6 +184,26 @@ class IndependentProjectRuntimeTest(unittest.TestCase):
         self.assertEqual(len(processes), 1)
         self.assertIsNotNone(processes[0].poll())
         self.assertEqual(list(state_root.iterdir()), [])
+
+    def test_complete_snapshot_does_not_wait_for_project_background_threads(self):
+        self.project('one', 'first', 'import threading, time\n'
+            'threading.Thread(target=time.sleep, args=(30,), daemon=False).start()\n')
+        projects, files = self.plan()
+        processes = []
+        import subprocess
+        original = subprocess.Popen
+        def started(*args, **kwargs):
+            child = original(*args, **kwargs)
+            processes.append(child)
+            return child
+        with mock.patch('django_orm_intellisense.runtime.projects.subprocess.Popen', side_effect=started):
+            value, = collect_project_runtimes(projects, workspace_root=self.root,
+                source_files=files, timeout_seconds=4)
+        self.assertIsInstance(value, ProjectRuntime)
+        self.assertEqual(value.inspection.bootstrap_status, 'ready')
+        self.assertIn('first', value.surface['inventory.Item']['instance'])
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
 
 
 if __name__ == '__main__':

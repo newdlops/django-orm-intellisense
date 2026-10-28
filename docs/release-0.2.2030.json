@@ -1,0 +1,103 @@
+{
+  "version": "0.2.2030",
+  "date": "2026-10-28",
+  "target": "darwin-arm64",
+  "sourceBase": "bb428fe30f6c5720d611d2a2a07c2c9e92d97564",
+  "scope": [
+    "Automatic workspace Python selection and readiness recovery, preserving virtualenv paths",
+    "Every concrete Django settings registry, including several services sharing a project root",
+    "Shared source parsing and immutable rows; isolated serial registries and atomic child handoff",
+    "Deduplicated common models and unioned custom members, relations and lookup types",
+    "Distinct source identities for colliding Django labels; source-checked seeds and dependent save refresh",
+    "Per-settings status, optional manager inspection fallback and large-workspace collection bounds"
+  ],
+  "validation": {
+    "django5": {
+      "version": "5.2.12",
+      "passed": 165,
+      "skipped": 0
+    },
+    "django6": {
+      "version": "6.1.2",
+      "passed": 165,
+      "skipped": 0
+    },
+    "clientProgramsPassed": 7,
+    "typeScriptBuildPassed": true,
+    "realEditor": {
+      "surface": "existing macOS VS Code desktop window",
+      "djangoVersion": "5.2.13",
+      "settingsCount": 7,
+      "readySettings": 7,
+      "phase": "ready",
+      "uniqueRuntimeModels": 1375,
+      "automaticProjectVirtualenv": true,
+      "manualProjectConfigurationChanges": false,
+      "checked": [
+        "ordinary Python hover request triggers lazy automatic startup",
+        "all seven settings registry results visible in status",
+        "native surface update and AST preparation"
+      ]
+    },
+    "packageChecks": {
+      "version": "0.2.2030",
+      "target": "darwin-arm64",
+      "members": 376,
+      "runtimeFilesMatched": 127,
+      "testsAndPrivateDataExcluded": true,
+      "zipCrcPassed": true,
+      "nativeExecutableModesPassed": true,
+      "nativeMatchesPublished2029": true,
+      "bytes": 2330656,
+      "sha256": "40c1d366093b3df4cd8390f96657ebd344e92a3b10add80ae840028b3cca033b"
+    }
+  },
+  "limits": [
+    "All registries use one selected Python environment, which must contain their dependencies.",
+    "Shared settings fragments are covered through their consumers in the current project environment.",
+    "Cold repository indexing and serial registry collection are longer operations; this release makes no new latency guarantee.",
+    "Multi-registry metadata is session-only; it does not reuse the single-registry persistent startup cache.",
+    "The targeted editor check did not repeat the historical eight editing actions, full IR suite or Windows checks.",
+    "Per-process RSS observations do not establish deduplicated physical memory or an instantaneous peak."
+  ],
+  "systemScope": [
+    "No administrator access, system path or security policy changes.",
+    "No autostart registration or separate resident service.",
+    "Disposable validation environments retired after per-path retention policy checks; dependency archives retained."
+  ],
+  "sourceSha256": {
+    ".vscodeignore": "a024fe77162de1c9354daab9114e11b7fd55c0882507b86d9d2d14e1d5843c3b",
+    "CHANGELOG.md": "c38b8306afe6dcf5635c87bb2b3c538eef7035ca8e3b8b264916c1b1eb5d12f7",
+    "README.md": "ef7d4bb10c11ec4a9b9537f7ba4801eb2b93279fc64cb442f67358ff42946064",
+    "package-lock.json": "1dd394ef6a7cb11a979794edd77c93c4f21235336623411f17b9a411a0e9abc9",
+    "package.json": "302b394bffea300c382e45bc5ae54f52c6d0b9313e37cbc34add90c1c11be355",
+    "python/django_orm_intellisense/discovery/settings.py": "8e83029858c8c0a2d02ba049ef6c45d9bc547c09c80ae8ff65bb12289b4ada4f",
+    "python/django_orm_intellisense/features/orm_members.py": "eef6fc03147d6afa563c230bbdc43c75ac42431312c9986db1b9096e8c41881d",
+    "python/django_orm_intellisense/runtime/projects.py": "85f1ea906651f05a581a0ea1e501593774b1049289bfa551959a44b5f5fac70f",
+    "python/django_orm_intellisense/server/project_daemon.py": "836bedc276ed5bc7d33c5c2a084c50ade35d2d99e813d18f75608f983efaf41a",
+    "python/django_orm_intellisense/server/settings_union.py": "1b4d89472fa91fe3ac20aeea98c6fbacfe1143efd68ff30518ca1425c1e6e68c",
+    "python/django_orm_intellisense/server/workspace_projects.py": "889438692c9693b2fe37087ba92ca3baa4076ecee591c5d3987121d5a5b0729e",
+    "python/django_orm_intellisense/static_index/indexer.py": "593e346fcf089f70cd613e829bb6d3b29990125779c1c36713cc588f58a1afac",
+    "python/tests/test_project_runtime_isolation.py": "0c49b57c13cba2b2c36452cadc4469903ff2482bfd36e80662a3ff9c30d9ee56",
+    "python/tests/test_same_root_settings.py": "bd861c23f19b95b6b37baa8db3c8b4d46706d0e64f57e6c0b857ff92e6a19f0b",
+    "scripts/check-client-project-contexts.cjs": "99e66e89cbd993a7f457117ac42f75a02169655967e8dfd40b1751058da3a1b8",
+    "src/client/commands/showStatus.ts": "6067d9f40dc65ab3f590760e54104ae61282d80dc8d38c01cf5bd0f8ec607d21",
+    "src/client/config/settings.ts": "2bc1975c012b1d360b151b8f70d9bb3ea114b6533a7221cfc44b191e7d12f128",
+    "src/client/daemon/analysisDaemon.ts": "3d71d2bc61e861e3c04009dcfd5cee607e5feab8936ba5848552470b7519ca65",
+    "src/client/extension.ts": "487fcffc2e89db7c691137b89b3961e40bdbfa4f815ffc5de8a04d04db3bf41f",
+    "src/client/protocol.ts": "e280aad2a5de867819a6d027a69ac7b693ca82ff24ae44a943b3af70f7ac9ab5",
+    "src/client/python/automaticInterpreter.test.ts": "35a62235febde504d3d4972801615a942511a59e004b0cac7e856207247c8ef2",
+    "src/client/python/interpreter.ts": "7dd2908dda86dd802a99b095f6995709788de536b8931b5cb6395529b9eeecca",
+    "src/client/python/interpreterChanges.ts": "41204a8bbdbc5520679d71c43cc48ac8fc9b1c2643635e5266994241fb58f966",
+    "src/client/python/providerReadiness.ts": "642a21055d3faedcb20484da6af6f60e31c0339aabe57caca57a9932639cdfb3",
+    "src/client/python/runtimeCompatibility.test.ts": "34a0a49bd82f878d02a0252b15e8a137bccac3015e2a5420da8b5f7fc27bdbcf",
+    "src/client/python/runtimeCompatibility.ts": "06be43fe9d5858348ce440b90b97a92cf80efc44b7c8a0c83fb8a1150621f27d",
+    "src/client/status/healthStatus.ts": "215d0dc0d66e500587d24c656b5d7b4e9c4604b5b71ad570d22c84421dd4343e",
+    "src/test/extension.test.ts": "71f4761fa44d1af06b751b4178ddba9fdb4b1bf520db33da4ae153044bd28e5d"
+  },
+  "package": {
+    "file": "django-orm-intellisense-0.2.2030-darwin-arm64.vsix",
+    "bytes": 2330656,
+    "sha256": "40c1d366093b3df4cd8390f96657ebd344e92a3b10add80ae840028b3cca033b"
+  }
+}

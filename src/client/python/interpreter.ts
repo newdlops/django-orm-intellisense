@@ -15,6 +15,9 @@ const DARWIN_PYTHON3_CANDIDATES = [
 
 export type PythonInterpreterSource =
   | 'djangoOrmIntellisense.pythonInterpreter'
+  | 'python-extension'
+  | 'python.defaultInterpreterPath'
+  | 'workspace-venv'
   | 'fallback';
 
 export interface ResolvedPythonInterpreter {
@@ -48,7 +51,8 @@ export function getInterpreterResource(
 }
 
 export function getInterpreterBasePath(
-  settings: ExtensionSettings = getExtensionSettings()
+  settings: ExtensionSettings = getExtensionSettings(),
+  resource: vscode.Uri | undefined = getInterpreterResource(settings)
 ): string | undefined {
   const configuredWorkspaceRoot = resolveExistingWorkspaceRootSetting(
     settings.workspaceRoot
@@ -57,7 +61,6 @@ export function getInterpreterBasePath(
     return configuredWorkspaceRoot;
   }
 
-  const resource = getInterpreterResource(settings);
   const workspaceFolder = getWorkspaceFolderPath(resource);
   if (workspaceFolder) {
     return workspaceFolder;
@@ -67,10 +70,10 @@ export function getInterpreterBasePath(
 }
 
 export async function resolvePythonInterpreter(
-  settings: ExtensionSettings = getExtensionSettings()
+  settings: ExtensionSettings = getExtensionSettings(),
+  resource: vscode.Uri | undefined = getInterpreterResource(settings)
 ): Promise<ResolvedPythonInterpreter> {
-  const resource = getInterpreterResource(settings);
-  const basePath = getInterpreterBasePath(settings);
+  const basePath = getInterpreterBasePath(settings, resource);
 
   const configuredInterpreter = normalizeInterpreterCandidate(
     settings.pythonInterpreter,
@@ -100,14 +103,100 @@ export async function resolvePythonInterpreter(
     };
   }
 
+  // Read the public selection synchronously. Environment discovery/activation
+  // may still be running; the owned readiness observer reconciles it later.
+  try {
+    const python = vscode.extensions.getExtension<PythonSelectionApi>('ms-python.python');
+    const selected = python?.isActive
+      ? python.exports.environments?.getActiveEnvironmentPath(resource)?.path : undefined;
+    const selectedPath = existingAutomaticInterpreter(selected, resource, basePath);
+    if (selectedPath) {
+      const directory = path.dirname(selectedPath);
+      const environmentRoot = ['bin', 'scripts'].includes(path.basename(directory).toLowerCase())
+        ? path.dirname(directory) : directory;
+      const selectedEnvironment = fs.existsSync(path.join(environmentRoot, 'pyvenv.cfg'))
+        || fs.existsSync(path.join(environmentRoot, 'conda-meta'));
+      // Public selection may be the resolved base executable of a project
+      // virtualenv. Preserve the virtualenv path so its installed packages
+      // remain visible. An explicitly selected external env stays external.
+      const projectPath = !selectedEnvironment
+        ? findAutomaticWorkspaceInterpreter(resource, basePath, safeRealpath(selectedPath)) : undefined;
+      return {
+        path: projectPath ?? selectedPath, source: 'python-extension',
+        detail: projectPath
+          ? 'Using the project virtualenv for the base Python executable selected in VS Code.'
+          : 'Using the Python environment selected in VS Code for this workspace.',
+      };
+    }
+  } catch {
+    // The Python extension may not have published its API yet.
+  }
+
+  const pythonConfiguration = vscode.workspace.getConfiguration('python', resource);
+  const defaultPath = existingAutomaticInterpreter(
+    pythonConfiguration.get<string>('defaultInterpreterPath'), resource, basePath);
+  if (defaultPath) return {
+    path: defaultPath, source: 'python.defaultInterpreterPath',
+    detail: 'Using the workspace `python.defaultInterpreterPath` setting.',
+  };
+
+  const localPath = findAutomaticWorkspaceInterpreter(resource, basePath);
+  if (localPath) return {
+    path: localPath, source: 'workspace-venv',
+    detail: 'Using the project virtual environment discovered from the source file and workspace root.',
+  };
+
   const fallbackInterpreter = findFallbackPythonInterpreter();
   return {
     path: fallbackInterpreter,
     source: 'fallback',
     detail:
-      `No \`djangoOrmIntellisense.pythonInterpreter\` is configured. ` +
+      `No selected Python environment or project virtual environment was found. ` +
       `Falling back to \`${fallbackInterpreter}\`.`,
   };
+}
+
+/** Public contract: https://github.com/microsoft/vscode-python/blob/main/pythonExtensionApi/src/main.ts */
+export interface PythonSelectionApi {
+  ready?: PromiseLike<unknown>;
+  environments?: {
+    getActiveEnvironmentPath(resource?: vscode.Uri): { path: string } | undefined;
+    onDidChangeActiveEnvironmentPath?: vscode.Event<{ resource?: vscode.Uri | vscode.WorkspaceFolder }>;
+  };
+}
+
+function existingAutomaticInterpreter(candidate: string | undefined, resource?: vscode.Uri,
+                                      basePath?: string): string | undefined {
+  const normalized = normalizeInterpreterCandidate(candidate, resource, basePath);
+  // The Python API's unselected default can be the command "python". It
+  // must not hide an existing project virtualenv or another folder's choice.
+  if (!normalized || !path.isAbsolute(normalized)) return undefined;
+  return validatePythonInterpreterPath(normalized).valid ? normalized : undefined;
+}
+
+function findAutomaticWorkspaceInterpreter(resource?: vscode.Uri, basePath?: string,
+                                           selectedBase?: string): string | undefined {
+  if (!basePath) return undefined;
+  const root = path.resolve(basePath);
+  let current = root;
+  if (resource?.scheme === 'file') {
+    const source = path.resolve(resource.fsPath);
+    const directory = fs.statSync(source, { throwIfNoEntry: false })?.isDirectory() ? source : path.dirname(source);
+    const relative = path.relative(root, directory);
+    if (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative)) current = directory;
+  }
+  while (true) {
+    for (const name of ['.venv', 'venv', 'env', '.env']) {
+      const candidate = listVirtualEnvInterpreterCandidates(path.join(current, name))
+        .find(value => validatePythonInterpreterPath(value).valid
+          && (!selectedBase || safeRealpath(value) === selectedBase));
+      if (candidate) return candidate;
+    }
+    if (current === root) return undefined;
+    const parent = path.dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
 }
 
 export async function normalizePythonInterpreterSettings(
@@ -637,39 +726,20 @@ function buildDirectoryExecutableCandidates(directory: string): string[] {
 }
 
 function findFallbackPythonInterpreter(): string {
-  if (process.platform === 'win32') {
-    return 'python';
-  }
-
-  for (const candidate of [
-    ...DARWIN_PYTHON3_CANDIDATES,
-    '/opt/homebrew/bin/python3',
-    '/usr/local/bin/python3',
-    '/usr/bin/python3',
-  ]) {
-    try {
-      const stat = fs.statSync(candidate);
-      if (stat.isFile()) {
-        return path.normalize(candidate);
-      }
-    } catch {
-      // Keep searching fallback locations.
-    }
-  }
-
   for (const segment of (process.env.PATH ?? '').split(path.delimiter)) {
-    const candidate = path.join(segment, 'python3');
-    try {
-      const stat = fs.statSync(candidate);
-      if (stat.isFile()) {
-        return path.normalize(candidate);
-      }
-    } catch {
-      // Keep searching PATH entries.
+    if (!segment || !path.isAbsolute(segment)) continue;
+    for (const name of process.platform === 'win32' ? ['python.exe', 'python3.exe'] : ['python3', 'python']) {
+      const candidate = path.join(segment, name);
+      if (validatePythonInterpreterPath(candidate).valid) return path.normalize(candidate);
     }
   }
-
-  return 'python3';
+  for (const candidate of process.platform === 'win32' ? [] : [
+    '/opt/homebrew/bin/python3', '/usr/local/bin/python3',
+    ...(process.platform === 'darwin' ? DARWIN_PYTHON3_CANDIDATES : []), '/usr/bin/python3',
+  ]) {
+    if (validatePythonInterpreterPath(candidate).valid) return path.normalize(candidate);
+  }
+  return process.platform === 'win32' ? 'python' : 'python3';
 }
 
 function remapKnownMacOsPythonStub(candidate: string): string {

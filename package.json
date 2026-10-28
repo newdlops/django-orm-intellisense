@@ -2,7 +2,7 @@
   "name": "django-orm-intellisense",
   "displayName": "Django ORM Intellisense",
   "description": "Framework-aware autocomplete, hover, go-to-definition, and optional diagnostics for Django ORM lookup paths, relation strings, and queryset chains.",
-  "version": "0.2.2029",
+  "version": "0.2.2030",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -98,13 +98,13 @@
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "Path to the Python interpreter for the analysis daemon. Accepts a virtualenv directory (.venv) or a Python executable path. Falls back to python3 if empty. Use Cmd+Shift+P → 'Django ORM: Select Python Interpreter' to browse."
+          "description": "Optional Python executable or virtualenv override. Otherwise follows the Python environment selected in VS Code, python.defaultInterpreterPath, or a project virtualenv. Requires Python 3.10 or newer."
         },
         "djangoOrmIntellisense.settingsModule": {
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "Override an automatically discovered settings variant. Independent Django projects are discovered throughout the analysis root, using their own manage.py, WSGI or ASGI declarations."
+          "description": "Prioritize a discovered Django settings module. All concrete Django settings in the analysis root contribute apps and models, including variants sharing one project root. Shared base fragments are covered through their consumers."
         },
         "djangoOrmIntellisense.workspaceRoot": {
           "type": "string",

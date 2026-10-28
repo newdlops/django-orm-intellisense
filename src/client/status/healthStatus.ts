@@ -36,7 +36,7 @@ export class HealthStatusView implements vscode.Disposable {
       `Detail: ${snapshot.detail}`,
       `Workspace: ${snapshot.workspaceRoot ?? 'Unavailable'}`,
       `Python: ${snapshot.pythonPath ?? 'Unavailable'}`,
-      `Settings: ${snapshot.settingsModule ?? 'Not set'}`,
+      `Settings: ${snapshot.settingsModule ?? (snapshot.settingsProfiles?.length ? `${snapshot.settingsProfiles.length} settings combined` : 'Not set')}`,
       `Bootstrap: ${snapshot.runtime?.bootstrapStatus ?? 'Not started'}`,
       `Runtime models: ${snapshot.runtime?.modelCount ?? 0}`,
       'Click to open the full status report.',

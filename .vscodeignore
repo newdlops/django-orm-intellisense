@@ -23,6 +23,9 @@ fixtures/**
 
 # Test output
 out/test/**
+out/bench/**
+log.txt
+rust-toolchain.toml
 
 # Python non-runtime
 python/**/tests/**

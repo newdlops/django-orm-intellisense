@@ -23,6 +23,7 @@ import { applyStubOverrides } from './pylance/stubOverrides';
 import { normalizePythonInterpreterSettings } from './python/interpreter';
 import { isPylanceAvailable, PYLANCE_EXTENSION_ID } from './python/pylance';
 import { registerPythonProviderReadiness } from './python/providerReadiness';
+import { registerPythonInterpreterChanges } from './python/interpreterChanges';
 import { HealthStatusView } from './status/healthStatus';
 import { currentPythonFilesBelowRoot, isWatchedSourcePath, normalizeSourceEventPath, normalizeSourcePath, pythonFilesBelowDirectory, retainPendingSourceEvents, shouldScanSourceDirectory, sourceWatcherRoots } from './sourceWatcher';
 import { captureNativeSourceBoundary, createNativeSourceWatcher, createNativePathWatcher, type NativePathSelection, type NativeSourceBatch, type NativeSourceHandle } from './native/sourceWatcher';
@@ -1022,6 +1023,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   activeDaemon = daemon;
+  context.subscriptions.push(registerPythonInterpreterChanges(resource => {
+    if (!autoRestartsEnabled) return;
+    const state = daemon.getState();
+    // Selection readiness never starts a daemon the user has not requested.
+    if (!state.workspaceRoot || state.phase === 'stopped') return;
+    if (resource) {
+      const changedRoot = vscode.workspace.getWorkspaceFolder(resource)?.uri.fsPath;
+      const daemonRoot = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(state.workspaceRoot))?.uri.fsPath;
+      if (changedRoot && daemonRoot && normalizeSourcePath(changedRoot) !== normalizeSourcePath(daemonRoot)) return;
+    }
+    void daemon.restartIfInterpreterChanged().catch(error => {
+      output.appendLine(`[interpreter] Failed to follow the selected Python environment: ${String(error)}`);
+    });
+  }, message => output.appendLine(message)));
   const pythonProviderOwner = new PythonInteractiveProviderOwner();
   context.subscriptions.push(pythonProviderOwner);
   context.subscriptions.push(registerPythonProviderReadiness(
@@ -1295,6 +1310,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       if (!isRelevantConfigurationChange(event)) {
+        return;
+      }
+      if (!event.affectsConfiguration('djangoOrmIntellisense')) {
+        // Following Python's default selection preserves lazy startup when
+        // no ORM request has started this workspace yet.
+        void daemon.restartIfInterpreterChanged().catch(error => {
+          output.appendLine(`[interpreter] Failed to follow Python configuration: ${String(error)}`);
+        });
         return;
       }
 

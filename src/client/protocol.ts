@@ -55,13 +55,27 @@ export interface RelationTargetItem extends RuntimeModelPreview {
   projectRoot?: string;
 }
 
-/** Internal IDs are qualified per registry; Django source names stay intact. */
+export interface DjangoSettingsProfile {
+  namespace: string;
+  settingsModule?: string | null;
+  selector?: string | null;
+  root: string;
+  phase: ServerPhase;
+  pending: boolean;
+  bootstrapStatus?: string;
+  modelCount?: number;
+  error?: string | null;
+}
+
+/** Internal IDs are qualified per project; Django source names stay intact. */
 export interface DjangoProjectContext {
   root: string;
   importRoot: string;
   rootAliases?: string[];
   namespace: string;
   settingsModule?: string | null;
+  settingsModules?: string[];
+  settingsProfiles?: DjangoSettingsProfile[];
   selector?: string | null;
   candidates: string[];
   phase: ServerPhase;
@@ -223,6 +237,7 @@ export interface HealthSnapshot {
   pythonSourceDetail?: string;
   settingsModule?: string;
   settingsCandidates?: string[];
+  settingsProfiles?: DjangoSettingsProfile[];
   startedAt?: string;
   staticIndex?: StaticIndexSnapshot;
   runtime?: RuntimeInspectionSnapshot;

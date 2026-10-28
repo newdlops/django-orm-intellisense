@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+import hashlib
 import sys
 import threading
 
@@ -14,6 +15,7 @@ from ..features.orm_members import fingerprint_surface_index
 from ..runtime.projects import ProjectRuntime, ProjectRuntimeFailure
 from ..semantic.graph import build_semantic_graph
 from .app import DaemonServer, fingerprint_json_payload
+from .settings_union import CatalogUnion, merge_fallback, merge_surface
 
 
 _LABEL_KEYS = frozenset(('modelLabel', 'baseModelLabel', 'relatedModelLabel',
@@ -32,10 +34,13 @@ _METHODS = {
 
 
 class ProjectWire:
-    def __init__(self, project, engine, workspace_root, raw_root=None):
+    def __init__(self, project, engine, workspace_root, raw_root=None, label_map=None):
         self.project = project
         self.engine = engine
         self.prefix = project.namespace + '.'
+        self.group_prefix = (project.group_namespace or project.namespace) + '.'
+        self.label_map = label_map or {}
+        self.local_labels = {qualified: local for local, qualified in self.label_map.items()}
         aliases = {str(Path(project.root).resolve())}
         if raw_root is not None and Path(project.root).is_relative_to(workspace_root):
             aliases.add(str(Path(raw_root) / Path(project.root).relative_to(workspace_root)))
@@ -49,10 +54,10 @@ class ProjectWire:
                 self.local_modules['.'.join(parts)] = module.module_name
 
     def label(self, value):
-        return self.prefix + value if isinstance(value, str) and value else value
+        return self.label_map.get(value, self.group_prefix + value) if isinstance(value, str) and value else value
 
     def local_label(self, value):
-        return value[len(self.prefix):] if isinstance(value, str) and value.startswith(self.prefix) else value
+        return self.local_labels.get(value, value[len(self.group_prefix):]) if isinstance(value, str) and value.startswith(self.group_prefix) else value
 
     def metadata(self, value):
         if isinstance(value, Mapping):
@@ -207,6 +212,57 @@ class WorkspaceProjects:
         self.pending = {project.namespace for project in self.projects}
         self._lock = threading.RLock()
         self._closed = False
+        self._model_ids = {}
+        self._label_owners = {}
+
+    def _labels_for(self, project, graph):
+        group = project.group_namespace or project.namespace
+        labels = {}
+        for label, node in graph.nodes_by_label.items():
+            # Runtime app labels can collide while the source modules differ.
+            # Prefer the module's actual indexed file over a label-only candidate.
+            source = str(Path(project.import_root).joinpath(*node.module.split('.'))) if node.module else node.file_path
+            identity = group, source, node.object_name
+            qualified = self._model_ids.get(identity)
+            if qualified is None:
+                qualified = group + '.' + label
+                owner = self._label_owners.get(qualified)
+                if owner is not None and owner != identity:
+                    qualified = group + '.source_' + hashlib.sha256(
+                        (str(source) + '\0' + node.object_name).encode()).hexdigest()[:16] + '.' + label
+                self._model_ids[identity] = qualified
+                self._label_owners[qualified] = identity
+            labels[label] = qualified
+        return labels
+
+    def _share_records(self, value):
+        """Reuse equal immutable member rows; keep each registry's owners separate."""
+        group = value.project.group_namespace or value.project.namespace
+        previous = next((state for state in self.states.values()
+            if (state.runtime.project.group_namespace or state.runtime.project.namespace) == group), None)
+        if previous is None:
+            return value
+        surface = dict(value.surface)
+        for label, row in surface.items():
+            old = (previous.engine._last_surface_index or {}).get(label)
+            if old == row:
+                surface[label] = old
+            elif old:
+                surface[label] = {kind: old[kind] if old.get(kind) == members else members for kind, members in row.items()}
+        members = value.members
+        owned = getattr(previous.engine.static_index, '_runtime_member_snapshot', None)
+        if members is not None and owned is not None:
+            items = {}
+            for key, rows in members.items.items():
+                old = owned.items.get(key, ())
+                if rows == old:
+                    items[key] = old
+                else:
+                    by_name = {item.name: item for item in old}
+                    items[key] = tuple(by_name[item.name] if by_name.get(item.name) == item else item for item in rows)
+            members = replace(members, items=items)
+            value.static_index._runtime_member_snapshot = members
+        return replace(value, surface=surface, members=members)
 
     def install(self, value):
         project = value.project
@@ -228,6 +284,7 @@ class WorkspaceProjects:
                 return
             if not isinstance(value, ProjectRuntime):
                 raise TypeError('Expected a pure project runtime result.')
+            value = self._share_records(value)
             output = sys.stdout
             try:
                 engine = DaemonServer(Path(project.import_root))
@@ -271,7 +328,12 @@ class WorkspaceProjects:
             if old is not None:
                 old.engine._stopping.set()
                 old.engine._discard_bg_pool()
-            self.states[project.namespace] = _ProjectState(value, engine, ProjectWire(project, engine, self.root, self.raw_root))
+            # The embedded engine owns mutable generations. Do not retain its
+            # pre-edit graphs/indexes a second time in the collection receipt.
+            receipt = replace(value, static_index=None, inspection=None, model_graph=None,
+                members=None, surface={}, fingerprints={}, source_snapshot=None)
+            self.states[project.namespace] = _ProjectState(receipt, engine, ProjectWire(project, engine, self.root, self.raw_root,
+                self._labels_for(project, engine.model_graph)))
             if value.inspection.bootstrap_status == 'warming_up':
                 self.pending.add(project.namespace)
             self.failures.pop(project.namespace, None)
@@ -291,6 +353,10 @@ class WorkspaceProjects:
     def source_file(self, path):
         if path.is_relative_to(self.root):
             return path
+        path = path.resolve()
+        physical_root = self.root.resolve()
+        if path.is_relative_to(physical_root):
+            return self.root / path.relative_to(physical_root)
         matches = [(project, Path(project.root).resolve()) for project in self.projects
             if path.is_relative_to(Path(project.root).resolve())]
         if not matches:
@@ -298,14 +364,17 @@ class WorkspaceProjects:
         project, physical = max(matches, key=lambda pair: len(pair[1].parts))
         return Path(project.root) / path.relative_to(physical)
 
-    def _state_for(self, params):
+    def _states_for(self, params):
         labels = [params.get(key) for key in ('modelLabel', 'baseModelLabel', 'value')]
         for label in labels:
             if isinstance(label, str):
-                project = next((project for project in self.projects
-                    if label.startswith(project.namespace + '.')), None)
-                if project is not None:
-                    return self.states.get(project.namespace)
+                qualified = [state for state in self.states.values()
+                    if label in state.wire.local_labels
+                    and state.wire.local_labels[label] in state.engine.model_graph.nodes_by_label]
+                if qualified:
+                    return self._prefer_runtime(qualified, labels)
+                if any(label.startswith((project.group_namespace or project.namespace) + '.') for project in self.projects):
+                    return []
         module = params.get('module')
         if not isinstance(module, str) and isinstance(params.get('value'), str):
             module = params['value'].rpartition('.')[0]
@@ -313,17 +382,48 @@ class WorkspaceProjects:
         if isinstance(module, str):
             matches = [state for state in self.states.values() if module in state.wire.local_modules]
             if len(matches) == 1 and not any(module in state.engine.static_index.modules for state in self.states.values()):
-                return matches[0]
+                return matches
         project = self.project_for_file(params.get('_sourceFile') or params.get('filePath'))
         if project is not None:
-            return self.states.get(project.namespace)
-        if len(matches) == 1:
-            return matches[0]
+            group = project.group_namespace or project.namespace
+            # A canonical import path can point at a different project than
+            # the requesting document. It remains authoritative in that case.
+            if matches and len({state.runtime.project.group_namespace or state.runtime.project.namespace for state in matches}) == 1:
+                return self._prefer_runtime(matches, labels)
+            return self._prefer_runtime([state for state in self.states.values()
+                if (state.runtime.project.group_namespace or state.runtime.project.namespace) == group], labels)
+        if matches:
+            if len({state.runtime.project.group_namespace or state.runtime.project.namespace for state in matches}) == 1:
+                return self._prefer_runtime(matches, labels)
+            return []
         candidates = [state for state in self.states.values()
             if any(label in state.engine.model_graph.nodes_by_label for label in labels if isinstance(label, str))]
-        if len(candidates) == 1:
-            return candidates[0]
-        return next(iter(self.states.values())) if len(self.projects) == len(self.states) == 1 else None
+        if candidates:
+            return self._prefer_runtime(candidates, labels) if len({
+                state.runtime.project.group_namespace or state.runtime.project.namespace for state in candidates}) == 1 else []
+        return list(self.states.values()) if len({project.group_namespace or project.namespace for project in self.projects}) == 1 else []
+
+    @staticmethod
+    def _prefer_runtime(states, labels):
+        def priority(state):
+            return not any((node := state.engine.model_graph.nodes_by_label.get(state.wire.local_label(label))) is not None
+                and node.runtime_model is not None for label in labels if isinstance(label, str))
+        return sorted(states, key=priority)
+
+    @staticmethod
+    def _merge_targets(replies):
+        items = {}
+        for reply in replies:
+            for item in reply:
+                label = item['label']
+                previous = items.get(label)
+                if previous is None or previous.get('source') != 'runtime' and item.get('source') == 'runtime':
+                    items[label] = item
+                elif previous is not None:
+                    for key in ('fieldNames', 'relationNames', 'reverseRelationNames', 'managerNames'):
+                        if key in previous or key in item:
+                            previous[key] = list(dict.fromkeys((*previous.get(key, ()), *item.get(key, ()))))
+        return list(items.values())
 
     def request(self, method, params):
         with self._lock:
@@ -331,25 +431,41 @@ class WorkspaceProjects:
                 single = 'resolveOrmMember' if method == 'resolveOrmMemberBatch' else 'resolveLookupPath'
                 return {'results': [self.request(single, {**item, '_sourceFile': params.get('_sourceFile')})
                                     for item in params.get('items', [])]}
-            state = self._state_for(params)
-            if state is None:
-                if method == 'relationTargets':
-                    items = []
-                    for current in self.states.values():
-                        items.extend(current.wire.result(current.engine._relation_targets(params))['items'])
-                    return {'items': items}
-                return {'resolved': False, 'reason': 'ambiguous_or_pending_project'}
             name = _METHODS.get(method)
             if name is None:
                 raise ValueError('Unsupported project request: ' + method)
-            result = getattr(state.engine, name)(state.wire.local_params(params))
-            return state.wire.result(result)
+            states = self._states_for(params)
+            if method == 'relationTargets' and not states:
+                states = list(self.states.values())
+            if not states:
+                return {'resolved': False, 'reason': 'ambiguous_or_pending_project'}
+            replies = []
+            for state in states:
+                result = state.wire.result(getattr(state.engine, name)(state.wire.local_params(params)))
+                replies.append(result)
+                if result.get('resolved') and method not in ('resolveRelationTarget', 'relationTargets', 'lookupPathCompletions', 'ormMemberCompletions'):
+                    return result
+            if method == 'relationTargets':
+                return {'items': self._merge_targets(reply.get('items', ()) for reply in replies)}
+            if method == 'resolveRelationTarget':
+                targets = self._merge_targets([reply['target']] for reply in replies if reply.get('resolved'))
+                if len(targets) == 1:
+                    return {**next(reply for reply in replies if reply.get('resolved')), 'target': targets[0]}
+                if len(targets) > 1:
+                    return {'resolved': False, 'reason': 'ambiguous_settings_model', 'candidates': targets}
+            if method in ('lookupPathCompletions', 'ormMemberCompletions'):
+                items = {}
+                for reply in replies:
+                    for item in reply.get('items', ()):
+                        items.setdefault(item.get('name', item.get('label')), item)
+                return {**replies[0], 'items': list(items.values()), 'resolved': any(reply.get('resolved') for reply in replies)}
+            return replies[0]
 
     def reindex_file(self, params):
         with self._lock:
             owner = self.project_for_file(params.get('filePath'))
             selected = [state for state in self.states.values() if owner is None
-                        or state.runtime.project == owner or owner.namespace in state.runtime.dependencies]
+                        or state.runtime.project.root == owner.root or owner.namespace in state.runtime.dependencies]
             if not selected:
                 return {'error': 'Project runtime is still pending.'}
             replies = []
@@ -357,73 +473,160 @@ class WorkspaceProjects:
                 raw = state.engine._reindex_file(params)
                 if 'error' in raw:
                     return raw
+                state.wire.label_map.update(self._labels_for(state.runtime.project, state.engine.model_graph))
+                state.wire.local_labels = {qualified: local for local, qualified in state.wire.label_map.items()
+                    if local in state.engine.model_graph.nodes_by_label}
                 replies.append(state.wire.result(raw))
             merged = {'runtimeMembersPending': True}
             for reply in replies:
                 for key, value in reply.items():
                     if key in _LABEL_LISTS:
                         merged.setdefault(key, []).extend(value)
-                    elif key in _MODEL_TABLES or key in ('lookupCatalogDelta', 'surfaceFingerprints'):
-                        merged.setdefault(key, {}).update(value)
                     elif key == 'unchanged':
                         merged['unchanged'] = merged.get('unchanged', True) and value
                     elif key == 'sourceUnchanged':
                         merged['sourceUnchanged'] = merged.get('sourceUnchanged', True) and value
+            affected = set().union(*(set(reply.get('surfaceIndexDelta', {})) | set(reply.get('lookupCatalogDelta', {}))
+                | set(reply.get('staticFallbackDelta', {})) | set(reply.get('removedLabels', ())) for reply in replies))
+            surface, fallback, catalogs = {}, {}, {}
+            for state in self.states.values():
+                wire, engine = state.wire, state.engine
+                for local, row in (engine._last_surface_index or {}).items():
+                    label = wire.label(local)
+                    if label in affected:
+                        surface[label] = merge_surface(surface.get(label, {}), wire.metadata(row))
+                for local, row in (engine._last_static_fallback or {}).items():
+                    label = wire.label(local)
+                    if label in affected:
+                        fallback[label] = merge_fallback(fallback.get(label), wire.metadata(row))
+            for reply in replies:
+                for label, chunk in reply.get('lookupCatalogDelta', {}).items():
+                    if chunk is not None:
+                        catalogs.setdefault(label, CatalogUnion()).add(chunk)
+            merged['surfaceIndexDelta'] = surface
+            merged['surfaceFingerprints'] = fingerprint_surface_index(surface)
+            merged['staticFallbackDelta'] = fallback
+            merged['lookupCatalogDelta'] = {label: catalogs[label].value if label in catalogs else None for label in affected}
+            for key in _LABEL_LISTS:
+                if key in merged:
+                    merged[key] = sorted(set(merged[key]))
+            for key in ('removedLabels', 'removedSurfaceLabels'):
+                if key in merged:
+                    merged[key] = [label for label in merged[key] if label not in surface]
+            if 'removedStaticFallbackLabels' in merged:
+                merged['removedStaticFallbackLabels'] = [label for label in merged['removedStaticFallbackLabels'] if label not in fallback]
             return merged
 
     def payload(self):
         with self._lock:
-            surface, catalog, fallback, contexts, names = {}, {
-                'fields': {}, 'types': {}, 'expressionFields': {}, 'relationPaths': {}, 'kinds': {}}, {}, [], set()
-            previews, counts = [], {key: 0 for key in ('appCount', 'modelCount', 'fieldCount',
-                'relationCount', 'reverseRelationCount', 'managerCount')}
+            surface, fallback, groups, names = {}, {}, {}, set()
+            catalogs = CatalogUnion()
+            preferred, model_sources, runtime_models, previews = set(), set(), {}, {}
+            field_keys, relation_keys, reverse_keys, manager_keys, app_keys = set(), set(), set(), set(), set()
+            static_groups, profiles = {}, []
             ready = 0
             for project in self.projects:
+                group = project.group_namespace or project.namespace
+                context = groups.setdefault(group, {**project.to_dict(), 'namespace': group,
+                    'models': {}, 'settingsProfiles': [], 'customLookups': {}, 'lookupKinds': {}, 'rootAliases': []})
                 state = self.states.get(project.namespace)
+                pending = project.namespace in self.pending
+                summary = {'namespace': project.namespace, 'settingsModule': project.settings_module,
+                    'selector': project.selector, 'root': project.root, 'pending': pending,
+                    'phase': 'starting' if pending else 'degraded', 'error': self.failures.get(project.namespace)}
+                profiles.append(summary)
+                context['settingsProfiles'].append(summary)
                 if state is None:
-                    contexts.append({**project.to_dict(), 'phase': 'starting' if project.namespace in self.pending else 'degraded',
-                        'error': self.failures.get(project.namespace), 'models': {}})
                     continue
                 engine, wire = state.engine, state.wire
-                ready += engine.runtime_inspection.bootstrap_status == 'ready'
-                surface.update(wire.result({'surfaceIndex': engine._last_surface_index or {}})['surfaceIndex'])
+                runtime = engine.runtime_inspection
+                is_ready = runtime.bootstrap_status == 'ready' and not pending
+                ready += is_ready
+                summary.update(phase='starting' if pending else engine.health_snapshot['phase'],
+                    bootstrapStatus=runtime.bootstrap_status, modelCount=runtime.model_count,
+                    error=summary['error'] or runtime.bootstrap_error)
+                context.setdefault('runtime', runtime.to_dict())
+                static_groups.setdefault((project.root, project.import_root), engine.static_index)
+                runtime_labels = {wire.label(label) for label, node in engine.model_graph.nodes_by_label.items()
+                    if node.runtime_model is not None}
+                for label, row in wire.result({'surfaceIndex': engine._last_surface_index or {}})['surfaceIndex'].items():
+                    surface[label] = merge_surface(surface.get(label, {}), row,
+                        prefer_right=label in runtime_labels and label not in preferred)
                 converted = wire.catalog(engine.runtime_inspection.lookup_catalog)
-                for key in ('fields', 'types', 'expressionFields', 'relationPaths'):
-                    catalog[key].update(converted[key])
-                fallback.update(wire.result({'staticFallback': engine._last_static_fallback or {}})['staticFallback'])
+                catalogs.add(converted)
+                catalogs.merge_kinds(context['lookupKinds'], converted['kinds'])
+                for label, row in wire.result({'staticFallback': engine._last_static_fallback or {}})['staticFallback'].items():
+                    fallback[label] = merge_fallback(fallback.get(label), row,
+                        prefer_right=label in runtime_labels and label not in preferred)
                 names.update(engine._last_model_names or ())
-                context = wire.context(self.root, converted['kinds'])
-                if project.namespace in self.failures:
-                    context['error'] = self.failures[project.namespace]
-                context['runtimeMembersPending'] = project.namespace in self.pending
-                contexts.append(context)
-                runtime_health = engine.runtime_inspection.to_dict()
-                for key in counts:
-                    counts[key] += runtime_health.get(key, 0)
-                previews.extend(wire.result(row.to_dict()) for row in engine.runtime_inspection.model_preview)
+                sources = wire.context(self.root)['models']
+                for label, row in sources.items():
+                    if label not in context['models'] or label in runtime_labels and label not in model_sources:
+                        context['models'][label] = row
+                model_sources.update(runtime_labels)
+                preferred.update(runtime_labels)
+                context['rootAliases'] = sorted(set(context['rootAliases']) | set(wire.root_aliases))
+                for kind, lookups in runtime.custom_lookups.items():
+                    context['customLookups'][kind] = sorted(set(context['customLookups'].get(kind, ())) | set(lookups))
+                for local, node in engine.model_graph.nodes_by_label.items():
+                    model = node.runtime_model
+                    if model is None:
+                        continue
+                    label = wire.label(local)
+                    runtime_models.setdefault(label, model)
+                    for field in model.fields:
+                        field_keys.add((label, field.name))
+                        if field.is_relation:
+                            (reverse_keys if field.direction == 'reverse' else relation_keys).add((label, field.name))
+                    manager_keys.update((label, name) for name in model.manager_names)
+                    if not state.runtime.app_names:
+                        app_keys.add((group, model.label.split('.', 1)[0]))
+                app_keys.update((group, name) for name in state.runtime.app_names)
+                for row in runtime.model_preview:
+                    previews.setdefault(wire.label(row.label), wire.result(row.to_dict()))
+            contexts = list(groups.values())
+            for context in contexts:
+                items = context['settingsProfiles']
+                complete = sum(item.get('bootstrapStatus') == 'ready' and not item['pending'] for item in items)
+                context['phase'] = 'ready' if complete == len(items) else 'degraded' if complete or not any(item['pending'] for item in items) else 'starting'
+                context['runtimeMembersPending'] = any(item['pending'] for item in items)
+                context['settingsModules'] = [item['settingsModule'] for item in items if item['settingsModule']]
+                if len(items) > 1:
+                    context['settingsModule'] = None
+                errors = [item['error'] for item in items if item.get('error')]
+                if errors:
+                    context['error'] = '\n'.join(dict.fromkeys(errors))
+            counts = {'appCount': len(app_keys), 'modelCount': len(runtime_models), 'fieldCount': len(field_keys),
+                'relationCount': len(relation_keys), 'reverseRelationCount': len(reverse_keys), 'managerCount': len(manager_keys)}
+            catalog = catalogs.value
             static_files = set(self.source_files)
-            phase = 'ready' if ready else 'starting' if self.pending else 'degraded'
+            phase = 'ready' if ready == len(self.projects) else 'degraded' if ready or not self.pending else 'starting'
+            model_candidates = {(candidate.file_path, candidate.object_name) for static in static_groups.values()
+                for candidate in static.model_candidates}
             health = {
                 'phase': phase, 'workspaceRoot': str(self.root),
-                'detail': f'Runtime ORM inspection is active for {ready}/{len(self.projects)} Django projects.',
+                'detail': f'Runtime ORM inspection completed for {ready}/{len(self.projects)} settings across {len(groups)} Django projects.'
+                    + (f' {len(self.pending)} settings pending.' if self.pending else ''),
                 'capabilities': ['workspace.discovery', 'workspace.settings_projects', 'static.index', 'semantic.graph']
                     + (['runtime.environment', 'runtime.django_setup', 'runtime.orm_metadata'] if ready else []),
-                'settingsModule': None, 'settingsCandidates': [candidate for project in self.projects for candidate in project.candidates],
-                'settingsProjects': contexts, 'startedAt': self.started_at.isoformat(),
+                'settingsModule': None, 'settingsCandidates': list(dict.fromkeys(candidate for project in self.projects for candidate in project.candidates)),
+                'settingsProjects': contexts, 'settingsProfiles': profiles, 'startedAt': self.started_at.isoformat(),
                 'staticIndex': {'pythonFileCount': len(static_files), 'packageInitCount': sum(path.name == '__init__.py' for path in static_files),
-                    'reexportModuleCount': sum(state.engine.static_index.reexport_module_count for state in self.states.values()),
-                    'starImportCount': sum(state.engine.static_index.star_import_count for state in self.states.values()),
-                    'explicitAllCount': sum(state.engine.static_index.explicit_all_count for state in self.states.values()),
-                    'modelCandidateCount': sum(state.engine.static_index.model_candidate_count for state in self.states.values())},
+                    'reexportModuleCount': sum(static.reexport_module_count for static in static_groups.values()),
+                    'starImportCount': sum(static.star_import_count for static in static_groups.values()),
+                    'explicitAllCount': sum(static.explicit_all_count for static in static_groups.values()),
+                    'modelCandidateCount': len(model_candidates)},
                 'runtime': {'djangoImportable': any(state.engine.runtime_inspection.django_importable for state in self.states.values()),
                     'djangoVersion': next((state.engine.runtime_inspection.django_version for state in self.states.values()
                         if state.engine.runtime_inspection.django_version), None),
-                    'bootstrapStatus': 'ready' if ready else 'warming_up' if self.pending else 'setup_failed',
-                    'settingsModule': None, 'projectCount': len(self.projects), 'readyProjectCount': ready,
-                    **counts, 'modelPreview': previews[:10]},
+                    'bootstrapStatus': 'warming_up' if self.pending else 'ready' if ready == len(self.projects) else 'setup_failed',
+                    'settingsModule': None, 'projectCount': len(groups),
+                    'readyProjectCount': sum(context['phase'] == 'ready' for context in contexts),
+                    'settingsCount': len(self.projects), 'readySettingsCount': ready,
+                    **counts, 'modelPreview': list(previews.values())[:10]},
                 'semanticGraph': {'coverageMode': 'hybrid_scaffold' if ready else 'static_only_scaffold',
                     'moduleCount': len(static_files), 'exportSurfaceCount': 0,
-                    'modelCandidateCount': sum(state.engine.static_index.model_candidate_count for state in self.states.values()),
+                    'modelCandidateCount': len(model_candidates),
                     'runtimeModelCount': counts['modelCount'], 'provenanceLayers': ['static_source', 'settings_discovery']
                         + (['runtime_environment', 'django_runtime_meta'] if ready else [])},
             }
@@ -444,3 +647,5 @@ class WorkspaceProjects:
                 state.engine._discard_bg_pool()
             self.states.clear()
             self.pending.clear()
+            self._model_ids.clear()
+            self._label_owners.clear()

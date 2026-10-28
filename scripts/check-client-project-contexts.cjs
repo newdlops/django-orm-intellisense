@@ -37,6 +37,25 @@ async function main() {
   assert(daemon.getAllModelNames().every(name => !name.includes('.')), 'Published model names remain source class names');
   daemon.retireMetadata();
   assert.equal(daemon.projectContexts.length, 0);
+  const combined = createDaemon(loadDaemonClass());
+  adopt(combined, {projectContexts: [{root: '/repo', importRoot: '/repo', namespace: 'project',
+    candidates: ['config.one', 'config.two'], settingsModules: ['config.one', 'config.two'], phase: 'ready',
+    models: {
+      'project.common.Shared': {djangoLabel: 'common.Shared', sourceModule: 'common.models', module: 'common.models'},
+      'project.one.OnlyOne': {djangoLabel: 'one.OnlyOne', sourceModule: 'one.models', module: 'one.models'},
+      'project.two.OnlyTwo': {djangoLabel: 'two.OnlyTwo', sourceModule: 'two.models', module: 'two.models'},
+    }}], surfaceIndex: {
+      'project.common.Shared': {instance: {title: ['scalar', null, 'field', 'CharField']}},
+      'project.one.OnlyOne': {instance: {first: ['scalar', null, 'field', 'IntegerField']}},
+      'project.two.OnlyTwo': {instance: {second: ['scalar', null, 'field', 'IntegerField']}},
+    }, health: {phase: 'ready', capabilities: []}});
+  combined.withDocumentContext('/repo/views.py', () => {
+    assert.equal(combined.findModelLabelByShortName('Shared'), 'project.common.Shared');
+    assert.equal(combined.findModelLabelByShortName('OnlyOne'), 'project.one.OnlyOne');
+    assert.equal(combined.findModelLabelByShortName('OnlyTwo'), 'project.two.OnlyTwo');
+    assert.equal(combined.getLookupIndex().models.size, 3, 'One project view retains every settings registry');
+  });
+  combined.retireMetadata();
   console.log('client-project-contexts: interleaved requests, scoped cache, name maps, publication and retirement passed');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

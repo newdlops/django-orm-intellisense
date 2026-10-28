@@ -573,9 +573,12 @@ class StaticIndex:
     _scalar_add_module: dataclasses.InitVar[str | frozenset[str] | None] = dataclasses.field(default=None, kw_only=True)
     _scalar_field_source: dataclasses.InitVar[StaticIndex | None] = dataclasses.field(default=None, kw_only=True)
     _constructor_files: dataclasses.InitVar[dict[str, tuple[str, bool]] | None] = dataclasses.field(default=None, kw_only=True)
+    _profile_model_modules: dataclasses.InitVar[dict[str, str] | None] = dataclasses.field(default=None, kw_only=True)
 
-    def __post_init__(self, _cached_fields: list[FieldCandidate] | None, _cached_direct_fields: dict[str, list[FieldCandidate]] | None, _cached_index: StaticIndex | None, _scalar_add_module: str | frozenset[str] | None, _scalar_field_source: StaticIndex | None, _constructor_files: dict[str, tuple[str, bool]] | None) -> None:
+    def __post_init__(self, _cached_fields: list[FieldCandidate] | None, _cached_direct_fields: dict[str, list[FieldCandidate]] | None, _cached_index: StaticIndex | None, _scalar_add_module: str | frozenset[str] | None, _scalar_field_source: StaticIndex | None, _constructor_files: dict[str, tuple[str, bool]] | None, _profile_model_modules: dict[str, str] | None) -> None:
         field_map_source = _cached_index or _scalar_field_source
+        self._profile_model_modules = (_profile_model_modules if _profile_model_modules is not None
+            else getattr(field_map_source, '_profile_model_modules', None)) or {}
         self._workspace_source_paths: frozenset[str] | None = None
         self._workspace_source_paths_by_module: dict[str, str] | None = None
         self._workspace_source_path_counts: dict[str, int] | None = None
@@ -625,6 +628,14 @@ class StaticIndex:
                 self._model_candidates_by_name.setdefault(candidate.object_name, []).append(candidate)
                 labels_by_module.setdefault(candidate.module, set()).add(candidate.label)
             self._model_labels_by_module = {name: frozenset(labels) for name, labels in labels_by_module.items()}
+        if self._profile_model_modules:
+            # Parsed modules stay shared. Only the registry's label lookup map
+            # chooses which source class owns a colliding Django model label.
+            self._model_candidates_by_label = dict(self._model_candidates_by_label)
+            for label, module in self._profile_model_modules.items():
+                candidate = self._model_candidates_by_module_and_name.get((module, label.rsplit('.', 1)[-1]))
+                if candidate is not None:
+                    self._model_candidates_by_label[label] = candidate
         # Reuse immutable results only when import/model resolution is unchanged.
         self._direct_fields_by_module = dict(_cached_direct_fields or {})
         self._independent_field_modules = (
@@ -1244,10 +1255,18 @@ class StaticIndex:
         expanded_forward_fields = expanded_reverse_fields = None
         try:
             direct_fields_by_model: dict[str, list[FieldCandidate]] = {}
+            seen, collisions = set(), set()
+            for candidate in self.model_candidates:
+                if candidate.label in seen:
+                    collisions.add(candidate.label)
+                seen.add(candidate.label)
             for module in self.modules.values():
                 if not module.pending_fields:
                     continue
                 for field in self._resolve_direct_module_fields(module):
+                    if (field.model_label in collisions
+                            and self._model_candidates_by_label[field.model_label].file_path != field.file_path):
+                        continue
                     direct_fields_by_model.setdefault(field.model_label, []).append(field)
 
             inherited_forward_cache: dict[str, list[FieldCandidate]] = {}
@@ -3592,6 +3611,7 @@ def _static_index_from_modules(
         _scalar_add_module=scalar_add_module,
         _scalar_field_source=source_index,
         _constructor_files=constructor_files,
+        _profile_model_modules=getattr(source_index or cached_index, '_profile_model_modules', None),
     )
     import_owner = source_index or cached_index
     if import_owner is not None and getattr(import_owner, '_source_import_roots', ()):

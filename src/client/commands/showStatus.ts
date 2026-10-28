@@ -77,7 +77,7 @@ function buildStatusReport(
     `- Manage.py: \`${snapshot.managePyPath ?? 'Unavailable'}\``,
     `- Python: \`${snapshot.pythonPath ?? 'Unavailable'}\``,
     `- Python source: \`${snapshot.pythonSource ?? 'Unavailable'}\``,
-    `- Settings: \`${snapshot.settingsModule ?? 'Not set'}\``,
+    `- Settings: \`${snapshot.settingsModule ?? (snapshot.settingsProfiles?.length ? `${snapshot.settingsProfiles.length} settings combined` : 'Not set')}\``,
   ];
 
   const plainTextLines = [
@@ -89,7 +89,7 @@ function buildStatusReport(
     `Manage.py: ${snapshot.managePyPath ?? 'Unavailable'}`,
     `Python: ${snapshot.pythonPath ?? 'Unavailable'}`,
     `Python source: ${snapshot.pythonSource ?? 'Unavailable'}`,
-    `Settings: ${snapshot.settingsModule ?? 'Not set'}`,
+    `Settings: ${snapshot.settingsModule ?? (snapshot.settingsProfiles?.length ? `${snapshot.settingsProfiles.length} settings combined` : 'Not set')}`,
   ];
 
   markdownLines.push('', '## Interpreter Configuration', '');
@@ -144,6 +144,25 @@ function buildStatusReport(
     plainTextLines.push(
       `Settings candidates: ${snapshot.settingsCandidates.join(', ')}`
     );
+  }
+
+  if (snapshot.settingsProfiles?.length) {
+    markdownLines.push('', '## Settings Coverage', '');
+    plainTextLines.push('', 'Settings Coverage');
+    for (const profile of snapshot.settingsProfiles) {
+      const state = profile.pending ? 'pending' : profile.bootstrapStatus ?? profile.phase;
+      const line = `${profile.settingsModule ?? profile.selector ?? profile.root}: ${state}${profile.modelCount !== undefined ? ` (${profile.modelCount} models)` : ''}`;
+      markdownLines.push(`- ${line}`);
+      plainTextLines.push(`- ${line}`);
+      if (profile.error) {
+        // Show the cause beside the profile; keep the full traceback in Output.
+        const detail = profile.error.startsWith('Project runtime timed out.')
+          ? 'Project runtime timed out.'
+          : profile.error.trim().split(/\r?\n/).at(-1) ?? profile.error;
+        markdownLines.push(`  - Error: ${detail}`);
+        plainTextLines.push(`  Error: ${profile.error}`);
+      }
+    }
   }
 
   if (snapshot.runtime) {
@@ -233,7 +252,7 @@ function buildRecommendations(
   const runtime = snapshot.runtime;
   const pylanceAvailable = isPylanceAvailable();
 
-  if (!configuredInterpreter) {
+  if (!configuredInterpreter && (!snapshot.pythonSource || snapshot.pythonSource === 'fallback')) {
     recommendations.push(
       'Run "Django ORM Intellisense: Select Python Interpreter" and set `djangoOrmIntellisense.pythonInterpreter` for this workspace.'
     );

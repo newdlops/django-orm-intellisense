@@ -167,6 +167,7 @@ export function isRelevantConfigurationChange(
     scopes.some((scope) => event.affectsConfiguration(section, scope));
 
   return (
+    affectsConfiguration('python.defaultInterpreterPath') ||
     affectsConfiguration(CONFIGURATION_SECTION) &&
     (
       !affectsConfiguration(`${CONFIGURATION_SECTION}.inlayHints.enabled`) ||

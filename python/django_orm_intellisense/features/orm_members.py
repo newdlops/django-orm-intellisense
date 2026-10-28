@@ -1780,10 +1780,11 @@ def _project_manager_method_items(*, static_index, runtime, model_label, manager
     items = _runtime_callable_member_items(owner_classes=[manager.__class__],
         workspace_files=_workspace_files(static_index), receiver_kind='manager',
         model_label=model_label, manager_name=manager_name, default_return_kind='queryset')
-    queryset = manager.get_queryset()
-    items.extend(_runtime_callable_member_items(owner_classes=[queryset.__class__],
-        workspace_files=_workspace_files(static_index), receiver_kind='manager',
-        model_label=model_label, manager_name=manager_name, default_return_kind='queryset'))
+    queryset_class = _runtime_queryset_class(manager)
+    if queryset_class is not None:
+        items.extend(_runtime_callable_member_items(owner_classes=[queryset_class],
+            workspace_files=_workspace_files(static_index), receiver_kind='manager',
+            model_label=model_label, manager_name=manager_name, default_return_kind='queryset'))
     return items
 
 
@@ -1843,10 +1844,23 @@ def _project_queryset_method_items(*, static_index, runtime, model_label, manage
     manager = _runtime_manager(model_label, manager_name) if runtime.bootstrap_status == 'ready' else None
     if manager is None:
         return []
-    queryset = manager.get_queryset()
-    return _runtime_callable_member_items(owner_classes=[queryset.__class__],
+    queryset_class = _runtime_queryset_class(manager)
+    if queryset_class is None:
+        return []
+    return _runtime_callable_member_items(owner_classes=[queryset_class],
         workspace_files=_workspace_files(static_index), receiver_kind='queryset',
         model_label=model_label, manager_name=manager_name, default_return_kind='queryset')
+
+
+def _runtime_queryset_class(manager):
+    try:
+        return type(manager.get_queryset())
+    except Exception:
+        # Some managers consult database-backed configuration while creating
+        # a queryset. Optional callable inspection must not discard an already
+        # populated registry. Use its declared class without calling it again.
+        declared = inspect.getattr_static(manager, '_queryset_class', None)
+        return declared if isinstance(declared, type) else None
 
 
 def _related_manager_surface(

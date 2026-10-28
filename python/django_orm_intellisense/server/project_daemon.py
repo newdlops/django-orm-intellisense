@@ -13,6 +13,7 @@ from ..features.orm_members import prebuild_member_surface_cache, fingerprint_su
 from ..runtime.inspector import create_pending_runtime_inspection
 from ..runtime.projects import (ProjectRuntime, ProjectRuntimeFailure, collect_project_runtimes,
     project_source_files, project_source_projection, snapshot_project_sources)
+from ..runtime.projects import copy_source_index
 from ..semantic.graph import build_model_graph
 from ..static_index.indexer import build_static_index
 from .app import DaemonServer
@@ -64,6 +65,8 @@ class ProjectDaemonServer(DaemonServer):
         self._projects_params = dict(params)
         if not projects or (len(projects) == 1 and projects[0].root == str(root)
                             and projects[0].import_root == str(root)):
+            if len(projects) == 1 and projects[0].settings_module and not params.get('settingsModule'):
+                params = {**params, 'settingsModule': projects[0].settings_module}
             return super()._initialize(params, observation_attempt=observation_attempt)
         generation = self._reserve_state_generation(workspace_root=root,
             initialized_at=datetime.now(timezone.utc))
@@ -86,13 +89,21 @@ class ProjectDaemonServer(DaemonServer):
             self._surface_transport.reset()
         # Publish source-only analysis immediately. Runtime registries replace
         # their own context serially; they never share a configured Django app.
+        static_groups = {}
         for project in projects:
             files = project_source_files(projects, project, snapshot.files)
             runtime = replace(create_pending_runtime_inspection(project.settings_module), detached=True)
-            static = build_static_index(Path(project.import_root), python_files=files,
-                import_roots=(project.import_root, project.root, str(root), *map(str, extra)))
-            graph = build_model_graph(static, runtime)
-            surface = prebuild_member_surface_cache(static, runtime, graph)
+            key = project.root, project.import_root
+            previous = static_groups.get(key)
+            if previous is None:
+                static = build_static_index(Path(project.import_root), python_files=files,
+                    import_roots=(project.import_root, project.root, str(root), *map(str, extra)))
+                graph = build_model_graph(static, runtime)
+                surface = prebuild_member_surface_cache(static, runtime, graph)
+                static_groups[key] = static, graph, surface
+            else:
+                shared, graph, surface = previous
+                static = copy_source_index(shared)
             coordinator.install(ProjectRuntime(project, static, runtime, graph, None, surface,
                 fingerprint_surface_index(surface), snapshot_project_sources(Path(project.import_root), files),
                 dependencies=(project.namespace,)))
@@ -113,6 +124,7 @@ class ProjectDaemonServer(DaemonServer):
     def _combined_payload(self):
         if self._projects_payload is None:
             self._projects_payload = self._projects.payload()
+            self._projects_payload['health']['managePyPath'] = self.workspace_profile.manage_py_path
             # Multi-registry startup cache entries need their project context.
             # Do not attach the single-registry cache witness to this format.
             self._projects_payload['sourceProvenance'] = None
@@ -136,7 +148,10 @@ class ProjectDaemonServer(DaemonServer):
             coordinator.source_files = snapshot.files
             for value in collect_project_runtimes(selected, all_projects=coordinator.projects,
                     workspace_root=self.workspace_root, source_files=snapshot.files,
-                    extra_roots=self._editable_source_roots, stopping=stopping, is_current=current):
+                    extra_roots=self._editable_source_roots, stopping=stopping, is_current=current,
+                    timeout_seconds=60 if len(snapshot.files) > 10000 else 30,
+                    static_indexes={namespace: state.engine.static_index for namespace, state in coordinator.states.items()},
+                    static_snapshots={namespace: state.engine.source_snapshot for namespace, state in coordinator.states.items()}):
                 _observation, live_configuration = source_observation_context(self.workspace_root,
                     resolve_venv_info(self.workspace_root))
                 if live_configuration != configuration:
@@ -241,10 +256,7 @@ class ProjectDaemonServer(DaemonServer):
             self._projects_revision += 1
             self._reindex_serial += 1
             self._projects_payload = None
-            result['projectContexts'] = [state.wire.context(self.workspace_root,
-                {kind: state.wire.type_id(type_id) for kind, type_id in
-                    state.engine.runtime_inspection.lookup_catalog.get('kinds', {}).items()})
-                for state in self._projects.states.values()]
+            result['projectContexts'] = self._combined_payload()['projectContexts']
         self._schedule_project_refresh()
         return result
 
