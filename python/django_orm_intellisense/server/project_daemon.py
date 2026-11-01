@@ -121,7 +121,7 @@ class ProjectDaemonServer(DaemonServer):
             else:
                 shared, graph, surface = previous
                 static = copy_source_index(shared)
-            restored = cache.load(project, static, roots)
+            restored = None if params.get('deferRuntime') else cache.load(project, static, roots)
             restored_any |= restored is not None
             if restored is not None:
                 restored_inputs.append(restored.cache_inputs)
@@ -190,12 +190,35 @@ class ProjectDaemonServer(DaemonServer):
                     self._projects_cache = cache
             saved_groups = set()
             def collect(which, sources, timeout=None):
-                return collect_project_runtimes(which, all_projects=coordinator.projects,
-                    workspace_root=self.workspace_root, source_files=sources.files,
-                    extra_roots=self._editable_source_roots, stopping=stopping, is_current=current,
-                    source_snapshot=sources, timeout_seconds=timeout if timeout is not None else 60 if len(sources.files) > 10000 else 30,
-                    static_indexes={namespace: state.engine.static_index for namespace, state in coordinator.states.items()},
-                    static_snapshots={namespace: state.engine.source_snapshot for namespace, state in coordinator.states.items()})
+                # Deferred startup must send its source-only response before
+                # decoding registry records. Cache misses still share one
+                # generation witness and static seed in the serial collector.
+                uncached = []
+                for project in which:
+                    if not current():
+                        return
+                    restored = None
+                    state = coordinator.states.get(project.namespace)
+                    if (cache is not None and state is not None
+                            and cache.snapshot.fingerprint == sources.fingerprint and cache.context_current()):
+                        roots = tuple(dict.fromkeys((project.import_root, project.root,
+                            str(self.workspace_root), *map(str, self._editable_source_roots))))
+                        restored = cache.load(project, state.engine.static_index, roots)
+                        if restored is not None and not cache.context_current():
+                            restored = None
+                    if not current():
+                        return
+                    if restored is not None:
+                        yield restored
+                    else:
+                        uncached.append(project)
+                if uncached:
+                    yield from collect_project_runtimes(uncached, all_projects=coordinator.projects,
+                        workspace_root=self.workspace_root, source_files=sources.files,
+                        extra_roots=self._editable_source_roots, stopping=stopping, is_current=current,
+                        source_snapshot=sources, timeout_seconds=timeout if timeout is not None else 60 if len(sources.files) > 10000 else 30,
+                        static_indexes={namespace: state.engine.static_index for namespace, state in coordinator.states.items()},
+                        static_snapshots={namespace: state.engine.source_snapshot for namespace, state in coordinator.states.items()})
             def changed(value):
                 return isinstance(value, ProjectRuntime) and (value.cache_inputs_changed
                     or value.cache_inputs is not None and not inputs_match(value.cache_inputs))

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2032 — 2026-11-01
+
+- Keep deferred multi-settings initialization responsive by restoring registry
+  caches in the existing background refresh instead of the initial request.
+  Cache hits still avoid registry workers; misses share one generation witness
+  and static seed, with cancellation and input revalidation preserved.
+
 ## 0.2.2031 — 2026-11-01
 
 - Reuse unchanged settings contributions, client model indexes and native

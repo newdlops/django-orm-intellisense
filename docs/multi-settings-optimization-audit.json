@@ -1,7 +1,9 @@
 {
   "schemaVersion": 1,
   "date": "2026-11-01",
-  "version": "0.2.2031",
+  "version": "0.2.2032",
+  "measurementsVersion": "0.2.2031",
+  "measurementProvenance": "The paired benchmark, seven-settings captain runs, full discovery and actual editor checks below were completed on 0.2.2031. Version 0.2.2032 fixes deferred registry-cache restoration sequencing; changed-path regression and release evidence are recorded separately.",
   "baselineCommit": "c5ef62ccc6979c5bfcc78ead50dbfa51a215cde6",
   "scope": [
     "incremental publication and client/native adoption",
@@ -300,6 +302,59 @@
     "memoryScope": "Per-process macOS RSS high-water observations only; no deduplicated physical memory or simultaneous system peak claim. Restore peaks can be higher despite fewer retained metadata records."
   },
   "validation": {
+    "deferredStartupFix2032": {
+      "test": "test_deferred_restart_returns_before_restoring_registries",
+      "red": "Real two-profile cache restoration occurred twice before the initial deferred response.",
+      "green": "No registry cache load before the initial deferred response; existing refresh restored both profiles with zero registry workers and identical complete surfaces, fingerprints, lookups and project contexts.",
+      "relatedRegression": [
+        {
+          "djangoMajor": 5,
+          "tests": 214,
+          "passed": 214,
+          "modules": [
+            "test_discovery_settings_inference",
+            "test_discovery_settings_inventory",
+            "test_project_runtime_isolation",
+            "test_workspace_project_union",
+            "test_project_daemon",
+            "test_same_root_settings",
+            "test_lookup_catalog_snapshot",
+            "test_lookup_catalog_delta",
+            "test_duplicate_reindex",
+            "test_source_root_reindex",
+            "test_workspace_path_resolution",
+            "test_stdio_shutdown",
+            "test_source_provenance",
+            "test_static_parse_pipeline",
+            "test_static_cache_serialization",
+            "test_static_member_declarations",
+            "test_runtime_manager_catalog",
+            "test_runtime_member_catalog_actual",
+            "test_runtime_callable_snapshot",
+            "test_project_incremental_union",
+            "test_project_shared_inputs",
+            "test_source_snapshot_revalidation",
+            "test_project_record_sharing",
+            "test_project_runtime_cache"
+          ],
+          "seconds": 327.466,
+          "log": "bench/multi-settings-optimization-20261101-v1/django5-settings-regression-2032.log"
+        },
+        {
+          "djangoMajor": 6,
+          "tests": 40,
+          "passed": 40,
+          "modules": [
+            "test_project_runtime_cache",
+            "test_project_daemon",
+            "test_same_root_settings",
+            "test_project_shared_inputs"
+          ],
+          "seconds": 131.084,
+          "log": "bench/multi-settings-optimization-20261101-v1/django6-settings-regression-2032-startup.log"
+        }
+      ]
+    },
     "pythonFullDiscovery": [
       {
         "djangoMajor": 5,
@@ -399,9 +454,24 @@
     "Task 5 Ruling: do not execute the default vscode-test launcher because its dependencies add --no-sandbox, --disable-gpu-sandbox and --disable-workspace-trust — user explicitly forbids security weakening — use an explicit editor test launch retaining default protections and the previously approved synthetic fixture folder, or report that gate unavailable.",
     "Task5 Ruling: reuse a separate already-installed official VS Code test application for CUA targeting instead of disturbing the user main Code process or copying another application — identical bundle IDs prevented targeting separate instances of the main installation — reported host version is1.143.1, and its current Python/Pylance extensions were activated.",
     "Final Ruling: follow the explicit existing commit/push/release authorization instead of presenting the finishing skill integration menu again — main fork point and current remote both c5ef62c; no integration ambiguity — only fast-forward integration, preserving unrelated files.",
-    "Final Ruling: retain the plan explicit exception for the independently reproduced pre-existing full-suite failure instead of the finishing skill generic stop-on-any-failure rule — all changed-path gates pass and both full runs report the identical baseline failure — release notes/audit must not claim an entirely green full suite."
+    "Final Ruling: retain the plan explicit exception for the independently reproduced pre-existing full-suite failure instead of the finishing skill generic stop-on-any-failure rule — all changed-path gates pass and both full runs report the identical baseline failure — release notes/audit must not claim an entirely green full suite.",
+    "Final Ruling: publish a new immutable0.2.2032 release for the deferred-startup fix, retaining public0.2.2031 and its benchmark provenance — the already published artifact must not be silently replaced — repeat the changed-path Django5/6 regression and package/publication integrity gates, while retaining the original full-suite/editor evidence under0.2.2031."
   ],
   "release": {
+    "file": "django-orm-intellisense-0.2.2032-darwin-arm64.vsix",
+    "version": "0.2.2032",
+    "target": "darwin-arm64",
+    "bytes": 2344712,
+    "sha256": "ff51372cd610e482c7932d084c725640e61882ff2af8ab97b06982846adcbeb0",
+    "members": 380,
+    "pythonRuntimeFiles": 59,
+    "javascriptFiles": 64,
+    "unchangedNativeFiles": 8,
+    "runtimeBytesMatchSource": true,
+    "taskDataExcluded": true
+  },
+  "candidateAnalysisCodeSha256": "d85e80b1b03b143ac4fd2e351e41da4d50646b9c89ec23ee2b5a46ad2df32ae5",
+  "priorRelease2031": {
     "file": "django-orm-intellisense-0.2.2031-darwin-arm64.vsix",
     "version": "0.2.2031",
     "target": "darwin-arm64",
@@ -413,5 +483,20 @@
     "unchangedNativeFiles": 8,
     "runtimeBytesMatchSource": true,
     "taskDataExcluded": true
-  }
+  },
+  "taskCleanup": [
+    {
+      "receipt": "bench/multi-settings-optimization-20261101-v1/cleanup-obsolete-cache.json",
+      "removedFiles": 6,
+      "bytes": 462206585,
+      "policyChecked": true
+    },
+    {
+      "receipt": "bench/multi-settings-optimization-20261101-v1/cleanup-final.json",
+      "checkedPaths": 24060,
+      "logicalFileBytes": 441650947,
+      "policyChecked": true,
+      "removed": true
+    }
+  ]
 }

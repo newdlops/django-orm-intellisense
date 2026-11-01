@@ -46,6 +46,33 @@ class ProjectRuntimeCacheTest(unittest.TestCase):
             self.assertEqual(json.loads(json.dumps(cold[key])), json.loads(json.dumps(warm[key])), key)
         self.assertEqual(warm['health']['runtime']['readySettingsCount'], 2)
 
+    def test_deferred_restart_returns_before_restoring_registries(self):
+        from django_orm_intellisense.cache.projects import ProjectRuntimeCache
+        cold, _ = self.run_server()
+        original, restored = ProjectRuntimeCache.load, []
+        def load(cache, *args):
+            restored.append(args[0].namespace)
+            return original(cache, *args)
+        with mock.patch.object(ProjectRuntimeCache, 'load', load):
+            with mock.patch.object(self.server, '_schedule_project_refresh') as schedule:
+                initial = self.server._initialize({'workspaceRoot': str(self.root), 'deferRuntime': True})
+            self.assertEqual(restored, [], 'Deferred initialization restored registries before its first response')
+            self.assertTrue(initial['runtimeMembersPending'])
+            schedule.assert_called_once()
+            coordinator = self.server._projects
+            selected = tuple(project for project in coordinator.projects if project.namespace in coordinator.pending)
+            with mock.patch('subprocess.Popen', wraps=subprocess.Popen) as spawn:
+                self.server._collect_projects(coordinator, self.server._state_generation,
+                    self.server._projects_revision, selected, publish=True)
+        workers = sum('django_orm_intellisense._project_runtime_worker' in call.args[0]
+            for call in spawn.call_args_list)
+        self.assertEqual(len(restored), 2)
+        self.assertEqual(workers, 0, 'Deferred cache hits recollected unchanged registries')
+        final = self.server._combined_payload()
+        self.assertEqual(final['health']['runtime']['readySettingsCount'], 2)
+        for key in ('surfaceIndex', 'surfaceFingerprints', 'lookupCatalog', 'projectContexts'):
+            self.assertEqual(json.loads(json.dumps(cold[key])), json.loads(json.dumps(final[key])), key)
+
     def test_equal_size_source_replacement_with_restored_mtime_misses(self):
         self.run_server()
         path = self.root / 'common/models.py'
