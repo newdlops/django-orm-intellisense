@@ -84,5 +84,5 @@
 - [x] Run controlled before/after workloads with identical inputs and current code provenance for all four requirements.
 - [x] Verify all seven captain settings and native/editor startup without changing project/system configuration.
 - [x] Request one fresh whole-branch review; address important findings with reproducing tests.
-- [ ] Audit each design requirement, package source integrity, version, commit/push/release and published bytes; clean disposable task data with retention guards.
-- [ ] Mark the goal complete only when all four optimizations and their validation are proven.
+- [x] Audit each design requirement, package source integrity, version, commit/push/release and published bytes; clean disposable task data with retention guards.
+- [x] Mark the goal complete only when all four optimizations and their validation are proven.

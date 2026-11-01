@@ -497,6 +497,48 @@
       "logicalFileBytes": 441650947,
       "policyChecked": true,
       "removed": true
+    },
+    {
+      "receipt": "bench/multi-settings-optimization-20261101-v1/cleanup-final-2032.json",
+      "checkedPaths": 13541,
+      "logicalFileBytes": 62933210,
+      "policyChecked": true,
+      "removed": true
+    },
+    {
+      "receipt": "bench/multi-settings-optimization-20261101-v1/cleanup-plan-workspace.json",
+      "checkedPaths": 14,
+      "logicalFileBytes": 195366,
+      "policyChecked": true,
+      "removed": true,
+      "archivedLedger": "docs/superpowers/records/2026-11-01-multi-settings-optimization-progress.md"
     }
-  ]
+  ],
+  "publication2032": {
+    "github": {
+      "downloadedBytesMatchLocal": true,
+      "sha256": "ff51372cd610e482c7932d084c725640e61882ff2af8ab97b06982846adcbeb0",
+      "url": "https://github.com/newdlops/django-orm-intellisense/releases/tag/v0.2.2032",
+      "publishedAt": "2026-11-01T09:06:13Z",
+      "commit": "057667e0b8258807d647f1a6e59c5a343baa39da"
+    },
+    "marketplace": {
+      "downloadedBytesMatchLocal": true,
+      "sha256": "ff51372cd610e482c7932d084c725640e61882ff2af8ab97b06982846adcbeb0",
+      "catalogLatestAtCheck": "0.2.2031",
+      "note": "Publisher acknowledged2032 and its public versioned asset matched all bytes; general catalog can lag publication."
+    }
+  },
+  "installed2032": {
+    "version": "0.2.2032",
+    "runtimeFiles": 131,
+    "unchangedNativeModes": 8,
+    "bytesMatchPublishedPackage": true,
+    "path": "/Users/lky/.vscode/extensions/newdlops.django-orm-intellisense-0.2.2032",
+    "captainWindowReloadedWithCUA": true,
+    "observedDaemonState": "stopped",
+    "stateNote": "Existing autoStart=false preserved; no claim of a new seven-registry captain UI analysis in2032."
+  },
+  "executionLedger": "docs/superpowers/records/2026-11-01-multi-settings-optimization-progress.md",
+  "taskCleanupLogicalBytes": 966986108
 }
