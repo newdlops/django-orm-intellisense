@@ -33,6 +33,10 @@ class ProjectRuntime:
     source_membership: str | None = None
     dependencies: tuple[str, ...] = ()
     app_names: tuple[str, ...] = ()
+    cache_inputs: object = None
+    cache_code: str | None = None
+    cache_python: object = None
+    cache_environment: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +187,9 @@ def _collect_project_runtimes(projects, *, workspace_root, stopping, is_current,
             result_path = Path(input_path).with_name('result.pickle')
             log_path = result_path.with_suffix('.log')
             environment = dict(os.environ)
+            from ..launch_environment import fingerprint_environment
+            cache_environment = fingerprint_environment({key: value for key, value in environment.items()
+                if key != 'DJANGO_SETTINGS_MODULE'})
             declared = environment.get('PYTHONPATH')
             environment['PYTHONPATH'] = package_root + (os.pathsep + declared if declared else '')
             environment['PYTHONDONTWRITEBYTECODE'] = '1'
@@ -240,6 +247,8 @@ def _collect_project_runtimes(projects, *, workspace_root, stopping, is_current,
                         owned = scope_source_index(copy_source_index(seed), value.inspection)
                         owned._runtime_member_snapshot = value.members
                         value = replace(value, static_index=owned)
+                    if isinstance(value, ProjectRuntime):
+                        value = replace(value, cache_environment=cache_environment)
                 except (OSError, EOFError, pickle.UnpicklingError, ValueError) as error:
                     value = ProjectRuntimeFailure(project, 'Project runtime did not return a valid result: ' + str(error))
         if stopping.is_set() or not is_current():
@@ -256,6 +265,14 @@ def project_worker_main(input_path, result_path):
     from ..runtime.source_imports import current_workspace_source_imports
     from ..semantic.graph import build_model_graph
     from ..static_index.indexer import build_static_index
+    from .project_inputs import ProjectInputs
+    from .project_inputs import input_identity
+    from ..cache.projects import analysis_code_fingerprint
+    try:
+        cache_code = analysis_code_fingerprint()
+    except OSError:
+        cache_code = None
+    cache_python = [sys.executable, sys.version, sys.prefix, input_identity(sys.executable)]
     with Path(input_path).open('rb') as stream:
         state = pickle.load(stream)
         project, workspace_root, source_files, projects, expected, expected_membership, extra_roots = state[:7]
@@ -273,7 +290,8 @@ def project_worker_main(input_path, result_path):
     before_global = snapshot_python_sources(Path(workspace_root), extra_roots=list(extra_roots) or None,
         max_workers=1, previous_snapshot=expected)
     before_membership = source_membership_fingerprint(before_global)
-    with current_workspace_source_imports(tuple(Path(root) for root in roots)):
+    inputs = ProjectInputs(before_global.files)
+    with inputs.observe(), current_workspace_source_imports(tuple(Path(root) for root in roots)):
         runtime = inspect_runtime(project.settings_module)
         # Settings can import a sibling/shared helper or register an app whose
         # source is outside this project's directory. Include those sources in
@@ -318,9 +336,16 @@ def project_worker_main(input_path, result_path):
     after_files = tuple(path for path in after_global.files
         if (owner := project_owner(projects, path)) is None or owner.namespace in dependencies)
     after = project_source_projection(Path(project.import_root), after_global, after_files)
+    try:
+        if analysis_code_fingerprint() != cache_code:
+            cache_code = None
+    except OSError:
+        cache_code = None
     value = (ProjectRuntime(project, None if reused_static else static, runtime, graph, members, surface,
                             fingerprint_surface_index(surface), before,
-                            source_membership_fingerprint(before), tuple(sorted(dependencies)), app_names)
+                            source_membership_fingerprint(before), tuple(sorted(dependencies)), app_names,
+                            inputs.snapshot(), cache_code,
+                            cache_python)
              if expected_scope.fingerprint == before.fingerprint == after.fingerprint
              and expected_membership == before_membership == source_membership_fingerprint(after_global)
              else ProjectRuntimeFailure(project, 'Project source changed during runtime collection.'))

@@ -308,7 +308,8 @@ class WorkspaceProjects:
             # The embedded engine owns mutable generations. Do not retain its
             # pre-edit graphs/indexes a second time in the collection receipt.
             receipt = replace(value, static_index=None, inspection=None, model_graph=None,
-                members=None, surface={}, fingerprints={}, source_snapshot=None)
+                members=None, surface={}, fingerprints={}, source_snapshot=None, cache_inputs=None,
+                cache_code=None, cache_python=None, cache_environment=None)
             self.states[project.namespace] = _ProjectState(receipt, engine, ProjectWire(project, engine, self.root, self.raw_root,
                 self._labels_for(project, engine.model_graph)))
             if value.inspection.bootstrap_status == 'warming_up':

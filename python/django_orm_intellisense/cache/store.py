@@ -194,6 +194,7 @@ def _try_load_full_static_index(
     source_snapshot: PythonSourceSnapshot,
     *,
     import_roots: tuple[str, ...] = (),
+    cache_path: Path | None = None,
 ) -> StaticIndex | None:
     def metadata_matches(value):
         return (isinstance(value, dict)
@@ -205,7 +206,7 @@ def _try_load_full_static_index(
                 and value.get('sourceImportRoots', []) == list(import_roots))
 
     payload = _read_cache_payload(
-        _workspace_cache_dir(workspace_root) / STATIC_INDEX_FULL_CACHE_NAME,
+        cache_path if cache_path is not None else _workspace_cache_dir(workspace_root) / STATIC_INDEX_FULL_CACHE_NAME,
         restore_static_modules=True,
         static_metadata_matches=metadata_matches,
     )
@@ -292,7 +293,8 @@ def save_static_index(
         return
 
 
-def _save_static_index_spooled(workspace_root, source_snapshot, static_index, spool):
+def _save_static_index_spooled(workspace_root, source_snapshot, static_index, spool, *, write_payload=None):
+    write_payload = write_payload or _write_cache_payload
     entry_by_path = source_snapshot.entries_by_path
     encoder = json.JSONEncoder(sort_keys=True, default=lookup_catalog_json_default)
     module_offsets = {}
@@ -354,7 +356,7 @@ def _save_static_index_spooled(workspace_root, source_snapshot, static_index, sp
             'errorKind': error_kind,
         }
 
-    _write_cache_payload(
+    write_payload(
         _workspace_cache_dir(workspace_root) / STATIC_INDEX_CACHE_NAME,
         {
             'metadata': {
@@ -376,7 +378,7 @@ def _save_static_index_spooled(workspace_root, source_snapshot, static_index, sp
     )
 
     # Also save full StaticIndex for fast restoration on exact fingerprint match
-    _write_cache_payload(
+    write_payload(
         _workspace_cache_dir(workspace_root) / STATIC_INDEX_FULL_CACHE_NAME,
         {
             'metadata': {

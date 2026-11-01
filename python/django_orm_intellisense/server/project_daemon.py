@@ -7,6 +7,7 @@ from pathlib import Path
 import threading
 
 from ..discovery.settings import settings_projects
+from ..cache.projects import ProjectRuntimeCache
 from ..discovery.workspace import discover_workspace, snapshot_python_sources, resolve_venv_info
 from ..discovery.source_observation import source_observation_context
 from ..features.orm_members import prebuild_member_surface_cache, fingerprint_surface_index
@@ -33,6 +34,7 @@ class ProjectDaemonServer(DaemonServer):
         self._projects_params = {}
         self._projects_observation = None
         self._projects_payload = None
+        self._projects_cache = None
 
     def _close_projects(self):
         with self._state_lock:
@@ -44,6 +46,7 @@ class ProjectDaemonServer(DaemonServer):
             if previous is not None:
                 previous.close()
             self._projects_payload = None
+            self._projects_cache = None
 
     def run_stdio(self):
         try:
@@ -72,6 +75,7 @@ class ProjectDaemonServer(DaemonServer):
             initialized_at=datetime.now(timezone.utc))
         self._discard_bg_pool()
         observation, configuration = source_observation_context(root, venv)
+        cache = ProjectRuntimeCache(root, projects, snapshot, configuration)
         coordinator = WorkspaceProjects(root, projects, source_files=snapshot.files,
             raw_root=Path(str(params.get('workspaceRoot') or root)).absolute())
         self._projects_stop = threading.Event()
@@ -85,32 +89,52 @@ class ProjectDaemonServer(DaemonServer):
             self._editable_source_roots = extra
             self.workspace_profile = profile
             self.source_snapshot = snapshot
+            self._projects_cache = cache
             self._surface_transport_enabled = params.get('surfaceSnapshotTransport') == 1
             self._surface_transport.reset()
         # Publish source-only analysis immediately. Runtime registries replace
         # their own context serially; they never share a configured Django app.
         static_groups = {}
+        restored_any = False
+        def current():
+            return (not self._stopping.is_set() and self._projects is coordinator
+                and generation == self._state_generation and revision == self._projects_revision)
         for project in projects:
             files = project_source_files(projects, project, snapshot.files)
+            proof = project_source_projection(Path(project.import_root), snapshot, files)
+            roots = tuple(dict.fromkeys((project.import_root, project.root, str(root), *map(str, extra))))
             runtime = replace(create_pending_runtime_inspection(project.settings_module), detached=True)
             key = project.root, project.import_root
             previous = static_groups.get(key)
             if previous is None:
-                static = build_static_index(Path(project.import_root), python_files=files,
-                    import_roots=(project.import_root, project.root, str(root), *map(str, extra)))
+                static = cache.load_static(project, proof, roots)
+                if static is None:
+                    static = build_static_index(Path(project.import_root), python_files=files, import_roots=roots)
+                    cache.save_static(project, proof, static, current)
                 graph = build_model_graph(static, runtime)
                 surface = prebuild_member_surface_cache(static, runtime, graph)
                 static_groups[key] = static, graph, surface
             else:
                 shared, graph, surface = previous
                 static = copy_source_index(shared)
-            coordinator.install(ProjectRuntime(project, static, runtime, graph, None, surface,
-                fingerprint_surface_index(surface), project_source_projection(Path(project.import_root), snapshot, files),
-                dependencies=(project.namespace,)))
-        if params.get('deferRuntime'):
+            restored = cache.load(project, static, roots)
+            restored_any |= restored is not None
+            coordinator.install(restored if restored is not None else ProjectRuntime(project, static, runtime, graph, None, surface,
+                fingerprint_surface_index(surface), proof, dependencies=(project.namespace,)))
+        selected = tuple(project for project in projects if project.namespace in coordinator.pending)
+        if selected and params.get('deferRuntime'):
             self._schedule_project_refresh(delay=0.05)
-        else:
-            self._collect_projects(coordinator, generation, revision, projects)
+        elif selected:
+            self._collect_projects(coordinator, generation, revision, selected)
+        if restored_any:
+            live = snapshot_python_sources(root, extra_roots=list(extra) or None,
+                max_workers=1, previous_snapshot=snapshot)
+            _context, live_configuration = source_observation_context(root, resolve_venv_info(root))
+            if (live.fingerprint != snapshot.fingerprint or live_configuration != configuration
+                    or not cache.context_current()):
+                if observation_attempt >= 2:
+                    raise RuntimeError('Project inputs changed during cached initialization.')
+                return self._initialize(params, observation_attempt=observation_attempt + 1)
         with self._state_lock:
             if self._projects is not coordinator or generation != self._state_generation:
                 raise RuntimeError('Project initialization was superseded.')
@@ -134,6 +158,7 @@ class ProjectDaemonServer(DaemonServer):
     def _collect_projects(self, coordinator, generation, revision, selected, *, publish=False):
         stopping = self._projects_stop
         configuration = self._source_configuration_fingerprint
+        cache = self._projects_cache
         def current():
             return (not self._stopping.is_set() and not stopping.is_set()
                 and self._projects is coordinator and generation == self._state_generation
@@ -177,6 +202,8 @@ class ProjectDaemonServer(DaemonServer):
                     self._projects_payload = None
                     if publish:
                         self._write_notification('surfaceIndexChanged', self._combined_payload())
+                if isinstance(value, ProjectRuntime) and cache is not None:
+                    cache.save(value, current)
 
     def _schedule_project_refresh(self, *, delay=0.3):
         with self._state_lock:
