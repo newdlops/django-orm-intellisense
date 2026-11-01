@@ -46,6 +46,7 @@ let initGeneration = 0;
 let surfaceRequestGeneration = 0;
 let currentSurfaceKey: string | null = null;
 let pendingSurfaceKey: string | null = null;
+let pendingSurfaceRequestGeneration = 0;
 
 function getNative(): NativeBindings | undefined {
   if (!attempted) {
@@ -109,6 +110,7 @@ export async function ensureNativeFastPath(
   const generation = ++initGeneration;
   ++surfaceRequestGeneration;
   currentSurfaceKey = pendingSurfaceKey = null;
+  pendingSurfaceRequestGeneration = 0;
 
   const work = (async () => {
     try {
@@ -148,6 +150,7 @@ export function dropNativeFastPath(): void {
   ++initGeneration;
   ++surfaceRequestGeneration;
   currentSurfaceKey = pendingSurfaceKey = null;
+  pendingSurfaceRequestGeneration = 0;
   const n = getNative();
   if (n) {
     try {
@@ -255,13 +258,19 @@ export async function hydrateNativeFastPathFromSurface(
       initialized = true;
       return true;
     }
-    if (initInProgress && pendingSurfaceKey === key) return initInProgress;
+    if (initInProgress && pendingSurfaceKey === key) {
+      // The same native work now belongs to this latest, fully compared
+      // request. Its completion can safely publish readiness for both.
+      pendingSurfaceRequestGeneration = requestGeneration;
+      return initInProgress;
+    }
   }
   const generation = ++initGeneration;
   initialized = false;
   currentRoot = options.workspaceRoot;
   stateSource = null;
   pendingSurfaceKey = key;
+  pendingSurfaceRequestGeneration = requestGeneration;
   resetNativeAstModulesFlag();
 
   const work = (async () => {
@@ -276,7 +285,7 @@ export async function hydrateNativeFastPathFromSurface(
       const dispatchMs = performance.now() - dispatchStart;
       const res = await pending;
       if (!res || generation !== initGeneration) return false;
-      initialized = true;
+      initialized = pendingSurfaceRequestGeneration === surfaceRequestGeneration;
       currentRoot = options.workspaceRoot;
       stateSource = 'surface';
       currentSurfaceKey = key;
@@ -290,9 +299,9 @@ export async function hydrateNativeFastPathFromSurface(
           `${formatInitStats(res)} payloadKb=${(surfaceChunks.reduce((total, chunk) => total + chunk.length, 0) / 1024).toFixed(1)} ` +
           `serializeMs=${serializeMs.toFixed(1)} dispatchMs=${dispatchMs.toFixed(1)}`,
       );
-      return true;
+      return initialized;
     } catch (err) {
-      if (generation !== initGeneration) return false;
+      if (generation !== initGeneration || pendingSurfaceRequestGeneration !== surfaceRequestGeneration) return false;
       dropNativeFastPath();
       options.log?.(
         'warn',
@@ -303,6 +312,7 @@ export async function hydrateNativeFastPathFromSurface(
       if (generation === initGeneration) {
         initInProgress = null;
         pendingSurfaceKey = null;
+        pendingSurfaceRequestGeneration = 0;
       }
     }
   })();

@@ -66,11 +66,12 @@ class ProjectRuntimeCache:
         self.environment = fingerprint_environment({key: value for key, value in os.environ.items()
             if key != 'DJANGO_SETTINGS_MODULE'})
         self.python = [sys.executable, sys.version, sys.prefix, input_identity(sys.executable)]
-        self.context = _digest({'version': VERSION, 'sources': snapshot.fingerprint,
+        self.base_context = _digest({'version': VERSION,
             'projects': [project.to_dict() for project in projects], 'configuration': configuration,
             'environment': self.environment, 'code': code,
             'python': self.python,
             'sysPath': sys.path})
+        self.context = _digest([self.base_context, snapshot.fingerprint])
 
     def context_current(self):
         try:
@@ -91,7 +92,7 @@ class ProjectRuntimeCache:
                 return None
             with path.open(encoding='utf-8') as stream:
                 payload = json.load(stream)
-            if (type(payload) is not dict or payload.get('context') != self.context
+            if (type(payload) is not dict or payload.get('context') != self.base_context
                     or _digest(payload['record']) != payload['digest']):
                 return None
             return payload['record']
@@ -102,7 +103,7 @@ class ProjectRuntimeCache:
         if path is None or not current():
             return
         try:
-            payload = {'context': self.context, 'record': record, 'digest': _digest(record)}
+            payload = {'context': self.base_context, 'record': record, 'digest': _digest(record)}
             encoder = json.JSONEncoder(sort_keys=True, default=lookup_catalog_json_default)
             return self._commit(path, lambda stream: store._write_cache_json_value(stream, payload, encoder, 0),
                 current, validate)
@@ -148,7 +149,7 @@ class ProjectRuntimeCache:
             return None
         path = self._path(project, 'seed')
         try:
-            if record != [str(path), input_identity(path)]:
+            if record != {'sourceFingerprint': snapshot.fingerprint, 'seed': [str(path), input_identity(path)]}:
                 return None
             if path.stat().st_size > MAX_RECORD_BYTES:
                 return None
@@ -173,7 +174,8 @@ class ProjectRuntimeCache:
         except OSError:
             return
         if saved:
-            self._write(self._path(project, 'static'), [str(path), input_identity(path)], current)
+            self._write(self._path(project, 'static'), {'sourceFingerprint': snapshot.fingerprint,
+                'seed': [str(path), input_identity(path)]}, current)
 
     def load(self, project, static, roots):
         record = self._read(self._path(project, 'profile'))
@@ -181,6 +183,15 @@ class ProjectRuntimeCache:
             return None
         try:
             if record['project'] != project.to_dict() or not inputs_match(record['inputs']):
+                return None
+            dependencies = tuple(record['dependencies'])
+            if not set(dependencies).issubset(project.namespace for project in self.projects):
+                return None
+            from ..runtime.projects import project_owner
+            proof_files = tuple(path for path in self.snapshot.files
+                if (owner := project_owner(self.projects, path)) is None or owner.namespace in dependencies)
+            proof = project_source_projection(Path(project.import_root), self.snapshot, proof_files)
+            if record['sourceFingerprint'] != proof.fingerprint:
                 return None
             files = tuple(Path(path) for path in record['staticFiles'])
             if not set(files).issubset(self.snapshot.files):
@@ -206,13 +217,6 @@ class ProjectRuntimeCache:
             if (fingerprint_surface_index(surface) != fingerprints
                     or store._surface_index_cache_problem(surface, static_index=owned, model_graph=graph)):
                 return None
-            dependencies = tuple(record['dependencies'])
-            if not set(dependencies).issubset(project.namespace for project in self.projects):
-                return None
-            from ..runtime.projects import project_owner
-            proof_files = tuple(path for path in self.snapshot.files
-                if (owner := project_owner(self.projects, path)) is None or owner.namespace in dependencies)
-            proof = project_source_projection(Path(project.import_root), self.snapshot, proof_files)
             return ProjectRuntime(project, owned, runtime, graph, members, surface, fingerprints, proof,
                 dependencies=dependencies, app_names=tuple(record['appNames']), cache_inputs=record['inputs'])
         except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError):
@@ -238,6 +242,7 @@ class ProjectRuntimeCache:
         files.update(str(Path(value.project.import_root) / path)
             for path in (*value.static_index.unparseable_files, *value.static_index.shadowed_files))
         record = {'project': value.project.to_dict(), 'inputs': value.cache_inputs,
+            'sourceFingerprint': value.source_snapshot.fingerprint,
             'staticFiles': sorted(files), 'runtime': value.inspection.to_cache_dict(),
             'graph': store._model_graph_to_cache_dict(value.model_graph, _field_rows=True),
             'members': members, 'memberIdentity': value.members.runtime_identity,

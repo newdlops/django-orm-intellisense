@@ -37,6 +37,7 @@ class ProjectRuntime:
     cache_code: str | None = None
     cache_python: object = None
     cache_environment: str | None = None
+    cache_inputs_changed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,11 +342,11 @@ def project_worker_main(input_path, result_path):
             cache_code = None
     except OSError:
         cache_code = None
+    cache_inputs = inputs.snapshot()
     value = (ProjectRuntime(project, None if reused_static else static, runtime, graph, members, surface,
                             fingerprint_surface_index(surface), before,
                             source_membership_fingerprint(before), tuple(sorted(dependencies)), app_names,
-                            inputs.snapshot(), cache_code,
-                            cache_python)
+                            cache_inputs, cache_code, cache_python, cache_inputs_changed=inputs.changed)
              if expected_scope.fingerprint == before.fingerprint == after.fingerprint
              and expected_membership == before_membership == source_membership_fingerprint(after_global)
              else ProjectRuntimeFailure(project, 'Project source changed during runtime collection.'))

@@ -18,12 +18,20 @@ async function fixture(startPreparation = true) {
   let nativeTasks = 0;
   let nativeHydrations = 0;
   let nativeQueries = 0;
+  let heldHydration: {resolve: (value: any) => void; reject: (error: Error) => void} | undefined;
+  let holdNextHydration = false;
+  let holdSerialization = false;
+  const serializationSlices: Array<() => void> = [];
   let pythonCalls = 0;
   const pythonDispatches: Array<{ at: number; deadline: number | undefined }> = [];
   const binding = {
     nativeInitFromSurfaceChunksAsync: async () => {
       nativeHydrations++;
       prepared = false;
+      if (holdNextHydration) {
+        holdNextHydration = false;
+        return new Promise<any>((resolve, reject) => { heldHydration = {resolve, reject}; });
+      }
       return { modelCount: 1, fieldCount: 1, edgeCount: 0, elapsedMs: 0, rebuilt: true };
     },
     nativeEnsureAstModules: () => {
@@ -45,7 +53,8 @@ async function fixture(startPreparation = true) {
     },
   };
   const context = vm.createContext({
-    console, Buffer, performance, AbortController, setImmediate, clearImmediate,
+    console, Buffer, performance, AbortController, clearImmediate,
+    setImmediate: (callback: () => void) => holdSerialization ? serializationSlices.push(callback) : setImmediate(callback),
     process: { env: {} },
     setTimeout: (callback: () => void, delay: number) => {
       const timer = setTimeout(() => { timers.delete(timer); callback(); }, delay);
@@ -105,6 +114,14 @@ async function fixture(startPreparation = true) {
     get nativeTasks() { return nativeTasks; },
     get nativeHydrations() { return nativeHydrations; },
     get nativeQueries() { return nativeQueries; },
+    holdHydration() { holdNextHydration = true; },
+    finishHydration(failed = false) {
+      if (failed) heldHydration?.reject(new Error('held hydration failed'));
+      else heldHydration?.resolve({ modelCount: 1, fieldCount: 1, edgeCount: 0, elapsedMs: 0, rebuilt: true });
+    },
+    holdSerialization() { holdSerialization = true; },
+    get heldSlices() { return serializationSlices.length; },
+    resumeSerialization() { holdSerialization = false; for (const callback of serializationSlices.splice(0)) callback(); },
     finish(ok = true) { finishNative?.(ok); },
     async dispose() {
       finishNative?.(false);
@@ -124,6 +141,43 @@ async function withoutPreparationWait<T>(pending: Promise<T>): Promise<T> {
 }
 
 async function main(): Promise<void> {
+  for (const failed of process.argv.includes('--older-failure-only') ? [true] : [false, true]) {
+    const test = await fixture(false);
+    try {
+      test.holdHydration();
+      const older = test.native.hydrateNativeFastPathFromSurface({workspaceRoot, surfaceIndex: {
+        'blog.Post': {instance: {old: ['scalar', null, 'field', 'IntegerField']}},
+      }});
+      await new Promise<void>(resolve => setImmediate(resolve));
+      test.holdSerialization();
+      const instance: any = {};
+      for (let index = 0; index < 50000; index++) instance[`fresh${index}`] = ['scalar', null, 'field', 'CharField'];
+      const newer = test.native.hydrateNativeFastPathFromSurface({workspaceRoot, surfaceIndex: {'blog.Post': {instance}}});
+      assert.equal(test.heldSlices, 1, 'The replacement serialization is held at an actual yielded slice');
+      test.finishHydration(failed);
+      await older;
+      assert.equal(test.native.isNativeFastPathReady(), false,
+        'An older native completion must not restore readiness while newer fields are being serialized');
+      test.resumeSerialization();
+      assert.equal(await newer, true, 'An older native failure must not discard the valid replacement');
+      assert.equal(test.native.isNativeFastPathReady(), true);
+    } finally { test.resumeSerialization(); await test.dispose(); }
+  }
+  {
+    const test = await fixture(false);
+    try {
+      test.holdHydration();
+      const options: any = {workspaceRoot, surfaceIndex: {'blog.Post': {instance: {fresh: ['scalar', null, 'field', 'IntegerField']}}}};
+      const first = test.native.hydrateNativeFastPathFromSurface(options);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const duplicate = test.native.hydrateNativeFastPathFromSurface(options);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      test.finishHydration();
+      assert.deepEqual(await Promise.all([first, duplicate]), [true, true]);
+      assert.equal(test.native.isNativeFastPathReady(), true, 'An identical pending duplicate must publish shared readiness');
+      assert.equal(test.nativeHydrations, 2, 'An identical pending duplicate shares the in-flight native call');
+    } finally { await test.dispose(); }
+  }
   {
     const test = await fixture(false);
     try {

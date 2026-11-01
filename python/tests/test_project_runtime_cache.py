@@ -199,6 +199,117 @@ class ProjectRuntimeCacheTest(unittest.TestCase):
         shutil.rmtree(directory)
         self.assertEqual(self.run_server()[1], 2)
 
+    def external_lookup(self, directory):
+        path = Path(directory) / 'lookup.conf'
+        path.write_text('first')
+        settings = self.root / 'config/settings/base.py'
+        settings.write_text(settings.read_text() + f'\nfrom pathlib import Path\nCONFIG_VALUE=Path({str(path)!r}).read_text()\n')
+        apps = self.root / 'common/apps.py'
+        apps.write_text(apps.read_text().replace('lookup_name="from_" + settings.PROFILE',
+            'lookup_name="from_" + settings.PROFILE + "_" + settings.CONFIG_VALUE'))
+        return path
+
+    def assert_current_lookup(self, result):
+        label = next(label for label in result['lookupCatalog']['fields'] if label.endswith('.common.Shared'))
+        table = result['lookupCatalog']
+        names = table['types'][table['fields'][label]['title']]['lookups']
+        for profile in ('one', 'two'):
+            self.assertIn(f'from_{profile}_other', names)
+            self.assertNotIn(f'from_{profile}_first', names)
+
+    def test_external_input_replacement_after_last_restore_is_retried(self):
+        from django_orm_intellisense.cache.projects import ProjectRuntimeCache
+        with tempfile.TemporaryDirectory(prefix='djls-external-adoption-') as directory:
+            path = self.external_lookup(directory)
+            self.run_server()
+            original, restored = ProjectRuntimeCache.load, []
+            def load(cache, *args):
+                value = original(cache, *args)
+                if value is not None:
+                    restored.append(value)
+                if len(restored) == 2:
+                    before = path.stat()
+                    path.write_text('other')
+                    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+                return value
+            with mock.patch.object(ProjectRuntimeCache, 'load', load):
+                result, workers = self.run_server()
+            self.assertEqual(workers, 2, 'A dependency changed after cache validation but stale metadata was published')
+            self.assert_current_lookup(result)
+
+    def test_external_input_replacement_after_worker_yield_is_retried(self):
+        from django_orm_intellisense.server import project_daemon
+        with tempfile.TemporaryDirectory(prefix='djls-external-live-') as directory:
+            path = self.external_lookup(directory)
+            original, changed = project_daemon.collect_project_runtimes, False
+            def collect(*args, **kwargs):
+                nonlocal changed
+                for value in original(*args, **kwargs):
+                    if not changed:
+                        changed = True
+                        path.write_text('other')
+                    yield value
+            with mock.patch.object(project_daemon, 'collect_project_runtimes', collect):
+                result, workers = self.run_server()
+            self.assertEqual(workers, 3)
+            self.assert_current_lookup(result)
+
+    def test_input_race_detected_inside_worker_is_retried(self):
+        with tempfile.TemporaryDirectory(prefix='djls-external-worker-') as directory:
+            path = self.external_lookup(directory)
+            settings = self.root / 'config/settings/base.py'
+            flag = Path(directory) / 'written'
+            settings.write_text(settings.read_text() + f'\nflag=Path({str(flag)!r})\n'
+                f'if not flag.exists():\n    Path({str(path)!r}).write_text("other")\n    flag.write_text("yes")\n')
+            result, workers = self.run_server()
+            self.assertEqual(workers, 3)
+            self.assert_current_lookup(result)
+
+    def test_successful_save_refresh_persists_the_current_source_generation(self):
+        from django_orm_intellisense.server import project_daemon
+        self.server._initialize({'workspaceRoot': str(self.root)})
+        path = self.root / 'common/models.py'
+        path.write_text(path.read_text() + '\n    fresh = models.BooleanField(default=False)\n')
+        with mock.patch.object(self.server, '_schedule_project_refresh'):
+            self.server._reindex_file({'filePath': str(path)})
+        self.server._collect_projects(self.server._projects, self.server._state_generation,
+            self.server._projects_revision, self.server._projects.projects)
+        self.server._close_projects()
+        with mock.patch.object(project_daemon, 'build_static_index', wraps=project_daemon.build_static_index) as parse:
+            result, workers = self.run_server()
+        self.assertEqual(workers, 0, 'A successful source refresh wrote obsolete restart cache bindings')
+        self.assertEqual(parse.call_count, 0, 'The current shared source seed was not persisted')
+        shared = next(label for label in result['surfaceIndex'] if label.endswith('.common.Shared'))
+        self.assertIn('fresh', result['surfaceIndex'][shared]['instance'])
+
+    def test_unsupported_input_observation_is_not_reported_as_an_input_race(self):
+        from django_orm_intellisense.runtime.project_inputs import ProjectInputs
+        path = self.write('input.conf', 'unchanged')
+        inputs = ProjectInputs(())
+        with inputs.observe():
+            os.stat(path, follow_symlinks=False)
+        self.assertIsNone(inputs.snapshot())
+        self.assertFalse(inputs.changed)
+
+    def test_unaffected_independent_profiles_keep_valid_cache_bindings_after_an_edit(self):
+        from test_project_runtime_isolation import IndependentProjectRuntimeTest
+        one = IndependentProjectRuntimeTest.project(self, 'nested_one', 'first_only')
+        IndependentProjectRuntimeTest.project(self, 'nested_two', 'second_only')
+        self.server._initialize({'workspaceRoot': str(self.root)})
+        path = one / 'inventory/models.py'
+        path.write_text(path.read_text() + '\n    fresh = models.BooleanField(default=False)\n')
+        with mock.patch.object(self.server, '_schedule_project_refresh'):
+            self.server._reindex_file({'filePath': str(path)})
+        coordinator = self.server._projects
+        selected = tuple(project for project in coordinator.projects if project.namespace in coordinator.pending)
+        self.assertEqual(len(selected), 1)
+        self.server._collect_projects(coordinator, self.server._state_generation,
+            self.server._projects_revision, selected)
+        self.server._close_projects()
+        result, workers = self.run_server()
+        self.assertEqual(workers, 0, 'Unchanged profile caches lost their validated source ownership')
+        self.assertEqual(result['health']['runtime']['readySettingsCount'], 4)
+
 
 if __name__ == '__main__':
     unittest.main()

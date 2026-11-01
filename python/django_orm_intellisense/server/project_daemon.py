@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 import threading
+import time
 
 from ..discovery.settings import settings_projects
 from ..cache.projects import ProjectRuntimeCache
@@ -15,6 +17,7 @@ from ..runtime.inspector import create_pending_runtime_inspection
 from ..runtime.projects import (ProjectRuntime, ProjectRuntimeFailure, collect_project_runtimes,
     project_source_files, project_source_projection, snapshot_project_sources)
 from ..runtime.projects import copy_source_index
+from ..runtime.project_inputs import inputs_match
 from ..semantic.graph import build_model_graph
 from ..static_index.indexer import build_static_index
 from .app import DaemonServer
@@ -96,6 +99,7 @@ class ProjectDaemonServer(DaemonServer):
         # their own context serially; they never share a configured Django app.
         static_groups = {}
         restored_any = False
+        restored_inputs = []
         def current():
             return (not self._stopping.is_set() and self._projects is coordinator
                 and generation == self._state_generation and revision == self._projects_revision)
@@ -119,6 +123,8 @@ class ProjectDaemonServer(DaemonServer):
                 static = copy_source_index(shared)
             restored = cache.load(project, static, roots)
             restored_any |= restored is not None
+            if restored is not None:
+                restored_inputs.append(restored.cache_inputs)
             coordinator.install(restored if restored is not None else ProjectRuntime(project, static, runtime, graph, None, surface,
                 fingerprint_surface_index(surface), proof, dependencies=(project.namespace,)))
         selected = tuple(project for project in projects if project.namespace in coordinator.pending)
@@ -132,6 +138,10 @@ class ProjectDaemonServer(DaemonServer):
             _context, live_configuration = source_observation_context(root, resolve_venv_info(root))
             if (live.fingerprint != snapshot.fingerprint or live_configuration != configuration
                     or not cache.context_current()):
+                if observation_attempt >= 2:
+                    raise RuntimeError('Project inputs changed during cached initialization.')
+                return self._initialize(params, observation_attempt=observation_attempt + 1)
+            if not all(inputs_match(rows) for rows in restored_inputs):
                 if observation_attempt >= 2:
                     raise RuntimeError('Project inputs changed during cached initialization.')
                 return self._initialize(params, observation_attempt=observation_attempt + 1)
@@ -171,13 +181,39 @@ class ProjectDaemonServer(DaemonServer):
             snapshot = snapshot_python_sources(self.workspace_root,
                 extra_roots=list(self._editable_source_roots) or None, max_workers=1)
             coordinator.source_files = snapshot.files
-            for value in collect_project_runtimes(selected, all_projects=coordinator.projects,
-                    workspace_root=self.workspace_root, source_files=snapshot.files,
+            new_cache_generation = cache is None or cache.snapshot.fingerprint != snapshot.fingerprint
+            if new_cache_generation:
+                cache = ProjectRuntimeCache(self.workspace_root, coordinator.projects, snapshot, configuration)
+                with self._state_lock:
+                    if not current():
+                        return
+                    self._projects_cache = cache
+            saved_groups = set()
+            def collect(which, sources, timeout=None):
+                return collect_project_runtimes(which, all_projects=coordinator.projects,
+                    workspace_root=self.workspace_root, source_files=sources.files,
                     extra_roots=self._editable_source_roots, stopping=stopping, is_current=current,
-                    source_snapshot=snapshot,
-                    timeout_seconds=60 if len(snapshot.files) > 10000 else 30,
+                    source_snapshot=sources, timeout_seconds=timeout if timeout is not None else 60 if len(sources.files) > 10000 else 30,
                     static_indexes={namespace: state.engine.static_index for namespace, state in coordinator.states.items()},
-                    static_snapshots={namespace: state.engine.source_snapshot for namespace, state in coordinator.states.items()}):
+                    static_snapshots={namespace: state.engine.source_snapshot for namespace, state in coordinator.states.items()})
+            def changed(value):
+                return isinstance(value, ProjectRuntime) and (value.cache_inputs_changed
+                    or value.cache_inputs is not None and not inputs_match(value.cache_inputs))
+            profile_started = time.monotonic()
+            for value in collect(selected, snapshot):
+                if changed(value):
+                    # One bounded serial retry handles a dependency settling
+                    # between capture and adoption. Uncacheable projects whose
+                    # observed inputs did not race keep their normal behavior.
+                    fresh = snapshot_python_sources(self.workspace_root,
+                        extra_roots=list(self._editable_source_roots) or None, max_workers=1,
+                        previous_snapshot=snapshot)
+                    remaining = (60 if len(snapshot.files) > 10000 else 30) - (time.monotonic() - profile_started)
+                    if remaining <= 0:
+                        value = ProjectRuntimeFailure(value.project, 'Project dependency refresh exhausted its runtime budget.')
+                    else:
+                        with closing(collect((value.project,), fresh, remaining)) as retry:
+                            value = next(retry, ProjectRuntimeFailure(value.project, 'Project dependency refresh was cancelled.'))
                 _observation, live_configuration = source_observation_context(self.workspace_root,
                     resolve_venv_info(self.workspace_root))
                 if live_configuration != configuration:
@@ -198,12 +234,27 @@ class ProjectDaemonServer(DaemonServer):
                         proof = project_source_projection(Path(value.project.import_root), live, files)
                         if proof.fingerprint != value.source_snapshot.fingerprint:
                             value = ProjectRuntimeFailure(value.project, 'Project source changed before adoption.')
+                        elif changed(value):
+                            value = ProjectRuntimeFailure(value.project, 'Project dependency changed before adoption.')
                     coordinator.install(value)
                     self._projects_payload = None
                     if publish:
                         self._write_notification('surfaceIndexChanged', self._combined_payload())
                 if isinstance(value, ProjectRuntime) and cache is not None:
+                    group = value.project.root, value.project.import_root
+                    if new_cache_generation and group not in saved_groups:
+                        saved_groups.add(group)
+                        canonical = next(project for project in coordinator.projects
+                            if (project.root, project.import_root) == group)
+                        files = project_source_files(coordinator.projects, canonical, snapshot.files)
+                        proof = project_source_projection(Path(canonical.import_root), snapshot, files)
+                        if (project_source_projection(Path(canonical.import_root), value.source_snapshot, files).fingerprint
+                                == proof.fingerprint):
+                            static = copy_source_index(value.static_index)
+                            static._profile_model_modules = {}
+                            cache.save_static(canonical, proof, static, current)
                     cache.save(value, current)
+                profile_started = time.monotonic()
 
     def _schedule_project_refresh(self, *, delay=0.3):
         with self._state_lock:

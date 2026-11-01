@@ -42,6 +42,7 @@ class ProjectInputs:
         self.code_cache = str(Path(cache_root).expanduser().absolute() / 'dependency-code-v1')
         self.rows = {}
         self.valid = True
+        self.changed = False
         self.active = False
         self.local = threading.local()
 
@@ -67,6 +68,7 @@ class ProjectInputs:
             previous = self.rows.setdefault(path, identity)
             if previous != identity:
                 self.valid = False
+                self.changed = True
         except (OSError, ValueError, TypeError):
             self.valid = False
         finally:
@@ -117,4 +119,10 @@ class ProjectInputs:
 
     def snapshot(self):
         rows = [[path, value] for path, value in sorted(self.rows.items())]
-        return rows if self.valid and inputs_match(rows) else None
+        for path, expected in rows:
+            try:
+                if input_identity(path) != expected:
+                    self.changed = True
+            except (OSError, ValueError, TypeError):
+                self.valid = False
+        return rows if self.valid and not self.changed else None
