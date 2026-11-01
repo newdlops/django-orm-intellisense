@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { AsyncLocalStorage } from 'async_hooks';
+import { isDeepStrictEqual } from 'node:util';
 import { withKnownNativeMemberReturn } from './ormMemberConfidence';
 import { applyLookupCatalogDelta } from '../../server/lookupCatalog';
 import { attachProjectModelSources, projectForFile, projectWorkspaceView } from '../../server/projectScope';
@@ -520,14 +521,27 @@ export class AnalysisDaemon implements vscode.Disposable {
     return false;
   }
 
-  private rebuildLocalWorkspaceIndex(): void {
-    this.localWorkspaceIndex = buildWorkspaceIndex(
+  private rebuildLocalWorkspaceIndex(preserveUnchanged = false): void {
+    const previous = this.localWorkspaceIndex;
+    const next = buildWorkspaceIndex(
       this.surfaceIndex,
       Array.from(this.allModelNames),
       this.customLookups,
       this.effectiveStaticFallback(),
       this.lookupCatalog,
     );
+    if (preserveUnchanged) {
+      attachProjectModelSources(next, this.projectContexts);
+      for (const [label, model] of next.models) {
+        const old = previous.models.get(label);
+        if (old && isDeepStrictEqual(old, model)) {
+          next.models.set(label, old);
+          const trie = previous.fieldTrieByModel.get(label);
+          if (trie) next.fieldTrieByModel.set(label, trie);
+        }
+      }
+    }
+    this.localWorkspaceIndex = next;
     this._shortNameFromFullLabelIndex = null;
     this.invalidateProjectViews();
     this.localModelFingerprints.clear();
@@ -1257,6 +1271,7 @@ export class AnalysisDaemon implements vscode.Disposable {
     this.rebuildModelLabelByName();
     this.rebuildModelNames();
     this.invalidateProjectViews();
+    resetNativeAstModulesFlag();
     this.refreshNativeFastPathFromSurface('reindex');
     // Cached IPC answers (lookup resolutions, receiver chains) were computed
     // against the old models and would otherwise outlive the edit by the TTL.
@@ -3636,32 +3651,65 @@ export class AnalysisDaemon implements vscode.Disposable {
       }
     }
 
-    this.clearResponseCache();
     // A partial/legacy publication cannot retain proof from another frame.
     this.sourceProvenance = null;
+    let replacedMetadata = false;
     if (message.params?.surfaceIndex) {
-      this.surfaceIndex = message.params.surfaceIndex;
-      this.projectContexts = message.params.projectContexts ?? [];
+      const next = message.params;
+      const previousLookups = this.customLookups;
+      const nextLookups = next.customLookups ?? {};
+      const nextFallback = next.staticFallback ?? null;
+      const lookupChanged = this.customLookupsFingerprint !== next.customLookupsFingerprint
+        || !isDeepStrictEqual(previousLookups, nextLookups)
+        || !isDeepStrictEqual(this.lookupCatalog, next.lookupCatalog);
+      const fallbackChanged = !isDeepStrictEqual(this.staticFallback, nextFallback);
+      const orderChanged = !isDeepStrictEqual(Object.keys(this.surfaceIndex), Object.keys(next.surfaceIndex!));
+      const diff = diffSurfaceIndex(this.surfaceIndex, next.surfaceIndex!, this.localModelFingerprints, next.surfaceFingerprints);
+      const surfaceChanged = diff.added.length + diff.changed.length + diff.removed.length > 0;
+      const nextContexts = next.projectContexts ?? [];
+      const scope = (contexts: DjangoProjectContext[]) => contexts.map(context => ({
+        namespace: context.namespace, root: context.root, rootAliases: context.rootAliases,
+        models: context.models, lookupKinds: context.lookupKinds,
+      }));
+      const contextChanged = !isDeepStrictEqual(scope(this.projectContexts), scope(nextContexts));
+      this.projectContexts = nextContexts;
       this.sourceProvenance = message.params.sourceProvenance ?? null;
-      this.surfaceFingerprints = message.params.surfaceFingerprints ?? {};
-      this.customLookups = message.params.customLookups ?? {};
-      this.lookupCatalog = message.params.lookupCatalog;
-      this.customLookupsFingerprint = message.params.customLookupsFingerprint;
-      this.staticFallback = message.params.staticFallback ?? null;
-      this.staticFallbackFingerprint = message.params.staticFallbackFingerprint ?? null;
+      const changed = this.metadataRetired || surfaceChanged || lookupChanged || fallbackChanged || orderChanged;
+      if (changed) {
+        this.surfaceIndex = next.surfaceIndex!;
+        this.surfaceFingerprints = next.surfaceFingerprints ?? {};
+        this.customLookups = nextLookups;
+        this.lookupCatalog = next.lookupCatalog;
+        this.staticFallback = nextFallback;
+        this.rebuildModelLabelByName();
+        this.rebuildModelNames();
+        if (this.metadataRetired || lookupChanged || fallbackChanged || orderChanged || this.localWorkspaceIndex.models.size === 0) {
+          this.rebuildLocalWorkspaceIndex(true);
+        } else {
+          updateWorkspaceIndexIncremental(this.localWorkspaceIndex, this.surfaceIndex, diff,
+            this.customLookups, previousLookups, this.effectiveStaticFallback(), this.lookupCatalog);
+          this._shortNameFromFullLabelIndex = null;
+          this.invalidateProjectViews();
+        }
+        this.refreshNativeFastPathFromSurface('surfaceIndexChanged');
+      } else if (contextChanged) {
+        this.invalidateProjectViews();
+      }
+      this.customLookupsFingerprint = next.customLookupsFingerprint;
+      this.staticFallbackFingerprint = next.staticFallbackFingerprint ?? null;
       this.metadataRetired = false;
-      this.rebuildModelLabelByName();
-      this.rebuildModelNames();
-      this.rebuildLocalWorkspaceIndex();
-      this.refreshNativeFastPathFromSurface('surfaceIndexChanged');
-      this.modelsReindexedEmitter.fire();
+      replacedMetadata = changed || contextChanged;
+      if (replacedMetadata) {
+        this.clearResponseCache();
+        this.modelsReindexedEmitter.fire();
+      }
     }
 
     const nextSnapshot = message.params?.health
       ? this.decorateSnapshot(message.params.health)
       : this.currentState;
     this.updateState(nextSnapshot);
-    this.surfaceSnapshotEmitter.fire();
+    if (replacedMetadata) this.surfaceSnapshotEmitter.fire();
   }
 
   private requestSurfaceSnapshotResync(): void {

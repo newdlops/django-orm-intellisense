@@ -17,6 +17,7 @@
 // ============================================================================
 
 import { tryLoadNative, type NativeBindings } from '../native/loader';
+import { createHash } from 'node:crypto';
 import type { SurfaceIndex } from '../../server/workspaceIndexer';
 import type { ModelInfo, WorkspaceIndex } from '../../server/types';
 import type {
@@ -42,6 +43,9 @@ let currentRoot: string | null = null;
 let stateSource: 'ast' | 'surface' | null = null;
 let disabled = false;
 let initGeneration = 0;
+let surfaceRequestGeneration = 0;
+let currentSurfaceKey: string | null = null;
+let pendingSurfaceKey: string | null = null;
 
 function getNative(): NativeBindings | undefined {
   if (!attempted) {
@@ -103,6 +107,8 @@ export async function ensureNativeFastPath(
   }
 
   const generation = ++initGeneration;
+  ++surfaceRequestGeneration;
+  currentSurfaceKey = pendingSurfaceKey = null;
 
   const work = (async () => {
     try {
@@ -140,6 +146,8 @@ export function isNativeFastPathReady(): boolean {
 
 export function dropNativeFastPath(): void {
   ++initGeneration;
+  ++surfaceRequestGeneration;
+  currentSurfaceKey = pendingSurfaceKey = null;
   const n = getNative();
   if (n) {
     try {
@@ -170,7 +178,7 @@ function modelInstanceFields(model: ModelInfo): SurfaceIndex[string]['instance']
 }
 
 async function serializeSurface(
-  entries: Array<[string, SurfaceIndex[string] | ModelInfo]>, generation: number,
+  entries: Array<[string, SurfaceIndex[string] | ModelInfo]>, isCurrent: () => boolean,
 ): Promise<Buffer[] | undefined> {
   const chunks: Buffer[] = [Buffer.from('{')];
   let sliceStart = performance.now();
@@ -184,7 +192,7 @@ async function serializeSurface(
     chunks.push(Buffer.from(`${i ? ',' : ''}${JSON.stringify(label)}:${JSON.stringify({ instance })}`));
     if (performance.now() - sliceStart >= 4) {
       await new Promise<void>(resolve => setImmediate(resolve));
-      if (generation !== initGeneration) return undefined;
+      if (!isCurrent()) return undefined;
       sliceStart = performance.now();
     }
   }
@@ -220,17 +228,44 @@ export async function hydrateNativeFastPathFromSurface(
     return false;
   }
 
+  const requestGeneration = ++surfaceRequestGeneration;
+  const previousGeneration = initGeneration;
+  // Suspend queries immediately. Comparing an identical replacement may
+  // retain prepared sources, but changed fields must never expose the old
+  // authoritative native table during a yielded serialization slice.
+  initialized = false;
+  const serializeStart = performance.now();
+  let surfaceChunks: Buffer[] | undefined;
+  try {
+    surfaceChunks = await serializeSurface(entries, () => requestGeneration === surfaceRequestGeneration
+      && previousGeneration === initGeneration);
+  } catch (error) {
+    if (requestGeneration === surfaceRequestGeneration && previousGeneration === initGeneration) {
+      dropNativeFastPath();
+      options.log?.('warn', `[fastpath] native surface serialization failed: ${String(error)}`);
+    }
+    return false;
+  }
+  if (!surfaceChunks || requestGeneration !== surfaceRequestGeneration || previousGeneration !== initGeneration) return false;
+  const digest = createHash('sha256').update(options.workspaceRoot).update('\0');
+  for (const chunk of surfaceChunks) digest.update(chunk);
+  const key = digest.digest('hex');
+  if (currentRoot === options.workspaceRoot) {
+    if (stateSource === 'surface' && currentSurfaceKey === key) {
+      initialized = true;
+      return true;
+    }
+    if (initInProgress && pendingSurfaceKey === key) return initInProgress;
+  }
   const generation = ++initGeneration;
   initialized = false;
   currentRoot = options.workspaceRoot;
   stateSource = null;
+  pendingSurfaceKey = key;
   resetNativeAstModulesFlag();
 
   const work = (async () => {
     try {
-      const serializeStart = performance.now();
-      const surfaceChunks = await serializeSurface(entries, generation);
-      if (!surfaceChunks || generation !== initGeneration) return false;
       const serializeMs = performance.now() - serializeStart;
       const dispatchStart = performance.now();
       const pending = n.nativeInitFromSurfaceChunksAsync
@@ -244,6 +279,7 @@ export async function hydrateNativeFastPathFromSurface(
       initialized = true;
       currentRoot = options.workspaceRoot;
       stateSource = 'surface';
+      currentSurfaceKey = key;
       // Surface hydrate leaves `modules` empty. A follow-up
       // `ensureNativeAstModules` call has to run before export-origin
       // queries can be answered natively.
@@ -264,7 +300,10 @@ export async function hydrateNativeFastPathFromSurface(
       );
       return false;
     } finally {
-      if (generation === initGeneration) initInProgress = null;
+      if (generation === initGeneration) {
+        initInProgress = null;
+        pendingSurfaceKey = null;
+      }
     }
   })();
   initInProgress = work;

@@ -2,7 +2,8 @@
 
 const assert = require('node:assert/strict');
 const { loadDaemonClass, createDaemon, adopt, clone, state, assertFreshIndex } = require('./client-surface-adoption-harness.cjs');
-const Daemon = loadDaemonClass('candidate');
+const currentSource = process.argv.includes('--current');
+const Daemon = loadDaemonClass(currentSource ? 'current' : 'candidate');
 const Baseline = loadDaemonClass(true);
 const { getOrBuildFieldTrie } = require('../out/server/workspaceIndexer.js');
 let groups = 0;
@@ -166,7 +167,7 @@ async function main() {
     assertFreshIndex(current);
     groups++;
   } finally { console.log = log; }
-  console.log(JSON.stringify({ passed: groups, implementation: 'archived rejected candidate', oracle: 'actual compiled full-adoption baseline and complete freshly built model/name/lookup/catalog indexes',
+  console.log(JSON.stringify({ passed: groups, implementation: currentSource ? 'current compiled daemon' : 'archived rejected candidate', oracle: 'actual compiled full-adoption baseline and complete freshly built model/name/lookup/catalog indexes',
     scope: 'component only; no native/editor/LSP/process timing' }));
 }
 

@@ -16,6 +16,7 @@ from ..runtime.projects import ProjectRuntime, ProjectRuntimeFailure
 from ..semantic.graph import build_semantic_graph
 from .app import DaemonServer, fingerprint_json_payload
 from .settings_union import CatalogUnion, merge_fallback, merge_surface
+from .project_contributions import ProjectContributions
 
 
 _LABEL_KEYS = frozenset(('modelLabel', 'baseModelLabel', 'relatedModelLabel',
@@ -214,6 +215,9 @@ class WorkspaceProjects:
         self._closed = False
         self._model_ids = {}
         self._label_owners = {}
+        self._contributions = ProjectContributions()
+        self._catalog_fingerprint = (None, None)
+        self._fallback_fingerprint = (None, None)
 
     def _labels_for(self, project, graph):
         group = project.group_namespace or project.namespace
@@ -519,10 +523,10 @@ class WorkspaceProjects:
 
     def payload(self):
         with self._lock:
-            surface, fallback, groups, names = {}, {}, {}, set()
-            catalogs = CatalogUnion()
-            preferred, model_sources, runtime_models, previews = set(), set(), {}, {}
-            field_keys, relation_keys, reverse_keys, manager_keys, app_keys = set(), set(), set(), set(), set()
+            metadata = self._contributions
+            metadata.sync(self.projects, self.states, self.root)
+            surface, fallback, catalog = metadata.surface, metadata.fallback, metadata.catalog
+            groups = {group: {**context, 'settingsProfiles': []} for group, context in metadata.groups.items()}
             static_groups, profiles = {}, []
             ready = 0
             for project in self.projects:
@@ -547,43 +551,6 @@ class WorkspaceProjects:
                     error=summary['error'] or runtime.bootstrap_error)
                 context.setdefault('runtime', runtime.to_dict())
                 static_groups.setdefault((project.root, project.import_root), engine.static_index)
-                runtime_labels = {wire.label(label) for label, node in engine.model_graph.nodes_by_label.items()
-                    if node.runtime_model is not None}
-                for label, row in wire.result({'surfaceIndex': engine._last_surface_index or {}})['surfaceIndex'].items():
-                    surface[label] = merge_surface(surface.get(label, {}), row,
-                        prefer_right=label in runtime_labels and label not in preferred)
-                converted = wire.catalog(engine.runtime_inspection.lookup_catalog)
-                catalogs.add(converted)
-                catalogs.merge_kinds(context['lookupKinds'], converted['kinds'])
-                for label, row in wire.result({'staticFallback': engine._last_static_fallback or {}})['staticFallback'].items():
-                    fallback[label] = merge_fallback(fallback.get(label), row,
-                        prefer_right=label in runtime_labels and label not in preferred)
-                names.update(engine._last_model_names or ())
-                sources = wire.context(self.root)['models']
-                for label, row in sources.items():
-                    if label not in context['models'] or label in runtime_labels and label not in model_sources:
-                        context['models'][label] = row
-                model_sources.update(runtime_labels)
-                preferred.update(runtime_labels)
-                context['rootAliases'] = sorted(set(context['rootAliases']) | set(wire.root_aliases))
-                for kind, lookups in runtime.custom_lookups.items():
-                    context['customLookups'][kind] = sorted(set(context['customLookups'].get(kind, ())) | set(lookups))
-                for local, node in engine.model_graph.nodes_by_label.items():
-                    model = node.runtime_model
-                    if model is None:
-                        continue
-                    label = wire.label(local)
-                    runtime_models.setdefault(label, model)
-                    for field in model.fields:
-                        field_keys.add((label, field.name))
-                        if field.is_relation:
-                            (reverse_keys if field.direction == 'reverse' else relation_keys).add((label, field.name))
-                    manager_keys.update((label, name) for name in model.manager_names)
-                    if not state.runtime.app_names:
-                        app_keys.add((group, model.label.split('.', 1)[0]))
-                app_keys.update((group, name) for name in state.runtime.app_names)
-                for row in runtime.model_preview:
-                    previews.setdefault(wire.label(row.label), wire.result(row.to_dict()))
             contexts = list(groups.values())
             for context in contexts:
                 items = context['settingsProfiles']
@@ -596,9 +563,7 @@ class WorkspaceProjects:
                 errors = [item['error'] for item in items if item.get('error')]
                 if errors:
                     context['error'] = '\n'.join(dict.fromkeys(errors))
-            counts = {'appCount': len(app_keys), 'modelCount': len(runtime_models), 'fieldCount': len(field_keys),
-                'relationCount': len(relation_keys), 'reverseRelationCount': len(reverse_keys), 'managerCount': len(manager_keys)}
-            catalog = catalogs.value
+            counts = metadata.counts
             static_files = set(self.source_files)
             phase = 'ready' if ready == len(self.projects) else 'degraded' if ready or not self.pending else 'starting'
             model_candidates = {(candidate.file_path, candidate.object_name) for static in static_groups.values()
@@ -623,19 +588,23 @@ class WorkspaceProjects:
                     'settingsModule': None, 'projectCount': len(groups),
                     'readyProjectCount': sum(context['phase'] == 'ready' for context in contexts),
                     'settingsCount': len(self.projects), 'readySettingsCount': ready,
-                    **counts, 'modelPreview': list(previews.values())[:10]},
+                    **counts, 'modelPreview': metadata.previews},
                 'semanticGraph': {'coverageMode': 'hybrid_scaffold' if ready else 'static_only_scaffold',
                     'moduleCount': len(static_files), 'exportSurfaceCount': 0,
                     'modelCandidateCount': len(model_candidates),
                     'runtimeModelCount': counts['modelCount'], 'provenanceLayers': ['static_source', 'settings_discovery']
                         + (['runtime_environment', 'django_runtime_meta'] if ready else [])},
             }
-            return {'health': health, 'modelNames': sorted(names), 'projectContexts': contexts,
-                'surfaceIndex': surface, 'surfaceFingerprints': fingerprint_surface_index(surface),
+            if self._catalog_fingerprint[0] is not catalog:
+                self._catalog_fingerprint = catalog, fingerprint_json_payload(catalog)
+            if self._fallback_fingerprint[0] is not fallback:
+                self._fallback_fingerprint = fallback, fingerprint_json_payload(fallback) if fallback else None
+            return {'health': health, 'modelNames': metadata.names, 'projectContexts': contexts,
+                'surfaceIndex': surface, 'surfaceFingerprints': metadata.fingerprints,
                 'lookupCatalog': catalog, 'customLookups': {},
-                'customLookupsFingerprint': fingerprint_json_payload(catalog),
+                'customLookupsFingerprint': self._catalog_fingerprint[1],
                 'staticFallback': fallback or None,
-                'staticFallbackFingerprint': fingerprint_json_payload(fallback) if fallback else None,
+                'staticFallbackFingerprint': self._fallback_fingerprint[1],
                 'runtimeMembersPending': bool(self.pending)}
 
     def close(self):
@@ -649,3 +618,6 @@ class WorkspaceProjects:
             self.pending.clear()
             self._model_ids.clear()
             self._label_owners.clear()
+            self._contributions.clear()
+            self._catalog_fingerprint = (None, None)
+            self._fallback_fingerprint = (None, None)

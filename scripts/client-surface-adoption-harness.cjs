@@ -60,7 +60,7 @@ function state(daemon) {
     models: index.models, indexNames: index.modelLabelByName,
     lookupTrie: index.lookupTrie, transformTrie: index.transformTrie,
     lookupTypes: index.lookupTypes, indexCatalog: index.lookupCatalog,
-    health: daemon.getState(),
+    health: Object.fromEntries(Object.entries(daemon.getState()).filter(([, value]) => value !== undefined)),
   };
 }
 
@@ -68,6 +68,7 @@ function assertFreshIndex(daemon) {
   const { buildWorkspaceIndex } = require('../out/server/workspaceIndexer.js');
   const fresh = buildWorkspaceIndex(daemon.surfaceIndex, [...daemon.modelNames], daemon.customLookups,
     daemon.effectiveStaticFallback(), daemon.lookupCatalog);
+  require('../out/server/projectScope.js').attachProjectModelSources(fresh, daemon.projectContexts ?? []);
   const actual = daemon.localWorkspaceIndexForTesting;
   for (const key of ['models', 'modelLabelByName', 'lookupTrie', 'transformTrie', 'lookupTypes', 'lookupCatalog']) {
     assert.deepStrictEqual(actual[key], fresh[key], `Complete fresh-index oracle differs: ${key}`);

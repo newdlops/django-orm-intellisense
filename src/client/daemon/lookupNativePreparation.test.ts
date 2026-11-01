@@ -16,11 +16,16 @@ async function fixture(startPreparation = true) {
   let finishNative!: (ok: boolean) => void;
   let prepared = false;
   let nativeTasks = 0;
+  let nativeHydrations = 0;
   let nativeQueries = 0;
   let pythonCalls = 0;
   const pythonDispatches: Array<{ at: number; deadline: number | undefined }> = [];
   const binding = {
-    nativeInitFromSurfaceChunksAsync: async () => ({ modelCount: 1, fieldCount: 1, edgeCount: 0, elapsedMs: 0, rebuilt: true }),
+    nativeInitFromSurfaceChunksAsync: async () => {
+      nativeHydrations++;
+      prepared = false;
+      return { modelCount: 1, fieldCount: 1, edgeCount: 0, elapsedMs: 0, rebuilt: true };
+    },
     nativeEnsureAstModules: () => {
       nativeTasks++;
       return new Promise<boolean>(resolve => { finishNative = ok => { prepared = ok; resolve(ok); }; });
@@ -98,6 +103,7 @@ async function fixture(startPreparation = true) {
     get pythonCalls() { return pythonCalls; },
     get pythonDispatches() { return pythonDispatches; },
     get nativeTasks() { return nativeTasks; },
+    get nativeHydrations() { return nativeHydrations; },
     get nativeQueries() { return nativeQueries; },
     finish(ok = true) { finishNative?.(ok); },
     async dispose() {
@@ -118,6 +124,46 @@ async function withoutPreparationWait<T>(pending: Promise<T>): Promise<T> {
 }
 
 async function main(): Promise<void> {
+  {
+    const test = await fixture(false);
+    try {
+      const updating = test.native.hydrateNativeFastPathFromSurface({workspaceRoot, surfaceIndex: {
+        'blog.Post': {instance: {title: ['scalar', null, 'field', 'IntegerField']}},
+      }});
+      assert.equal(test.native.isNativeFastPathReady(), false, 'Native queries cannot expose previous fields while a replacement is being compared');
+      await updating;
+      assert.equal(test.native.isNativeFastPathReady(), true);
+      const circular: any = {};
+      circular.value = circular;
+      const failed = await test.native.hydrateNativeFastPathFromSurface({workspaceRoot, surfaceIndex: {
+        'blog.Post': {instance: {title: ['scalar', null, 'field', circular]}},
+      }});
+      assert.equal(failed, false, 'Malformed serialization must fall back instead of rejecting an unobserved background promise');
+    } finally { await test.dispose(); }
+  }
+  {
+    const test = await fixture();
+    try {
+      test.finish();
+      await test.native.ensureNativeAstModules(workspaceRoot);
+      await test.native.hydrateNativeFastPathFromSurface({ workspaceRoot, surfaceIndex: {
+        'blog.Post': {instance: {title: ['scalar', null, 'field', 'CharField']},
+          queryset: {only_other_settings: ['queryset', 'blog.Post', 'method', null]}},
+      }});
+      assert.equal(test.nativeHydrations, 1, 'A settings-only member update must retain identical native fields and prepared sources');
+      assert.equal((await test.query()).target?.filePath, fieldPath);
+      assert.equal(test.nativeTasks, 1);
+      test.native.resetNativeAstModulesFlag();
+      await test.native.hydrateNativeFastPathFromSurface({ workspaceRoot, surfaceIndex: {
+        'blog.Post': {instance: {title: ['scalar', null, 'field', 'CharField']}},
+      }});
+      const preparing = test.native.ensureNativeAstModules(workspaceRoot);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(test.nativeTasks, 2, 'A source edit still requires fresh preparation even when field shape is unchanged');
+      test.finish();
+      await preparing;
+    } finally { await test.dispose(); }
+  }
   {
     const test = await fixture();
     try {
