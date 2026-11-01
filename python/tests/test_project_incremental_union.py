@@ -1,6 +1,6 @@
 """Unchanged profile metadata must not be converted or unioned again."""
 from dataclasses import replace
-import copy
+import json
 import importlib.util
 import unittest
 from unittest import mock
@@ -81,7 +81,7 @@ class ProjectIncrementalUnionTest(unittest.TestCase):
         before = self.initialize()
         state = list(self.workspace.states.values())[1]
         engine = state.engine
-        catalog = copy.deepcopy(engine.runtime_inspection.lookup_catalog)
+        catalog = json.loads(json.dumps(engine.runtime_inspection.lookup_catalog))
         type_id = catalog['fields']['common.Shared']['title']
         catalog['types'][type_id]['lookups'] = [*catalog['types'][type_id]['lookups'], 'added_lookup']
         inspection = replace(engine.runtime_inspection, lookup_catalog=catalog)

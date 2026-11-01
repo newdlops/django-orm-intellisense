@@ -32,7 +32,7 @@ def _qualify_rows(wire, rows, old_rows, qualified, labels_unchanged):
         for label, row in rows.items()}
 
 
-def _contribution(state, root, previous):
+def _contribution(state, root, previous, pool):
     engine, wire = state.engine, state.wire
     runtime = engine.runtime_inspection
     sources = (engine._last_surface_index, engine._last_static_fallback, runtime.lookup_catalog,
@@ -47,6 +47,8 @@ def _contribution(state, root, previous):
     catalog = (previous.catalog if labels_unchanged and previous.sources[2] == sources[2]
                else wire.catalog(runtime.lookup_catalog))
     models = previous.models if previous is not None and previous.sources[3] is sources[3] and labels_unchanged else wire.context(root)['models']
+    if pool is not None:
+        surface, fallback, models = pool.share_contribution(state.runtime.project.namespace, (surface, fallback, models))
     graph = engine.model_graph
     runtime_labels = frozenset(wire.label(label) for label, node in graph.nodes_by_label.items() if node.runtime_model is not None)
     if previous is not None and previous.sources[3] is sources[3] and labels_unchanged:
@@ -75,7 +77,8 @@ def _contribution(state, root, previous):
 
 class ProjectContributions:
     """No process-global pool: old published tables remain immutable to callers."""
-    def __init__(self):
+    def __init__(self, pool=None):
+        self.pool = pool
         self.profiles = {}
         self.surface = {}
         self.fallback = {}
@@ -89,7 +92,7 @@ class ProjectContributions:
 
     def sync(self, projects, states, root):
         next_profiles = {project.namespace: _contribution(states[project.namespace], root,
-            self.profiles.get(project.namespace)) for project in projects if project.namespace in states}
+            self.profiles.get(project.namespace), self.pool) for project in projects if project.namespace in states}
         changed = {namespace for namespace in self.profiles.keys() | next_profiles.keys()
             if self.profiles.get(namespace) is not next_profiles.get(namespace)}
         if not changed:
@@ -184,4 +187,4 @@ class ProjectContributions:
         return result
 
     def clear(self):
-        self.__init__()
+        self.__init__(self.pool)

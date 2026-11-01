@@ -17,6 +17,7 @@ from ..semantic.graph import build_semantic_graph
 from .app import DaemonServer, fingerprint_json_payload
 from .settings_union import CatalogUnion, merge_fallback, merge_surface
 from .project_contributions import ProjectContributions
+from .project_records import ProjectRecordPool
 
 
 _LABEL_KEYS = frozenset(('modelLabel', 'baseModelLabel', 'relatedModelLabel',
@@ -215,7 +216,8 @@ class WorkspaceProjects:
         self._closed = False
         self._model_ids = {}
         self._label_owners = {}
-        self._contributions = ProjectContributions()
+        self._record_pool = ProjectRecordPool()
+        self._contributions = ProjectContributions(self._record_pool)
         self._catalog_fingerprint = (None, None)
         self._fallback_fingerprint = (None, None)
 
@@ -239,35 +241,6 @@ class WorkspaceProjects:
             labels[label] = qualified
         return labels
 
-    def _share_records(self, value):
-        """Reuse equal immutable member rows; keep each registry's owners separate."""
-        group = value.project.group_namespace or value.project.namespace
-        previous = next((state for state in self.states.values()
-            if (state.runtime.project.group_namespace or state.runtime.project.namespace) == group), None)
-        if previous is None:
-            return value
-        surface = dict(value.surface)
-        for label, row in surface.items():
-            old = (previous.engine._last_surface_index or {}).get(label)
-            if old == row:
-                surface[label] = old
-            elif old:
-                surface[label] = {kind: old[kind] if old.get(kind) == members else members for kind, members in row.items()}
-        members = value.members
-        owned = getattr(previous.engine.static_index, '_runtime_member_snapshot', None)
-        if members is not None and owned is not None:
-            items = {}
-            for key, rows in members.items.items():
-                old = owned.items.get(key, ())
-                if rows == old:
-                    items[key] = old
-                else:
-                    by_name = {item.name: item for item in old}
-                    items[key] = tuple(by_name[item.name] if by_name.get(item.name) == item else item for item in rows)
-            members = replace(members, items=items)
-            value.static_index._runtime_member_snapshot = members
-        return replace(value, surface=surface, members=members)
-
     def install(self, value):
         project = value.project
         if project not in self.projects:
@@ -288,7 +261,7 @@ class WorkspaceProjects:
                 return
             if not isinstance(value, ProjectRuntime):
                 raise TypeError('Expected a pure project runtime result.')
-            value = self._share_records(value)
+            value = self._record_pool.share(value)
             output = sys.stdout
             try:
                 engine = DaemonServer(Path(project.import_root))
@@ -619,5 +592,6 @@ class WorkspaceProjects:
             self._model_ids.clear()
             self._label_owners.clear()
             self._contributions.clear()
+            self._record_pool.clear()
             self._catalog_fingerprint = (None, None)
             self._fallback_fingerprint = (None, None)
