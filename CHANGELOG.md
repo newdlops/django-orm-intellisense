@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.2031 — 2026-11-01
+
+- Reuse unchanged settings contributions, client model indexes and native
+  instance fields. Health updates preserve prepared source locations.
+- Share one source witness and static seed across serial registry collectors,
+  while retaining source membership, file identity and cancellation checks.
+- Share equal immutable graph, field, member and lookup records within each
+  workspace; release replaced generations without changing global GC policy.
+- Restore successful settings from bounded, atomically written gzip JSON
+  caches, including a shared static seed. Validate source ownership, configuration,
+  dependencies, interpreter, analysis code and launch environment before reuse.
+  Saved changes update cache bindings; failed settings remain retryable.
+- Recheck external inputs before adoption and retry a witnessed dependency
+  race once within its remaining runtime budget. Reject corrupt or truncated
+  compressed records and retain the existing workspace cache-clear behavior.
+- Prevent an older native hydration from publishing readiness or dropping a
+  newer surface while it is being serialized. Identical pending inputs still
+  share their native work.
+
 ## 0.2.2030 — 2026-10-28
 
 - Analyze every concrete Django settings registry even when several settings

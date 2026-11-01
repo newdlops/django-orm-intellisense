@@ -62,9 +62,13 @@ export async function run(): Promise<void> {
   persist('starting');
   try {
     await until(() => vscode.workspace.isTrusted, Boolean, 'Workspace needs explicit trust approval', 120_000);
-    const pylance = vscode.extensions.getExtension('ms-python.vscode-pylance');
-    const python = vscode.extensions.getExtension('ms-python.python');
-    assert(pylance && python, 'Real Python and Pylance extensions are required for the diagnostic check');
+    // Standard workspace trust can register restricted extensions after the
+    // trust event itself. Wait for their real registrations before activation.
+    const dependencies = await until(() => ({
+      pylance: vscode.extensions.getExtension('ms-python.vscode-pylance'),
+      python: vscode.extensions.getExtension('ms-python.python'),
+    }), value => Boolean(value.pylance && value.python), 'Registered Python and Pylance extensions');
+    const pylance = dependencies.pylance!, python = dependencies.python!;
     await python.activate();
     await pylance.activate();
     const extension = vscode.extensions.getExtension('newdlops.django-orm-intellisense');

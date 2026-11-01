@@ -4,7 +4,7 @@ The user requested all four optimization opportunities identified after 0.2.2030
 
 ## Approach
 
-Keep isolated serial registry workers. Share source-generation inputs and immutable records, retain complete per-settings semantics, and update only changed model contributions. Reuse the existing surface transport and client incremental-index machinery. Cache pure records with explicit source, interpreter, code, dependency and launch-environment witnesses; reject corrupt or stale entries and retry failed settings. Cached startup remains subject to current source validation.
+Keep isolated serial registry workers. Share source-generation inputs and immutable records, retain complete per-settings semantics, and update only changed model contributions. Reuse the existing surface transport and client incremental-index machinery. Cache pure records in bounded gzip JSON with explicit per-profile source ownership, interpreter, code, dependency and launch-environment witnesses; reject corrupt or stale entries and retry failed settings. Cached startup remains subject to current source and external-input validation.
 
 Alternatives considered: parallel registry collection increases memory; collapsing equal INSTALLED_APPS is incorrect because settings can register different lookups or methods; retaining resident Django registries changes process ownership. None is needed. The chosen approach removes repeated work while retaining registry isolation.
 
