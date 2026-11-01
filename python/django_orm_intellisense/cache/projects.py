@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from hashlib import sha256
+import gzip
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
+import zlib
 
 from . import store
 from . import runtime_member_records as member_records
@@ -84,19 +86,25 @@ class ProjectRuntimeCache:
 
     def _path(self, project, kind):
         number = self.slots.get(project.namespace)
-        return None if number is None else self.directory / f'{kind}-{number:03}.json'
+        suffix = '.json.gz' if kind == 'profile' else '.json'
+        return None if number is None else self.directory / f'{kind}-{number:03}{suffix}'
 
     def _read(self, path):
         try:
             if path is None or path.stat().st_size > MAX_RECORD_BYTES:
                 return None
-            with path.open(encoding='utf-8') as stream:
-                payload = json.load(stream)
+            opener = gzip.open if path.suffix == '.gz' else open
+            with opener(path, 'rt', encoding='utf-8') as stream:
+                encoded = stream.read(MAX_RECORD_BYTES + 1)
+            if len(encoded) > MAX_RECORD_BYTES:
+                return None
+            payload = json.loads(encoded)
+            del encoded
             if (type(payload) is not dict or payload.get('context') != self.base_context
                     or _digest(payload['record']) != payload['digest']):
                 return None
             return payload['record']
-        except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        except (OSError, EOFError, zlib.error, ValueError, KeyError, TypeError, RecursionError):
             return None
 
     def _write(self, path, record, current, validate=lambda: True):
@@ -116,21 +124,30 @@ class ProjectRuntimeCache:
         temporary = None
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
-            entries = [*self.directory.glob('*.json'), *self.directory.glob('*.tmp')]
+            entries = [*self.directory.glob('*.json*'), *self.directory.glob('*.tmp')]
             total = sum(item.stat().st_size for item in entries if item != path)
             if total >= MAX_TOTAL_BYTES or sum(item.suffix == '.tmp' for item in entries) >= MAX_PROFILES * 2:
                 return
-            with tempfile.NamedTemporaryFile(mode='w', encoding='ascii', prefix='.record-', suffix='.tmp',
+            with tempfile.NamedTemporaryFile(mode='wb', prefix='.record-', suffix='.tmp',
                     dir=self.directory, delete=False) as stream:
                 temporary = Path(stream.name)
+                compressed = (gzip.GzipFile(filename='', mode='wb', compresslevel=1, fileobj=stream, mtime=0)
+                    if path.suffix == '.gz' else None)
+                destination = compressed or stream
                 class BoundedWriter:
                     size = 0
                     def write(self, chunk):
                         self.size += len(chunk)
-                        if self.size > MAX_RECORD_BYTES or total + self.size > MAX_TOTAL_BYTES or not current():
+                        if self.size > MAX_RECORD_BYTES or total + stream.tell() > MAX_TOTAL_BYTES or not current():
                             raise OSError('Project cache write stopped or exceeded its budget.')
-                        return stream.write(chunk)
-                write(BoundedWriter())
+                        return destination.write(chunk.encode('ascii'))
+                try:
+                    write(BoundedWriter())
+                finally:
+                    if compressed is not None:
+                        compressed.close()
+                if stream.tell() > MAX_RECORD_BYTES or total + stream.tell() > MAX_TOTAL_BYTES:
+                    return
             if current() and validate():
                 temporary.replace(path)
                 return True

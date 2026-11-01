@@ -90,7 +90,7 @@ class ProjectRuntimeCacheTest(unittest.TestCase):
 
     def test_corrupt_record_recollects_only_its_profile(self):
         self.run_server()
-        records = sorted(Path(self.cache.name).rglob('profile-*.json'))
+        records = sorted(Path(self.cache.name).rglob('profile-*.json*'))
         self.assertEqual(len(records), 2)
         records[0].write_text('{"incomplete":')
         result, workers = self.run_server()
@@ -195,7 +195,7 @@ class ProjectRuntimeCacheTest(unittest.TestCase):
         self.run_server()
         directory = store._workspace_cache_dir(self.root)
         self.assertEqual(len(list(directory.rglob('seed-*.json'))), 1)
-        self.assertEqual(len(list(directory.rglob('profile-*.json'))), 2)
+        self.assertEqual(len(list(directory.rglob('profile-*.json*'))), 2)
         shutil.rmtree(directory)
         self.assertEqual(self.run_server()[1], 2)
 
@@ -309,6 +309,32 @@ class ProjectRuntimeCacheTest(unittest.TestCase):
         result, workers = self.run_server()
         self.assertEqual(workers, 0, 'Unchanged profile caches lost their validated source ownership')
         self.assertEqual(result['health']['runtime']['readySettingsCount'], 4)
+
+    def test_repetitive_restart_metadata_is_compressed_and_expanded_reads_are_bounded(self):
+        from django_orm_intellisense.cache import projects as cache_module
+        from django_orm_intellisense.discovery.workspace import snapshot_python_sources, discover_workspace
+        from django_orm_intellisense.discovery.settings import settings_projects
+        snapshot = snapshot_python_sources(self.root, max_workers=1)
+        projects = settings_projects(self.root, discover_workspace(self.root).settings_sources)
+        cache = cache_module.ProjectRuntimeCache(self.root, projects, snapshot, 'control')
+        path = cache._path(projects[0], 'profile')
+        record = {'rows': ['shared metadata ' * 1000] * 400}
+        cache._write(path, record, lambda: True)
+        self.assertLess(path.stat().st_size, 150000, 'Repetitive registry metadata consumed its full expanded disk size')
+        self.assertEqual(cache._read(path), record)
+        with mock.patch.object(cache_module, 'MAX_RECORD_BYTES', 100000):
+            self.assertIsNone(cache._read(path), 'A small compressed file bypassed the expanded input limit')
+
+    def test_truncated_compressed_record_recollects_instead_of_aborting_startup(self):
+        self.run_server()
+        path = next(Path(self.cache.name).rglob('profile-*.json.gz'))
+        encoded = path.read_bytes()
+        for damaged in (encoded[:-5], encoded[:10] + b'\x07' * 20):
+            with self.subTest(truncated=len(damaged) > 30):
+                path.write_bytes(damaged)
+                result, workers = self.run_server()
+                self.assertEqual(workers, 1)
+                self.assertEqual(result['health']['runtime']['readySettingsCount'], 2)
 
 
 if __name__ == '__main__':
