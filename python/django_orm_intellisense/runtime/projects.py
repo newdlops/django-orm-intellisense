@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from copy import copy
+from contextlib import ExitStack
 from pathlib import Path
 import os
 import pickle
@@ -38,6 +39,11 @@ class ProjectRuntime:
 class ProjectRuntimeFailure:
     project: SettingsProject
     error: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SharedProjectFile:
+    path: str
 
 
 def copy_source_index(index):
@@ -89,6 +95,8 @@ def project_source_files(projects, project, files):
 
 
 def project_source_projection(root, snapshot, files):
+    if snapshot.root == str(root) and tuple(files) == snapshot.files:
+        return snapshot
     selected = set(files)
     entries, paths, identities = [], [], []
     assert snapshot._file_identities is not None
@@ -110,26 +118,67 @@ def project_source_projection(root, snapshot, files):
 def collect_project_runtimes(projects, *, workspace_root, source_files,
                              stopping=None, is_current=lambda: True,
                              timeout_seconds=30, extra_roots=(), all_projects=None,
-                             static_indexes=None, static_snapshots=None):
-    """Yield one project at a time; no Django classes or resident child survive."""
-    stopping = stopping if stopping is not None else threading.Event()
+                             static_indexes=None, static_snapshots=None, source_snapshot=None):
+    """Own one source witness and shared private seeds for this serial generation."""
     projects, source_files = tuple(projects), tuple(source_files)
-    ownership = tuple(all_projects) if all_projects is not None else projects
+    stopping = stopping if stopping is not None else threading.Event()
+    if stopping.is_set() or not is_current():
+        return
+    try:
+        expected = source_snapshot
+        if (expected is None or expected.root != str(workspace_root) or expected.files != source_files
+                or expected._file_identities is None):
+            expected = snapshot_project_sources(Path(workspace_root), source_files)
+        membership = source_membership_fingerprint(expected)
+    except OSError as error:
+        for project in projects:
+            if stopping.is_set() or not is_current():
+                return
+            yield ProjectRuntimeFailure(project, 'Project source inventory changed before collection: ' + str(error))
+        return
+    unique_owners = {}
+    for owner in tuple(all_projects) if all_projects is not None else projects:
+        unique_owners.setdefault(owner.root, owner)
+    ownership = tuple(unique_owners.values())
+    selections = {}
+    for project in projects:
+        if project.root not in selections:
+            selections[project.root] = project_source_files(ownership, project, source_files)
+    with ExitStack() as shared:
+        reference = _SharedProjectFile(shared.enter_context(_private_state_file(
+            (expected, membership, ownership, selections), 'djls-project-source-snapshot-')))
+        yield from _collect_project_runtimes(projects, workspace_root=workspace_root,
+            stopping=stopping, is_current=is_current, timeout_seconds=timeout_seconds, extra_roots=extra_roots,
+            static_indexes=static_indexes, static_snapshots=static_snapshots, reference=reference, shared=shared)
+
+
+def _collect_project_runtimes(projects, *, workspace_root, stopping, is_current,
+                             timeout_seconds, extra_roots, static_indexes, static_snapshots, reference, shared):
+    """Yield one project at a time; no Django classes or resident child survive."""
     package_root = str(Path(__file__).resolve().parents[2])
+    seeds = {}
     for project in projects:
         if stopping.is_set() or not is_current():
             return
-        selected = project_source_files(ownership, project, source_files)
-        try:
-            expected = snapshot_project_sources(Path(workspace_root), source_files)
-            membership = source_membership_fingerprint(expected)
-        except OSError as error:
-            yield ProjectRuntimeFailure(project, 'Project source inventory changed before collection: ' + str(error))
-            continue
         original = static_indexes.get(project.namespace) if static_indexes else None
-        seed = copy_source_index(original) if original is not None else None
         seed_snapshot = static_snapshots.get(project.namespace) if static_snapshots else None
-        state = (project, str(workspace_root), selected, ownership, expected, membership, tuple(extra_roots), seed, seed_snapshot)
+        seed, seed_reference = None, None
+        if original is not None and seed_snapshot is not None:
+            key = project.root, project.import_root, id(original.modules), id(original.model_candidates), seed_snapshot.fingerprint
+            cached = seeds.get(key)
+            if cached is None:
+                seed = copy_source_index(original)
+                if getattr(seed, '_profile_model_modules', {}):
+                    seed = replace(seed, _profile_model_modules={})
+                    if getattr(original, '_source_import_roots', ()):
+                        seed._source_import_roots = original._source_import_roots
+                seed_reference = _SharedProjectFile(shared.enter_context(_private_state_file(
+                    (seed, seed_snapshot), 'djls-project-source-seed-')))
+                seeds[key] = seed, seed_reference
+            else:
+                seed, seed_reference = cached
+        state = (project, str(workspace_root), None, None, reference, None,
+            tuple(extra_roots), seed_reference, None)
         with _private_state_file(state, 'djls-project-runtime-state-') as input_path:
             result_path = Path(input_path).with_name('result.pickle')
             log_path = result_path.with_suffix('.log')
@@ -212,9 +261,17 @@ def project_worker_main(input_path, result_path):
         project, workspace_root, source_files, projects, expected, expected_membership, extra_roots = state[:7]
         seed = state[7] if len(state) > 7 else None
         seed_snapshot = state[8] if len(state) > 8 else None
+    if isinstance(expected, _SharedProjectFile):
+        with Path(expected.path).open('rb') as stream:
+            expected, expected_membership, projects, selections = pickle.load(stream)
+        source_files = selections[project.root]
+    if isinstance(seed, _SharedProjectFile):
+        with Path(seed.path).open('rb') as stream:
+            seed, seed_snapshot = pickle.load(stream)
     roots = tuple(dict.fromkeys((project.import_root, project.root, workspace_root, *map(str, extra_roots))))
     sys.path[:] = [*roots, *(entry for entry in sys.path if entry not in roots)]
-    before_global = snapshot_python_sources(Path(workspace_root), extra_roots=list(extra_roots) or None, max_workers=1)
+    before_global = snapshot_python_sources(Path(workspace_root), extra_roots=list(extra_roots) or None,
+        max_workers=1, previous_snapshot=expected)
     before_membership = source_membership_fingerprint(before_global)
     with current_workspace_source_imports(tuple(Path(root) for root in roots)):
         runtime = inspect_runtime(project.settings_module)
@@ -235,8 +292,10 @@ def project_worker_main(input_path, result_path):
         proof_files = tuple(path for path in before_global.files
             if (owner := project_owner(projects, path)) is None or owner.namespace in dependencies)
         source_files = tuple(dict.fromkeys((*source_files, *(path for path in before_global.files if path in imported))))
-        covered = set(seed_snapshot.files) if seed_snapshot is not None else set()
-        reused_static = (seed is not None and set(source_files).issubset(covered)
+        covered = {Path(module.file_path) for module in seed.modules.values()} if seed is not None else set()
+        if seed is not None:
+            covered.update(Path(project.import_root) / relative for relative in (*seed.unparseable_files, *seed.shadowed_files))
+        reused_static = (seed is not None and seed_snapshot is not None and set(source_files).issubset(covered)
             and project_source_projection(Path(project.import_root), seed_snapshot, source_files).fingerprint
                 == project_source_projection(Path(project.import_root), before_global, source_files).fingerprint)
         static = seed if reused_static else build_static_index(Path(project.import_root), python_files=source_files,
@@ -252,7 +311,8 @@ def project_worker_main(input_path, result_path):
             app_names = tuple(config.name for config in apps.get_app_configs())
         else:
             app_names = ()
-    after_global = snapshot_python_sources(Path(workspace_root), extra_roots=list(extra_roots) or None, max_workers=1)
+    after_global = snapshot_python_sources(Path(workspace_root), extra_roots=list(extra_roots) or None,
+        max_workers=1, previous_snapshot=before_global)
     before = project_source_projection(Path(project.import_root), before_global, proof_files)
     expected_scope = project_source_projection(Path(project.import_root), expected, proof_files)
     after_files = tuple(path for path in after_global.files

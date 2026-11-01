@@ -105,7 +105,7 @@ class ProjectDaemonServer(DaemonServer):
                 shared, graph, surface = previous
                 static = copy_source_index(shared)
             coordinator.install(ProjectRuntime(project, static, runtime, graph, None, surface,
-                fingerprint_surface_index(surface), snapshot_project_sources(Path(project.import_root), files),
+                fingerprint_surface_index(surface), project_source_projection(Path(project.import_root), snapshot, files),
                 dependencies=(project.namespace,)))
         if params.get('deferRuntime'):
             self._schedule_project_refresh(delay=0.05)
@@ -149,6 +149,7 @@ class ProjectDaemonServer(DaemonServer):
             for value in collect_project_runtimes(selected, all_projects=coordinator.projects,
                     workspace_root=self.workspace_root, source_files=snapshot.files,
                     extra_roots=self._editable_source_roots, stopping=stopping, is_current=current,
+                    source_snapshot=snapshot,
                     timeout_seconds=60 if len(snapshot.files) > 10000 else 30,
                     static_indexes={namespace: state.engine.static_index for namespace, state in coordinator.states.items()},
                     static_snapshots={namespace: state.engine.source_snapshot for namespace, state in coordinator.states.items()}):
@@ -161,7 +162,8 @@ class ProjectDaemonServer(DaemonServer):
                         return
                     if isinstance(value, ProjectRuntime):
                         live = snapshot_python_sources(self.workspace_root,
-                            extra_roots=list(self._editable_source_roots) or None, max_workers=1)
+                            extra_roots=list(self._editable_source_roots) or None, max_workers=1,
+                            previous_snapshot=snapshot)
                         owners = set(value.dependencies)
                         # Use longest ownership so a root project does not claim
                         # a nested independent project in the source witness.
